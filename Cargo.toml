@@ -1,0 +1,48 @@
+[package]
+name = "kappa-registry"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "A conforming kappa-Distribution /v2/ registry. Filesystem-backed, single-node, all five conformance levels."
+
+[lib]
+name = "kappa_registry"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kappa-registry"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+tower = "0.5"
+tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
+sha2 = "0.10"
+blake3 = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonschema = { version = "0.46", default-features = false }
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["blocking"], optional = true }
+
+[features]
+default = []
+federation = ["reqwest"]
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["blocking"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = true
+strip = true

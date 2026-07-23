@@ -1,0 +1,7 @@
+/target/
+/.direnv/
+/.env
+*.swp
+*.swo
+*~
+tmp
