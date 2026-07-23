@@ -20,7 +20,17 @@ pub async fn manifest_put(
     auth::authorize(ns, "manifest.put")?;
 
     let content = body.to_vec();
-    let kappa = KappaLabel::sha256(&content);
+
+    // Determine digest algorithm: if the reference is a valid digest, use its axis.
+    // Otherwise default to sha256.
+    let kappa = if let Ok(ref_label) = KappaLabel::parse(tag) {
+        match crate::kappa::compute_kappa(ref_label.axis(), &content) {
+            Ok(k) => k,
+            Err(_) => KappaLabel::sha256(&content),
+        }
+    } else {
+        KappaLabel::sha256(&content)
+    };
 
     // Gate 1: admission filters
     let s = state.store.clone();
@@ -72,21 +82,48 @@ pub async fn manifest_put(
         }
     }
 
-    // Gate 3: content-before-tag - store blob first
+    // Gate 3: store blob
     let s = state.store.clone();
     let k = kappa.as_str().to_string();
     let c = content;
     tokio::task::spawn_blocking(move || s.put(&k, &c)).await??;
 
-    // Gate 4: bind the primary tag
-    let s = state.store.clone();
-    let p = ns.to_string();
-    let t = tag.to_string();
-    let k = kappa.as_str().to_string();
-    tokio::task::spawn_blocking(move || s.tag_set(&p, &t, &k)).await??;
+    // Gate 4: determine if reference is a digest or a tag.
+    // A valid digest parses as a KappaLabel. An invalid digest uses a recognized
+    // algorithm prefix (sha256, blake3, etc.) but fails full validation - reject
+    // with 400. Anything else (including timestamps with colons) is a tag name.
+    let ref_is_valid_digest = KappaLabel::parse(tag).is_ok();
+    let ref_looks_like_bad_digest = !ref_is_valid_digest
+        && tag
+            .split_once(':')
+            .map(|(algo, _)| {
+                matches!(
+                    algo,
+                    "sha256" | "blake3" | "sha3-256" | "keccak256" | "sha512"
+                )
+            })
+            .unwrap_or(false);
 
-    // Gate 5: bind additional tags from ?tag= query parameters (B38)
-    if let Some(extra_tag) = params.get("tag") {
+    if ref_looks_like_bad_digest {
+        return Err(AppError::digest_invalid(tag, "invalid digest format"));
+    }
+
+    // When pushing by digest, verify the computed digest matches the reference
+    if ref_is_valid_digest && kappa.as_str() != tag {
+        return Err(AppError::digest_invalid(tag, kappa.as_str()));
+    }
+
+    if !ref_is_valid_digest {
+        // Reference is a tag name - bind it
+        let s = state.store.clone();
+        let p = ns.to_string();
+        let t = tag.to_string();
+        let k = kappa.as_str().to_string();
+        tokio::task::spawn_blocking(move || s.tag_set(&p, &t, &k)).await??;
+    }
+
+    // Bind additional tags from ?tag= query parameters
+    for extra_tag in params.get("tag").into_iter() {
         let s = state.store.clone();
         let p = ns.to_string();
         let et = extra_tag.clone();
@@ -94,18 +131,77 @@ pub async fn manifest_put(
         tokio::task::spawn_blocking(move || s.tag_set(&p, &et, &k)).await??;
     }
 
-    Ok((
-        StatusCode::CREATED,
-        [
-            ("x-kappa-label", kappa.as_str().to_string()),
-            ("docker-content-digest", kappa.as_str().to_string()),
-            (
-                "location",
-                crate::routes::segments::manifest_url(ns, kappa.as_str()),
-            ),
-            ("content-length", "0".to_string()),
-        ],
-    )
+    // Store Content-Type metadata from the request or default to OCI manifest type
+    let ct_value = params
+        .get("_content_type")
+        .cloned()
+        .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+    let s = state.store.clone();
+    let k = kappa.as_str().to_string();
+    let ct_bytes = ct_value.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || s.put_meta(&k, "content-type", &ct_bytes)).await??;
+
+    // Detect subject field for OCI-Subject header
+    let subject_digest: Option<String> = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("subject")
+                .and_then(|s| s.get("digest"))
+                .and_then(|d| d.as_str())
+                .map(String::from)
+        });
+
+    // Create refers-to edge when subject is present
+    if let Some(ref subj) = subject_digest {
+        let edge_meta = vec![0xA0u8];
+        let edge_canon = super::edge::edge_canonical_pub(
+            kappa.as_str().as_bytes(),
+            "refers-to",
+            subj.as_bytes(),
+            &edge_meta,
+        );
+        let axis = kappa.as_str().split(':').next().unwrap_or("sha256");
+        if let Ok(edge_kappa) = crate::kappa::compute_kappa(axis, &edge_canon) {
+            let s = state.store.clone();
+            let ek = edge_kappa.as_str().to_string();
+            let ec = edge_canon.clone();
+            let _ = tokio::task::spawn_blocking({
+                let s = s.clone();
+                let ek = ek.clone();
+                move || s.put(&ek, &ec)
+            })
+            .await;
+            let s = state.store.clone();
+            let src = kappa.as_str().to_string();
+            let tgt = subj.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                s.edge_put(
+                    &ek,
+                    &src,
+                    "refers-to",
+                    &tgt,
+                    &edge_canon,
+                    serde_json::json!({}),
+                )
+            })
+            .await;
+        }
+    }
+
+    let mut resp = axum::http::Response::builder().status(StatusCode::CREATED);
+    resp = resp.header("x-kappa-label", kappa.as_str());
+    resp = resp.header("docker-content-digest", kappa.as_str());
+    resp = resp.header(
+        "location",
+        crate::routes::segments::manifest_url(ns, kappa.as_str()),
+    );
+    resp = resp.header("content-length", "0");
+    if let Some(ref subj) = subject_digest {
+        resp = resp.header("oci-subject", subj.as_str());
+    }
+    Ok(resp
+        .body(axum::body::Body::empty())
+        .unwrap()
         .into_response())
 }
 
@@ -143,6 +239,47 @@ pub async fn manifest_get(state: &AppState, ns: &str, version: &str) -> Result<R
             ("content-type", ct),
         ],
         content,
+    )
+        .into_response())
+}
+
+pub async fn manifest_head(
+    state: &AppState,
+    ns: &str,
+    version: &str,
+) -> Result<Response, AppError> {
+    auth::authorize(ns, "manifest.head")?;
+
+    let kappa_str = if version.contains(':') {
+        version.to_string()
+    } else {
+        let s = state.store.clone();
+        let p = ns.to_string();
+        let v = version.to_string();
+        let result = tokio::task::spawn_blocking(move || s.tag_get(&p, &v)).await??;
+        result.ok_or(AppError::TagUnknown)?
+    };
+
+    let s = state.store.clone();
+    let k = kappa_str.clone();
+    let content = tokio::task::spawn_blocking(move || s.get(&k)).await??;
+    let content = content.ok_or(AppError::BlobUnknown)?;
+
+    let s = state.store.clone();
+    let k = kappa_str.clone();
+    let ct = tokio::task::spawn_blocking(move || s.get_meta(&k, "content-type"))
+        .await??
+        .and_then(|v| String::from_utf8(v).ok())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    Ok((
+        StatusCode::OK,
+        [
+            ("content-length", content.len().to_string()),
+            ("x-kappa-label", kappa_str.clone()),
+            ("docker-content-digest", kappa_str),
+            ("content-type", ct),
+        ],
     )
         .into_response())
 }
@@ -209,7 +346,8 @@ pub async fn tag_list(
     let p = ns.to_string();
     let page = tokio::task::spawn_blocking(move || s.tag_list(&p, &opts)).await??;
 
-    let body = serde_json::json!({"name": ns, "tags": page.tags});
+    let tag_names: Vec<&str> = page.tags.iter().map(|t| t.name.as_str()).collect();
+    let body = serde_json::json!({"name": ns, "tags": tag_names});
 
     if page.has_more {
         if let Some(last_entry) = page.tags.last() {

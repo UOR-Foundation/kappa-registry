@@ -63,7 +63,7 @@ fn blob_verify_on_put_rejects_mismatch() {
         &[],
         b"actual content",
     );
-    assert_eq!(status, 409);
+    assert_eq!(status, 400);
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("DIGEST_INVALID"), "body: {text}");
 }
@@ -276,5 +276,5 @@ fn multi_label_bad_also_rejected() {
     let path = format!("{}?also={bad_also}", blob_uri(ns, &sha_k));
 
     let (status, _, _) = request(&srv.addr, "PUT", &path, &[], content);
-    assert_eq!(status, 409, "bad also kappa rejected");
+    assert_eq!(status, 400, "bad also kappa rejected");
 }

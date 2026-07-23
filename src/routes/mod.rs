@@ -23,6 +23,7 @@ pub enum Endpoint<'a> {
     UploadCancel { id: &'a str },
 
     // L2 manifests (atomic store+tag)
+    ManifestHead { ns: &'a str, version: &'a str },
     ManifestGet { ns: &'a str, version: &'a str },
     ManifestPut { ns: &'a str, tag: &'a str },
     ManifestDelete { ns: &'a str, tag: &'a str },
@@ -31,6 +32,9 @@ pub enum Endpoint<'a> {
     TagList { ns: &'a str },
     TagGet { ns: &'a str, name: &'a str },
     TagPut { ns: &'a str, name: &'a str },
+
+    // OCI referrers
+    Referrers { ns: &'a str, digest: &'a str },
 
     // L3 edges
     EdgePut { ns: &'a str },
@@ -120,11 +124,21 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
         if let Some((ns, version)) = extract::split_at(path, segments::MANIFESTS) {
             if !version.is_empty() {
                 return match method {
+                    "HEAD" => Endpoint::ManifestHead { ns, version },
                     "GET" => Endpoint::ManifestGet { ns, version },
                     "PUT" => Endpoint::ManifestPut { ns, tag: version },
                     "DELETE" => Endpoint::ManifestDelete { ns, tag: version },
                     _ => Endpoint::NotFound,
                 };
+            }
+        }
+    }
+
+    // Referrers: {ns}/referrers/{digest}
+    if inner.contains(segments::REFERRERS) {
+        if let Some((ns, digest)) = extract::split_at(path, segments::REFERRERS) {
+            if !digest.is_empty() && method == "GET" {
+                return Endpoint::Referrers { ns, digest };
             }
         }
     }
@@ -264,11 +278,43 @@ pub fn query_params(uri: &str) -> HashMap<String, String> {
     if let Some((_, query)) = uri.split_once('?') {
         for pair in query.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
-                params.insert(k.to_string(), v.to_string());
+                let key = url_decode(k);
+                let val = url_decode(v);
+                params.insert(key, val);
             }
         }
     }
     params
+}
+
+fn url_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next().and_then(hex_val);
+            let lo = chars.next().and_then(hex_val);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                result.push((h << 4 | l) as char);
+            } else {
+                result.push('%');
+            }
+        } else if b == b'+' {
+            result.push(' ');
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +564,76 @@ mod tests {
         assert!(matches!(
             parse("GET", "/v2/_health/bogus"),
             Endpoint::NotFound
+        ));
+    }
+
+    #[test]
+    fn query_params_with_digest() {
+        let params = query_params("/v2/_uploads/abc?digest=sha256:0123456789abcdef");
+        assert_eq!(
+            params.get("digest").map(|s| s.as_str()),
+            Some("sha256:0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn query_params_url_encoded_digest() {
+        let params =
+            query_params("/v2/_uploads/abc?digest=sha256%3A0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            params.get("digest").map(|s| s.as_str()),
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn query_params_multiple() {
+        let params = query_params("/v2/ns/tags/list?n=5&last=v1.0");
+        assert_eq!(params.get("n").map(|s| s.as_str()), Some("5"));
+        assert_eq!(params.get("last").map(|s| s.as_str()), Some("v1.0"));
+    }
+
+    #[test]
+    fn query_params_empty() {
+        let params = query_params("/v2/ns/blobs/sha256:abc");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn manifest_head_routing() {
+        assert!(matches!(
+            parse("HEAD", "/v2/ns/manifests/latest"),
+            Endpoint::ManifestHead {
+                ns: "ns",
+                version: "latest"
+            }
+        ));
+        assert!(matches!(
+            parse("HEAD", "/v2/ns/manifests/sha256:abc"),
+            Endpoint::ManifestHead {
+                ns: "ns",
+                version: "sha256:abc"
+            }
+        ));
+    }
+
+    #[test]
+    fn referrers_routing() {
+        assert!(matches!(
+            parse("GET", "/v2/ns/referrers/sha256:abc"),
+            Endpoint::Referrers {
+                ns: "ns",
+                digest: "sha256:abc"
+            }
+        ));
+    }
+
+    #[test]
+    fn upload_complete_with_digest_param() {
+        // The upload URL is /v2/_uploads/{id}, PUT dispatches to UploadComplete
+        assert!(matches!(
+            parse("PUT", "/v2/_uploads/uuid-123"),
+            Endpoint::UploadComplete { id: "uuid-123" }
         ));
     }
 }

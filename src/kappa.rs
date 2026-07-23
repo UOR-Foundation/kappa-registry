@@ -1,4 +1,4 @@
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -105,6 +105,17 @@ impl KappaLabel {
         KappaLabel { buf, len: 71 }
     }
 
+    pub fn sha512(content: &[u8]) -> Self {
+        let hash = Sha512::digest(content);
+        let mut buf = [0u8; 135];
+        buf[..7].copy_from_slice(b"sha512:");
+        for (i, &byte) in hash.iter().enumerate() {
+            buf[7 + 2 * i] = HEX[(byte >> 4) as usize];
+            buf[7 + 2 * i + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        KappaLabel { buf, len: 135 }
+    }
+
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.buf[..self.len as usize]).unwrap()
     }
@@ -165,6 +176,7 @@ pub fn compute_kappa(axis: &str, content: &[u8]) -> Result<KappaLabel, LabelErro
     match axis {
         "sha256" => Ok(KappaLabel::sha256(content)),
         "blake3" => Ok(KappaLabel::blake3(content)),
+        "sha512" => Ok(KappaLabel::sha512(content)),
         _ => Err(LabelError::UnknownAxis),
     }
 }

@@ -48,7 +48,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
             Self::DigestInvalid { expected, got } => (
-                StatusCode::CONFLICT,
+                StatusCode::BAD_REQUEST,
                 "DIGEST_INVALID",
                 format!("expected {expected}, got {got}"),
             ),

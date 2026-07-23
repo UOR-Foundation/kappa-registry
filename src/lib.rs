@@ -32,6 +32,7 @@ pub struct AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .fallback(any(dispatch))
+        .layer(axum::extract::DefaultBodyLimit::max(state.max_blob_size))
         .layer(middleware::map_response(add_warning_header))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -51,6 +52,7 @@ pub fn app_with_rate_limit(state: AppState, per_second: u64, burst: u32) -> Rout
 
     Router::new()
         .fallback(any(dispatch))
+        .layer(axum::extract::DefaultBodyLimit::max(state.max_blob_size))
         .layer(middleware::map_response(add_warning_header))
         .layer(GovernorLayer::new(governor_conf))
         .layer(TraceLayer::new_for_http())
@@ -76,7 +78,17 @@ async fn dispatch(
     let method_str = method.as_str();
     let params = routes::query_params(&uri_str);
 
-    match routes::parse(method_str, path) {
+    let endpoint = routes::parse(method_str, path);
+    tracing::debug!(
+        method = method_str,
+        path = path,
+        uri = uri_str.as_str(),
+        params = ?params,
+        endpoint = ?endpoint,
+        "dispatch"
+    );
+
+    match endpoint {
         Endpoint::Version => handlers::blob::version_check().into_response(),
         Endpoint::Health => {
             let probe = path.strip_prefix("/v2/_health/").unwrap_or("live");
@@ -148,17 +160,28 @@ async fn dispatch(
                 .or_else(|| params.get("digest"))
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            handlers::upload::complete(&state, id, kappa, &body)
+            let range_start = headers
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(handlers::upload::parse_range_start);
+            handlers::upload::complete(&state, id, kappa, range_start, &body)
                 .await
                 .into_response()
         }
         Endpoint::UploadCancel { id } => handlers::upload::cancel(&state, id).into_response(),
 
         Endpoint::ManifestPut { ns, tag } => {
-            handlers::tag::manifest_put(&state, ns, tag, &params, &body)
+            let mut manifest_params = params.clone();
+            if let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
+                manifest_params.insert("_content_type".to_string(), ct.to_string());
+            }
+            handlers::tag::manifest_put(&state, ns, tag, &manifest_params, &body)
                 .await
                 .into_response()
         }
+        Endpoint::ManifestHead { ns, version } => handlers::tag::manifest_head(&state, ns, version)
+            .await
+            .into_response(),
         Endpoint::ManifestGet { ns, version } => handlers::tag::manifest_get(&state, ns, version)
             .await
             .into_response(),
@@ -176,6 +199,12 @@ async fn dispatch(
             let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
             let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
             handlers::tag::tag_put(&state, ns, name, kappa, if_match, if_none_match)
+                .await
+                .into_response()
+        }
+
+        Endpoint::Referrers { ns, digest } => {
+            handlers::referrers::list(&state, ns, digest, &params)
                 .await
                 .into_response()
         }

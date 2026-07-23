@@ -188,6 +188,7 @@ pub async fn complete(
     state: &AppState,
     id: &str,
     kappa_str: &str,
+    range_start: Option<usize>,
     final_body: &[u8],
 ) -> Result<Response, AppError> {
     if state.sessions.is_expired(id, state.upload_timeout_secs) {
@@ -196,8 +197,13 @@ pub async fn complete(
     }
 
     if !final_body.is_empty() {
-        if let Some(received) = state.sessions.bytes_received(id) {
-            let _ = state.sessions.append(id, received, final_body);
+        let offset = match (range_start, state.sessions.bytes_received(id)) {
+            (Some(start), Some(_)) => start,
+            (None, Some(received)) => received,
+            (_, None) => return Err(AppError::UploadNotFound),
+        };
+        if state.sessions.append(id, offset, final_body).is_err() {
+            return Err(AppError::RangeNotSatisfiable);
         }
     }
 
@@ -207,6 +213,7 @@ pub async fn complete(
     let computed = match kappa.axis() {
         "sha256" => KappaLabel::sha256(&data),
         "blake3" => KappaLabel::blake3(&data),
+        "sha512" => KappaLabel::sha512(&data),
         _ => return Err(AppError::NameInvalid("unsupported axis".to_string())),
     };
     if computed != kappa {

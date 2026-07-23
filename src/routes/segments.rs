@@ -16,6 +16,7 @@ pub const GC_PIN: &str = "/gc/pin";
 pub const GC_UNPIN: &str = "/gc/unpin";
 pub const GC_SWEEP: &str = "/gc/sweep";
 pub const GC_STATUS: &str = "/gc/status";
+pub const REFERRERS: &str = "/referrers/";
 pub const FILTERS: &str = "/filters/";
 pub const FILTERS_BARE: &str = "/filters";
 pub const UPLOADS: &str = "/v2/_uploads/";
