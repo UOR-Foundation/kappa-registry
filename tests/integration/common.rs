@@ -155,6 +155,14 @@ pub fn reconcile_uri(ns: &str) -> String {
     format!("/v2/{ns}/_reconcile")
 }
 
+pub fn tag_symref_uri(ns: &str, name: &str, target: &str) -> String {
+    format!("/v2/{ns}/tags/{name}?symref={target}")
+}
+
+pub fn tag_raw_uri(ns: &str, name: &str) -> String {
+    format!("/v2/{ns}/tags/{name}?raw=true")
+}
+
 pub fn tag_batch_uri(ns: &str) -> String {
     format!("/v2/{ns}/tags/_batch")
 }

@@ -101,6 +101,12 @@ impl KappaStore for FsStore {
     fn tag_set_batch(&self, updates: &[TagUpdate]) -> Result<BatchResult, StoreError> {
         tag::set_batch(&self.root, updates)
     }
+    fn tag_set_symbolic(&self, ns: &str, name: &str, target: &str) -> Result<(), StoreError> {
+        tag::set_symbolic(&self.root, ns, name, target)
+    }
+    fn tag_get_raw(&self, ns: &str, name: &str) -> Result<Option<String>, StoreError> {
+        tag::get_raw(&self.root, ns, name)
+    }
 
     fn edge_put(
         &self,

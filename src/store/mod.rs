@@ -175,7 +175,17 @@ pub trait KappaStore: Send + Sync + 'static {
     fn tag_find_by_kappa(&self, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError>;
     /// Atomically apply a batch of tag updates. All CAS expectations are
     /// validated before any writes. If any check fails, no writes are applied.
+    /// CAS comparisons operate on raw values -- a symbolic ref's raw value
+    /// is "ref:target_name", not the resolved kappa-label.
     fn tag_set_batch(&self, updates: &[TagUpdate]) -> Result<BatchResult, StoreError>;
+
+    /// Set a symbolic pointer: tag `name` in namespace `ns` points to tag
+    /// `target` (another tag name within the same namespace). Stored as
+    /// "ref:{target}" in the tag index.
+    fn tag_set_symbolic(&self, ns: &str, name: &str, target: &str) -> Result<(), StoreError>;
+    /// Return the raw tag value without resolution. For direct tags this
+    /// is the kappa-label string. For symbolic tags this is "ref:{target}".
+    fn tag_get_raw(&self, ns: &str, name: &str) -> Result<Option<String>, StoreError>;
 
     // edge (global by canonical form)
     fn edge_put(

@@ -197,14 +197,18 @@ async fn dispatch(
         Endpoint::TagList { ns } => handlers::tag::tag_list(&state, ns, &params)
             .await
             .into_response(),
-        Endpoint::TagGet { ns, name } => handlers::tag::tag_get(&state, ns, name)
-            .await
-            .into_response(),
+        Endpoint::TagGet { ns, name } => {
+            let raw = params.get("raw").map(|s| s == "true").unwrap_or(false);
+            handlers::tag::tag_get(&state, ns, name, raw)
+                .await
+                .into_response()
+        }
         Endpoint::TagPut { ns, name } => {
             let kappa = params.get("kappa").map(|s| s.as_str()).unwrap_or("");
+            let symref = params.get("symref").map(|s| s.as_str());
             let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
             let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
-            handlers::tag::tag_put(&state, ns, name, kappa, if_match, if_none_match)
+            handlers::tag::tag_put(&state, ns, name, kappa, symref, if_match, if_none_match)
                 .await
                 .into_response()
         }

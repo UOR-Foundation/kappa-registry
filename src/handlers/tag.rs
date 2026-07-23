@@ -359,20 +359,33 @@ pub async fn tag_list(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
-pub async fn tag_get(state: &AppState, ns: &str, name: &str) -> Result<Response, AppError> {
+pub async fn tag_get(
+    state: &AppState,
+    ns: &str,
+    name: &str,
+    raw: bool,
+) -> Result<Response, AppError> {
     auth::authorize(ns, "tag.get")?;
 
     let s = state.store.clone();
     let p = ns.to_string();
     let n = name.to_string();
-    let result = tokio::task::spawn_blocking(move || s.tag_get(&p, &n)).await??;
-    let kappa = result.ok_or(AppError::TagUnknown)?;
+    let result = if raw {
+        tokio::task::spawn_blocking(move || s.tag_get_raw(&p, &n)).await??
+    } else {
+        tokio::task::spawn_blocking(move || s.tag_get(&p, &n)).await??
+    };
+    let value = result.ok_or(AppError::TagUnknown)?;
 
-    let body = serde_json::json!({"name": name, "kappa": kappa});
+    let body = if raw {
+        serde_json::json!({"name": name, "value": value})
+    } else {
+        serde_json::json!({"name": name, "kappa": value})
+    };
     Ok((
         StatusCode::OK,
         [
-            ("x-kappa-label", kappa),
+            ("x-kappa-label", value),
             ("content-type", "application/json".to_string()),
         ],
         Json(body),
@@ -385,10 +398,28 @@ pub async fn tag_put(
     ns: &str,
     name: &str,
     kappa: &str,
+    symref: Option<&str>,
     if_match: Option<&str>,
     if_none_match: Option<&str>,
 ) -> Result<Response, AppError> {
     auth::authorize(ns, "tag.put")?;
+
+    // Symbolic ref creation: ?symref=target_name
+    if let Some(target) = symref {
+        let s = state.store.clone();
+        let p = ns.to_string();
+        let n = name.to_string();
+        let t = target.to_string();
+        tokio::task::spawn_blocking(move || s.tag_set_symbolic(&p, &n, &t)).await??;
+        return Ok((
+            StatusCode::CREATED,
+            [
+                ("x-kappa-label", format!("ref:{target}")),
+                ("content-length", "0".to_string()),
+            ],
+        )
+            .into_response());
+    }
 
     // Content-before-tag: kappa must exist in store
     let s = state.store.clone();

@@ -31,10 +31,50 @@ pub fn set(root: &Path, ns: &str, name: &str, kappa: &str) -> Result<(), StoreEr
     write_index(&path, &index)
 }
 
+/// Maximum depth for symbolic ref resolution (matches Git's SYMREF_MAXDEPTH).
+const SYMREF_MAXDEPTH: usize = 10;
+
+/// Symbolic ref prefix. Values starting with this are pointers to other
+/// tag names within the same namespace, not kappa-labels.
+const SYMREF_PREFIX: &str = "ref:";
+
+/// Resolve a tag value, following symbolic ref chains up to SYMREF_MAXDEPTH.
+/// Returns the terminal kappa-label, or None if the chain is broken
+/// (target does not exist) or exceeds the depth limit.
 pub fn get(root: &Path, ns: &str, name: &str) -> Result<Option<String>, StoreError> {
     let path = index_path(root, ns);
     let index = read_index(&path)?;
+
+    let mut current_name = name.to_string();
+    for _ in 0..SYMREF_MAXDEPTH {
+        match index.get(&current_name) {
+            None => return Ok(None),
+            Some(value) => {
+                if let Some(target) = value.strip_prefix(SYMREF_PREFIX) {
+                    current_name = target.to_string();
+                } else {
+                    return Ok(Some(value.clone()));
+                }
+            }
+        }
+    }
+    // Exceeded depth limit -- treat as unresolvable
+    Ok(None)
+}
+
+/// Return the raw tag value without following symbolic refs.
+pub fn get_raw(root: &Path, ns: &str, name: &str) -> Result<Option<String>, StoreError> {
+    let path = index_path(root, ns);
+    let index = read_index(&path)?;
     Ok(index.get(name).cloned())
+}
+
+/// Create a symbolic pointer: store "ref:{target}" as the value for `name`.
+pub fn set_symbolic(root: &Path, ns: &str, name: &str, target: &str) -> Result<(), StoreError> {
+    let path = index_path(root, ns);
+    let mut index = read_index(&path)?;
+    index.insert(name.to_string(), format!("{SYMREF_PREFIX}{target}"));
+    write_index(&path, &index)
 }
 
 pub fn list(root: &Path, ns: &str, opts: &TagListOpts) -> Result<TagPage, StoreError> {

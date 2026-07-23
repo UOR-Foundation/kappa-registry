@@ -111,6 +111,127 @@ fn batch_cas_update_with_expected() {
     assert!(text.contains(&k_new), "tag should point to new kappa");
 }
 
+// ── Symbolic Pointers (P6) ───────────────────────────────────────────────
+
+#[test]
+fn symref_create_and_resolve() {
+    let srv = TestServer::start();
+    let ns = "l2-symref";
+    let kappa = push_blob(&srv.addr, ns, b"symref-target-content");
+
+    // Create direct tag "main" pointing to the blob
+    request(&srv.addr, "PUT", &tag_put_uri(ns, "main", &kappa), &[], b"");
+
+    // Create symbolic ref "HEAD" pointing to "main"
+    let (status, _, _) = request(
+        &srv.addr,
+        "PUT",
+        &tag_symref_uri(ns, "HEAD", "main"),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 201);
+
+    // Resolve HEAD -- should follow the chain and return the kappa-label
+    let (status, _, body) = request(&srv.addr, "GET", &tag_uri(ns, "HEAD"), &[], b"");
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(&kappa),
+        "resolved HEAD contains kappa: {text}"
+    );
+}
+
+#[test]
+fn symref_raw_access() {
+    let srv = TestServer::start();
+    let ns = "l2-symref-raw";
+    let kappa = push_blob(&srv.addr, ns, b"symref-raw-content");
+
+    request(&srv.addr, "PUT", &tag_put_uri(ns, "main", &kappa), &[], b"");
+    request(
+        &srv.addr,
+        "PUT",
+        &tag_symref_uri(ns, "HEAD", "main"),
+        &[],
+        b"",
+    );
+
+    // Raw GET should return "ref:main", not the resolved kappa
+    let (status, _, body) = request(&srv.addr, "GET", &tag_raw_uri(ns, "HEAD"), &[], b"");
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("ref:main"),
+        "raw access shows symref target: {text}"
+    );
+    assert!(
+        !text.contains(&kappa),
+        "raw access does not resolve: {text}"
+    );
+}
+
+#[test]
+fn symref_chain_resolution() {
+    let srv = TestServer::start();
+    let ns = "l2-symref-chain";
+    let kappa = push_blob(&srv.addr, ns, b"chain-terminal");
+
+    // Create chain: HEAD -> dev -> main -> kappa
+    request(&srv.addr, "PUT", &tag_put_uri(ns, "main", &kappa), &[], b"");
+    request(
+        &srv.addr,
+        "PUT",
+        &tag_symref_uri(ns, "dev", "main"),
+        &[],
+        b"",
+    );
+    request(
+        &srv.addr,
+        "PUT",
+        &tag_symref_uri(ns, "HEAD", "dev"),
+        &[],
+        b"",
+    );
+
+    // Resolve HEAD through chain: HEAD -> dev -> main -> kappa
+    let (status, _, body) = request(&srv.addr, "GET", &tag_uri(ns, "HEAD"), &[], b"");
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(&kappa),
+        "chain resolves to terminal kappa: {text}"
+    );
+}
+
+#[test]
+fn symref_dangling_returns_404() {
+    let srv = TestServer::start();
+    let ns = "l2-symref-dangle";
+
+    // Create symref pointing to nonexistent target
+    request(
+        &srv.addr,
+        "PUT",
+        &tag_symref_uri(ns, "HEAD", "nonexistent"),
+        &[],
+        b"",
+    );
+
+    // Resolve should return 404 (dangling symref)
+    let (status, _, _) = request(&srv.addr, "GET", &tag_uri(ns, "HEAD"), &[], b"");
+    assert_eq!(status, 404, "dangling symref returns 404 on resolve");
+
+    // But raw access should still work
+    let (status, _, body) = request(&srv.addr, "GET", &tag_raw_uri(ns, "HEAD"), &[], b"");
+    assert_eq!(status, 200, "dangling symref is accessible via raw");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("ref:nonexistent"),
+        "raw shows the target: {text}"
+    );
+}
+
 // ── Tag Operations ──────────────────────────────────────────────────────
 
 #[test]
