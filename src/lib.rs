@@ -5,6 +5,7 @@ pub mod handlers;
 pub mod kappa;
 pub mod routes;
 pub mod store;
+pub mod transaction;
 
 use std::sync::Arc;
 
@@ -20,11 +21,13 @@ use tower_http::trace::TraceLayer;
 use crate::handlers::upload::SessionStore;
 use crate::routes::Endpoint;
 use crate::store::fs::FsStore;
+use crate::transaction::TransactionManager;
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<FsStore>,
     pub sessions: Arc<SessionStore>,
+    pub transactions: Arc<TransactionManager>,
     pub max_blob_size: usize,
     pub upload_timeout_secs: u64,
 }
@@ -188,6 +191,9 @@ async fn dispatch(
         Endpoint::ManifestDelete { ns, tag } => handlers::tag::manifest_delete(&state, ns, tag)
             .await
             .into_response(),
+        Endpoint::TagBatch { ns } => handlers::tag::tag_batch(&state, ns, &body)
+            .await
+            .into_response(),
         Endpoint::TagList { ns } => handlers::tag::tag_list(&state, ns, &params)
             .await
             .into_response(),
@@ -228,6 +234,21 @@ async fn dispatch(
             .into_response(),
 
         Endpoint::Reconcile { ns } => handlers::reconcile::handle(&state, ns, &body)
+            .await
+            .into_response(),
+
+        Endpoint::TransactionBegin { ns } => handlers::transaction::begin(&state, ns)
+            .await
+            .into_response(),
+        Endpoint::TransactionPut { ns, id, kappa } => {
+            handlers::transaction::put(&state, ns, id, kappa, &body)
+                .await
+                .into_response()
+        }
+        Endpoint::TransactionCommit { ns, id } => handlers::transaction::commit(&state, ns, id)
+            .await
+            .into_response(),
+        Endpoint::TransactionAbort { ns, id } => handlers::transaction::abort(&state, ns, id)
             .await
             .into_response(),
 

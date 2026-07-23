@@ -8,6 +8,8 @@ pub struct Config {
     pub upload_timeout_secs: u64,
     pub rate_limit_rps: u64,
     pub rate_limit_burst: u32,
+    pub max_transactions: usize,
+    pub max_staging_bytes: usize,
 }
 
 impl Config {
@@ -30,6 +32,13 @@ impl Config {
 
         let rate_limit_burst: u32 = env_or("KAPPA_RATE_LIMIT_BURST", "50").parse().unwrap_or(50);
 
+        let max_transactions: usize = env_or("KAPPA_MAX_TRANSACTIONS", "64").parse().unwrap_or(64);
+
+        // Default 256 MiB global staging limit
+        let max_staging_bytes: usize = env_or("KAPPA_MAX_STAGING_BYTES", "268435456")
+            .parse()
+            .unwrap_or(268_435_456);
+
         Config {
             listen_addr,
             store_root,
@@ -37,6 +46,8 @@ impl Config {
             upload_timeout_secs,
             rate_limit_rps,
             rate_limit_burst,
+            max_transactions,
+            max_staging_bytes,
         }
     }
 }

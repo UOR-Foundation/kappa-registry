@@ -6,6 +6,7 @@ use std::time::Duration;
 use kappa_registry::handlers::upload::SessionStore;
 use kappa_registry::kappa::KappaLabel;
 use kappa_registry::store::fs::FsStore;
+use kappa_registry::transaction::TransactionManager;
 use kappa_registry::AppState;
 
 // Test blob fixtures - computed once, used everywhere.
@@ -154,6 +155,26 @@ pub fn reconcile_uri(ns: &str) -> String {
     format!("/v2/{ns}/_reconcile")
 }
 
+pub fn tag_batch_uri(ns: &str) -> String {
+    format!("/v2/{ns}/tags/_batch")
+}
+
+pub fn transaction_begin_uri(ns: &str) -> String {
+    format!("/v2/{ns}/_transaction/begin")
+}
+
+pub fn transaction_put_uri(ns: &str, id: &str, kappa: &str) -> String {
+    format!("/v2/{ns}/_transaction/{id}/{kappa}")
+}
+
+pub fn transaction_commit_uri(ns: &str, id: &str) -> String {
+    format!("/v2/{ns}/_transaction/{id}/commit")
+}
+
+pub fn transaction_abort_uri(ns: &str, id: &str) -> String {
+    format!("/v2/{ns}/_transaction/{id}")
+}
+
 // Absent kappa - a valid format that was never stored.
 pub fn absent_kappa() -> String {
     format!("sha256:{}", "0".repeat(64))
@@ -174,9 +195,18 @@ impl TestServer {
     pub fn start() -> Self {
         let data_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(FsStore::new(data_dir.path().to_path_buf()).unwrap());
+        let transactions = Arc::new(TransactionManager::new(
+            data_dir.path().to_path_buf(),
+            64,                // max concurrent
+            64 * 1024 * 1024,  // max bytes per txn (same as max_blob_size)
+            256 * 1024 * 1024, // max global staging bytes
+            3600,              // timeout secs
+        ));
+
         let state = AppState {
             store,
             sessions: Arc::new(SessionStore::new()),
+            transactions,
             max_blob_size: 64 * 1024 * 1024,
             upload_timeout_secs: 3600,
         };

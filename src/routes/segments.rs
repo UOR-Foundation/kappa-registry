@@ -6,6 +6,7 @@ pub const BLOBS_UPLOADS_BARE: &str = "/blobs/uploads";
 pub const MANIFESTS: &str = "/manifests/";
 pub const TAGS: &str = "/tags/";
 pub const TAGS_LIST: &str = "/tags/list";
+pub const TAGS_BATCH: &str = "/tags/_batch";
 pub const EDGES: &str = "/edges/";
 pub const EDGES_BARE: &str = "/edges";
 pub const COMPOSE: &str = "/compose/";
@@ -21,6 +22,9 @@ pub const FILTERS: &str = "/filters/";
 pub const FILTERS_BARE: &str = "/filters";
 pub const EDGE_DIFF: &str = "/edges/_diff";
 pub const RECONCILE: &str = "/_reconcile";
+pub const TRANSACTION: &str = "/_transaction/";
+pub const TRANSACTION_BEGIN: &str = "/_transaction/begin";
+pub const TRANSACTION_COMMIT_SUFFIX: &str = "/commit";
 pub const UPLOADS: &str = "/v2/_uploads/";
 pub const HEALTH: &str = "/v2/_health/";
 

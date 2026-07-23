@@ -147,12 +147,22 @@ fn run_sweep(
         }
     }
 
+    // Build a roaring bitmap of reachable blob positions for O(1) eviction checks.
+    // At scale (millions of objects), this replaces O(n) HashSet::contains per blob
+    // with a bitmap test that fits in cache.
+    let mut reachable_bitmap = roaring::RoaringBitmap::new();
+    for (i, kappa) in all_blobs.iter().enumerate() {
+        if reachable.contains(kappa) {
+            reachable_bitmap.insert(i as u32);
+        }
+    }
+
     let scanned = all_blobs.len();
     let mut evicted = 0usize;
 
     let mut evicted_set = Vec::new();
-    for kappa in &all_blobs {
-        if !reachable.contains(kappa) {
+    for (i, kappa) in all_blobs.iter().enumerate() {
+        if !reachable_bitmap.contains(i as u32) {
             let _ = store.remove(kappa);
             evicted_set.push(kappa.clone());
             evicted += 1;

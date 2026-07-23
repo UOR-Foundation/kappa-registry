@@ -7,6 +7,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use kappa_registry::config::Config;
 use kappa_registry::handlers::upload::SessionStore;
 use kappa_registry::store::fs::FsStore;
+use kappa_registry::transaction::TransactionManager;
 use kappa_registry::AppState;
 
 #[tokio::main]
@@ -29,9 +30,18 @@ async fn main() {
         }
     };
 
+    let transactions = Arc::new(TransactionManager::new(
+        cfg.store_root.clone(),
+        cfg.max_transactions,
+        cfg.max_blob_size,
+        cfg.max_staging_bytes,
+        cfg.upload_timeout_secs,
+    ));
+
     let state = AppState {
         store,
         sessions: Arc::new(SessionStore::new()),
+        transactions,
         max_blob_size: cfg.max_blob_size,
         upload_timeout_secs: cfg.upload_timeout_secs,
     };
@@ -47,6 +57,7 @@ async fn main() {
     tracing::info!("kappa-registry listening on {}", cfg.listen_addr);
 
     let cleanup_sessions = state.sessions.clone();
+    let cleanup_transactions = state.transactions.clone();
     let cleanup_timeout = cfg.upload_timeout_secs;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -55,6 +66,10 @@ async fn main() {
             let evicted = cleanup_sessions.evict_expired(cleanup_timeout);
             if evicted > 0 {
                 tracing::info!("upload cleanup: evicted {evicted} expired sessions");
+            }
+            let txn_evicted = cleanup_transactions.evict_expired();
+            if txn_evicted > 0 {
+                tracing::info!("transaction cleanup: evicted {txn_evicted} expired transactions");
             }
         }
     });

@@ -1,5 +1,118 @@
 use super::common::*;
 
+// ── Batch CAS (P5) ──────────────────────────────────────────────────────
+
+#[test]
+fn batch_cas_all_succeed() {
+    let srv = TestServer::start();
+    let ns = "l2-batch-ok";
+    let k1 = push_blob(&srv.addr, ns, b"batch-v1");
+    let k2 = push_blob(&srv.addr, ns, b"batch-v2");
+
+    let body = format!(
+        r#"{{"updates":[
+            {{"name":"ref-a","kappa":"{k1}","expected":null}},
+            {{"name":"ref-b","kappa":"{k2}","expected":null}}
+        ]}}"#
+    );
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &tag_batch_uri(ns),
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    assert_eq!(v["result"].as_str(), Some("all_succeeded"));
+
+    // Verify both tags exist
+    let (s, _, _) = request(&srv.addr, "GET", &tag_uri(ns, "ref-a"), &[], b"");
+    assert_eq!(s, 200);
+    let (s, _, _) = request(&srv.addr, "GET", &tag_uri(ns, "ref-b"), &[], b"");
+    assert_eq!(s, 200);
+}
+
+#[test]
+fn batch_cas_partial_failure_rolls_back() {
+    let srv = TestServer::start();
+    let ns = "l2-batch-fail";
+    let k1 = push_blob(&srv.addr, ns, b"batch-fail-v1");
+    let k2 = push_blob(&srv.addr, ns, b"batch-fail-v2");
+
+    // Pre-create ref-b so the create-if-absent (expected:null) fails
+    request(
+        &srv.addr,
+        "PUT",
+        &manifest_uri(ns, "ref-b"),
+        &[],
+        b"batch-fail-v2",
+    );
+
+    let body = format!(
+        r#"{{"updates":[
+            {{"name":"ref-a","kappa":"{k1}","expected":null}},
+            {{"name":"ref-b","kappa":"{k2}","expected":null}}
+        ]}}"#
+    );
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &tag_batch_uri(ns),
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    assert_eq!(v["result"].as_str(), Some("failed"));
+    assert_eq!(v["index"].as_u64(), Some(1));
+
+    // ref-a should NOT have been created (rollback)
+    let (s, _, _) = request(&srv.addr, "GET", &tag_uri(ns, "ref-a"), &[], b"");
+    assert_eq!(s, 404, "ref-a should not exist after batch failure");
+}
+
+#[test]
+fn batch_cas_update_with_expected() {
+    let srv = TestServer::start();
+    let ns = "l2-batch-update";
+    let k_old = push_blob(&srv.addr, ns, b"batch-old");
+    let k_new = push_blob(&srv.addr, ns, b"batch-new");
+
+    // Create initial tag
+    request(
+        &srv.addr,
+        "PUT",
+        &tag_put_uri(ns, "versioned", &k_old),
+        &[],
+        b"",
+    );
+
+    // Batch update with correct expected value
+    let body = format!(
+        r#"{{"updates":[
+            {{"name":"versioned","kappa":"{k_new}","expected":"{k_old}"}}
+        ]}}"#
+    );
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &tag_batch_uri(ns),
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    assert_eq!(v["result"].as_str(), Some("all_succeeded"));
+
+    // Verify the tag was updated
+    let (_, _, resp) = request(&srv.addr, "GET", &tag_uri(ns, "versioned"), &[], b"");
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.contains(&k_new), "tag should point to new kappa");
+}
+
+// ── Tag Operations ──────────────────────────────────────────────────────
+
 #[test]
 fn tag_bind_resolve_delete() {
     let srv = TestServer::start();

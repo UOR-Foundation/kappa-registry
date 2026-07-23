@@ -1,5 +1,177 @@
 use super::common::*;
 
+// ── Multi-Object Transactions (P3) ──────────────────────────────────────
+
+#[test]
+fn transaction_begin_put_commit() {
+    let srv = TestServer::start();
+    let ns = "l6-txn";
+
+    // Begin
+    let (status, _, resp) = request(&srv.addr, "POST", &transaction_begin_uri(ns), &[], b"");
+    assert_eq!(status, 201);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let txn_id = v["transaction_id"].as_str().unwrap().to_string();
+    assert!(!txn_id.is_empty());
+
+    // Put two blobs into the transaction
+    let content_a = b"txn-blob-alpha";
+    let kappa_a = kappa_registry::kappa::KappaLabel::sha256(content_a)
+        .as_str()
+        .to_string();
+    let (status, _, _) = request(
+        &srv.addr,
+        "PUT",
+        &transaction_put_uri(ns, &txn_id, &kappa_a),
+        &[],
+        content_a,
+    );
+    assert_eq!(status, 201);
+
+    let content_b = b"txn-blob-beta";
+    let kappa_b = kappa_registry::kappa::KappaLabel::sha256(content_b)
+        .as_str()
+        .to_string();
+    let (status, _, _) = request(
+        &srv.addr,
+        "PUT",
+        &transaction_put_uri(ns, &txn_id, &kappa_b),
+        &[],
+        content_b,
+    );
+    assert_eq!(status, 201);
+
+    // Blobs should NOT be visible in the main store yet
+    let (status, _, _) = request(&srv.addr, "GET", &blob_uri(ns, &kappa_a), &[], b"");
+    assert_eq!(status, 404, "staged blob should not be in main store");
+
+    // Commit
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &transaction_commit_uri(ns, &txn_id),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let promoted = v["promoted"].as_array().unwrap();
+    assert_eq!(promoted.len(), 2, "both blobs promoted");
+
+    // Blobs should now be visible in the main store
+    let (status, _, body) = request(&srv.addr, "GET", &blob_uri(ns, &kappa_a), &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, content_a);
+
+    let (status, _, body) = request(&srv.addr, "GET", &blob_uri(ns, &kappa_b), &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, content_b);
+}
+
+#[test]
+fn transaction_abort_discards() {
+    let srv = TestServer::start();
+    let ns = "l6-txn-abort";
+
+    let (status, _, resp) = request(&srv.addr, "POST", &transaction_begin_uri(ns), &[], b"");
+    assert_eq!(status, 201);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let txn_id = v["transaction_id"].as_str().unwrap().to_string();
+
+    let content = b"abort-me";
+    let kappa = kappa_registry::kappa::KappaLabel::sha256(content)
+        .as_str()
+        .to_string();
+    request(
+        &srv.addr,
+        "PUT",
+        &transaction_put_uri(ns, &txn_id, &kappa),
+        &[],
+        content,
+    );
+
+    // Abort
+    let (status, _, _) = request(
+        &srv.addr,
+        "DELETE",
+        &transaction_abort_uri(ns, &txn_id),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 204);
+
+    // Blob should not exist in main store
+    let (status, _, _) = request(&srv.addr, "GET", &blob_uri(ns, &kappa), &[], b"");
+    assert_eq!(status, 404, "aborted blob should not be in main store");
+
+    // Committing the aborted transaction should fail
+    let (status, _, _) = request(
+        &srv.addr,
+        "POST",
+        &transaction_commit_uri(ns, &txn_id),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 404, "aborted transaction should not be committable");
+}
+
+#[test]
+fn transaction_put_verifies_digest() {
+    let srv = TestServer::start();
+    let ns = "l6-txn-verify";
+
+    let (_, _, resp) = request(&srv.addr, "POST", &transaction_begin_uri(ns), &[], b"");
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let txn_id = v["transaction_id"].as_str().unwrap().to_string();
+
+    // Put with wrong kappa
+    let wrong_kappa = format!("sha256:{}", "0".repeat(64));
+    let (status, _, _) = request(
+        &srv.addr,
+        "PUT",
+        &transaction_put_uri(ns, &txn_id, &wrong_kappa),
+        &[],
+        b"actual content",
+    );
+    assert!(
+        status == 409 || status == 400,
+        "wrong digest should be rejected: {status}"
+    );
+}
+
+#[test]
+fn transaction_idempotent_put() {
+    let srv = TestServer::start();
+    let ns = "l6-txn-idem";
+
+    let (_, _, resp) = request(&srv.addr, "POST", &transaction_begin_uri(ns), &[], b"");
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let txn_id = v["transaction_id"].as_str().unwrap().to_string();
+
+    let content = b"idempotent-blob";
+    let kappa = kappa_registry::kappa::KappaLabel::sha256(content)
+        .as_str()
+        .to_string();
+
+    let (status1, _, _) = request(
+        &srv.addr,
+        "PUT",
+        &transaction_put_uri(ns, &txn_id, &kappa),
+        &[],
+        content,
+    );
+    assert_eq!(status1, 201);
+
+    let (status2, _, _) = request(
+        &srv.addr,
+        "PUT",
+        &transaction_put_uri(ns, &txn_id, &kappa),
+        &[],
+        content,
+    );
+    assert_eq!(status2, 200, "idempotent re-put returns 200");
+}
+
 // ── Range-Based Set Reconciliation (P2 Arm 2) ───────────────────────────
 
 #[test]

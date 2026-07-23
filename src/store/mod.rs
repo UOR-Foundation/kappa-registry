@@ -95,6 +95,31 @@ pub struct FilterRecord {
     pub kappa: String,
 }
 
+/// A single tag update within an atomic batch.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TagUpdate {
+    /// Namespace path.
+    pub ns: String,
+    /// Tag name.
+    pub name: String,
+    /// New kappa-label to bind.
+    pub new_kappa: String,
+    /// CAS expectation. None = create-if-absent (tag must not exist).
+    /// Some(kappa) = tag must currently equal kappa.
+    /// Some("") = unconditional (no CAS check).
+    pub expected: Option<String>,
+}
+
+/// Result of an atomic batch tag update.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "result")]
+pub enum BatchResult {
+    #[serde(rename = "all_succeeded")]
+    AllSucceeded,
+    #[serde(rename = "failed")]
+    Failed { index: usize, reason: String },
+}
+
 /// Result of a range fingerprint query for set reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RangeFingerprint {
@@ -148,6 +173,9 @@ pub trait KappaStore: Send + Sync + 'static {
     ) -> Result<bool, StoreError>;
     fn tag_all_kappas_global(&self) -> Result<Vec<String>, StoreError>;
     fn tag_find_by_kappa(&self, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError>;
+    /// Atomically apply a batch of tag updates. All CAS expectations are
+    /// validated before any writes. If any check fails, no writes are applied.
+    fn tag_set_batch(&self, updates: &[TagUpdate]) -> Result<BatchResult, StoreError>;
 
     // edge (global by canonical form)
     fn edge_put(

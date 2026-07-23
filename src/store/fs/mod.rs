@@ -98,6 +98,9 @@ impl KappaStore for FsStore {
     fn tag_find_by_kappa(&self, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError> {
         tag::find_by_kappa(&self.root, ns, kappa)
     }
+    fn tag_set_batch(&self, updates: &[TagUpdate]) -> Result<BatchResult, StoreError> {
+        tag::set_batch(&self.root, updates)
+    }
 
     fn edge_put(
         &self,

@@ -7,4 +7,5 @@ pub mod reconcile;
 pub mod referrers;
 pub mod schema;
 pub mod tag;
+pub mod transaction;
 pub mod upload;

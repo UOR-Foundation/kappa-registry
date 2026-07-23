@@ -9,61 +9,171 @@ pub enum Endpoint<'a> {
     Health,
 
     // L1 blobs
-    BlobGet { ns: &'a str, kappa: &'a str },
-    BlobHead { ns: &'a str, kappa: &'a str },
-    BlobPut { ns: &'a str, kappa: &'a str },
-    BlobDelete { ns: &'a str, kappa: &'a str },
-    BlobList { ns: &'a str },
+    BlobGet {
+        ns: &'a str,
+        kappa: &'a str,
+    },
+    BlobHead {
+        ns: &'a str,
+        kappa: &'a str,
+    },
+    BlobPut {
+        ns: &'a str,
+        kappa: &'a str,
+    },
+    BlobDelete {
+        ns: &'a str,
+        kappa: &'a str,
+    },
+    BlobList {
+        ns: &'a str,
+    },
 
     // L1 uploads
-    UploadStart { ns: &'a str },
-    UploadChunk { id: &'a str },
-    UploadStatus { id: &'a str },
-    UploadComplete { id: &'a str },
-    UploadCancel { id: &'a str },
+    UploadStart {
+        ns: &'a str,
+    },
+    UploadChunk {
+        id: &'a str,
+    },
+    UploadStatus {
+        id: &'a str,
+    },
+    UploadComplete {
+        id: &'a str,
+    },
+    UploadCancel {
+        id: &'a str,
+    },
 
     // L2 manifests (atomic store+tag)
-    ManifestHead { ns: &'a str, version: &'a str },
-    ManifestGet { ns: &'a str, version: &'a str },
-    ManifestPut { ns: &'a str, tag: &'a str },
-    ManifestDelete { ns: &'a str, tag: &'a str },
+    ManifestHead {
+        ns: &'a str,
+        version: &'a str,
+    },
+    ManifestGet {
+        ns: &'a str,
+        version: &'a str,
+    },
+    ManifestPut {
+        ns: &'a str,
+        tag: &'a str,
+    },
+    ManifestDelete {
+        ns: &'a str,
+        tag: &'a str,
+    },
 
     // L2 tags
-    TagList { ns: &'a str },
-    TagGet { ns: &'a str, name: &'a str },
-    TagPut { ns: &'a str, name: &'a str },
+    TagList {
+        ns: &'a str,
+    },
+    TagGet {
+        ns: &'a str,
+        name: &'a str,
+    },
+    TagPut {
+        ns: &'a str,
+        name: &'a str,
+    },
+    TagBatch {
+        ns: &'a str,
+    },
 
     // OCI referrers
-    Referrers { ns: &'a str, digest: &'a str },
+    Referrers {
+        ns: &'a str,
+        digest: &'a str,
+    },
 
     // L3 edges
-    EdgePut { ns: &'a str },
-    EdgeQuery { ns: &'a str, node: &'a str },
-    EdgeDelete { ns: &'a str, kappa: &'a str },
-    EdgeDiff { ns: &'a str },
+    EdgePut {
+        ns: &'a str,
+    },
+    EdgeQuery {
+        ns: &'a str,
+        node: &'a str,
+    },
+    EdgeDelete {
+        ns: &'a str,
+        kappa: &'a str,
+    },
+    EdgeDiff {
+        ns: &'a str,
+    },
 
     // Set reconciliation
-    Reconcile { ns: &'a str },
+    Reconcile {
+        ns: &'a str,
+    },
+
+    // Transactions
+    TransactionBegin {
+        ns: &'a str,
+    },
+    TransactionPut {
+        ns: &'a str,
+        id: &'a str,
+        kappa: &'a str,
+    },
+    TransactionCommit {
+        ns: &'a str,
+        id: &'a str,
+    },
+    TransactionAbort {
+        ns: &'a str,
+        id: &'a str,
+    },
 
     // L4 composition
-    Compose { ns: &'a str, op: &'a str },
-    Witness { ns: &'a str, kappa: &'a str },
+    Compose {
+        ns: &'a str,
+        op: &'a str,
+    },
+    Witness {
+        ns: &'a str,
+        kappa: &'a str,
+    },
 
     // L4 schemas
-    SchemaPut { ns: &'a str, scope: &'a str },
-    SchemaGet { ns: &'a str, scope: &'a str },
-    SchemaList { ns: &'a str },
+    SchemaPut {
+        ns: &'a str,
+        scope: &'a str,
+    },
+    SchemaGet {
+        ns: &'a str,
+        scope: &'a str,
+    },
+    SchemaList {
+        ns: &'a str,
+    },
 
     // L5 GC
-    GcPin { ns: &'a str },
-    GcUnpin { ns: &'a str },
-    GcSweep { ns: &'a str },
-    GcStatus { ns: &'a str },
+    GcPin {
+        ns: &'a str,
+    },
+    GcUnpin {
+        ns: &'a str,
+    },
+    GcSweep {
+        ns: &'a str,
+    },
+    GcStatus {
+        ns: &'a str,
+    },
 
     // L5 filters
-    FilterPut { ns: &'a str, scope: &'a str },
-    FilterList { ns: &'a str },
-    FilterDelete { ns: &'a str, kappa: &'a str },
+    FilterPut {
+        ns: &'a str,
+        scope: &'a str,
+    },
+    FilterList {
+        ns: &'a str,
+    },
+    FilterDelete {
+        ns: &'a str,
+        kappa: &'a str,
+    },
 
     NotFound,
 }
@@ -100,6 +210,13 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
         }
         if let Some((ns, _)) = extract::split_at_allow_empty(path, segments::BLOBS_UPLOADS_BARE) {
             return Endpoint::UploadStart { ns };
+        }
+    }
+
+    // Tag batch: {ns}/tags/_batch (must match before general tag routing)
+    if inner.ends_with(segments::TAGS_BATCH) && method == "POST" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::TAGS_BATCH) {
+            return Endpoint::TagBatch { ns };
         }
     }
 
@@ -229,6 +346,37 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
     if inner.ends_with(segments::FILTERS_BARE) {
         if let Some(ns) = extract::ns_before_suffix(path, segments::FILTERS_BARE) {
             return Endpoint::FilterList { ns };
+        }
+    }
+
+    // Transactions: {ns}/_transaction/begin, {ns}/_transaction/{id}/commit,
+    // {ns}/_transaction/{id}/{kappa}, {ns}/_transaction/{id}
+    if inner.contains(segments::TRANSACTION) {
+        if inner.ends_with(segments::TRANSACTION_BEGIN) && method == "POST" {
+            if let Some(ns) = extract::ns_before_suffix(path, segments::TRANSACTION_BEGIN) {
+                return Endpoint::TransactionBegin { ns };
+            }
+        }
+        if let Some((ns, rest)) = extract::split_at(path, segments::TRANSACTION) {
+            if !rest.is_empty() {
+                // rest is "{id}/commit" or "{id}/{kappa}" or "{id}"
+                if let Some((id, suffix)) = rest.split_once('/') {
+                    if suffix == "commit" && method == "POST" {
+                        return Endpoint::TransactionCommit { ns, id };
+                    }
+                    if method == "PUT" {
+                        return Endpoint::TransactionPut {
+                            ns,
+                            id,
+                            kappa: suffix,
+                        };
+                    }
+                }
+                // DELETE {ns}/_transaction/{id}
+                if method == "DELETE" && !rest.contains('/') {
+                    return Endpoint::TransactionAbort { ns, id: rest };
+                }
+            }
         }
     }
 

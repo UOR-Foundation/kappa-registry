@@ -7,7 +7,7 @@ use axum::Json;
 use crate::auth;
 use crate::error::AppError;
 use crate::kappa::KappaLabel;
-use crate::store::{KappaStore, TagListOpts};
+use crate::store::{KappaStore, TagListOpts, TagUpdate};
 use crate::AppState;
 
 pub async fn manifest_put(
@@ -477,4 +477,39 @@ pub async fn tag_put(
         ],
     )
         .into_response())
+}
+
+pub async fn tag_batch(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, AppError> {
+    auth::authorize(ns, "tag.batch")?;
+
+    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let raw_updates = v["updates"]
+        .as_array()
+        .ok_or_else(|| AppError::NameInvalid("missing updates array".to_string()))?;
+
+    let mut updates = Vec::with_capacity(raw_updates.len());
+    for entry in raw_updates {
+        let name = entry["name"]
+            .as_str()
+            .ok_or_else(|| AppError::NameInvalid("update missing name".to_string()))?;
+        let new_kappa = entry["kappa"]
+            .as_str()
+            .ok_or_else(|| AppError::NameInvalid("update missing kappa".to_string()))?;
+        let expected = if entry["expected"].is_null() {
+            None
+        } else {
+            Some(entry["expected"].as_str().unwrap_or("").to_string())
+        };
+        updates.push(TagUpdate {
+            ns: ns.to_string(),
+            name: name.to_string(),
+            new_kappa: new_kappa.to_string(),
+            expected,
+        });
+    }
+
+    let s = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || s.tag_set_batch(&updates)).await??;
+
+    Ok((StatusCode::OK, Json(result)).into_response())
 }
