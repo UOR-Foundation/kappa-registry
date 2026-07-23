@@ -1,3 +1,4 @@
+use sha1_checked::Sha1 as Sha1Checked;
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
 
@@ -24,12 +25,13 @@ pub enum LabelError {
     UnknownAxis,
     BadHex { position: usize, byte: u8 },
     WrongDigitCount { expected: usize, got: usize },
+    CollisionDetected,
 }
 
 impl fmt::Display for LabelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LabelError::BadLength { got } => write!(f, "length {got} not in 71..=135"),
+            LabelError::BadLength { got } => write!(f, "length {got} not in 45..=135"),
             LabelError::NoColon => write!(f, "no colon separator"),
             LabelError::UnknownAxis => write!(f, "unrecognized axis token"),
             LabelError::BadHex { position, byte } => {
@@ -37,6 +39,9 @@ impl fmt::Display for LabelError {
             }
             LabelError::WrongDigitCount { expected, got } => {
                 write!(f, "expected {expected} hex digits, got {got}")
+            }
+            LabelError::CollisionDetected => {
+                write!(f, "SHA-1 collision detected, content rejected")
             }
         }
     }
@@ -47,7 +52,7 @@ impl std::error::Error for LabelError {}
 impl KappaLabel {
     pub fn parse(s: &str) -> Result<Self, LabelError> {
         let bytes = s.as_bytes();
-        if !(71..=135).contains(&bytes.len()) {
+        if !(45..=135).contains(&bytes.len()) {
             return Err(LabelError::BadLength { got: bytes.len() });
         }
         let colon = bytes
@@ -56,6 +61,7 @@ impl KappaLabel {
             .ok_or(LabelError::NoColon)?;
         let axis = &s[..colon];
         let expected_hex = match axis {
+            "sha1" => 40,
             "sha256" | "blake3" | "sha3-256" | "keccak256" => 64,
             "sha512" => 128,
             _ => return Err(LabelError::UnknownAxis),
@@ -116,6 +122,26 @@ impl KappaLabel {
         KappaLabel { buf, len: 135 }
     }
 
+    /// Compute a SHA-1 label with collision detection via sha1-checked.
+    ///
+    /// Returns `Err(LabelError::CollisionDetected)` if the content
+    /// triggers the SHA-1 collision detection algorithm. Legitimate
+    /// content will never trigger this -- only crafted collision attacks.
+    pub fn sha1(content: &[u8]) -> Result<Self, LabelError> {
+        let result = Sha1Checked::try_digest(content);
+        if result.has_collision() {
+            return Err(LabelError::CollisionDetected);
+        }
+        let hash = result.hash();
+        let mut buf = [0u8; 135];
+        buf[..5].copy_from_slice(b"sha1:");
+        for (i, &byte) in hash.iter().enumerate() {
+            buf[5 + 2 * i] = HEX[(byte >> 4) as usize];
+            buf[5 + 2 * i + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        Ok(KappaLabel { buf, len: 45 })
+    }
+
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.buf[..self.len as usize]).unwrap()
     }
@@ -174,6 +200,7 @@ impl std::ops::Deref for KappaLabel {
 /// Compute the kappa for `content` under the given axis.
 pub fn compute_kappa(axis: &str, content: &[u8]) -> Result<KappaLabel, LabelError> {
     match axis {
+        "sha1" => KappaLabel::sha1(content),
         "sha256" => Ok(KappaLabel::sha256(content)),
         "blake3" => Ok(KappaLabel::blake3(content)),
         "sha512" => Ok(KappaLabel::sha512(content)),
@@ -197,6 +224,9 @@ pub fn axis_of(kappa: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    const EMPTY_SHA1: &str = "sha1:da39a3ee5e6b4b0d3255bfef95601890afd80709";
+    const HELLO_SHA1: &str = "sha1:aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d";
+
     const EMPTY_SHA256: &str =
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const HELLO_SHA256: &str =
@@ -205,6 +235,58 @@ mod tests {
         "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
     const HELLO_BLAKE3: &str =
         "blake3:ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
+
+    #[test]
+    fn sha1_empty() {
+        assert_eq!(KappaLabel::sha1(b"").unwrap().as_str(), EMPTY_SHA1);
+    }
+
+    #[test]
+    fn sha1_hello() {
+        assert_eq!(KappaLabel::sha1(b"hello").unwrap().as_str(), HELLO_SHA1);
+    }
+
+    #[test]
+    fn sha1_label_length() {
+        assert_eq!(KappaLabel::sha1(b"x").unwrap().as_str().len(), 45);
+    }
+
+    #[test]
+    fn parse_roundtrip_sha1() {
+        let k = KappaLabel::sha1(b"test").unwrap();
+        let parsed = KappaLabel::parse(k.as_str()).unwrap();
+        assert_eq!(k, parsed);
+    }
+
+    #[test]
+    fn parse_sha1_wrong_digits() {
+        // 41 hex digits (46 bytes total, within 45..=135 range) but sha1 expects 40.
+        let s = format!("sha1:{}", "a".repeat(41));
+        assert_eq!(s.len(), 46);
+        assert!(matches!(
+            KappaLabel::parse(&s),
+            Err(LabelError::WrongDigitCount {
+                expected: 40,
+                got: 41
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_sha1() {
+        assert_eq!(verify_kappa(HELLO_SHA1, b"hello"), Ok(true));
+    }
+
+    #[test]
+    fn verify_sha1_mismatch() {
+        assert_eq!(verify_kappa(HELLO_SHA1, b"wrong"), Ok(false));
+    }
+
+    #[test]
+    fn complement_sha1_roundtrip() {
+        let k = KappaLabel::sha1(b"involution test").unwrap();
+        assert_eq!(k.complement().complement(), k);
+    }
 
     #[test]
     fn sha256_empty() {

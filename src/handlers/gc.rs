@@ -133,7 +133,14 @@ fn run_sweep(
     let reachable = store.edge_walk(&roots, &["owns", "composed-of"])?;
 
     let mut all_blobs = Vec::new();
-    for axis in &["sha256", "blake3", "sha3-256", "keccak256", "sha512"] {
+    for axis in &[
+        "sha1",
+        "sha256",
+        "blake3",
+        "sha3-256",
+        "keccak256",
+        "sha512",
+    ] {
         let prefix = format!("{axis}:");
         if let Ok(keys) = store.list(&prefix) {
             all_blobs.extend(keys);

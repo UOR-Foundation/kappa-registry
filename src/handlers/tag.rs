@@ -99,7 +99,7 @@ pub async fn manifest_put(
             .map(|(algo, _)| {
                 matches!(
                     algo,
-                    "sha256" | "blake3" | "sha3-256" | "keccak256" | "sha512"
+                    "sha1" | "sha256" | "blake3" | "sha3-256" | "keccak256" | "sha512"
                 )
             })
             .unwrap_or(false);

@@ -211,6 +211,7 @@ pub async fn complete(
 
     let kappa = KappaLabel::parse(kappa_str)?;
     let computed = match kappa.axis() {
+        "sha1" => KappaLabel::sha1(&data)?,
         "sha256" => KappaLabel::sha256(&data),
         "blake3" => KappaLabel::blake3(&data),
         "sha512" => KappaLabel::sha512(&data),
