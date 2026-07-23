@@ -1,5 +1,103 @@
 use super::common::*;
 
+// ── Edge Diff (P2 Arm 1) ────────────────────────────────────────────────
+
+#[test]
+fn edge_diff_returns_want_minus_have() {
+    let srv = TestServer::start();
+    let ns = "l3-diff";
+
+    // Create a chain: A -> B -> C -> D
+    let a = push_blob(&srv.addr, ns, b"diff-node-a");
+    let b = push_blob(&srv.addr, ns, b"diff-node-b");
+    let c = push_blob(&srv.addr, ns, b"diff-node-c");
+    let d = push_blob(&srv.addr, ns, b"diff-node-d");
+
+    // Create edges: A owns B, B owns C, C owns D
+    for (src, tgt) in [(&a, &b), (&b, &c), (&c, &d)] {
+        let body =
+            format!(r#"{{"source":"{src}","relation":"owns","target":"{tgt}","metadata":{{}}}}"#);
+        request(
+            &srv.addr,
+            "PUT",
+            &edge_put_uri(ns),
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+        );
+    }
+
+    // Diff: want everything from A, have everything from C.
+    // Should return A, B, and their edge kappas (but not C, D, or C->D edge).
+    let diff_body = format!(r#"{{"have":["{c}"],"want":["{a}"],"relations":["owns"]}}"#);
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &edge_diff_uri(ns),
+        &[("Content-Type", "application/json")],
+        diff_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&resp);
+    // A and B should be in the diff (reachable from want but not from have)
+    assert!(text.contains(&a), "diff should contain A: {text}");
+    assert!(text.contains(&b), "diff should contain B: {text}");
+    // C and D should NOT be in the diff (reachable from have)
+    assert!(!text.contains(&d), "diff should not contain D: {text}");
+}
+
+#[test]
+fn edge_diff_empty_have_returns_full_want() {
+    let srv = TestServer::start();
+    let ns = "l3-diff-empty";
+    let a = push_blob(&srv.addr, ns, b"diff-empty-a");
+    let b = push_blob(&srv.addr, ns, b"diff-empty-b");
+
+    let edge_body =
+        format!(r#"{{"source":"{a}","relation":"owns","target":"{b}","metadata":{{}}}}"#);
+    request(
+        &srv.addr,
+        "PUT",
+        &edge_put_uri(ns),
+        &[("Content-Type", "application/json")],
+        edge_body.as_bytes(),
+    );
+
+    let diff_body = format!(r#"{{"have":[],"want":["{a}"],"relations":["owns"]}}"#);
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &edge_diff_uri(ns),
+        &[("Content-Type", "application/json")],
+        diff_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.contains(&a), "diff contains A: {text}");
+    assert!(text.contains(&b), "diff contains B: {text}");
+}
+
+#[test]
+fn edge_diff_identical_have_want_returns_empty() {
+    let srv = TestServer::start();
+    let ns = "l3-diff-same";
+    let a = push_blob(&srv.addr, ns, b"diff-same-a");
+
+    let diff_body = format!(r#"{{"have":["{a}"],"want":["{a}"],"relations":["owns"]}}"#);
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &edge_diff_uri(ns),
+        &[("Content-Type", "application/json")],
+        diff_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let diff = v["diff"].as_array().unwrap();
+    assert!(diff.is_empty(), "identical have/want yields empty diff");
+}
+
+// ── Edge CRUD ────────────────────────────────────────────────────────────
+
 #[test]
 fn edge_create_query_delete() {
     let srv = TestServer::start();

@@ -146,6 +146,14 @@ pub fn filter_delete_uri(ns: &str, kappa: &str) -> String {
     format!("/v2/{ns}/filters/{kappa}")
 }
 
+pub fn edge_diff_uri(ns: &str) -> String {
+    format!("/v2/{ns}/edges/_diff")
+}
+
+pub fn reconcile_uri(ns: &str) -> String {
+    format!("/v2/{ns}/_reconcile")
+}
+
 // Absent kappa - a valid format that was never stored.
 pub fn absent_kappa() -> String {
     format!("sha256:{}", "0".repeat(64))
