@@ -212,3 +212,49 @@ pub fn walk(root: &Path, roots: &[String], rels: &[&str]) -> Result<HashSet<Stri
 
     Ok(visited)
 }
+
+/// Compute the set difference: kappa-labels reachable from `want` roots
+/// but NOT reachable from `have` roots, walking along the given relation
+/// types. The `have` walk terminates early when it reaches a node already
+/// found in the `want` set (common ancestor pruning).
+pub fn diff(
+    root: &Path,
+    have: &[String],
+    want: &[String],
+    rels: &[&str],
+) -> Result<Vec<String>, StoreError> {
+    // Walk forward from want roots to collect the full reachable set W.
+    let want_set = walk(root, want, rels)?;
+
+    // Walk forward from have roots to collect reachable set H.
+    // Early termination: stop expanding a node if it is already in W
+    // (common ancestor -- everything beyond it is shared).
+    let mut have_visited: HashSet<String> = have.iter().cloned().collect();
+    let mut have_queue: VecDeque<String> = have.iter().cloned().collect();
+
+    while let Some(node) = have_queue.pop_front() {
+        // If this node is in the want set, it is a common ancestor.
+        // Its entire downstream is shared -- do not expand further.
+        if want_set.contains(&node) && !have.contains(&node) {
+            continue;
+        }
+        let path = by_source_path(root, &node);
+        let records = read_records(&path);
+        for record in records {
+            if rels.iter().any(|&r| r == record.relation) {
+                if have_visited.insert(record.target.clone()) {
+                    have_queue.push_back(record.target);
+                }
+                have_visited.insert(record.edge_kappa);
+            }
+        }
+    }
+
+    // W - H: items reachable from want but not from have.
+    let mut result: Vec<String> = want_set
+        .into_iter()
+        .filter(|k| !have_visited.contains(k))
+        .collect();
+    result.sort();
+    Ok(result)
+}

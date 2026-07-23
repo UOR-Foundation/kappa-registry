@@ -223,6 +223,13 @@ async fn dispatch(
         Endpoint::EdgeDelete { ns, kappa } => handlers::edge::delete(&state, ns, kappa)
             .await
             .into_response(),
+        Endpoint::EdgeDiff { ns } => handlers::edge::diff(&state, ns, &body)
+            .await
+            .into_response(),
+
+        Endpoint::Reconcile { ns } => handlers::reconcile::handle(&state, ns, &body)
+            .await
+            .into_response(),
 
         Endpoint::Compose { ns, op } => handlers::compose::compose(&state, ns, op, &body)
             .await

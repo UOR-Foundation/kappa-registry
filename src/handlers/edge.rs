@@ -108,6 +108,46 @@ pub async fn delete(state: &AppState, ns: &str, edge_kappa: &str) -> Result<Resp
     }
 }
 
+pub async fn diff(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, AppError> {
+    auth::authorize(ns, "edge.diff")?;
+
+    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let have: Vec<String> = v["have"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let want: Vec<String> = v["want"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let rels: Vec<String> = v["relations"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let s = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let rel_refs: Vec<&str> = rels.iter().map(|s| s.as_str()).collect();
+        s.edge_diff(&have, &want, &rel_refs)
+    })
+    .await??;
+
+    let body = serde_json::json!({"diff": result});
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
 pub fn edge_canonical_pub(
     source: &[u8],
     relation: &str,

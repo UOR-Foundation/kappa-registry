@@ -19,6 +19,8 @@ pub const GC_STATUS: &str = "/gc/status";
 pub const REFERRERS: &str = "/referrers/";
 pub const FILTERS: &str = "/filters/";
 pub const FILTERS_BARE: &str = "/filters";
+pub const EDGE_DIFF: &str = "/edges/_diff";
+pub const RECONCILE: &str = "/_reconcile";
 pub const UPLOADS: &str = "/v2/_uploads/";
 pub const HEALTH: &str = "/v2/_health/";
 

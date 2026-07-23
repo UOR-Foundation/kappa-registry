@@ -1,6 +1,7 @@
 mod blob;
 mod edge;
 mod filter;
+pub mod fingerprint;
 mod pin;
 mod schema;
 mod tag;
@@ -127,6 +128,26 @@ impl KappaStore for FsStore {
     }
     fn edge_walk(&self, roots: &[String], rels: &[&str]) -> Result<HashSet<String>, StoreError> {
         edge::walk(&self.root, roots, rels)
+    }
+    fn edge_diff(
+        &self,
+        have: &[String],
+        want: &[String],
+        rels: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        edge::diff(&self.root, have, want, rels)
+    }
+
+    fn range_fingerprint(
+        &self,
+        ns: &str,
+        lower: &str,
+        upper: &str,
+    ) -> Result<RangeFingerprint, StoreError> {
+        fingerprint::range_fp(&self.root, ns, lower, upper)
+    }
+    fn range_items(&self, ns: &str, lower: &str, upper: &str) -> Result<Vec<String>, StoreError> {
+        fingerprint::range_items(&self.root, ns, lower, upper)
     }
 
     fn pin(&self, protected: &str, ttl: u64, ctrl: &str) -> Result<String, StoreError> {

@@ -40,6 +40,10 @@ pub enum Endpoint<'a> {
     EdgePut { ns: &'a str },
     EdgeQuery { ns: &'a str, node: &'a str },
     EdgeDelete { ns: &'a str, kappa: &'a str },
+    EdgeDiff { ns: &'a str },
+
+    // Set reconciliation
+    Reconcile { ns: &'a str },
 
     // L4 composition
     Compose { ns: &'a str, op: &'a str },
@@ -225,6 +229,20 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
     if inner.ends_with(segments::FILTERS_BARE) {
         if let Some(ns) = extract::ns_before_suffix(path, segments::FILTERS_BARE) {
             return Endpoint::FilterList { ns };
+        }
+    }
+
+    // Edge diff: {ns}/edges/_diff (must match before general edge routing)
+    if inner.ends_with(segments::EDGE_DIFF) && method == "POST" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::EDGE_DIFF) {
+            return Endpoint::EdgeDiff { ns };
+        }
+    }
+
+    // Reconcile: {ns}/_reconcile
+    if inner.ends_with(segments::RECONCILE) && method == "POST" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::RECONCILE) {
+            return Endpoint::Reconcile { ns };
         }
     }
 

@@ -95,6 +95,35 @@ pub struct FilterRecord {
     pub kappa: String,
 }
 
+/// Result of a range fingerprint query for set reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RangeFingerprint {
+    /// XOR-aggregated SHA-256 hash of all kappa-labels in the range.
+    #[serde(with = "hex_fingerprint")]
+    pub fingerprint: [u8; 32],
+    /// Number of items in the range.
+    pub count: usize,
+}
+
+mod hex_fingerprint {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(fp: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(fp))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        let mut out = [0u8; 32];
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("expected 32 bytes"));
+        }
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+}
+
 pub trait KappaStore: Send + Sync + 'static {
     // blob (global by kappa)
     fn put(&self, kappa: &str, content: &[u8]) -> Result<bool, StoreError>;
@@ -149,6 +178,28 @@ pub trait KappaStore: Send + Sync + 'static {
     fn edge_remove(&self, edge_kappa: &str) -> Result<bool, StoreError>;
     fn edge_remove_by_node(&self, kappa: &str) -> Result<(), StoreError>;
     fn edge_walk(&self, roots: &[String], rels: &[&str]) -> Result<HashSet<String>, StoreError>;
+    /// Compute graph set difference: kappa-labels reachable from `want`
+    /// roots but NOT reachable from `have` roots, along the given
+    /// relation types. The `have` walk prunes at common ancestors.
+    fn edge_diff(
+        &self,
+        have: &[String],
+        want: &[String],
+        rels: &[&str],
+    ) -> Result<Vec<String>, StoreError>;
+
+    // range-based set reconciliation (RBSR)
+    /// Return the XOR-monoid fingerprint for kappa-labels in [lower, upper).
+    /// If lower == upper, returns the fingerprint of the entire namespace.
+    fn range_fingerprint(
+        &self,
+        ns: &str,
+        lower: &str,
+        upper: &str,
+    ) -> Result<RangeFingerprint, StoreError>;
+    /// Return all kappa-labels in the range [lower, upper) for a namespace.
+    /// If lower == upper, returns all items.
+    fn range_items(&self, ns: &str, lower: &str, upper: &str) -> Result<Vec<String>, StoreError>;
 
     // pin (global)
     fn pin(&self, protected: &str, ttl: u64, ctrl: &str) -> Result<String, StoreError>;
