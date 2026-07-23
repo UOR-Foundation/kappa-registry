@@ -94,6 +94,9 @@ impl KappaStore for FsStore {
     fn tag_all_kappas_global(&self) -> Result<Vec<String>, StoreError> {
         tag::all_kappas_global(&self.root)
     }
+    fn tag_find_by_kappa(&self, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError> {
+        tag::find_by_kappa(&self.root, ns, kappa)
+    }
 
     fn edge_put(
         &self,

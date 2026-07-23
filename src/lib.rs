@@ -111,10 +111,24 @@ async fn dispatch(
         }
 
         Endpoint::UploadStart { ns } => {
-            let mount = params.get("mount").map(|s| s.as_str());
-            handlers::upload::start(&state, ns, mount)
-                .await
-                .into_response()
+            // Single-POST blob push: POST with ?digest= and a non-empty body
+            if let Some(digest) = params.get("digest") {
+                if !body.is_empty() {
+                    handlers::blob::put(&state, ns, digest, &params, &headers, &body)
+                        .await
+                        .into_response()
+                } else {
+                    let mount = params.get("mount").map(|s| s.as_str());
+                    handlers::upload::start(&state, ns, mount)
+                        .await
+                        .into_response()
+                }
+            } else {
+                let mount = params.get("mount").map(|s| s.as_str());
+                handlers::upload::start(&state, ns, mount)
+                    .await
+                    .into_response()
+            }
         }
         Endpoint::UploadChunk { id } => {
             let range_start = headers
@@ -129,7 +143,11 @@ async fn dispatch(
             handlers::upload::recovery(&state, id).await.into_response()
         }
         Endpoint::UploadComplete { id } => {
-            let kappa = params.get("kappa").map(|s| s.as_str()).unwrap_or("");
+            let kappa = params
+                .get("kappa")
+                .or_else(|| params.get("digest"))
+                .map(|s| s.as_str())
+                .unwrap_or("");
             handlers::upload::complete(&state, id, kappa, &body)
                 .await
                 .into_response()

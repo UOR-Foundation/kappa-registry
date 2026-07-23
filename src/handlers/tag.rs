@@ -98,6 +98,11 @@ pub async fn manifest_put(
         StatusCode::CREATED,
         [
             ("x-kappa-label", kappa.as_str().to_string()),
+            ("docker-content-digest", kappa.as_str().to_string()),
+            (
+                "location",
+                crate::routes::segments::manifest_url(ns, kappa.as_str()),
+            ),
             ("content-length", "0".to_string()),
         ],
     )
@@ -133,7 +138,8 @@ pub async fn manifest_get(state: &AppState, ns: &str, version: &str) -> Result<R
         StatusCode::OK,
         [
             ("content-length", content.len().to_string()),
-            ("x-kappa-label", kappa_str),
+            ("x-kappa-label", kappa_str.clone()),
+            ("docker-content-digest", kappa_str),
             ("content-type", ct),
         ],
         content,
@@ -143,6 +149,30 @@ pub async fn manifest_get(state: &AppState, ns: &str, version: &str) -> Result<R
 
 pub async fn manifest_delete(state: &AppState, ns: &str, tag: &str) -> Result<Response, AppError> {
     auth::authorize(ns, "manifest.delete")?;
+
+    // If the reference contains a colon, it is a digest - find and delete all
+    // tags pointing to it, then remove the blob itself.
+    if tag.contains(':') {
+        let s = state.store.clone();
+        let p = ns.to_string();
+        let digest = tag.to_string();
+        let tags = tokio::task::spawn_blocking({
+            let s = s.clone();
+            let p = p.clone();
+            let d = digest.clone();
+            move || s.tag_find_by_kappa(&p, &d)
+        })
+        .await??;
+        for t in &tags {
+            let s = state.store.clone();
+            let p = ns.to_string();
+            let t = t.clone();
+            tokio::task::spawn_blocking(move || s.tag_delete(&p, &t)).await??;
+        }
+        let s = state.store.clone();
+        tokio::task::spawn_blocking(move || s.remove(&digest)).await??;
+        return Ok(StatusCode::ACCEPTED.into_response());
+    }
 
     let s = state.store.clone();
     let p = ns.to_string();
@@ -171,7 +201,7 @@ pub async fn tag_list(
     };
 
     if opts.n == Some(0) {
-        let body = serde_json::json!({"tags": []});
+        let body = serde_json::json!({"name": ns, "tags": []});
         return Ok((StatusCode::OK, Json(body)).into_response());
     }
 
@@ -179,14 +209,11 @@ pub async fn tag_list(
     let p = ns.to_string();
     let page = tokio::task::spawn_blocking(move || s.tag_list(&p, &opts)).await??;
 
-    let body = serde_json::json!({"tags": page.tags});
+    let body = serde_json::json!({"name": ns, "tags": page.tags});
 
     if page.has_more {
         if let Some(last_entry) = page.tags.last() {
-            let link = format!(
-                "</v2/{ns}/tags/list?last={}>; rel=\"next\"",
-                last_entry.name
-            );
+            let link = crate::routes::segments::tag_list_link(ns, &last_entry.name);
             return Ok((StatusCode::OK, [("link", link)], Json(body)).into_response());
         }
     }

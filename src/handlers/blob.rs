@@ -104,7 +104,7 @@ pub async fn put(
         status,
         [
             ("x-kappa-label", kappa_str.to_string()),
-            ("location", format!("/v2/{ns}/blobs/{kappa_str}")),
+            ("location", crate::routes::segments::blob_url(ns, kappa_str)),
             ("content-length", "0".to_string()),
         ],
     )
@@ -135,6 +135,7 @@ pub async fn get(state: &AppState, ns: &str, kappa: &str) -> Result<Response, Ap
             ("x-kappa-label", kappa.to_string()),
             ("x-kappa-axis", axis.to_string()),
             ("content-type", ct),
+            ("docker-content-digest", kappa.to_string()),
         ],
         content,
     )
@@ -165,6 +166,7 @@ pub async fn head(state: &AppState, ns: &str, kappa: &str) -> Result<Response, A
             ("x-kappa-label", kappa.to_string()),
             ("x-kappa-axis", axis.to_string()),
             ("content-type", ct),
+            ("docker-content-digest", kappa.to_string()),
         ],
     )
         .into_response())

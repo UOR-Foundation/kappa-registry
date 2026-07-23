@@ -20,3 +20,19 @@ pub const FILTERS: &str = "/filters/";
 pub const FILTERS_BARE: &str = "/filters";
 pub const UPLOADS: &str = "/v2/_uploads/";
 pub const HEALTH: &str = "/v2/_health/";
+
+pub fn blob_url(ns: &str, kappa: &str) -> String {
+    format!("/v2/{ns}/blobs/{kappa}")
+}
+
+pub fn manifest_url(ns: &str, reference: &str) -> String {
+    format!("/v2/{ns}/manifests/{reference}")
+}
+
+pub fn upload_url(id: &str) -> String {
+    format!("/v2/_uploads/{id}")
+}
+
+pub fn tag_list_link(ns: &str, last: &str) -> String {
+    format!("</v2/{ns}/tags/list?last={last}>; rel=\"next\"")
+}

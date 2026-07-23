@@ -124,6 +124,17 @@ pub fn set_if(
     Ok(true)
 }
 
+pub fn find_by_kappa(root: &Path, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError> {
+    let path = index_path(root, ns);
+    let index = read_index(&path)?;
+    let names: Vec<String> = index
+        .iter()
+        .filter(|(_, v)| v.as_str() == kappa)
+        .map(|(k, _)| k.clone())
+        .collect();
+    Ok(names)
+}
+
 pub fn all_kappas_global(root: &Path) -> Result<Vec<String>, StoreError> {
     let tags_dir = root.join("tags");
     if !tags_dir.exists() {

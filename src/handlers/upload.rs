@@ -104,7 +104,7 @@ pub async fn start(
             return Ok((
                 StatusCode::CREATED,
                 [
-                    ("location", format!("/v2/{ns}/blobs/{kappa}")),
+                    ("location", crate::routes::segments::blob_url(ns, kappa)),
                     ("content-length", "0".to_string()),
                 ],
             )
@@ -116,9 +116,10 @@ pub async fn start(
     Ok((
         StatusCode::ACCEPTED,
         [
-            ("location", format!("/v2/_uploads/{id}")),
+            ("location", crate::routes::segments::upload_url(&id)),
             ("x-kappa-upload-session", id.clone()),
             ("x-kappa-chunk-min-length", "0".to_string()),
+            ("oci-chunk-min-length", "0".to_string()),
             ("content-length", "0".to_string()),
         ],
     )
@@ -151,7 +152,7 @@ pub async fn chunk(
                 StatusCode::ACCEPTED,
                 [
                     ("range", range),
-                    ("location", format!("/v2/_uploads/{id}")),
+                    ("location", crate::routes::segments::upload_url(id)),
                     ("content-length", "0".to_string()),
                 ],
             )
@@ -176,7 +177,7 @@ pub async fn recovery(state: &AppState, id: &str) -> Result<Response, AppError> 
         StatusCode::NO_CONTENT,
         [
             ("range", range),
-            ("location", format!("/v2/_uploads/{id}")),
+            ("location", crate::routes::segments::upload_url(id)),
             ("content-length", "0".to_string()),
         ],
     )
@@ -220,7 +221,10 @@ pub async fn complete(
         StatusCode::CREATED,
         [
             ("x-kappa-label", kappa_str.to_string()),
-            ("location", format!("/v2/{path}/blobs/{kappa_str}")),
+            (
+                "location",
+                crate::routes::segments::blob_url(&path, kappa_str),
+            ),
             ("content-length", "0".to_string()),
         ],
     )

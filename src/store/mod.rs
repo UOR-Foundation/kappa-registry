@@ -118,6 +118,7 @@ pub trait KappaStore: Send + Sync + 'static {
         expected: Option<&str>,
     ) -> Result<bool, StoreError>;
     fn tag_all_kappas_global(&self) -> Result<Vec<String>, StoreError>;
+    fn tag_find_by_kappa(&self, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError>;
 
     // edge (global by canonical form)
     fn edge_put(
