@@ -204,4 +204,8 @@ impl KappaStore for FsStore {
     fn filter_evaluate(&self, path: &str, content: &[u8]) -> Result<(), String> {
         filter::evaluate(&self.root, path, content)
     }
+
+    fn list_by_meta(&self, key: &str, value: &str) -> Result<Vec<String>, StoreError> {
+        blob::list_by_meta(&self.root, key, value)
+    }
 }

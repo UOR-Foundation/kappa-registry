@@ -21,6 +21,10 @@ pub async fn register(
     let content = body.to_vec();
     let kappa = tokio::task::spawn_blocking(move || s.filter_register(&p, &sc, &content)).await??;
 
+    let s = state.store.clone();
+    let k = kappa.clone();
+    tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"filter")).await??;
+
     Ok((
         StatusCode::CREATED,
         [

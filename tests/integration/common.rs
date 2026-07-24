@@ -167,6 +167,10 @@ pub fn tag_batch_uri(ns: &str) -> String {
     format!("/v2/{ns}/tags/_batch")
 }
 
+pub fn meta_list_uri(ns: &str, key: &str, value: &str) -> String {
+    format!("/v2/{ns}/blobs/_meta?key={key}&value={value}")
+}
+
 pub fn transaction_begin_uri(ns: &str) -> String {
     format!("/v2/{ns}/_transaction/begin")
 }
@@ -215,6 +219,74 @@ impl TestServer {
             store,
             sessions: Arc::new(SessionStore::new()),
             transactions,
+            rate_limiter: None,
+            max_blob_size: 64 * 1024 * 1024,
+            upload_timeout_secs: 3600,
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
+
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap().to_string();
+                addr_tx.send(addr).unwrap();
+                let app = kappa_registry::app(state);
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        rx.await.ok();
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+
+        let addr = addr_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..50 {
+            if TcpStream::connect(&addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        TestServer {
+            addr,
+            _data_dir: data_dir,
+            _shutdown: tx,
+            _handle: Some(handle),
+        }
+    }
+
+    pub fn start_with_rate_limit(period_ms: u64, burst: u32) -> Self {
+        use kappa_registry::ratelimit::{ClassConfig, RateLimitConfig, TieredRateLimiter};
+
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FsStore::new(data_dir.path().to_path_buf()).unwrap());
+        let transactions = Arc::new(TransactionManager::new(
+            data_dir.path().to_path_buf(),
+            64,
+            64 * 1024 * 1024,
+            256 * 1024 * 1024,
+            3600,
+        ));
+
+        // Apply the same config to all classes for integration test simplicity.
+        let rl_config = RateLimitConfig {
+            read: ClassConfig { period_ms, burst },
+            write: ClassConfig { period_ms, burst },
+            admin: ClassConfig { period_ms, burst },
+        };
+
+        let state = AppState {
+            store,
+            sessions: Arc::new(SessionStore::new()),
+            transactions,
+            rate_limiter: Some(TieredRateLimiter::new(&rl_config)),
             max_blob_size: 64 * 1024 * 1024,
             upload_timeout_secs: 3600,
         };

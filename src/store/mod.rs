@@ -255,4 +255,7 @@ pub trait KappaStore: Send + Sync + 'static {
     fn filter_list(&self, ns: &str) -> Result<Vec<FilterRecord>, StoreError>;
     fn filter_remove(&self, filter_kappa: &str) -> Result<bool, StoreError>;
     fn filter_evaluate(&self, ns: &str, content: &[u8]) -> Result<(), String>;
+
+    // metadata query
+    fn list_by_meta(&self, key: &str, value: &str) -> Result<Vec<String>, StoreError>;
 }

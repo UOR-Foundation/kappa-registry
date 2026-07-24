@@ -190,3 +190,19 @@ pub async fn list(state: &AppState, ns: &str, prefix: &str) -> Result<Response, 
     let body = serde_json::json!({"kappas": kappas});
     Ok((StatusCode::OK, Json(body)).into_response())
 }
+
+pub async fn list_by_meta(
+    state: &AppState,
+    ns: &str,
+    key: &str,
+    value: &str,
+) -> Result<Response, AppError> {
+    auth::authorize(ns, "blob.list_by_meta")?;
+
+    let s = state.store.clone();
+    let k = key.to_string();
+    let v = value.to_string();
+    let kappas = tokio::task::spawn_blocking(move || s.list_by_meta(&k, &v)).await??;
+    let body = serde_json::json!({"kappas": kappas});
+    Ok((StatusCode::OK, Json(body)).into_response())
+}

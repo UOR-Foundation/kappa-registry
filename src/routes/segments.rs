@@ -1,6 +1,7 @@
 pub const PREFIX: &str = "/v2/";
 pub const PREFIX_BARE: &str = "/v2";
 pub const BLOBS: &str = "/blobs/";
+pub const BLOBS_META: &str = "/blobs/_meta";
 pub const BLOBS_UPLOADS: &str = "/blobs/uploads/";
 pub const BLOBS_UPLOADS_BARE: &str = "/blobs/uploads";
 pub const MANIFESTS: &str = "/manifests/";

@@ -141,6 +141,11 @@ pub async fn manifest_put(
     let ct_bytes = ct_value.as_bytes().to_vec();
     tokio::task::spawn_blocking(move || s.put_meta(&k, "content-type", &ct_bytes)).await??;
 
+    // Store object-type metadata
+    let s = state.store.clone();
+    let k = kappa.as_str().to_string();
+    tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"manifest")).await??;
+
     // Detect subject field for OCI-Subject header
     let subject_digest: Option<String> = serde_json::from_slice::<serde_json::Value>(body)
         .ok()

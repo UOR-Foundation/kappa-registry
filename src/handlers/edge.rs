@@ -43,6 +43,10 @@ pub async fn put(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, Ap
     tokio::task::spawn_blocking(move || s.put(&ek, &canon)).await??;
 
     let s = state.store.clone();
+    let k = edge_kappa.as_str().to_string();
+    tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"edge")).await??;
+
+    let s = state.store.clone();
     let ek = edge_kappa.as_str().to_string();
     let src = source.to_string();
     let rel = relation.to_string();

@@ -99,6 +99,40 @@ pub fn get_meta(root: &Path, kappa: &str, key: &str) -> Result<Option<Vec<u8>>, 
         .map(|s| s.as_bytes().to_vec()))
 }
 
+pub fn list_by_meta(root: &Path, key: &str, value: &str) -> Result<Vec<String>, StoreError> {
+    let blobs_dir = root.join("blobs");
+    if !blobs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut results = Vec::new();
+    for axis_entry in std::fs::read_dir(&blobs_dir)? {
+        let axis_entry = axis_entry?;
+        if !axis_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for shard_entry in std::fs::read_dir(axis_entry.path())? {
+            let shard_entry = shard_entry?;
+            if !shard_entry.file_type()?.is_dir() {
+                continue;
+            }
+            for file_entry in std::fs::read_dir(shard_entry.path())? {
+                let file_entry = file_entry?;
+                let name = file_entry.file_name().to_string_lossy().to_string();
+                if !name.ends_with(".meta") {
+                    continue;
+                }
+                let meta = read_meta(&file_entry.path());
+                if meta.get(key).and_then(|v| v.as_str()) == Some(value) {
+                    let kappa = name.strip_suffix(".meta").unwrap_or(&name).to_string();
+                    results.push(kappa);
+                }
+            }
+        }
+    }
+    results.sort();
+    Ok(results)
+}
+
 fn read_meta(path: &Path) -> serde_json::Map<String, serde_json::Value> {
     match std::fs::read(path) {
         Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),

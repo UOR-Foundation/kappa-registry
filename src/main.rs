@@ -38,10 +38,28 @@ async fn main() {
         cfg.upload_timeout_secs,
     ));
 
+    let rate_limiter = if cfg.rate_limit.is_enabled() {
+        tracing::info!(
+            "rate limiting enabled: read={}/{}ms write={}/{}ms admin={}/{}ms",
+            cfg.rate_limit.read.burst,
+            cfg.rate_limit.read.period_ms,
+            cfg.rate_limit.write.burst,
+            cfg.rate_limit.write.period_ms,
+            cfg.rate_limit.admin.burst,
+            cfg.rate_limit.admin.period_ms,
+        );
+        Some(kappa_registry::ratelimit::TieredRateLimiter::new(
+            &cfg.rate_limit,
+        ))
+    } else {
+        None
+    };
+
     let state = AppState {
         store,
         sessions: Arc::new(SessionStore::new()),
         transactions,
+        rate_limiter,
         max_blob_size: cfg.max_blob_size,
         upload_timeout_secs: cfg.upload_timeout_secs,
     };
@@ -74,16 +92,7 @@ async fn main() {
         }
     });
 
-    let router = if cfg.rate_limit_rps > 0 {
-        tracing::info!(
-            "rate limiting enabled: {} rps, burst {}",
-            cfg.rate_limit_rps,
-            cfg.rate_limit_burst
-        );
-        kappa_registry::app_with_rate_limit(state, cfg.rate_limit_rps, cfg.rate_limit_burst)
-    } else {
-        kappa_registry::app(state)
-    };
+    let router = kappa_registry::app(state);
 
     axum::serve(
         listener,

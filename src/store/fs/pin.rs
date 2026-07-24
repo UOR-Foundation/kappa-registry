@@ -24,6 +24,7 @@ pub fn pin(root: &Path, protected: &str, ttl: u64, ctrl: &str) -> Result<String,
 
     // Store pin blob itself
     super::blob::put(root, pin_kappa.as_str(), pin_content.as_bytes())?;
+    super::blob::put_meta(root, pin_kappa.as_str(), "object-type", b"pin")?;
 
     Ok(pin_kappa.as_str().to_string())
 }

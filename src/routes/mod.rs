@@ -3,178 +3,134 @@ pub mod segments;
 
 use std::collections::HashMap;
 
-#[derive(Debug)]
+/// Parsed HTTP endpoint. Each variant is annotated with `#[op_class(...)]`
+/// for tiered rate limiting. The `ClassifyEndpoint` derive macro generates
+/// `op_class(&self) -> OpClass` from these annotations. Adding a new variant
+/// without an `#[op_class(...)]` attribute is a compile error.
+///
+/// Operation classes:
+///   Exempt -- health probes, version check (never rate limited)
+///   Read   -- GET/HEAD on content, metadata, listings
+///   Write  -- PUT/POST/PATCH on content, manifests, edges, uploads
+///   Admin  -- DELETE, GC, transactions, reconcile
+#[derive(Debug, kappa_macros::ClassifyEndpoint)]
 pub enum Endpoint<'a> {
+    #[op_class(Exempt)]
     Version,
+    #[op_class(Exempt)]
     Health,
 
     // L1 blobs
-    BlobGet {
-        ns: &'a str,
-        kappa: &'a str,
-    },
-    BlobHead {
-        ns: &'a str,
-        kappa: &'a str,
-    },
-    BlobPut {
-        ns: &'a str,
-        kappa: &'a str,
-    },
-    BlobDelete {
-        ns: &'a str,
-        kappa: &'a str,
-    },
-    BlobList {
-        ns: &'a str,
-    },
+    #[op_class(Read)]
+    BlobGet { ns: &'a str, kappa: &'a str },
+    #[op_class(Read)]
+    BlobHead { ns: &'a str, kappa: &'a str },
+    #[op_class(Write)]
+    BlobPut { ns: &'a str, kappa: &'a str },
+    #[op_class(Admin)]
+    BlobDelete { ns: &'a str, kappa: &'a str },
+    #[op_class(Read)]
+    BlobList { ns: &'a str },
+    #[op_class(Read)]
+    MetaList { ns: &'a str },
 
     // L1 uploads
-    UploadStart {
-        ns: &'a str,
-    },
-    UploadChunk {
-        id: &'a str,
-    },
-    UploadStatus {
-        id: &'a str,
-    },
-    UploadComplete {
-        id: &'a str,
-    },
-    UploadCancel {
-        id: &'a str,
-    },
+    #[op_class(Write)]
+    UploadStart { ns: &'a str },
+    #[op_class(Write)]
+    UploadChunk { id: &'a str },
+    #[op_class(Read)]
+    UploadStatus { id: &'a str },
+    #[op_class(Write)]
+    UploadComplete { id: &'a str },
+    #[op_class(Admin)]
+    UploadCancel { id: &'a str },
 
     // L2 manifests (atomic store+tag)
-    ManifestHead {
-        ns: &'a str,
-        version: &'a str,
-    },
-    ManifestGet {
-        ns: &'a str,
-        version: &'a str,
-    },
-    ManifestPut {
-        ns: &'a str,
-        tag: &'a str,
-    },
-    ManifestDelete {
-        ns: &'a str,
-        tag: &'a str,
-    },
+    #[op_class(Read)]
+    ManifestHead { ns: &'a str, version: &'a str },
+    #[op_class(Read)]
+    ManifestGet { ns: &'a str, version: &'a str },
+    #[op_class(Write)]
+    ManifestPut { ns: &'a str, tag: &'a str },
+    #[op_class(Admin)]
+    ManifestDelete { ns: &'a str, tag: &'a str },
 
     // L2 tags
-    TagList {
-        ns: &'a str,
-    },
-    TagGet {
-        ns: &'a str,
-        name: &'a str,
-    },
-    TagPut {
-        ns: &'a str,
-        name: &'a str,
-    },
-    TagBatch {
-        ns: &'a str,
-    },
+    #[op_class(Read)]
+    TagList { ns: &'a str },
+    #[op_class(Read)]
+    TagGet { ns: &'a str, name: &'a str },
+    #[op_class(Write)]
+    TagPut { ns: &'a str, name: &'a str },
+    #[op_class(Write)]
+    TagBatch { ns: &'a str },
 
     // OCI referrers
-    Referrers {
-        ns: &'a str,
-        digest: &'a str,
-    },
+    #[op_class(Read)]
+    Referrers { ns: &'a str, digest: &'a str },
 
     // L3 edges
-    EdgePut {
-        ns: &'a str,
-    },
-    EdgeQuery {
-        ns: &'a str,
-        node: &'a str,
-    },
-    EdgeDelete {
-        ns: &'a str,
-        kappa: &'a str,
-    },
-    EdgeDiff {
-        ns: &'a str,
-    },
+    #[op_class(Write)]
+    EdgePut { ns: &'a str },
+    #[op_class(Read)]
+    EdgeQuery { ns: &'a str, node: &'a str },
+    #[op_class(Admin)]
+    EdgeDelete { ns: &'a str, kappa: &'a str },
+    #[op_class(Read)]
+    EdgeDiff { ns: &'a str },
 
     // Set reconciliation
-    Reconcile {
-        ns: &'a str,
-    },
+    #[op_class(Admin)]
+    Reconcile { ns: &'a str },
 
     // Transactions
-    TransactionBegin {
-        ns: &'a str,
-    },
+    #[op_class(Admin)]
+    TransactionBegin { ns: &'a str },
+    #[op_class(Write)]
     TransactionPut {
         ns: &'a str,
         id: &'a str,
         kappa: &'a str,
     },
-    TransactionCommit {
-        ns: &'a str,
-        id: &'a str,
-    },
-    TransactionAbort {
-        ns: &'a str,
-        id: &'a str,
-    },
+    #[op_class(Admin)]
+    TransactionCommit { ns: &'a str, id: &'a str },
+    #[op_class(Admin)]
+    TransactionAbort { ns: &'a str, id: &'a str },
 
     // L4 composition
-    Compose {
-        ns: &'a str,
-        op: &'a str,
-    },
-    Witness {
-        ns: &'a str,
-        kappa: &'a str,
-    },
+    #[op_class(Write)]
+    Compose { ns: &'a str, op: &'a str },
+    #[op_class(Read)]
+    Witness { ns: &'a str, kappa: &'a str },
 
     // L4 schemas
-    SchemaPut {
-        ns: &'a str,
-        scope: &'a str,
-    },
-    SchemaGet {
-        ns: &'a str,
-        scope: &'a str,
-    },
-    SchemaList {
-        ns: &'a str,
-    },
+    #[op_class(Write)]
+    SchemaPut { ns: &'a str, scope: &'a str },
+    #[op_class(Read)]
+    SchemaGet { ns: &'a str, scope: &'a str },
+    #[op_class(Read)]
+    SchemaList { ns: &'a str },
 
     // L5 GC
-    GcPin {
-        ns: &'a str,
-    },
-    GcUnpin {
-        ns: &'a str,
-    },
-    GcSweep {
-        ns: &'a str,
-    },
-    GcStatus {
-        ns: &'a str,
-    },
+    #[op_class(Admin)]
+    GcPin { ns: &'a str },
+    #[op_class(Admin)]
+    GcUnpin { ns: &'a str },
+    #[op_class(Admin)]
+    GcSweep { ns: &'a str },
+    #[op_class(Read)]
+    GcStatus { ns: &'a str },
 
     // L5 filters
-    FilterPut {
-        ns: &'a str,
-        scope: &'a str,
-    },
-    FilterList {
-        ns: &'a str,
-    },
-    FilterDelete {
-        ns: &'a str,
-        kappa: &'a str,
-    },
+    #[op_class(Write)]
+    FilterPut { ns: &'a str, scope: &'a str },
+    #[op_class(Read)]
+    FilterList { ns: &'a str },
+    #[op_class(Admin)]
+    FilterDelete { ns: &'a str, kappa: &'a str },
 
+    #[op_class(Read)]
     NotFound,
 }
 
@@ -202,6 +158,13 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
     }
 
     let inner = &path[segments::PREFIX.len()..];
+
+    // Meta list: {ns}/blobs/_meta (must match before blobs/uploads and general blobs)
+    if inner.ends_with(segments::BLOBS_META) && method == "GET" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::BLOBS_META) {
+            return Endpoint::MetaList { ns };
+        }
+    }
 
     // Upload start: {ns}/blobs/uploads/
     if inner.contains(segments::BLOBS_UPLOADS) || inner.ends_with(segments::BLOBS_UPLOADS_BARE) {
@@ -791,6 +754,18 @@ mod tests {
                 ns: "ns",
                 digest: "sha256:abc"
             }
+        ));
+    }
+
+    #[test]
+    fn meta_list_routing() {
+        assert!(matches!(
+            parse("GET", "/v2/ns/blobs/_meta"),
+            Endpoint::MetaList { ns: "ns" }
+        ));
+        assert!(matches!(
+            parse("GET", "/v2/org/sub/blobs/_meta"),
+            Endpoint::MetaList { ns: "org/sub" }
         ));
     }
 

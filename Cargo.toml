@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/kappa-macros"]
+
 [package]
 name = "kappa-registry"
 version = "0.1.0"
@@ -20,7 +23,11 @@ axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 tower = "0.5"
-tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
+governor = "0.10"
+http = "1"
+
+# Proc macros
+kappa-macros = { path = "crates/kappa-macros" }
 
 # Hashing -- all RustCrypto digest-trait compatible
 sha2 = "0.10"

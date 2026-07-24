@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod kappa;
+pub mod ratelimit;
 pub mod routes;
 pub mod store;
 pub mod transaction;
@@ -19,6 +20,7 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 use crate::handlers::upload::SessionStore;
+use crate::ratelimit::TieredRateLimiter;
 use crate::routes::Endpoint;
 use crate::store::fs::FsStore;
 use crate::transaction::TransactionManager;
@@ -28,6 +30,7 @@ pub struct AppState {
     pub store: Arc<FsStore>,
     pub sessions: Arc<SessionStore>,
     pub transactions: Arc<TransactionManager>,
+    pub rate_limiter: Option<TieredRateLimiter>,
     pub max_blob_size: usize,
     pub upload_timeout_secs: u64,
 }
@@ -37,27 +40,6 @@ pub fn app(state: AppState) -> Router {
         .fallback(any(dispatch))
         .layer(axum::extract::DefaultBodyLimit::max(state.max_blob_size))
         .layer(middleware::map_response(add_warning_header))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
-}
-
-pub fn app_with_rate_limit(state: AppState, per_second: u64, burst: u32) -> Router {
-    use tower_governor::governor::GovernorConfigBuilder;
-    use tower_governor::key_extractor::GlobalKeyExtractor;
-    use tower_governor::GovernorLayer;
-
-    let governor_conf = GovernorConfigBuilder::default()
-        .per_second(per_second)
-        .burst_size(burst)
-        .key_extractor(GlobalKeyExtractor)
-        .finish()
-        .unwrap();
-
-    Router::new()
-        .fallback(any(dispatch))
-        .layer(axum::extract::DefaultBodyLimit::max(state.max_blob_size))
-        .layer(middleware::map_response(add_warning_header))
-        .layer(GovernorLayer::new(governor_conf))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -91,7 +73,29 @@ async fn dispatch(
         "dispatch"
     );
 
-    match endpoint {
+    // Tiered rate limiting: check the appropriate bucket for this
+    // endpoint's operation class and the client's IP.
+    let mut rate_snapshot = None;
+    if let Some(ref limiter) = state.rate_limiter {
+        let ip = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').find_map(|s| s.trim().parse().ok()))
+            .or_else(|| {
+                headers
+                    .get("x-real-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let op_class = endpoint.op_class();
+        match limiter.check(ip, op_class) {
+            Ok(snap) => rate_snapshot = snap,
+            Err(rejection) => return (*rejection).into_response(),
+        }
+    }
+
+    let mut response = match endpoint {
         Endpoint::Version => handlers::blob::version_check().into_response(),
         Endpoint::Health => {
             let probe = path.strip_prefix("/v2/_health/").unwrap_or("live");
@@ -121,6 +125,13 @@ async fn dispatch(
         Endpoint::BlobList { ns } => {
             let prefix = params.get("prefix").map(|s| s.as_str()).unwrap_or("");
             handlers::blob::list(&state, ns, prefix)
+                .await
+                .into_response()
+        }
+        Endpoint::MetaList { ns } => {
+            let key = params.get("key").map(|s| s.as_str()).unwrap_or("");
+            let value = params.get("value").map(|s| s.as_str()).unwrap_or("");
+            handlers::blob::list_by_meta(&state, ns, key, value)
                 .await
                 .into_response()
         }
@@ -287,5 +298,12 @@ async fn dispatch(
         Endpoint::NotFound => {
             crate::error::AppError::NameInvalid("unknown route".to_string()).into_response()
         }
+    };
+
+    // Attach rate limit headers to successful responses.
+    if let Some(snap) = rate_snapshot {
+        ratelimit::limiter::attach_headers(&mut response, &snap);
     }
+
+    response
 }

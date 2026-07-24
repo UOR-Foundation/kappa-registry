@@ -228,3 +228,164 @@ fn gc_tag_as_root() {
     let (status, _, _) = request(&srv.addr, "GET", &blob_uri(ns, &orphan_k), &[], b"");
     assert_eq!(status, 404, "untagged orphan evicted");
 }
+
+#[test]
+fn type_metadata_manifest() {
+    let srv = TestServer::start();
+    let ns = "l5-meta-manifest";
+    let content = br#"{"type":"test-manifest"}"#;
+    request(
+        &srv.addr,
+        "PUT",
+        &manifest_uri(ns, "meta-test"),
+        &[],
+        content,
+    );
+    let (status, _, body) = request(
+        &srv.addr,
+        "GET",
+        &meta_list_uri(ns, "object-type", "manifest"),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("sha256:"),
+        "manifest in metadata list: {text}"
+    );
+}
+
+#[test]
+fn type_metadata_composition() {
+    let srv = TestServer::start();
+    let ns = "l5-meta-compose";
+    let ka = push_blob(&srv.addr, ns, b"meta-compose-a");
+    let kb = push_blob(&srv.addr, ns, b"meta-compose-b");
+    let compose_body = format!(r#"{{"operands":["{ka}","{kb}"]}}"#);
+    request(
+        &srv.addr,
+        "POST",
+        &compose_uri(ns, "g2"),
+        &[("Content-Type", "application/json")],
+        compose_body.as_bytes(),
+    );
+    let (status, _, body) = request(
+        &srv.addr,
+        "GET",
+        &meta_list_uri(ns, "object-type", "composition"),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("sha256:"),
+        "composition in metadata list: {text}"
+    );
+
+    let (status, _, body) = request(
+        &srv.addr,
+        "GET",
+        &meta_list_uri(ns, "object-type", "witness"),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("sha256:"), "witness in metadata list: {text}");
+}
+
+#[test]
+fn type_metadata_edge() {
+    let srv = TestServer::start();
+    let ns = "l5-meta-edge";
+    let src = push_blob(&srv.addr, ns, b"meta-edge-src");
+    let tgt = push_blob(&srv.addr, ns, b"meta-edge-tgt");
+    let edge_body =
+        format!(r#"{{"source":"{src}","relation":"owns","target":"{tgt}","metadata":{{}}}}"#);
+    request(
+        &srv.addr,
+        "PUT",
+        &edge_put_uri(ns),
+        &[("Content-Type", "application/json")],
+        edge_body.as_bytes(),
+    );
+    let (status, _, body) = request(
+        &srv.addr,
+        "GET",
+        &meta_list_uri(ns, "object-type", "edge"),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("sha256:"), "edge in metadata list: {text}");
+}
+
+#[test]
+fn rate_limit_triggers_429() {
+    // burst=3: first 3 read requests succeed, 4th returns 429.
+    // Use /v2/ns/tags/list (Read class) -- /v2/ is Exempt.
+    let srv = TestServer::start_with_rate_limit(500, 3);
+    let path = "/v2/rl-test/tags/list";
+    for i in 1..=3 {
+        let (s, _, _) = request(&srv.addr, "GET", path, &[], b"");
+        assert_eq!(s, 200, "request {i} succeeds within burst");
+    }
+    let (s4, hdrs, _) = request(&srv.addr, "GET", path, &[], b"");
+    assert_eq!(s4, 429, "request beyond burst returns 429");
+    assert!(
+        header(&hdrs, "retry-after").is_some(),
+        "429 includes retry-after"
+    );
+    assert_eq!(
+        header(&hdrs, "x-ratelimit-remaining"),
+        Some("0"),
+        "remaining is 0 when rate limited"
+    );
+    // Version check is exempt -- still works while read bucket is drained
+    let (sv, _, _) = request(&srv.addr, "GET", "/v2/", &[], b"");
+    assert_eq!(sv, 200, "exempt endpoint unaffected by read limit");
+}
+
+#[test]
+fn rate_limit_headers_present() {
+    let srv = TestServer::start_with_rate_limit(500, 5);
+    let path = "/v2/rl-test/tags/list";
+    let (status, hdrs, _) = request(&srv.addr, "GET", path, &[], b"");
+    assert_eq!(status, 200);
+    let limit = header(&hdrs, "x-ratelimit-limit");
+    let remaining = header(&hdrs, "x-ratelimit-remaining");
+    assert_eq!(limit, Some("5"), "x-ratelimit-limit matches burst size");
+    assert_eq!(
+        remaining,
+        Some("4"),
+        "remaining is burst - 1 after first request"
+    );
+}
+
+#[test]
+fn rate_limit_recovers_after_wait() {
+    // period_ms=100, burst=2: drain in 2 requests, refill 1 per 100ms
+    let srv = TestServer::start_with_rate_limit(100, 2);
+    let path = "/v2/rl-test/tags/list";
+    let (s1, _, _) = request(&srv.addr, "GET", path, &[], b"");
+    assert_eq!(s1, 200);
+    let (s2, _, _) = request(&srv.addr, "GET", path, &[], b"");
+    assert_eq!(s2, 200);
+    let (s3, hdrs, _) = request(&srv.addr, "GET", path, &[], b"");
+    assert_eq!(s3, 429, "burst exhausted");
+    // Read retry-after to know when to retry
+    let wait = header(&hdrs, "retry-after")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    // Wait for refill: at least the retry-after value + margin
+    std::thread::sleep(std::time::Duration::from_millis((wait * 1000) + 200));
+    let (s4, hdrs4, _) = request(&srv.addr, "GET", path, &[], b"");
+    assert_eq!(s4, 200, "request succeeds after refill");
+    assert!(
+        header(&hdrs4, "x-ratelimit-remaining").is_some(),
+        "recovered response has remaining header"
+    );
+}
