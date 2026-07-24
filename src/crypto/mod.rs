@@ -81,6 +81,41 @@ pub fn signer_from_bytes(
     }
 }
 
+/// Generate a raw keypair for the given algorithm. Returns (private_key_bytes,
+/// public_key_bytes). The private bytes are wrapped in Zeroizing to ensure
+/// they are cleared from memory after use. The caller persists these bytes
+/// to disk, then constructs a signer via `signer_from_bytes()`. The raw
+/// bytes are never exposed through the signer type.
+pub fn generate_raw_keypair(
+    algorithm: &str,
+) -> Result<(zeroize::Zeroizing<Vec<u8>>, Vec<u8>), CryptoError> {
+    match algorithm {
+        ALG_ED25519 => {
+            use getrandom::rand_core::UnwrapErr;
+            use getrandom::SysRng;
+            let sk = ed25519_dalek::SigningKey::generate(&mut UnwrapErr(SysRng));
+            let pk = sk.verifying_key().to_bytes().to_vec();
+            let private = zeroize::Zeroizing::new(sk.to_bytes().to_vec());
+            Ok((private, pk))
+        }
+        ALG_P256 => {
+            use p256::elliptic_curve::Generate;
+            let sk = p256::ecdsa::SigningKey::generate();
+            let pk = sk.verifying_key().to_sec1_point(true).as_ref().to_vec();
+            let private = zeroize::Zeroizing::new(sk.to_bytes().to_vec());
+            Ok((private, pk))
+        }
+        ALG_K256 => {
+            use p256::elliptic_curve::Generate;
+            let sk = k256::ecdsa::SigningKey::generate();
+            let pk = sk.verifying_key().to_sec1_point(true).as_ref().to_vec();
+            let private = zeroize::Zeroizing::new(sk.to_bytes().to_vec());
+            Ok((private, pk))
+        }
+        _ => Err(CryptoError::UnsupportedAlgorithm(algorithm.to_string())),
+    }
+}
+
 /// Signed namespace root statement. Produced by P10 + P11 together.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SignedRoot {
@@ -217,26 +252,35 @@ mod tests {
     }
 
     #[test]
-    fn signer_from_bytes_p256_roundtrip() {
-        let gen = ecdsa::P256Signer::generate();
-        let privkey = gen.private_key_bytes();
-        let restored = signer_from_bytes(ALG_P256, &privkey).unwrap();
-        let msg = b"p256 dispatch test";
-        let sig = restored.sign(msg).unwrap();
-        let pubkey = restored.public_key_bytes();
+    fn p256_generate_persist_restore_roundtrip() {
+        let (private, public) = generate_raw_keypair(ALG_P256).unwrap();
+        let signer = signer_from_bytes(ALG_P256, &private).unwrap();
+        let msg = b"p256 roundtrip test";
+        let sig = signer.sign(msg).unwrap();
+        assert_eq!(signer.public_key_bytes(), public);
         let verifier = ecdsa::P256Verifier;
-        assert!(verifier.verify(msg, &sig, &pubkey).unwrap());
+        assert!(verifier.verify(msg, &sig, &public).unwrap());
     }
 
     #[test]
-    fn signer_from_bytes_k256_roundtrip() {
-        let gen = ecdsa::K256Signer::generate();
-        let privkey = gen.private_key_bytes();
-        let restored = signer_from_bytes(ALG_K256, &privkey).unwrap();
-        let msg = b"k256 dispatch test";
-        let sig = restored.sign(msg).unwrap();
-        let pubkey = restored.public_key_bytes();
+    fn k256_generate_persist_restore_roundtrip() {
+        let (private, public) = generate_raw_keypair(ALG_K256).unwrap();
+        let signer = signer_from_bytes(ALG_K256, &private).unwrap();
+        let msg = b"k256 roundtrip test";
+        let sig = signer.sign(msg).unwrap();
+        assert_eq!(signer.public_key_bytes(), public);
         let verifier = ecdsa::K256Verifier;
-        assert!(verifier.verify(msg, &sig, &pubkey).unwrap());
+        assert!(verifier.verify(msg, &sig, &public).unwrap());
+    }
+
+    #[test]
+    fn ed25519_generate_persist_restore_roundtrip() {
+        let (private, public) = generate_raw_keypair(ALG_ED25519).unwrap();
+        let signer = signer_from_bytes(ALG_ED25519, &private).unwrap();
+        let msg = b"ed25519 roundtrip test";
+        let sig = signer.sign(msg).unwrap();
+        assert_eq!(signer.public_key_bytes(), public);
+        let verifier = ed25519::Ed25519Verifier;
+        assert!(verifier.verify(msg, &sig, &public).unwrap());
     }
 }

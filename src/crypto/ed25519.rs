@@ -24,10 +24,6 @@ impl Ed25519Signer {
             key: SigningKey::generate(&mut csprng),
         }
     }
-
-    pub fn private_key_bytes(&self) -> Vec<u8> {
-        self.key.to_bytes().to_vec()
-    }
 }
 
 impl RegistrySigner for Ed25519Signer {
