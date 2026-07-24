@@ -177,4 +177,66 @@ mod tests {
         // Unknown algorithm rejected
         assert!(signer_from_bytes("rsa", &[0u8; 32]).is_err());
     }
+
+    #[test]
+    fn signed_root_serialization_roundtrip() {
+        let sr = SignedRoot {
+            namespace: "test/ns".to_string(),
+            root: "sha256:abc123".to_string(),
+            timestamp: "2026-07-23T00:00:00Z".to_string(),
+            algorithm: ALG_ED25519.to_string(),
+            public_key: vec![1, 2, 3],
+            signature: vec![4, 5, 6],
+            attestation: None,
+        };
+        let json = serde_json::to_string(&sr).unwrap();
+        let parsed: SignedRoot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.namespace, sr.namespace);
+        assert_eq!(parsed.root, sr.root);
+        assert_eq!(parsed.timestamp, sr.timestamp);
+        assert_eq!(parsed.algorithm, sr.algorithm);
+        assert_eq!(parsed.public_key, sr.public_key);
+        assert_eq!(parsed.signature, sr.signature);
+        assert!(parsed.attestation.is_none());
+    }
+
+    #[test]
+    fn signed_root_with_attestation_roundtrip() {
+        let sr = SignedRoot {
+            namespace: "test".to_string(),
+            root: "sha256:def".to_string(),
+            timestamp: "2026-07-23T12:00:00Z".to_string(),
+            algorithm: ALG_P256.to_string(),
+            public_key: vec![2, 3, 4],
+            signature: vec![5, 6, 7],
+            attestation: Some(vec![8, 9, 10]),
+        };
+        let json = serde_json::to_string(&sr).unwrap();
+        let parsed: SignedRoot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.attestation, Some(vec![8, 9, 10]));
+    }
+
+    #[test]
+    fn signer_from_bytes_p256_roundtrip() {
+        let gen = ecdsa::P256Signer::generate();
+        let privkey = gen.private_key_bytes();
+        let restored = signer_from_bytes(ALG_P256, &privkey).unwrap();
+        let msg = b"p256 dispatch test";
+        let sig = restored.sign(msg).unwrap();
+        let pubkey = restored.public_key_bytes();
+        let verifier = ecdsa::P256Verifier;
+        assert!(verifier.verify(msg, &sig, &pubkey).unwrap());
+    }
+
+    #[test]
+    fn signer_from_bytes_k256_roundtrip() {
+        let gen = ecdsa::K256Signer::generate();
+        let privkey = gen.private_key_bytes();
+        let restored = signer_from_bytes(ALG_K256, &privkey).unwrap();
+        let msg = b"k256 dispatch test";
+        let sig = restored.sign(msg).unwrap();
+        let pubkey = restored.public_key_bytes();
+        let verifier = ecdsa::K256Verifier;
+        assert!(verifier.verify(msg, &sig, &pubkey).unwrap());
+    }
 }

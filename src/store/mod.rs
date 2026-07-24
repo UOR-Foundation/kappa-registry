@@ -104,11 +104,11 @@ pub struct NamespaceProof {
     pub root: String,
 }
 
-/// A single tag update within an atomic batch.
+/// A single tag update within an atomic batch. The namespace is not part of
+/// the update -- all updates in a batch target the endpoint namespace,
+/// derived from the URL path.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TagUpdate {
-    /// Namespace path.
-    pub ns: String,
     /// Tag name.
     pub name: String,
     /// New kappa-label to bind.
@@ -182,11 +182,12 @@ pub trait KappaStore: Send + Sync + 'static {
     ) -> Result<bool, StoreError>;
     fn tag_all_kappas_global(&self) -> Result<Vec<String>, StoreError>;
     fn tag_find_by_kappa(&self, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError>;
-    /// Atomically apply a batch of tag updates. All CAS expectations are
-    /// validated before any writes. If any check fails, no writes are applied.
+    /// Atomically apply a batch of tag updates within a single namespace.
+    /// All updates target `ns`. All CAS expectations are validated before
+    /// any writes. If any check fails, no writes are applied.
     /// CAS comparisons operate on raw values -- a symbolic ref's raw value
     /// is "ref:target_name", not the resolved kappa-label.
-    fn tag_set_batch(&self, updates: &[TagUpdate]) -> Result<BatchResult, StoreError>;
+    fn tag_set_batch(&self, ns: &str, updates: &[TagUpdate]) -> Result<BatchResult, StoreError>;
 
     /// Set a symbolic pointer: tag `name` in namespace `ns` points to tag
     /// `target` (another tag name within the same namespace). Stored as

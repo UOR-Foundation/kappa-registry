@@ -98,8 +98,8 @@ impl KappaStore for FsStore {
     fn tag_find_by_kappa(&self, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError> {
         tag::find_by_kappa(&self.root, ns, kappa)
     }
-    fn tag_set_batch(&self, updates: &[TagUpdate]) -> Result<BatchResult, StoreError> {
-        tag::set_batch(&self.root, updates)
+    fn tag_set_batch(&self, ns: &str, updates: &[TagUpdate]) -> Result<BatchResult, StoreError> {
+        tag::set_batch(&self.root, ns, updates)
     }
     fn tag_set_symbolic(&self, ns: &str, name: &str, target: &str) -> Result<(), StoreError> {
         tag::set_symbolic(&self.root, ns, name, target)

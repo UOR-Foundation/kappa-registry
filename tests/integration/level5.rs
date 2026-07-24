@@ -407,3 +407,75 @@ fn rate_limit_recovers_after_wait() {
         "recovered response has remaining header"
     );
 }
+
+#[test]
+fn type_metadata_pin() {
+    let srv = TestServer::start();
+    let ns = "l5-meta-pin";
+    let kappa = push_blob(&srv.addr, ns, b"pinnable content");
+    let pin_body = format!(r#"{{"kappa":"{kappa}","ttl":0,"controller":""}}"#);
+    request(
+        &srv.addr,
+        "POST",
+        &gc_pin_uri(ns),
+        &[("Content-Type", "application/json")],
+        pin_body.as_bytes(),
+    );
+    let (status, _, body) = request(
+        &srv.addr,
+        "GET",
+        &meta_list_uri(ns, "object-type", "pin"),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("sha256:"), "pin in metadata list: {text}");
+}
+
+#[test]
+fn type_metadata_filter() {
+    let srv = TestServer::start();
+    let ns = "l5-meta-filter";
+    request(
+        &srv.addr,
+        "PUT",
+        &filter_put_uri(ns, "meta-scope"),
+        &[("Content-Type", "application/json")],
+        b"deny:BLOCKED",
+    );
+    let (status, _, body) = request(
+        &srv.addr,
+        "GET",
+        &meta_list_uri(ns, "object-type", "filter"),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("sha256:"), "filter in metadata list: {text}");
+}
+
+#[test]
+fn type_metadata_schema() {
+    let srv = TestServer::start();
+    let ns = "l5-meta-schema";
+    let schema = br#"{"scope":"meta","format":"json-schema","validation":{"type":"object"}}"#;
+    request(
+        &srv.addr,
+        "PUT",
+        &schema_uri(ns, "meta-scope"),
+        &[("Content-Type", "application/json")],
+        schema,
+    );
+    let (status, _, body) = request(
+        &srv.addr,
+        "GET",
+        &meta_list_uri(ns, "object-type", "schema"),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("sha256:"), "schema in metadata list: {text}");
+}

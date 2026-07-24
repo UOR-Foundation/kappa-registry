@@ -20,6 +20,10 @@ impl P256Signer {
             key: p256::ecdsa::SigningKey::generate(),
         }
     }
+
+    pub fn private_key_bytes(&self) -> Vec<u8> {
+        self.key.to_bytes().to_vec()
+    }
 }
 
 impl RegistrySigner for P256Signer {
@@ -82,6 +86,10 @@ impl K256Signer {
         Self {
             key: k256::ecdsa::SigningKey::generate(),
         }
+    }
+
+    pub fn private_key_bytes(&self) -> Vec<u8> {
+        self.key.to_bytes().to_vec()
     }
 }
 

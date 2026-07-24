@@ -278,3 +278,37 @@ fn edge_blob_retrievable() {
     assert_eq!(status, 200, "edge blob retrievable as a blob");
     assert!(!edge_body.is_empty(), "edge blob has content");
 }
+
+#[test]
+fn edge_namespace_isolation() {
+    let srv = TestServer::start();
+    let ns_a = "l3-iso-a";
+    let ns_b = "l3-iso-b";
+    let src = push_blob(&srv.addr, ns_a, b"isolation-src");
+    let tgt = push_blob(&srv.addr, ns_a, b"isolation-tgt");
+
+    let edge_body =
+        format!(r#"{{"source":"{src}","relation":"owns","target":"{tgt}","metadata":{{}}}}"#);
+    let (status, _, _) = request(
+        &srv.addr,
+        "PUT",
+        &edge_put_uri(ns_a),
+        &[("Content-Type", "application/json")],
+        edge_body.as_bytes(),
+    );
+    assert_eq!(status, 201);
+
+    let (status, _, body) = request(
+        &srv.addr,
+        "GET",
+        &edge_query_uri(ns_b, &src, "outbound", Some("owns")),
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains(&tgt),
+        "namespace B should not see namespace A edges: {text}"
+    );
+}

@@ -220,11 +220,12 @@ pub fn find_by_kappa(root: &Path, ns: &str, kappa: &str) -> Result<Vec<String>, 
     Ok(names)
 }
 
-/// Atomically apply a batch of tag updates across one or more namespaces.
+/// Atomically apply a batch of tag updates within a single namespace.
 /// All CAS expectations are validated before any writes are applied.
 /// If any check fails, no writes are applied and the failing index is returned.
 pub fn set_batch(
     root: &Path,
+    ns: &str,
     updates: &[crate::store::TagUpdate],
 ) -> Result<crate::store::BatchResult, StoreError> {
     use crate::store::BatchResult;
@@ -233,65 +234,42 @@ pub fn set_batch(
         return Ok(BatchResult::AllSucceeded);
     }
 
-    // Group updates by namespace, preserving original index for error reporting.
-    // Use BTreeMap so namespace iteration order is deterministic (deadlock prevention).
-    let mut by_ns: std::collections::BTreeMap<String, Vec<(usize, &crate::store::TagUpdate)>> =
-        std::collections::BTreeMap::new();
-    for (i, u) in updates.iter().enumerate() {
-        by_ns.entry(u.ns.clone()).or_default().push((i, u));
-    }
+    let path = index_path(root, ns);
+    let mut index = read_index(&path)?;
 
-    // Phase 1: read all indexes and validate all CAS expectations.
-    let mut indexes: std::collections::BTreeMap<String, BTreeMap<String, String>> =
-        std::collections::BTreeMap::new();
-    for (ns, group) in &by_ns {
-        let path = index_path(root, ns);
-        let index = read_index(&path)?;
-
-        for &(orig_idx, update) in group {
-            match &update.expected {
-                Some(exp) if exp.is_empty() => {
-                    // Unconditional -- no CAS check
+    // Phase 1: validate all CAS expectations before any writes.
+    for (i, update) in updates.iter().enumerate() {
+        match &update.expected {
+            Some(exp) if exp.is_empty() => {
+                // Unconditional -- no CAS check
+            }
+            Some(exp) => {
+                let current = index.get(&update.name);
+                if current.map(|s| s.as_str()) != Some(exp.as_str()) {
+                    let reason = match current {
+                        Some(cur) => format!("expected {}, current is {}", exp, cur),
+                        None => format!("expected {}, tag does not exist", exp),
+                    };
+                    return Ok(BatchResult::Failed { index: i, reason });
                 }
-                Some(exp) => {
-                    // Must match current value
-                    let current = index.get(&update.name);
-                    if current.map(|s| s.as_str()) != Some(exp.as_str()) {
-                        let reason = match current {
-                            Some(cur) => format!("expected {}, current is {}", exp, cur),
-                            None => format!("expected {}, tag does not exist", exp),
-                        };
-                        return Ok(BatchResult::Failed {
-                            index: orig_idx,
-                            reason,
-                        });
-                    }
-                }
-                None => {
-                    // Create-if-absent -- tag must not exist
-                    if index.contains_key(&update.name) {
-                        return Ok(BatchResult::Failed {
-                            index: orig_idx,
-                            reason: "tag already exists".to_string(),
-                        });
-                    }
+            }
+            None => {
+                if index.contains_key(&update.name) {
+                    return Ok(BatchResult::Failed {
+                        index: i,
+                        reason: "tag already exists".to_string(),
+                    });
                 }
             }
         }
-
-        indexes.insert(ns.clone(), index);
     }
 
-    // Phase 2: all validations passed -- apply all updates and write indexes.
-    for (ns, group) in &by_ns {
-        let index = indexes.get_mut(ns).unwrap();
-        for &(_, update) in group {
-            index.insert(update.name.clone(), update.new_kappa.clone());
-        }
-        let path = index_path(root, ns);
-        write_index(&path, index)?;
-        write_root(root, ns, index)?;
+    // Phase 2: all validations passed -- apply all updates.
+    for update in updates {
+        index.insert(update.name.clone(), update.new_kappa.clone());
     }
+    write_index(&path, &index)?;
+    write_root(root, ns, &index)?;
 
     Ok(BatchResult::AllSucceeded)
 }

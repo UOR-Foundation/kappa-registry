@@ -539,7 +539,6 @@ pub async fn tag_batch(state: &AppState, ns: &str, body: &[u8]) -> Result<Respon
             Some(entry["expected"].as_str().unwrap_or("").to_string())
         };
         updates.push(TagUpdate {
-            ns: ns.to_string(),
             name: name.to_string(),
             new_kappa: new_kappa.to_string(),
             expected,
@@ -547,7 +546,8 @@ pub async fn tag_batch(state: &AppState, ns: &str, body: &[u8]) -> Result<Respon
     }
 
     let s = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || s.tag_set_batch(&updates)).await??;
+    let n = ns.to_string();
+    let result = tokio::task::spawn_blocking(move || s.tag_set_batch(&n, &updates)).await??;
 
     Ok((StatusCode::OK, Json(result)).into_response())
 }
