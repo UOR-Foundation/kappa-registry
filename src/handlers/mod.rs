@@ -1,4 +1,5 @@
 pub mod blob;
+pub mod bundle;
 pub mod compose;
 pub mod edge;
 pub mod filter;

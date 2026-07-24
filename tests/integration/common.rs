@@ -171,6 +171,14 @@ pub fn meta_list_uri(ns: &str, key: &str, value: &str) -> String {
     format!("/v2/{ns}/blobs/_meta?key={key}&value={value}")
 }
 
+pub fn bundle_create_uri(ns: &str) -> String {
+    format!("/v2/{ns}/_bundle/create")
+}
+
+pub fn bundle_ingest_uri(ns: &str) -> String {
+    format!("/v2/{ns}/_bundle/ingest")
+}
+
 pub fn transaction_begin_uri(ns: &str) -> String {
     format!("/v2/{ns}/_transaction/begin")
 }

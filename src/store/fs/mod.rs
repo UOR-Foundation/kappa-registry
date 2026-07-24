@@ -208,4 +208,24 @@ impl KappaStore for FsStore {
     fn list_by_meta(&self, key: &str, value: &str) -> Result<Vec<String>, StoreError> {
         blob::list_by_meta(&self.root, key, value)
     }
+
+    fn bundle_create(&self, kappas: &[String], _delta: bool) -> Result<Vec<u8>, StoreError> {
+        let mut objects: Vec<(&str, Vec<u8>)> = Vec::with_capacity(kappas.len());
+        for k in kappas {
+            let content = blob::get(&self.root, k)?.ok_or(StoreError::NotFound)?;
+            objects.push((k.as_str(), content));
+        }
+        let refs: Vec<(&str, &[u8])> = objects.iter().map(|(k, c)| (*k, c.as_slice())).collect();
+        Ok(crate::bundle::encode(&refs))
+    }
+
+    fn bundle_ingest(&self, bundle: &[u8]) -> Result<Vec<String>, StoreError> {
+        let entries = crate::bundle::decode(bundle)?;
+        let mut ingested = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            blob::put(&self.root, &entry.kappa, &entry.content)?;
+            ingested.push(entry.kappa.clone());
+        }
+        Ok(ingested)
+    }
 }

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod bundle;
 pub mod config;
 pub mod error;
 pub mod handlers;
@@ -249,6 +250,13 @@ async fn dispatch(
             .into_response(),
 
         Endpoint::Reconcile { ns } => handlers::reconcile::handle(&state, ns, &body)
+            .await
+            .into_response(),
+
+        Endpoint::BundleCreate { ns } => handlers::bundle::create(&state, ns, &body)
+            .await
+            .into_response(),
+        Endpoint::BundleIngest { ns } => handlers::bundle::ingest(&state, ns, &body)
             .await
             .into_response(),
 

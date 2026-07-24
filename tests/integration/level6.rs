@@ -390,3 +390,116 @@ fn reconcile_empty_namespace_nonzero_fingerprint_mismatches() {
     let items = v["items"].as_array().unwrap();
     assert!(items.is_empty(), "empty namespace has no items to send");
 }
+
+// ── Bundle Bulk Transfer (P8) ────────────────────────────────────────────
+
+#[test]
+fn bundle_create_and_ingest() {
+    let srv = TestServer::start();
+    let ns = "l6-bundle";
+
+    // Push blobs to the source namespace
+    let ka = push_blob(&srv.addr, ns, b"bundle-alpha");
+    let kb = push_blob(&srv.addr, ns, b"bundle-beta");
+    let kc = push_blob(&srv.addr, ns, b"bundle-gamma");
+
+    // Create bundle
+    let create_body = format!(r#"{{"kappas":["{ka}","{kb}","{kc}"],"delta":false}}"#);
+    let (status, hdrs, bundle_bytes) = request(
+        &srv.addr,
+        "POST",
+        &bundle_create_uri(ns),
+        &[("Content-Type", "application/json")],
+        create_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        header(&hdrs, "content-type"),
+        Some("application/x-kappa-bundle")
+    );
+    assert!(!bundle_bytes.is_empty(), "bundle is not empty");
+    // Verify KBND magic
+    assert_eq!(&bundle_bytes[..4], b"KBND", "bundle has KBND magic");
+
+    // Delete the blobs from the source
+    request(&srv.addr, "DELETE", &blob_uri(ns, &ka), &[], b"");
+    request(&srv.addr, "DELETE", &blob_uri(ns, &kb), &[], b"");
+    request(&srv.addr, "DELETE", &blob_uri(ns, &kc), &[], b"");
+
+    // Verify they are gone
+    let (status, _, _) = request(&srv.addr, "GET", &blob_uri(ns, &ka), &[], b"");
+    assert_eq!(status, 404, "blob deleted before ingest");
+
+    // Ingest the bundle
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &bundle_ingest_uri(ns),
+        &[("Content-Type", "application/x-kappa-bundle")],
+        &bundle_bytes,
+    );
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let ingested = v["ingested"].as_array().unwrap();
+    assert_eq!(ingested.len(), 3, "all 3 blobs ingested");
+
+    // Verify blobs are back
+    let (status, _, body) = request(&srv.addr, "GET", &blob_uri(ns, &ka), &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"bundle-alpha");
+
+    let (status, _, body) = request(&srv.addr, "GET", &blob_uri(ns, &kb), &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"bundle-beta");
+
+    let (status, _, body) = request(&srv.addr, "GET", &blob_uri(ns, &kc), &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"bundle-gamma");
+}
+
+#[test]
+fn bundle_ingest_rejects_corrupted() {
+    let srv = TestServer::start();
+    let ns = "l6-bundle-corrupt";
+
+    let ka = push_blob(&srv.addr, ns, b"corrupt-test");
+    let create_body = format!(r#"{{"kappas":["{ka}"],"delta":false}}"#);
+    let (_, _, mut bundle) = request(
+        &srv.addr,
+        "POST",
+        &bundle_create_uri(ns),
+        &[("Content-Type", "application/json")],
+        create_body.as_bytes(),
+    );
+
+    // Corrupt the trailer
+    let last = bundle.len() - 1;
+    bundle[last] ^= 0xFF;
+
+    let (status, _, _) = request(
+        &srv.addr,
+        "POST",
+        &bundle_ingest_uri(ns),
+        &[("Content-Type", "application/x-kappa-bundle")],
+        &bundle,
+    );
+    assert!(
+        status == 409 || status == 400,
+        "corrupted bundle rejected: {status}"
+    );
+}
+
+#[test]
+fn bundle_empty_kappas_rejected() {
+    let srv = TestServer::start();
+    let ns = "l6-bundle-empty";
+
+    let (status, _, _) = request(
+        &srv.addr,
+        "POST",
+        &bundle_create_uri(ns),
+        &[("Content-Type", "application/json")],
+        br#"{"kappas":[]}"#,
+    );
+    assert_eq!(status, 400, "empty kappas list rejected");
+}

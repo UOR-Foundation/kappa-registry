@@ -84,6 +84,12 @@ pub enum Endpoint<'a> {
     #[op_class(Admin)]
     Reconcile { ns: &'a str },
 
+    // Bundles
+    #[op_class(Read)]
+    BundleCreate { ns: &'a str },
+    #[op_class(Write)]
+    BundleIngest { ns: &'a str },
+
     // Transactions
     #[op_class(Admin)]
     TransactionBegin { ns: &'a str },
@@ -354,6 +360,18 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
     if inner.ends_with(segments::RECONCILE) && method == "POST" {
         if let Some(ns) = extract::ns_before_suffix(path, segments::RECONCILE) {
             return Endpoint::Reconcile { ns };
+        }
+    }
+
+    // Bundle create/ingest: {ns}/_bundle/create, {ns}/_bundle/ingest
+    if inner.ends_with(segments::BUNDLE_CREATE) && method == "POST" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::BUNDLE_CREATE) {
+            return Endpoint::BundleCreate { ns };
+        }
+    }
+    if inner.ends_with(segments::BUNDLE_INGEST) && method == "POST" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::BUNDLE_INGEST) {
+            return Endpoint::BundleIngest { ns };
         }
     }
 

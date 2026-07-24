@@ -258,4 +258,8 @@ pub trait KappaStore: Send + Sync + 'static {
 
     // metadata query
     fn list_by_meta(&self, key: &str, value: &str) -> Result<Vec<String>, StoreError>;
+
+    // bundle (bulk transfer)
+    fn bundle_create(&self, kappas: &[String], delta: bool) -> Result<Vec<u8>, StoreError>;
+    fn bundle_ingest(&self, bundle: &[u8]) -> Result<Vec<String>, StoreError>;
 }
