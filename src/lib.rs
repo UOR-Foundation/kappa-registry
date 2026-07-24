@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod bundle;
 pub mod config;
+pub mod crypto;
 pub mod error;
 pub mod handlers;
 pub mod kappa;
@@ -17,6 +18,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
+use axum::Json;
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -24,6 +26,7 @@ use crate::handlers::upload::SessionStore;
 use crate::ratelimit::TieredRateLimiter;
 use crate::routes::Endpoint;
 use crate::store::fs::FsStore;
+use crate::store::KappaStore;
 use crate::transaction::TransactionManager;
 
 #[derive(Clone)]
@@ -302,6 +305,28 @@ async fn dispatch(
         Endpoint::FilterDelete { ns, kappa } => handlers::filter::delete(&state, ns, kappa)
             .await
             .into_response(),
+
+        Endpoint::NamespaceRoot { ns } => {
+            let s = state.store.clone();
+            let p = ns.to_string();
+            match tokio::task::spawn_blocking(move || s.namespace_root(&p)).await {
+                Ok(Ok((root, count))) => {
+                    let body = serde_json::json!({"root": root, "count": count});
+                    (StatusCode::OK, Json(body)).into_response()
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        Endpoint::NamespaceProof { ns, name } => {
+            let s = state.store.clone();
+            let p = ns.to_string();
+            let n = name.to_string();
+            match tokio::task::spawn_blocking(move || s.namespace_proof(&p, &n)).await {
+                Ok(Ok(Some(proof))) => (StatusCode::OK, Json(proof)).into_response(),
+                Ok(Ok(None)) => crate::error::AppError::TagUnknown.into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
 
         Endpoint::NotFound => {
             crate::error::AppError::NameInvalid("unknown route".to_string()).into_response()

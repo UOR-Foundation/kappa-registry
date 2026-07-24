@@ -171,6 +171,14 @@ pub fn meta_list_uri(ns: &str, key: &str, value: &str) -> String {
     format!("/v2/{ns}/blobs/_meta?key={key}&value={value}")
 }
 
+pub fn namespace_root_uri(ns: &str) -> String {
+    format!("/v2/{ns}/_root")
+}
+
+pub fn namespace_proof_uri(ns: &str, name: &str) -> String {
+    format!("/v2/{ns}/_root/proof/{name}")
+}
+
 pub fn bundle_create_uri(ns: &str) -> String {
     format!("/v2/{ns}/_bundle/create")
 }

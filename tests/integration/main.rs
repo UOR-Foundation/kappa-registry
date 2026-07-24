@@ -5,3 +5,4 @@ mod level3;
 mod level4;
 mod level5;
 mod level6;
+mod level7;

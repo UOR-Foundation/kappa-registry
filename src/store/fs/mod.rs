@@ -236,4 +236,11 @@ impl KappaStore for FsStore {
         }
         Ok(ingested)
     }
+
+    fn namespace_root(&self, ns: &str) -> Result<(Option<String>, usize), StoreError> {
+        tag::namespace_root(&self.root, ns)
+    }
+    fn namespace_proof(&self, ns: &str, name: &str) -> Result<Option<NamespaceProof>, StoreError> {
+        tag::namespace_proof(&self.root, ns, name)
+    }
 }

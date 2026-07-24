@@ -95,6 +95,15 @@ pub struct FilterRecord {
     pub kappa: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NamespaceProof {
+    pub tag: String,
+    pub value: String,
+    pub proof_format: String,
+    pub leaves: Vec<(String, String)>,
+    pub root: String,
+}
+
 /// A single tag update within an atomic batch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TagUpdate {
@@ -272,4 +281,8 @@ pub trait KappaStore: Send + Sync + 'static {
     // bundle (bulk transfer)
     fn bundle_create(&self, kappas: &[String], delta: bool) -> Result<Vec<u8>, StoreError>;
     fn bundle_ingest(&self, bundle: &[u8]) -> Result<Vec<String>, StoreError>;
+
+    // namespace root (authenticated namespace state)
+    fn namespace_root(&self, ns: &str) -> Result<(Option<String>, usize), StoreError>;
+    fn namespace_proof(&self, ns: &str, name: &str) -> Result<Option<NamespaceProof>, StoreError>;
 }

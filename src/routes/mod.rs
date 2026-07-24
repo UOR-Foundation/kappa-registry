@@ -136,6 +136,12 @@ pub enum Endpoint<'a> {
     #[op_class(Admin)]
     FilterDelete { ns: &'a str, kappa: &'a str },
 
+    // Namespace root
+    #[op_class(Read)]
+    NamespaceRoot { ns: &'a str },
+    #[op_class(Read)]
+    NamespaceProof { ns: &'a str, name: &'a str },
+
     #[op_class(Read)]
     NotFound,
 }
@@ -353,6 +359,22 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
     if inner.ends_with(segments::EDGE_DIFF) && method == "POST" {
         if let Some(ns) = extract::ns_before_suffix(path, segments::EDGE_DIFF) {
             return Endpoint::EdgeDiff { ns };
+        }
+    }
+
+    // Namespace proof: {ns}/_root/proof/{name} (must match before _root)
+    if inner.contains(segments::NAMESPACE_PROOF) && method == "GET" {
+        if let Some((ns, name)) = extract::split_at(path, segments::NAMESPACE_PROOF) {
+            if !name.is_empty() {
+                return Endpoint::NamespaceProof { ns, name };
+            }
+        }
+    }
+
+    // Namespace root: {ns}/_root
+    if inner.ends_with(segments::NAMESPACE_ROOT) && !inner.contains("proof") && method == "GET" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::NAMESPACE_ROOT) {
+            return Endpoint::NamespaceRoot { ns };
         }
     }
 
