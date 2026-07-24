@@ -35,6 +35,7 @@ pub struct AppState {
     pub sessions: Arc<SessionStore>,
     pub transactions: Arc<TransactionManager>,
     pub rate_limiter: Option<TieredRateLimiter>,
+    pub signer: Option<Arc<dyn crate::crypto::RegistrySigner>>,
     pub max_blob_size: usize,
     pub upload_timeout_secs: u64,
 }
@@ -311,6 +312,24 @@ async fn dispatch(
             let p = ns.to_string();
             match tokio::task::spawn_blocking(move || s.namespace_root(&p)).await {
                 Ok(Ok((root, count))) => {
+                    let want_signed = params.get("signed").map(|v| v == "true").unwrap_or(false);
+                    if want_signed {
+                        if let (Some(ref root_kappa), Some(ref signer)) = (&root, &state.signer) {
+                            let timestamp = chrono::Utc::now().to_rfc3339();
+                            let message = format!("{ns}\n{root_kappa}\n{timestamp}");
+                            let sig = signer.sign(message.as_bytes()).unwrap_or_default();
+                            let signed = crate::crypto::SignedRoot {
+                                namespace: ns.to_string(),
+                                root: root_kappa.clone(),
+                                timestamp,
+                                algorithm: signer.algorithm().to_string(),
+                                public_key: signer.public_key_bytes(),
+                                signature: sig,
+                                attestation: None,
+                            };
+                            return (StatusCode::OK, Json(signed)).into_response();
+                        }
+                    }
                     let body = serde_json::json!({"root": root, "count": count});
                     (StatusCode::OK, Json(body)).into_response()
                 }

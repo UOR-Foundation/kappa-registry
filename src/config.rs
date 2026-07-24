@@ -9,6 +9,7 @@ pub struct Config {
     pub rate_limit: crate::ratelimit::RateLimitConfig,
     pub max_transactions: usize,
     pub max_staging_bytes: usize,
+    pub signing_algorithm: String,
 }
 
 impl Config {
@@ -61,6 +62,8 @@ impl Config {
             .parse()
             .unwrap_or(268_435_456);
 
+        let signing_algorithm = env_or("KAPPA_SIGNING_ALGORITHM", "ed25519");
+
         Config {
             listen_addr,
             store_root,
@@ -69,6 +72,7 @@ impl Config {
             rate_limit,
             max_transactions,
             max_staging_bytes,
+            signing_algorithm,
         }
     }
 }

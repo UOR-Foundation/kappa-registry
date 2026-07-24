@@ -55,11 +55,36 @@ async fn main() {
         None
     };
 
+    let signer: Option<Arc<dyn kappa_registry::crypto::RegistrySigner>> = {
+        let keystore = kappa_registry::crypto::keystore::KeyStore::new(store.root());
+        match keystore {
+            Ok(ks) => match ks.load_or_generate(&cfg.signing_algorithm) {
+                Ok(s) => {
+                    tracing::info!(
+                        algorithm = s.algorithm(),
+                        key_id = s.key_id(),
+                        "signing key loaded"
+                    );
+                    Some(Arc::from(s))
+                }
+                Err(e) => {
+                    tracing::warn!("signing key unavailable: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("keystore initialization failed: {e}");
+                None
+            }
+        }
+    };
+
     let state = AppState {
         store,
         sessions: Arc::new(SessionStore::new()),
         transactions,
         rate_limiter,
+        signer,
         max_blob_size: cfg.max_blob_size,
         upload_timeout_secs: cfg.upload_timeout_secs,
     };

@@ -8,6 +8,7 @@
 
 pub mod ecdsa;
 pub mod ed25519;
+pub mod keystore;
 
 use sha2::{Digest, Sha256};
 

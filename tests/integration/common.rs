@@ -231,11 +231,19 @@ impl TestServer {
             3600,              // timeout secs
         ));
 
+        let signer: Option<Arc<dyn kappa_registry::crypto::RegistrySigner>> = {
+            let ks = kappa_registry::crypto::keystore::KeyStore::new(data_dir.path());
+            ks.ok()
+                .and_then(|k| k.load_or_generate("ed25519").ok())
+                .map(|s| Arc::from(s) as Arc<dyn kappa_registry::crypto::RegistrySigner>)
+        };
+
         let state = AppState {
             store,
             sessions: Arc::new(SessionStore::new()),
             transactions,
             rate_limiter: None,
+            signer,
             max_blob_size: 64 * 1024 * 1024,
             upload_timeout_secs: 3600,
         };
@@ -303,6 +311,7 @@ impl TestServer {
             sessions: Arc::new(SessionStore::new()),
             transactions,
             rate_limiter: Some(TieredRateLimiter::new(&rl_config)),
+            signer: None,
             max_blob_size: 64 * 1024 * 1024,
             upload_timeout_secs: 3600,
         };

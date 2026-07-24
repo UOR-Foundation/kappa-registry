@@ -245,3 +245,31 @@ fn batch_cas_rollback_on_failure() {
     let (status, _, _) = request(&srv.addr, "GET", &tag_uri(ns, "ref-a"), &[], b"");
     assert_eq!(status, 404, "ref-a should not exist after rollback");
 }
+
+#[test]
+fn namespace_root_signed() {
+    let srv = TestServer::start();
+    let ns = "l7-signed";
+    request(
+        &srv.addr,
+        "PUT",
+        &manifest_uri(ns, "sig-tag"),
+        &[],
+        b"signed-content",
+    );
+
+    let uri = format!("/v2/{ns}/_root?signed=true");
+    let (status, _, body) = request(&srv.addr, "GET", &uri, &[], b"");
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["root"].as_str().unwrap().starts_with("sha256:"));
+    assert!(v["algorithm"].as_str().is_some(), "algorithm present");
+    assert!(v["public_key"].as_str().is_some(), "public_key present");
+    assert!(v["signature"].as_str().is_some(), "signature present");
+    assert!(
+        !v["signature"].as_str().unwrap().is_empty(),
+        "signature is non-empty"
+    );
+    assert!(v["timestamp"].as_str().is_some(), "timestamp present");
+    assert_eq!(v["namespace"].as_str(), Some(ns));
+}
