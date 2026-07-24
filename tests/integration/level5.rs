@@ -35,14 +35,20 @@ fn gc_pin_unpin_sweep_status() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("sweep_id"), "sweep response: {text}");
 
-    // Wait briefly for async sweep
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Status
-    let (status, _, body) = request(&srv.addr, "GET", &gc_status_uri(ns), &[], b"");
-    assert_eq!(status, 200);
-    let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("last_sweep"), "status has last_sweep: {text}");
+    // Poll for sweep completion (redb edge operations may take longer under load)
+    let mut sweep_done = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (s, _, b) = request(&srv.addr, "GET", &gc_status_uri(ns), &[], b"");
+        if s == 200 {
+            let t = String::from_utf8_lossy(&b);
+            if t.contains("last_sweep") {
+                sweep_done = true;
+                break;
+            }
+        }
+    }
+    assert!(sweep_done, "sweep did not complete within 5 seconds");
 }
 
 #[test]
@@ -184,9 +190,15 @@ fn gc_reachability_pinned_and_owned_survive() {
         pin_body.as_bytes(),
     );
 
-    // Sweep
+    // Sweep and poll for completion
     request(&srv.addr, "POST", &gc_sweep_uri(ns), &[], b"");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (s, _, b) = request(&srv.addr, "GET", &gc_status_uri(ns), &[], b"");
+        if s == 200 && String::from_utf8_lossy(&b).contains("last_sweep") {
+            break;
+        }
+    }
 
     // Pinned root survives
     let (status, _, _) = request(&srv.addr, "GET", &blob_uri(ns, &root_k), &[], b"");
@@ -216,9 +228,15 @@ fn gc_tag_as_root() {
     // Push an untagged orphan
     let orphan_k = push_blob(&srv.addr, ns, b"orphan no tag no pin");
 
-    // Sweep
+    // Sweep and poll for completion
     request(&srv.addr, "POST", &gc_sweep_uri(ns), &[], b"");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (s, _, b) = request(&srv.addr, "GET", &gc_status_uri(ns), &[], b"");
+        if s == 200 && String::from_utf8_lossy(&b).contains("last_sweep") {
+            break;
+        }
+    }
 
     // Tagged blob survives
     let (status, _, _) = request(&srv.addr, "GET", &blob_uri(ns, &tagged_k), &[], b"");

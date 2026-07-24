@@ -28,8 +28,7 @@ pub async fn create(state: &AppState, ns: &str, body: &[u8]) -> Result<Response,
     }
 
     let s = state.store.clone();
-    let bundle =
-        tokio::task::spawn_blocking(move || s.bundle_create(&kappas, delta)).await??;
+    let bundle = tokio::task::spawn_blocking(move || s.bundle_create(&kappas, delta)).await??;
 
     Ok((
         StatusCode::OK,

@@ -187,9 +187,11 @@ pub trait KappaStore: Send + Sync + 'static {
     /// is the kappa-label string. For symbolic tags this is "ref:{target}".
     fn tag_get_raw(&self, ns: &str, name: &str) -> Result<Option<String>, StoreError>;
 
-    // edge (global by canonical form)
+    // edge (scoped to namespace)
+    #[allow(clippy::too_many_arguments)]
     fn edge_put(
         &self,
+        ns: &str,
         edge_kappa: &str,
         src: &str,
         rel: &str,
@@ -199,6 +201,7 @@ pub trait KappaStore: Send + Sync + 'static {
     ) -> Result<bool, StoreError>;
     fn edge_query(
         &self,
+        ns: &str,
         node: &str,
         dir: Direction,
         rel: Option<&str>,
@@ -207,20 +210,27 @@ pub trait KappaStore: Send + Sync + 'static {
     ) -> Result<Vec<EdgeRecord>, StoreError>;
     fn edge_find(
         &self,
+        ns: &str,
         node: &str,
         dir: Direction,
         rel: Option<&str>,
     ) -> Result<Vec<EdgeRecord>, StoreError> {
-        self.edge_query(node, dir, rel, None, None)
+        self.edge_query(ns, node, dir, rel, None, None)
     }
-    fn edge_remove(&self, edge_kappa: &str) -> Result<bool, StoreError>;
-    fn edge_remove_by_node(&self, kappa: &str) -> Result<(), StoreError>;
-    fn edge_walk(&self, roots: &[String], rels: &[&str]) -> Result<HashSet<String>, StoreError>;
+    fn edge_remove(&self, ns: &str, edge_kappa: &str) -> Result<bool, StoreError>;
+    fn edge_remove_by_node(&self, ns: &str, kappa: &str) -> Result<(), StoreError>;
+    fn edge_walk(
+        &self,
+        ns: &str,
+        roots: &[String],
+        rels: &[&str],
+    ) -> Result<HashSet<String>, StoreError>;
     /// Compute graph set difference: kappa-labels reachable from `want`
     /// roots but NOT reachable from `have` roots, along the given
     /// relation types. The `have` walk prunes at common ancestors.
     fn edge_diff(
         &self,
+        ns: &str,
         have: &[String],
         want: &[String],
         rels: &[&str],

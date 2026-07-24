@@ -114,8 +114,9 @@ pub async fn compose(
         let ck = composed_kappa.as_str().to_string();
         let op = operand.clone();
         let edge_meta = serde_json::json!({"operation": op_token});
+        let n = ns.to_string();
         tokio::task::spawn_blocking(move || {
-            s.edge_put(&ek_str, &ck, "composed-of", &op, &edge_canon, edge_meta)
+            s.edge_put(&n, &ek_str, &ck, "composed-of", &op, &edge_canon, edge_meta)
         })
         .await??;
     }
@@ -138,9 +139,10 @@ pub async fn compose(
     .await??;
     let wk = witness_kappa.as_str().to_string();
     let ck = composed_kappa.as_str().to_string();
+    let n = ns.to_string();
     let wit_meta = serde_json::json!({});
     tokio::task::spawn_blocking(move || {
-        s.edge_put(&wek, &wk, "witness-of", &ck, &wit_edge, wit_meta)
+        s.edge_put(&n, &wek, &wk, "witness-of", &ck, &wit_edge, wit_meta)
     })
     .await??;
 
@@ -164,8 +166,9 @@ pub async fn witness(state: &AppState, ns: &str, kappa: &str) -> Result<Response
 
     let s = state.store.clone();
     let k = kappa.to_string();
+    let n = ns.to_string();
     let edges = tokio::task::spawn_blocking(move || {
-        s.edge_find(&k, Direction::Inbound, Some("witness-of"))
+        s.edge_find(&n, &k, Direction::Inbound, Some("witness-of"))
     })
     .await??;
 

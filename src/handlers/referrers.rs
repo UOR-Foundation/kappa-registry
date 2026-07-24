@@ -18,8 +18,9 @@ pub async fn list(
 
     let s = state.store.clone();
     let node = digest.to_string();
+    let n = ns.to_string();
     let edges = tokio::task::spawn_blocking(move || {
-        s.edge_query(&node, Direction::Inbound, Some("refers-to"), None, None)
+        s.edge_query(&n, &node, Direction::Inbound, Some("refers-to"), None, None)
     })
     .await??;
 

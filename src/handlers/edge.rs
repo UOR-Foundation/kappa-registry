@@ -53,8 +53,9 @@ pub async fn put(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, Ap
     let tgt = target.to_string();
     let canon = canonical;
     let meta = serde_json::json!({});
+    let n = ns.to_string();
     let is_new =
-        tokio::task::spawn_blocking(move || s.edge_put(&ek, &src, &rel, &tgt, &canon, meta))
+        tokio::task::spawn_blocking(move || s.edge_put(&n, &ek, &src, &rel, &tgt, &canon, meta))
             .await??;
 
     let status = if is_new {
@@ -90,8 +91,16 @@ pub async fn query(
     let node_owned = node.to_string();
     let rel = relation.map(String::from);
     let last_owned = last.map(String::from);
+    let ns_owned = ns.to_string();
     let edges = tokio::task::spawn_blocking(move || {
-        s.edge_query(&node_owned, dir, rel.as_deref(), n, last_owned.as_deref())
+        s.edge_query(
+            &ns_owned,
+            &node_owned,
+            dir,
+            rel.as_deref(),
+            n,
+            last_owned.as_deref(),
+        )
     })
     .await??;
 
@@ -104,7 +113,8 @@ pub async fn delete(state: &AppState, ns: &str, edge_kappa: &str) -> Result<Resp
 
     let s = state.store.clone();
     let ek = edge_kappa.to_string();
-    let removed = tokio::task::spawn_blocking(move || s.edge_remove(&ek)).await??;
+    let n = ns.to_string();
+    let removed = tokio::task::spawn_blocking(move || s.edge_remove(&n, &ek)).await??;
     if removed {
         Ok(StatusCode::ACCEPTED.into_response())
     } else {
@@ -142,9 +152,10 @@ pub async fn diff(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, A
         .unwrap_or_default();
 
     let s = state.store.clone();
+    let n = ns.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let rel_refs: Vec<&str> = rels.iter().map(|s| s.as_str()).collect();
-        s.edge_diff(&have, &want, &rel_refs)
+        s.edge_diff(&n, &have, &want, &rel_refs)
     })
     .await??;
 

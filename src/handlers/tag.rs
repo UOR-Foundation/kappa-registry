@@ -179,8 +179,10 @@ pub async fn manifest_put(
             let s = state.store.clone();
             let src = kappa.as_str().to_string();
             let tgt = subj.clone();
+            let n = ns.to_string();
             let _ = tokio::task::spawn_blocking(move || {
                 s.edge_put(
+                    &n,
                     &ek,
                     &src,
                     "refers-to",

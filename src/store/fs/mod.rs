@@ -110,6 +110,7 @@ impl KappaStore for FsStore {
 
     fn edge_put(
         &self,
+        ns: &str,
         edge_kappa: &str,
         src: &str,
         rel: &str,
@@ -117,34 +118,41 @@ impl KappaStore for FsStore {
         canon: &[u8],
         metadata: serde_json::Value,
     ) -> Result<bool, StoreError> {
-        edge::put(&self.root, edge_kappa, src, rel, tgt, canon, metadata)
+        edge::put(&self.root, ns, edge_kappa, src, rel, tgt, canon, metadata)
     }
     fn edge_query(
         &self,
+        ns: &str,
         node: &str,
         dir: Direction,
         rel: Option<&str>,
         n: Option<usize>,
         last: Option<&str>,
     ) -> Result<Vec<EdgeRecord>, StoreError> {
-        edge::query(&self.root, node, dir, rel, n, last)
+        edge::query(&self.root, ns, node, dir, rel, n, last)
     }
-    fn edge_remove(&self, edge_kappa: &str) -> Result<bool, StoreError> {
-        edge::remove(&self.root, edge_kappa)
+    fn edge_remove(&self, ns: &str, edge_kappa: &str) -> Result<bool, StoreError> {
+        edge::remove(&self.root, ns, edge_kappa)
     }
-    fn edge_remove_by_node(&self, kappa: &str) -> Result<(), StoreError> {
-        edge::remove_by_node(&self.root, kappa)
+    fn edge_remove_by_node(&self, ns: &str, kappa: &str) -> Result<(), StoreError> {
+        edge::remove_by_node(&self.root, ns, kappa)
     }
-    fn edge_walk(&self, roots: &[String], rels: &[&str]) -> Result<HashSet<String>, StoreError> {
-        edge::walk(&self.root, roots, rels)
+    fn edge_walk(
+        &self,
+        ns: &str,
+        roots: &[String],
+        rels: &[&str],
+    ) -> Result<HashSet<String>, StoreError> {
+        edge::walk(&self.root, ns, roots, rels)
     }
     fn edge_diff(
         &self,
+        ns: &str,
         have: &[String],
         want: &[String],
         rels: &[&str],
     ) -> Result<Vec<String>, StoreError> {
-        edge::diff(&self.root, have, want, rels)
+        edge::diff(&self.root, ns, have, want, rels)
     }
 
     fn range_fingerprint(

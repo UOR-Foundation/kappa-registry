@@ -118,7 +118,7 @@ pub async fn status(state: &AppState, ns: &str) -> Result<Response, AppError> {
 
 fn run_sweep(
     store: &dyn KappaStore,
-    _ns: &str,
+    ns: &str,
     store_root: &std::path::Path,
     sweep_id: &str,
 ) -> Result<(), StoreError> {
@@ -130,7 +130,7 @@ fn run_sweep(
     roots.sort();
     roots.dedup();
 
-    let reachable = store.edge_walk(&roots, &["owns", "composed-of"])?;
+    let reachable = store.edge_walk(ns, &roots, &["owns", "composed-of"])?;
 
     let mut all_blobs = Vec::new();
     for axis in &[
@@ -171,7 +171,7 @@ fn run_sweep(
 
     // Clean up edge index entries referencing evicted blobs
     for kappa in &evicted_set {
-        let _ = store.edge_remove_by_node(kappa);
+        let _ = store.edge_remove_by_node(ns, kappa);
     }
 
     let reachable_count = scanned - evicted;

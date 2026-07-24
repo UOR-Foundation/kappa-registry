@@ -66,8 +66,10 @@ pub async fn register(
             .await??;
             let new_k = kappa.clone();
             let old = old_k.clone();
+            let n = ns.to_string();
             tokio::task::spawn_blocking(move || {
                 s.edge_put(
+                    &n,
                     &ek,
                     &new_k,
                     "derives-from",

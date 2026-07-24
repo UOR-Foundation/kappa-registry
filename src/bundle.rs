@@ -87,9 +87,9 @@ pub fn decode(data: &[u8]) -> Result<Vec<BundleEntry>, StoreError> {
         pos += 1;
 
         if entry_type != ENTRY_TYPE_FULL {
-            return Err(StoreError::Conflict(
-                format!("unsupported entry type 0x{entry_type:02x}"),
-            ));
+            return Err(StoreError::Conflict(format!(
+                "unsupported entry type 0x{entry_type:02x}"
+            )));
         }
 
         if pos + 2 > payload.len() {
