@@ -1,0 +1,86 @@
+[workspace]
+members = ["crates/kappa-macros"]
+
+[package]
+name = "kappa-registry"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "A conforming kappa-Distribution /v2/ registry. Filesystem-backed, single-node, all five conformance levels."
+
+[lib]
+name = "kappa_registry"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kappa-registry"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+tower = "0.5"
+governor = "0.10"
+http = "1"
+
+# Proc macros
+kappa-macros = { path = "crates/kappa-macros" }
+
+# Hashing -- all RustCrypto digest-trait compatible
+sha2 = "0.10"
+sha1-checked = { version = "0.10", default-features = false }
+blake3 = "1"
+hex = "0.4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Schema validation
+jsonschema = { version = "0.46", default-features = false }
+
+# Filesystem / temp
+tempfile = "3"
+
+# Identifiers
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Embedded KV store for edge index (P9)
+redb = "4"
+
+# Reachability acceleration (P4)
+roaring = "0.11"
+
+# Cryptographic signing and verification (P11)
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
+k256 = { version = "0.14", features = ["ecdsa"] }
+signature = "3"
+
+# Optional
+reqwest = { version = "0.12", features = ["blocking"], optional = true }
+getrandom = "0.4.3"
+zeroize = "1.9.0"
+
+[features]
+default = []
+federation = ["reqwest"]
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["blocking"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = true
+strip = true

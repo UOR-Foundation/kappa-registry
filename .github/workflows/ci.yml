@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Check, Lint, Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (all targets, deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+      - name: Build release (musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kappa-registry-x86_64-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/kappa-registry
