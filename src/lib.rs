@@ -2,6 +2,7 @@ pub mod auth;
 pub mod bundle;
 pub mod config;
 pub mod crypto;
+pub mod delta;
 pub mod error;
 pub mod handlers;
 pub mod kappa;

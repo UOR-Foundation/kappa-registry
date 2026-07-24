@@ -7,12 +7,70 @@ pub enum StoreError {
     NotFound,
     Conflict(String),
     Io(std::io::Error),
+    // P8 delta codec errors
+    DeltaTruncated(&'static str),
+    DeltaReservedOpcode,
+    DeltaBaseSizeMismatch {
+        expected: usize,
+        got: usize,
+    },
+    DeltaResultSizeMismatch {
+        expected: usize,
+        got: usize,
+    },
+    DeltaCopyOutOfBounds {
+        offset: usize,
+        size: usize,
+        base_len: usize,
+    },
+    DeltaUnresolvableBase(String),
+    DeltaVarintOverflow,
+    BundleTruncated(&'static str),
+    BundleTrailerMismatch,
+    BundleDecodeLimitExceeded,
+    BundleDeltaInNoDeltaBundle,
+    BundleKappaMismatch(String),
+    BundleUnsupportedEntryType(u8),
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreError::NotFound => write!(f, "not found"),
+            StoreError::DeltaTruncated(field) => write!(f, "truncated delta {field}"),
+            StoreError::DeltaReservedOpcode => write!(f, "reserved delta opcode 0x00"),
+            StoreError::DeltaBaseSizeMismatch { expected, got } => {
+                write!(
+                    f,
+                    "delta base size mismatch: expected {expected}, got {got}"
+                )
+            }
+            StoreError::DeltaResultSizeMismatch { expected, got } => {
+                write!(
+                    f,
+                    "delta result size mismatch: expected {expected}, got {got}"
+                )
+            }
+            StoreError::DeltaCopyOutOfBounds {
+                offset,
+                size,
+                base_len,
+            } => {
+                write!(
+                    f,
+                    "copy out of bounds: offset={offset} size={size} base_len={base_len}"
+                )
+            }
+            StoreError::DeltaUnresolvableBase(k) => write!(f, "unresolvable delta base: {k}"),
+            StoreError::DeltaVarintOverflow => write!(f, "varint overflow"),
+            StoreError::BundleTruncated(field) => write!(f, "truncated bundle {field}"),
+            StoreError::BundleTrailerMismatch => write!(f, "bundle trailer mismatch"),
+            StoreError::BundleDecodeLimitExceeded => write!(f, "bundle exceeds decode limit"),
+            StoreError::BundleDeltaInNoDeltaBundle => write!(f, "delta entry in non-delta bundle"),
+            StoreError::BundleKappaMismatch(k) => write!(f, "bundle entry kappa mismatch: {k}"),
+            StoreError::BundleUnsupportedEntryType(t) => {
+                write!(f, "unsupported entry type 0x{t:02x}")
+            }
             StoreError::Conflict(msg) => write!(f, "conflict: {msg}"),
             StoreError::Io(e) => write!(f, "I/O error: {e}"),
         }

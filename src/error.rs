@@ -113,6 +113,31 @@ impl IntoResponse for AppError {
                 ),
                 StoreError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg),
                 StoreError::Io(e) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e.to_string()),
+                StoreError::BundleTrailerMismatch
+                | StoreError::BundleDecodeLimitExceeded
+                | StoreError::BundleDeltaInNoDeltaBundle => {
+                    (StatusCode::BAD_REQUEST, "BUNDLE_INVALID", e.to_string())
+                }
+                StoreError::BundleTruncated(_) => {
+                    (StatusCode::BAD_REQUEST, "BUNDLE_TRUNCATED", e.to_string())
+                }
+                StoreError::BundleKappaMismatch(_) => {
+                    (StatusCode::BAD_REQUEST, "DIGEST_INVALID", e.to_string())
+                }
+                StoreError::BundleUnsupportedEntryType(_) => {
+                    (StatusCode::BAD_REQUEST, "BUNDLE_INVALID", e.to_string())
+                }
+                StoreError::DeltaTruncated(_)
+                | StoreError::DeltaReservedOpcode
+                | StoreError::DeltaBaseSizeMismatch { .. }
+                | StoreError::DeltaResultSizeMismatch { .. }
+                | StoreError::DeltaCopyOutOfBounds { .. }
+                | StoreError::DeltaVarintOverflow => {
+                    (StatusCode::BAD_REQUEST, "DELTA_INVALID", e.to_string())
+                }
+                StoreError::DeltaUnresolvableBase(_) => {
+                    (StatusCode::BAD_REQUEST, "DELTA_BASE_UNKNOWN", e.to_string())
+                }
             },
         };
 

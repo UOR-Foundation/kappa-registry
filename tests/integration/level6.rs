@@ -490,6 +490,99 @@ fn bundle_ingest_rejects_corrupted() {
 }
 
 #[test]
+fn bundle_create_with_delta() {
+    let srv = TestServer::start();
+    let ns = "l6-bundle-delta";
+
+    // Large similar blobs: 200+ lines each, differing by a few lines.
+    // Delta compression needs content large enough for 16-byte block
+    // matching to find significant overlap.
+    let mut base_lines = Vec::new();
+    for i in 0..100 {
+        base_lines.push(format!("line-{i:04}-base-padding-content-here\n"));
+    }
+    let base_str = base_lines.join("");
+    let base = base_str.as_bytes();
+
+    let mut var1_lines = base_lines.clone();
+    var1_lines[10] = "line-0010-MODIFIED-variant-one!!\n".to_string();
+    var1_lines[50] = "line-0050-MODIFIED-variant-one!!\n".to_string();
+    let var1_str = var1_lines.join("");
+    let var1 = var1_str.as_bytes();
+
+    let mut var2_lines = base_lines.clone();
+    var2_lines[20] = "line-0020-CHANGED-variant-two!!\n".to_string();
+    var2_lines[80] = "line-0080-CHANGED-variant-two!!\n".to_string();
+    let var2_str = var2_lines.join("");
+    let var2 = var2_str.as_bytes();
+
+    let kb = push_blob(&srv.addr, ns, base);
+    let k1 = push_blob(&srv.addr, ns, var1);
+    let k2 = push_blob(&srv.addr, ns, var2);
+
+    let total_raw_size = base.len() + var1.len() + var2.len();
+
+    // Create bundle with delta=true
+    let create_body = format!(r#"{{"kappas":["{kb}","{k1}","{k2}"],"delta":true}}"#);
+    let (status, hdrs, bundle_bytes) = request(
+        &srv.addr,
+        "POST",
+        &bundle_create_uri(ns),
+        &[("Content-Type", "application/json")],
+        create_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        header(&hdrs, "content-type"),
+        Some("application/x-kappa-bundle")
+    );
+    assert_eq!(&bundle_bytes[..4], b"KBND");
+
+    // Bundle with deltas should be smaller than raw content
+    // (minus header/trailer overhead which is small)
+    assert!(
+        bundle_bytes.len() < total_raw_size,
+        "delta bundle ({}) should be smaller than raw ({})",
+        bundle_bytes.len(),
+        total_raw_size,
+    );
+
+    // Delete originals
+    request(&srv.addr, "DELETE", &blob_uri(ns, &kb), &[], b"");
+    request(&srv.addr, "DELETE", &blob_uri(ns, &k1), &[], b"");
+    request(&srv.addr, "DELETE", &blob_uri(ns, &k2), &[], b"");
+
+    let (status, _, _) = request(&srv.addr, "GET", &blob_uri(ns, &kb), &[], b"");
+    assert_eq!(status, 404, "blob deleted before ingest");
+
+    // Ingest the delta bundle
+    let (status, _, resp) = request(
+        &srv.addr,
+        "POST",
+        &bundle_ingest_uri(ns),
+        &[("Content-Type", "application/x-kappa-bundle")],
+        &bundle_bytes,
+    );
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let ingested = v["ingested"].as_array().unwrap();
+    assert_eq!(ingested.len(), 3, "all 3 blobs ingested from delta bundle");
+
+    // Verify all blobs recovered with correct content
+    let (status, _, body) = request(&srv.addr, "GET", &blob_uri(ns, &kb), &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, base);
+
+    let (status, _, body) = request(&srv.addr, "GET", &blob_uri(ns, &k1), &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, var1);
+
+    let (status, _, body) = request(&srv.addr, "GET", &blob_uri(ns, &k2), &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, var2);
+}
+
+#[test]
 fn bundle_empty_kappas_rejected() {
     let srv = TestServer::start();
     let ns = "l6-bundle-empty";
