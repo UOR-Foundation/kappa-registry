@@ -138,6 +138,16 @@ impl IntoResponse for AppError {
                 StoreError::DeltaUnresolvableBase(_) => {
                     (StatusCode::BAD_REQUEST, "DELTA_BASE_UNKNOWN", e.to_string())
                 }
+                StoreError::RangeNotSatisfiable { size } => {
+                    return (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [("content-range", format!("bytes */{size}"))],
+                        axum::Json(serde_json::json!({
+                            "errors": [{"code": "RANGE_NOT_SATISFIABLE", "message": e.to_string()}]
+                        })),
+                    )
+                        .into_response();
+                }
             },
         };
 

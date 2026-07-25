@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::store::fs::{atomic_write, escape_namespace};
+use crate::store::fs::{atomic_write, safe_name};
 use crate::store::{RangeFingerprint, StoreError};
 
 const FP_LEN: usize = 32;
@@ -151,7 +151,7 @@ impl NamespaceFingerprints {
 fn fingerprint_path(root: &Path, ns: &str) -> PathBuf {
     root.join("index")
         .join("fingerprints")
-        .join(format!("{}.json", escape_namespace(ns)))
+        .join(format!("{}.json", safe_name(ns)))
 }
 
 /// Load the fingerprint set for a namespace from disk.

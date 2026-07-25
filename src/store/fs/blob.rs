@@ -34,6 +34,53 @@ pub fn get(root: &Path, kappa: &str) -> Result<Option<Vec<u8>>, StoreError> {
     }
 }
 
+pub fn get_range(
+    root: &Path,
+    kappa: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, StoreError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = blob_path(root, kappa);
+    let mut file = std::fs::File::open(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StoreError::NotFound
+        } else {
+            StoreError::Io(e)
+        }
+    })?;
+    let file_size = file.metadata().map_err(StoreError::Io)?.len();
+    if offset >= file_size {
+        return Err(StoreError::RangeNotSatisfiable { size: file_size });
+    }
+    let actual_length = std::cmp::min(length, file_size - offset) as usize;
+    let mut buf = vec![0u8; actual_length];
+    file.seek(SeekFrom::Start(offset)).map_err(StoreError::Io)?;
+    file.read_exact(&mut buf).map_err(StoreError::Io)?;
+    Ok(buf)
+}
+
+pub fn size(root: &Path, kappa: &str) -> Result<Option<u64>, StoreError> {
+    let path = blob_path(root, kappa);
+    match std::fs::metadata(&path) {
+        Ok(m) => Ok(Some(m.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(StoreError::Io(e)),
+    }
+}
+
+pub fn reader(root: &Path, kappa: &str) -> Result<Box<dyn std::io::Read + Send>, StoreError> {
+    let path = blob_path(root, kappa);
+    let file = std::fs::File::open(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StoreError::NotFound
+        } else {
+            StoreError::Io(e)
+        }
+    })?;
+    Ok(Box::new(file))
+}
+
 pub fn exists(root: &Path, kappa: &str) -> Result<bool, StoreError> {
     Ok(blob_path(root, kappa).exists())
 }

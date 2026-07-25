@@ -436,6 +436,18 @@ pub fn push_blob_with_kappa(addr: &str, ns: &str, kappa: &str, content: &[u8]) -
     status
 }
 
+pub fn sequence_next_uri(ns: &str, name: &str) -> String {
+    format!("/v2/{ns}/_sequence/{name}/next")
+}
+
+pub fn sequence_current_uri(ns: &str, name: &str) -> String {
+    format!("/v2/{ns}/_sequence/{name}")
+}
+
+pub fn cascade_uri(ns: &str) -> String {
+    format!("/v2/{ns}/blobs/_cascade")
+}
+
 // JSON field extraction from response bodies.
 pub fn json_str(body: &[u8], key: &str) -> Option<String> {
     let text = String::from_utf8_lossy(body);

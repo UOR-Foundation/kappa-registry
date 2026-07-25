@@ -2,8 +2,10 @@ mod blob;
 mod edge;
 mod filter;
 pub mod fingerprint;
+mod meta;
 mod pin;
 mod schema;
+mod sequence;
 mod tag;
 
 use std::collections::HashSet;
@@ -44,8 +46,14 @@ pub fn atomic_write(dest: &Path, content: &[u8]) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn escape_namespace(ns: &str) -> String {
-    ns.replace(':', "__").replace('/', "_")
+/// Content-address any string to produce a collision-free filesystem-safe
+/// identifier. SHA-256 of the input, hex-encoded. Used for namespace
+/// directory names, pin record filenames, and any context where an
+/// arbitrary string must become a safe, unique path component.
+fn safe_name(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(s.as_bytes());
+    hex::encode(hash)
 }
 
 impl KappaStore for FsStore {
@@ -63,6 +71,15 @@ impl KappaStore for FsStore {
     }
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         blob::list(&self.root, prefix)
+    }
+    fn blob_get_range(&self, kappa: &str, offset: u64, length: u64) -> Result<Vec<u8>, StoreError> {
+        blob::get_range(&self.root, kappa, offset, length)
+    }
+    fn blob_size(&self, kappa: &str) -> Result<Option<u64>, StoreError> {
+        blob::size(&self.root, kappa)
+    }
+    fn blob_reader(&self, kappa: &str) -> Result<Box<dyn std::io::Read + Send>, StoreError> {
+        blob::reader(&self.root, kappa)
     }
     fn put_meta(&self, kappa: &str, key: &str, val: &[u8]) -> Result<(), StoreError> {
         blob::put_meta(&self.root, kappa, key, val)
@@ -106,6 +123,12 @@ impl KappaStore for FsStore {
     }
     fn tag_get_raw(&self, ns: &str, name: &str) -> Result<Option<String>, StoreError> {
         tag::get_raw(&self.root, ns, name)
+    }
+    fn tag_list_prefix(&self, ns: &str, prefix: &str) -> Result<Vec<TagEntry>, StoreError> {
+        tag::list_prefix(&self.root, ns, prefix)
+    }
+    fn tag_delete_prefix(&self, ns: &str, prefix: &str) -> Result<usize, StoreError> {
+        tag::delete_prefix(&self.root, ns, prefix)
     }
 
     fn edge_put(
@@ -217,6 +240,45 @@ impl KappaStore for FsStore {
         blob::list_by_meta(&self.root, key, value)
     }
 
+    fn meta_set(&self, ns: &str, kappa: &str, entries: &[(&str, &str)]) -> Result<(), StoreError> {
+        meta::set(&self.root, ns, kappa, entries)
+    }
+    fn meta_get(&self, ns: &str, kappa: &str, key: &str) -> Result<Option<String>, StoreError> {
+        meta::get(&self.root, ns, kappa, key)
+    }
+    fn meta_query(&self, ns: &str, key: &str, value: &str) -> Result<Vec<String>, StoreError> {
+        meta::query(&self.root, ns, key, value)
+    }
+    fn meta_query_exists(&self, ns: &str, key: &str) -> Result<Vec<String>, StoreError> {
+        meta::query_exists(&self.root, ns, key)
+    }
+    fn meta_query_compound(
+        &self,
+        ns: &str,
+        filters: &[(&str, &str)],
+    ) -> Result<Vec<String>, StoreError> {
+        meta::query_compound(&self.root, ns, filters)
+    }
+    fn meta_query_prefix(
+        &self,
+        ns: &str,
+        key: &str,
+        value_prefix: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        meta::query_prefix(&self.root, ns, key, value_prefix)
+    }
+    fn meta_remove_by_value_prefix(
+        &self,
+        ns: &str,
+        key: &str,
+        value_prefix: &str,
+    ) -> Result<usize, StoreError> {
+        meta::remove_by_value_prefix(&self.root, ns, key, value_prefix)
+    }
+    fn meta_remove(&self, ns: &str, kappa: &str) -> Result<(), StoreError> {
+        meta::remove(&self.root, ns, kappa)
+    }
+
     fn bundle_create(&self, kappas: &[String], use_deltas: bool) -> Result<Vec<u8>, StoreError> {
         let mut objects: Vec<(&str, Vec<u8>)> = Vec::with_capacity(kappas.len());
         for k in kappas {
@@ -237,6 +299,43 @@ impl KappaStore for FsStore {
             ingested.push(entry.kappa.clone());
         }
         Ok(ingested)
+    }
+
+    fn remove_reachable(
+        &self,
+        ns: &str,
+        roots: &[String],
+        rels: &[&str],
+    ) -> Result<RemovalReport, StoreError> {
+        let reachable = self.edge_walk(ns, roots, rels)?;
+        let mut report = RemovalReport::default();
+
+        // Remove tags pointing to reachable blobs
+        let tag_opts = TagListOpts::default();
+        let page = self.tag_list(ns, &tag_opts)?;
+        for entry in &page.tags {
+            if reachable.contains(&entry.kappa) && self.tag_delete(ns, &entry.name)? {
+                report.tags_removed.push(entry.name.clone());
+            }
+        }
+
+        // Remove edges, metadata, and blobs for reachable kappas
+        for kappa in &reachable {
+            self.edge_remove_by_node(ns, kappa)?;
+            report.edges_removed += 1;
+            let _ = self.meta_remove(ns, kappa);
+            self.remove(kappa)?;
+            report.blobs_removed.push(kappa.clone());
+        }
+
+        Ok(report)
+    }
+
+    fn sequence_next(&self, ns: &str, name: &str) -> Result<u64, StoreError> {
+        sequence::next(&self.root, ns, name)
+    }
+    fn sequence_current(&self, ns: &str, name: &str) -> Result<u64, StoreError> {
+        sequence::current(&self.root, ns, name)
     }
 
     fn namespace_root(&self, ns: &str) -> Result<(Option<String>, usize), StoreError> {

@@ -41,7 +41,8 @@ pub async fn register(
 
     let s = state.store.clone();
     let k = kappa.clone();
-    tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"schema")).await??;
+    let n = ns.to_string();
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "schema")])).await??;
 
     // B32: create derives-from edge if schema content changed
     if let Some(ref old_k) = old_kappa {
