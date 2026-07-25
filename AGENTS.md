@@ -26,6 +26,15 @@ with the existing dispatcher and handler architecture.
 - Add focused unit tests for pure logic and integration tests for HTTP behavior,
   persistence, concurrency, or protocol compatibility. Tests must not depend on
   the checked-in `data/` directory or generated credentials.
+- Keep public-interface behavior covered by the Cucumber BDD suite. Every
+  user-facing interface, including the registry HTTP API, OpenAPI document,
+  Scalar UI, and any future CLI, browser, SDK, or admin interface, must have
+  at least one `@status:enforced` scenario under `features/suites/`.
+- BDD scenarios must exercise the real public boundary and application wiring,
+  not call handlers or storage functions directly. Add the feature, step
+  definitions, and `features/README.md` interface mapping together.
+- Do not mark a scenario `@status:enforced` until its steps assert behavior and
+  pass. The BDD runner fails when an enforced scenario is skipped.
 - Do not commit secrets, private keys, generated credentials, temporary stores,
   or conformance reports.
 - Keep source files below 500 lines. Use ASCII punctuation in source files.
@@ -56,11 +65,20 @@ Before declaring route work complete, verify:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
+cargo test --test bdd
 ```
+
+The equivalent grouped local gate is `just check`; run `just bdd` when changing
+or adding a public interface. Keep the `Justfile` recipes and README workflow
+examples synchronized with the commands CI actually runs.
 
 For API changes, also smoke-test `/openapi.json` and `/docs` against a locally
 started server and inspect the generated OpenAPI document for the changed
 operation.
+
+For interface changes, run `cargo test --test bdd` and update the matching
+Gherkin scenario in `features/suites/`. The BDD suite is an integration test of
+the real application boundary and must cover every public interface.
 
 ## Repository conventions
 

@@ -169,6 +169,17 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+The repository also provides a `Justfile` for common iterations. Inside
+`nix develop`, `just --list` shows all recipes. Common commands are:
+
+```sh
+just check
+just bdd
+just run
+just conformance
+just oci-conformance
+```
+
 The integration tests start the application in-process with a temporary
 filesystem store. To run the external suites, build the corresponding tools
 described in the script comments and run:
@@ -176,6 +187,14 @@ described in the script comments and run:
 ```sh
 ./scripts/conformance.sh
 ./scripts/oci-conformance.sh
+```
+
+The public interfaces also have a Cucumber BDD integration suite. It exercises
+the real application boundary for the registry HTTP API, the OpenAPI document,
+and the Scalar API reference:
+
+```sh
+cargo test --test bdd
 ```
 
 ## Repository map
@@ -190,6 +209,9 @@ described in the script comments and run:
 | `src/openapi.rs`     | OpenAPI document and Scalar documentation routes                 |
 | `src/kappa.rs`       | Kappa label parsing, hashing, and verification                   |
 | `tests/integration/` | Live black-box behavior tests                                    |
+| `features/`          | Gherkin BDD scenarios for every public interface                 |
+| `tests/bdd.rs`       | Cucumber integration runner and enforced-scenario gate            |
+| `Justfile`           | Common formatting, test, build, run, and conformance recipes     |
 | `scripts/`           | External conformance runners                                     |
 
 ## Current scope
