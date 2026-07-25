@@ -39,13 +39,14 @@ The route parser and dispatcher are the runtime source of truth:
 - Add the same method and path to the `ROUTES` catalog in `src/openapi.rs`.
 - Include an operation ID, summary, tag, path and query parameters, request
   body media type, response media type, and error response in the OpenAPI entry.
-- Document documentation endpoints too, including `/openapi.json` and `/docs`.
+- Document documentation endpoints too, including `/openapi.json`, `/docs`,
+  and the Scalar asset route under `/docs/scalar.js`.
 - Keep OpenAPI paths synchronized with the actual trailing-slash behavior and
   query parameter names. If a namespace can contain slashes, explain that
   behavior in the operation description or README.
 - Add or update an OpenAPI test whenever routes change. The test must verify
   that every runtime route has a corresponding OpenAPI path and method; do not
-  rely only on Redoc rendering successfully.
+  rely only on the Scalar page rendering successfully.
 - When an endpoint's request or response schema changes, update both the
   OpenAPI catalog and the relevant integration test in the same change.
 

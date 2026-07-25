@@ -39,13 +39,13 @@ and the OCI distribution-spec suite when those external tools are available.
 
 When the server is running:
 
-- Redoc: <http://127.0.0.1:8080/docs>
+- Scalar API reference: <http://127.0.0.1:8080/docs>
 - OpenAPI JSON: <http://127.0.0.1:8080/openapi.json>
 
-The OpenAPI document is generated in-process with `utoipa`, rendered by
-`utoipa-redoc`, and served by Axum routes. The registry protocol itself remains
-available under `/v2/`; the documentation endpoints are outside the protocol
-dispatcher.
+The OpenAPI document is generated in-process with `utoipa`, rendered by the
+official `scalar_api_reference` Axum integration, and served with embedded
+Scalar assets. The registry protocol itself remains available under `/v2/`;
+the documentation endpoints are outside the protocol dispatcher.
 
 The main route groups are:
 
@@ -187,7 +187,7 @@ described in the script comments and run:
 | `src/routes/`        | URL parsing and endpoint classification                          |
 | `src/handlers/`      | Feature-specific protocol handlers                               |
 | `src/store/fs/`      | Filesystem persistence and indexes                               |
-| `src/openapi.rs`     | OpenAPI document and Redoc route                                 |
+| `src/openapi.rs`     | OpenAPI document and Scalar documentation routes                 |
 | `src/kappa.rs`       | Kappa label parsing, hashing, and verification                   |
 | `tests/integration/` | Live black-box behavior tests                                    |
 | `scripts/`           | External conformance runners                                     |

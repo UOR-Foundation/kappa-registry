@@ -1,12 +1,12 @@
-//! OpenAPI description and Redoc integration for the registry API.
+//! OpenAPI description and Scalar integration for the registry API.
 //!
 //! The dispatcher is centralized in `lib.rs`, so the public protocol is kept
 //! in a compact route catalog here instead of annotating framework handlers.
 
-use axum::response::IntoResponse;
+use axum::{routing::get, Router};
+use scalar_api_reference::axum::router as scalar_router;
 use serde_json::{json, Map, Value};
 use utoipa::openapi::OpenApi;
-use utoipa_redoc::Redoc;
 
 const BINARY: &str = "application/octet-stream";
 const JSON: &str = "application/json";
@@ -15,14 +15,19 @@ pub async fn json() -> axum::Json<OpenApi> {
     axum::Json(document())
 }
 
-pub async fn html() -> axum::response::Response {
-    let html = Redoc::new(document()).to_html();
-    (
-        axum::http::StatusCode::OK,
-        [("content-type", "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response()
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let configuration = json!({
+        "url": "/openapi.json",
+        "layout": "modern",
+        "agent": {"disabled": true}
+    });
+
+    Router::<S>::new()
+        .route("/openapi.json", get(json))
+        .merge(scalar_router("/docs", &configuration).with_state(()))
 }
 
 pub fn document() -> OpenApi {
@@ -31,7 +36,8 @@ pub fn document() -> OpenApi {
     // Type codes are - (none), t (text), h (HTML), b (binary), j (JSON), or k (bundle).
     const ROUTES: &[&str] = &[
         "get|/openapi.json|openapi_json|Get the OpenAPI document|Documentation||-|j",
-        "get|/docs|redoc|Browse the API with Redoc|Documentation||-|h",
+        "get|/docs|scalar|Browse the API with Scalar|Documentation||-|h",
+        "get|/docs/scalar.js|scalar_asset|Serve the Scalar UI asset|Documentation||-|s",
         "get|/v2/|version|Get registry version|System||-|j",
         "get|/v2|version_bare|Get registry version|System||-|j",
         "get|/v2/_health/{probe}|health|Run a health probe|System|probe:path!|-|t",
@@ -128,6 +134,7 @@ fn type_code(code: &str) -> Option<&'static str> {
         "j" => Some(JSON),
         "k" => Some("application/x-kappa-bundle"),
         "o" => Some("application/vnd.oci.image.index.v1+json"),
+        "s" => Some("application/javascript"),
         _ => None,
     }
 }
@@ -200,7 +207,11 @@ mod tests {
             value["paths"]["/openapi.json"]["get"]["operationId"],
             "openapi_json"
         );
-        assert_eq!(value["paths"]["/docs"]["get"]["operationId"], "redoc");
+        assert_eq!(value["paths"]["/docs"]["get"]["operationId"], "scalar");
+        assert_eq!(
+            value["paths"]["/docs/scalar.js"]["get"]["operationId"],
+            "scalar_asset"
+        );
         assert!(value["paths"]["/v2/{namespace}/blobs/{kappa}"]["get"].is_object());
         for path in [
             "/v2/{namespace}/blobs/uploads",

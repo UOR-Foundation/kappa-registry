@@ -21,7 +21,7 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 utoipa = "5"
-utoipa-redoc = { version = "6", features = ["axum"] }
+scalar_api_reference = { version = "0.2.2", features = ["axum"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 tower = "0.5"

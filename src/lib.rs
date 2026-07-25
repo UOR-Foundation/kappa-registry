@@ -19,7 +19,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::any;
 use axum::Json;
 use axum::Router;
 use tower_http::trace::TraceLayer;
@@ -43,9 +43,7 @@ pub struct AppState {
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/openapi.json", get(openapi::json))
-        .route("/docs", get(openapi::html))
+    openapi::router()
         .fallback(any(dispatch))
         .layer(axum::extract::DefaultBodyLimit::max(state.max_blob_size))
         .layer(middleware::map_response(add_warning_header))
