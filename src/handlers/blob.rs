@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::routes::param_first;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -20,7 +21,7 @@ pub async fn put(
     state: &AppState,
     ns: &str,
     kappa_str: &str,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, Vec<String>>,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, AppError> {
@@ -60,7 +61,7 @@ pub async fn put(
     }
 
     // Gate 3: multi-label verification
-    if let Some(also_str) = params.get("also") {
+    if let Some(also_str) = param_first(params, "also") {
         match verify_kappa(also_str, &body_owned) {
             Ok(true) => {}
             Ok(false) => {
@@ -88,9 +89,9 @@ pub async fn put(
     }
 
     // Store multi-label alias
-    if let Some(also_str) = params.get("also") {
+    if let Some(also_str) = param_first(params, "also") {
         let s = state.store.clone();
-        let ak = also_str.clone();
+        let ak = also_str.to_string();
         let content = body_owned;
         tokio::task::spawn_blocking(move || s.put(&ak, &content)).await??;
     }
@@ -111,13 +112,13 @@ pub async fn put(
         .into_response())
 }
 
-pub async fn get(state: &AppState, ns: &str, kappa: &str) -> Result<Response, AppError> {
+pub async fn get(
+    state: &AppState,
+    ns: &str,
+    kappa: &str,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
     auth::authorize(ns, "blob.get")?;
-
-    let s = state.store.clone();
-    let k = kappa.to_string();
-    let content = tokio::task::spawn_blocking(move || s.get(&k)).await??;
-    let content = content.ok_or(AppError::BlobUnknown)?;
 
     let s = state.store.clone();
     let k = kappa.to_string();
@@ -128,10 +129,58 @@ pub async fn get(state: &AppState, ns: &str, kappa: &str) -> Result<Response, Ap
 
     let axis = kappa.split(':').next().unwrap_or("sha256");
 
+    // Range request support
+    if let Some(range_header) = headers.get("range").and_then(|v| v.to_str().ok()) {
+        if let Some(range) = parse_range_header(range_header) {
+            let s = state.store.clone();
+            let k = kappa.to_string();
+            let total_size = tokio::task::spawn_blocking(move || s.blob_size(&k))
+                .await??
+                .ok_or(AppError::BlobUnknown)?;
+            // Reject: start >= total, or backwards range (start > end)
+            if range.0 >= total_size
+                || range.1.is_some_and(|end| end < range.0)
+            {
+                return Err(AppError::Store(
+                    crate::store::StoreError::RangeNotSatisfiable { size: total_size },
+                ));
+            }
+            let (offset, length) = resolve_range(range, total_size);
+            let end = offset + length - 1;
+            let s = state.store.clone();
+            let k = kappa.to_string();
+            let content =
+                tokio::task::spawn_blocking(move || s.blob_get_range(&k, offset, length)).await??;
+            return Ok((
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    ("content-length", content.len().to_string()),
+                    (
+                        "content-range",
+                        format!("bytes {offset}-{end}/{total_size}"),
+                    ),
+                    ("accept-ranges", "bytes".to_string()),
+                    ("x-kappa-label", kappa.to_string()),
+                    ("x-kappa-axis", axis.to_string()),
+                    ("content-type", ct),
+                    ("docker-content-digest", kappa.to_string()),
+                ],
+                content,
+            )
+                .into_response());
+        }
+    }
+
+    let s = state.store.clone();
+    let k = kappa.to_string();
+    let content = tokio::task::spawn_blocking(move || s.get(&k)).await??;
+    let content = content.ok_or(AppError::BlobUnknown)?;
+
     Ok((
         StatusCode::OK,
         [
             ("content-length", content.len().to_string()),
+            ("accept-ranges", "bytes".to_string()),
             ("x-kappa-label", kappa.to_string()),
             ("x-kappa-axis", axis.to_string()),
             ("content-type", ct),
@@ -142,13 +191,36 @@ pub async fn get(state: &AppState, ns: &str, kappa: &str) -> Result<Response, Ap
         .into_response())
 }
 
+/// Parse "bytes=N-M" or "bytes=N-" from a Range header value.
+/// Returns (offset, optional end).
+fn parse_range_header(header: &str) -> Option<(u64, Option<u64>)> {
+    let range = header.strip_prefix("bytes=")?;
+    let (start_str, end_str) = range.split_once('-')?;
+    let start: u64 = start_str.parse().ok()?;
+    let end: Option<u64> = if end_str.is_empty() {
+        None
+    } else {
+        Some(end_str.parse().ok()?)
+    };
+    Some((start, end))
+}
+
+/// Resolve a parsed range against the total file size.
+/// Returns (offset, length).
+fn resolve_range(range: (u64, Option<u64>), total: u64) -> (u64, u64) {
+    let (start, end) = range;
+    let end = end.map_or(total - 1, |e| std::cmp::min(e, total - 1));
+    (start, end - start + 1)
+}
+
 pub async fn head(state: &AppState, ns: &str, kappa: &str) -> Result<Response, AppError> {
     auth::authorize(ns, "blob.head")?;
 
     let s = state.store.clone();
     let k = kappa.to_string();
-    let content = tokio::task::spawn_blocking(move || s.get(&k)).await??;
-    let content = content.ok_or(AppError::BlobUnknown)?;
+    let size = tokio::task::spawn_blocking(move || s.blob_size(&k))
+        .await??
+        .ok_or(AppError::BlobUnknown)?;
 
     let s = state.store.clone();
     let k = kappa.to_string();
@@ -162,7 +234,8 @@ pub async fn head(state: &AppState, ns: &str, kappa: &str) -> Result<Response, A
     Ok((
         StatusCode::OK,
         [
-            ("content-length", content.len().to_string()),
+            ("content-length", size.to_string()),
+            ("accept-ranges", "bytes".to_string()),
             ("x-kappa-label", kappa.to_string()),
             ("x-kappa-axis", axis.to_string()),
             ("content-type", ct),

@@ -64,7 +64,11 @@ pub enum Endpoint<'a> {
     #[op_class(Write)]
     TagPut { ns: &'a str, name: &'a str },
     #[op_class(Write)]
+    TagCreate { ns: &'a str },
+    #[op_class(Write)]
     TagBatch { ns: &'a str },
+    #[op_class(Admin)]
+    TagDeletePrefix { ns: &'a str },
 
     // OCI referrers
     #[op_class(Read)]
@@ -136,6 +140,16 @@ pub enum Endpoint<'a> {
     #[op_class(Admin)]
     FilterDelete { ns: &'a str, kappa: &'a str },
 
+    // Sequences
+    #[op_class(Write)]
+    SequenceNext { ns: &'a str, name: &'a str },
+    #[op_class(Read)]
+    SequenceCurrent { ns: &'a str, name: &'a str },
+
+    // Cascade delete
+    #[op_class(Admin)]
+    CascadeDelete { ns: &'a str },
+
     // Namespace root
     #[op_class(Read)]
     NamespaceRoot { ns: &'a str },
@@ -185,6 +199,26 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
         }
         if let Some((ns, _)) = extract::split_at_allow_empty(path, segments::BLOBS_UPLOADS_BARE) {
             return Endpoint::UploadStart { ns };
+        }
+    }
+
+    // Tag create/get/delete via body/query: POST/GET/DELETE {ns}/tags/
+    // (must match before general tag routing)
+    if matches!(method, "POST" | "GET" | "DELETE")
+        && (inner.ends_with(segments::TAGS) || inner.ends_with("/tags"))
+        && !inner.ends_with(segments::TAGS_LIST)
+        && !inner.ends_with(segments::TAGS_BATCH)
+        && !inner.ends_with(segments::TAGS_DELETE_PREFIX)
+    {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::TAGS) {
+            return Endpoint::TagCreate { ns };
+        }
+    }
+
+    // Tag delete prefix: {ns}/tags/_prefix (must match before general tag routing)
+    if inner.ends_with(segments::TAGS_DELETE_PREFIX) && method == "DELETE" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::TAGS_DELETE_PREFIX) {
+            return Endpoint::TagDeletePrefix { ns };
         }
     }
 
@@ -362,6 +396,28 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
         }
     }
 
+    // Cascade delete: {ns}/blobs/_cascade
+    if inner.ends_with(segments::CASCADE) && method == "POST" {
+        if let Some(ns) = extract::ns_before_suffix(path, segments::CASCADE) {
+            return Endpoint::CascadeDelete { ns };
+        }
+    }
+
+    // Sequences: {ns}/_sequence/{name}/next or {ns}/_sequence/{name}
+    if inner.contains(segments::SEQUENCE) {
+        if let Some((ns, rest)) = extract::split_at(path, segments::SEQUENCE) {
+            if !rest.is_empty() {
+                if let Some(name) = rest.strip_suffix(segments::SEQUENCE_NEXT_SUFFIX) {
+                    if !name.is_empty() && method == "POST" {
+                        return Endpoint::SequenceNext { ns, name };
+                    }
+                } else if method == "GET" {
+                    return Endpoint::SequenceCurrent { ns, name: rest };
+                }
+            }
+        }
+    }
+
     // Namespace proof: {ns}/_root/proof/{name} (must match before _root)
     if inner.contains(segments::NAMESPACE_PROOF) && method == "GET" {
         if let Some((ns, name)) = extract::split_at(path, segments::NAMESPACE_PROOF) {
@@ -442,18 +498,23 @@ pub fn parse<'a>(method: &str, path: &'a str) -> Endpoint<'a> {
     Endpoint::NotFound
 }
 
-pub fn query_params(uri: &str) -> HashMap<String, String> {
-    let mut params = HashMap::new();
+pub fn query_params(uri: &str) -> HashMap<String, Vec<String>> {
+    let mut params: HashMap<String, Vec<String>> = HashMap::new();
     if let Some((_, query)) = uri.split_once('?') {
         for pair in query.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
                 let key = url_decode(k);
                 let val = url_decode(v);
-                params.insert(key, val);
+                params.entry(key).or_default().push(val);
             }
         }
     }
     params
+}
+
+/// Get the first value for a query parameter key, or None.
+pub fn param_first<'a>(params: &'a HashMap<String, Vec<String>>, key: &str) -> Option<&'a str> {
+    params.get(key).and_then(|v| v.first()).map(|s| s.as_str())
 }
 
 fn url_decode(s: &str) -> String {
@@ -740,7 +801,7 @@ mod tests {
     fn query_params_with_digest() {
         let params = query_params("/v2/_uploads/abc?digest=sha256:0123456789abcdef");
         assert_eq!(
-            params.get("digest").map(|s| s.as_str()),
+            param_first(&params, "digest"),
             Some("sha256:0123456789abcdef")
         );
     }
@@ -750,7 +811,7 @@ mod tests {
         let params =
             query_params("/v2/_uploads/abc?digest=sha256%3A0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         assert_eq!(
-            params.get("digest").map(|s| s.as_str()),
+            param_first(&params, "digest"),
             Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
     }
@@ -758,8 +819,17 @@ mod tests {
     #[test]
     fn query_params_multiple() {
         let params = query_params("/v2/ns/tags/list?n=5&last=v1.0");
-        assert_eq!(params.get("n").map(|s| s.as_str()), Some("5"));
-        assert_eq!(params.get("last").map(|s| s.as_str()), Some("v1.0"));
+        assert_eq!(param_first(&params, "n"), Some("5"));
+        assert_eq!(param_first(&params, "last"), Some("v1.0"));
+    }
+
+    #[test]
+    fn query_params_multi_value() {
+        let params = query_params("/v2/ns/blobs/_meta?filter=a:b&filter=c:d");
+        let filters = params.get("filter").unwrap();
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0], "a:b");
+        assert_eq!(filters[1], "c:d");
     }
 
     #[test]
@@ -806,6 +876,43 @@ mod tests {
         assert!(matches!(
             parse("GET", "/v2/org/sub/blobs/_meta"),
             Endpoint::MetaList { ns: "org/sub" }
+        ));
+    }
+
+    #[test]
+    fn sequence_routing() {
+        assert!(matches!(
+            parse("POST", "/v2/ns/_sequence/counter/next"),
+            Endpoint::SequenceNext {
+                ns: "ns",
+                name: "counter"
+            }
+        ));
+        assert!(matches!(
+            parse("GET", "/v2/ns/_sequence/counter"),
+            Endpoint::SequenceCurrent {
+                ns: "ns",
+                name: "counter"
+            }
+        ));
+        assert!(matches!(
+            parse("POST", "/v2/org/repo/_sequence/manifest-version/next"),
+            Endpoint::SequenceNext {
+                ns: "org/repo",
+                name: "manifest-version"
+            }
+        ));
+    }
+
+    #[test]
+    fn cascade_delete_routing() {
+        assert!(matches!(
+            parse("POST", "/v2/ns/blobs/_cascade"),
+            Endpoint::CascadeDelete { ns: "ns" }
+        ));
+        assert!(matches!(
+            parse("POST", "/v2/org/repo/blobs/_cascade"),
+            Endpoint::CascadeDelete { ns: "org/repo" }
         ));
     }
 

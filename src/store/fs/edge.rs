@@ -10,17 +10,16 @@ use std::path::{Path, PathBuf};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableError};
 
-use crate::store::fs::escape_namespace;
+use crate::store::fs::safe_name;
 use crate::store::{Direction, EdgeRecord, StoreError};
 
-const FORWARD: TableDefinition<&str, &str> = TableDefinition::new("edges_forward");
-const REVERSE: TableDefinition<&str, &str> = TableDefinition::new("edges_reverse");
-const BY_RELATION: TableDefinition<&str, &str> = TableDefinition::new("edges_by_relation");
+const FORWARD: TableDefinition<&[u8], &str> = TableDefinition::new("edges_forward");
+const REVERSE: TableDefinition<&[u8], &str> = TableDefinition::new("edges_reverse");
+const BY_RELATION: TableDefinition<&[u8], &str> = TableDefinition::new("edges_by_relation");
 const BY_KAPPA: TableDefinition<&str, &[u8]> = TableDefinition::new("edges_by_kappa");
 
 fn db_path(root: &Path, ns: &str) -> PathBuf {
-    root.join("edges")
-        .join(format!("{}.redb", escape_namespace(ns)))
+    root.join("edges").join(format!("{}.redb", safe_name(ns)))
 }
 
 fn open_db(root: &Path, ns: &str) -> Result<Database, StoreError> {
@@ -35,21 +34,77 @@ fn redb_err(e: impl std::fmt::Display) -> StoreError {
     StoreError::Io(std::io::Error::other(e.to_string()))
 }
 
-/// Returns true if the error is TableDoesNotExist (table not yet created).
 fn is_table_missing(e: &TableError) -> bool {
     matches!(e, TableError::TableDoesNotExist(_))
 }
 
-fn compound3(a: &str, b: &str, c: &str) -> String {
-    format!("{a}\0{b}\0{c}")
+/// Length-prefixed compound key: u16(a.len) + a + u16(b.len) + b + u16(c.len) + c.
+/// No delimiter character. Injection-immune regardless of field content.
+fn compound3(a: &str, b: &str, c: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + a.len() + b.len() + c.len());
+    out.extend_from_slice(&(a.len() as u16).to_le_bytes());
+    out.extend_from_slice(a.as_bytes());
+    out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+    out.extend_from_slice(b.as_bytes());
+    out.extend_from_slice(&(c.len() as u16).to_le_bytes());
+    out.extend_from_slice(c.as_bytes());
+    out
 }
 
-fn prefix1(a: &str) -> String {
-    format!("{a}\0")
+/// Prefix for scanning all entries where the first field equals `a`.
+fn prefix1(a: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + a.len());
+    out.extend_from_slice(&(a.len() as u16).to_le_bytes());
+    out.extend_from_slice(a.as_bytes());
+    out
 }
 
-fn prefix2(a: &str, b: &str) -> String {
-    format!("{a}\0{b}\0")
+/// Prefix for scanning entries where fields 1 and 2 equal `a` and `b`.
+fn prefix2(a: &str, b: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + a.len() + b.len());
+    out.extend_from_slice(&(a.len() as u16).to_le_bytes());
+    out.extend_from_slice(a.as_bytes());
+    out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+    out.extend_from_slice(b.as_bytes());
+    out
+}
+
+/// Parse the third field from a length-prefixed compound key.
+fn parse_field3(data: &[u8]) -> Option<&str> {
+    let mut pos = 0;
+    // Skip field 1
+    let len1 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
+    pos += 2 + len1;
+    // Skip field 2
+    let len2 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
+    pos += 2 + len2;
+    // Read field 3
+    let len3 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
+    pos += 2;
+    std::str::from_utf8(data.get(pos..pos + len3)?).ok()
+}
+
+/// Parse field 2 (relation) from a length-prefixed compound key.
+fn parse_field2(data: &[u8]) -> Option<&str> {
+    let mut pos = 0;
+    let len1 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
+    pos += 2 + len1;
+    let len2 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
+    pos += 2;
+    std::str::from_utf8(data.get(pos..pos + len2)?).ok()
+}
+
+/// Compute exclusive upper bound for prefix range scan.
+fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
+    let mut bound = prefix.to_vec();
+    while let Some(last) = bound.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return bound;
+        }
+        bound.pop();
+    }
+    vec![0xFF; prefix.len() + 1]
 }
 
 fn deserialize_record(data: &[u8]) -> Result<EdgeRecord, StoreError> {
@@ -62,17 +117,14 @@ fn serialize_record(record: &EdgeRecord) -> Result<Vec<u8>, StoreError> {
 
 /// Collect values from a table where keys start with the given prefix.
 fn prefix_scan_values(
-    table: &impl ReadableTable<&'static str, &'static str>,
-    prefix: &str,
+    table: &impl ReadableTable<&'static [u8], &'static str>,
+    prefix: &[u8],
 ) -> Result<Vec<String>, StoreError> {
     let mut results = Vec::new();
-    let range = table.range(prefix..).map_err(redb_err)?;
+    let upper = prefix_upper_bound(prefix);
+    let range = table.range(prefix..upper.as_slice()).map_err(redb_err)?;
     for entry in range {
         let entry = entry.map_err(redb_err)?;
-        let key = entry.0.value();
-        if !key.starts_with(prefix) {
-            break;
-        }
         results.push(entry.1.value().to_string());
     }
     Ok(results)
@@ -114,15 +166,15 @@ pub fn put(
 
     {
         let mut t = write_txn.open_table(FORWARD).map_err(redb_err)?;
-        t.insert(fwd_key.as_str(), edge_kappa).map_err(redb_err)?;
+        t.insert(fwd_key.as_slice(), edge_kappa).map_err(redb_err)?;
     }
     {
         let mut t = write_txn.open_table(REVERSE).map_err(redb_err)?;
-        t.insert(rev_key.as_str(), edge_kappa).map_err(redb_err)?;
+        t.insert(rev_key.as_slice(), edge_kappa).map_err(redb_err)?;
     }
     {
         let mut t = write_txn.open_table(BY_RELATION).map_err(redb_err)?;
-        t.insert(rel_key.as_str(), edge_kappa).map_err(redb_err)?;
+        t.insert(rel_key.as_slice(), edge_kappa).map_err(redb_err)?;
     }
     {
         let mut t = write_txn.open_table(BY_KAPPA).map_err(redb_err)?;
@@ -154,11 +206,11 @@ pub fn query(
     if matches!(dir, Direction::Outbound | Direction::Both) {
         match read_txn.open_table(FORWARD) {
             Ok(table) => {
-                let prefix = match rel {
+                let pfx = match rel {
                     Some(r) => prefix2(node, r),
                     None => prefix1(node),
                 };
-                edge_kappas.extend(prefix_scan_values(&table, &prefix)?);
+                edge_kappas.extend(prefix_scan_values(&table, &pfx)?);
             }
             Err(e) if is_table_missing(&e) => {}
             Err(e) => return Err(redb_err(e)),
@@ -168,11 +220,11 @@ pub fn query(
     if matches!(dir, Direction::Inbound | Direction::Both) {
         match read_txn.open_table(REVERSE) {
             Ok(table) => {
-                let prefix = match rel {
+                let pfx = match rel {
                     Some(r) => prefix2(node, r),
                     None => prefix1(node),
                 };
-                edge_kappas.extend(prefix_scan_values(&table, &prefix)?);
+                edge_kappas.extend(prefix_scan_values(&table, &pfx)?);
             }
             Err(e) if is_table_missing(&e) => {}
             Err(e) => return Err(redb_err(e)),
@@ -230,15 +282,15 @@ pub fn remove(root: &Path, ns: &str, edge_kappa: &str) -> Result<bool, StoreErro
 
     {
         let mut t = write_txn.open_table(FORWARD).map_err(redb_err)?;
-        let _ = t.remove(fwd_key.as_str()).map_err(redb_err)?;
+        let _ = t.remove(fwd_key.as_slice()).map_err(redb_err)?;
     }
     {
         let mut t = write_txn.open_table(REVERSE).map_err(redb_err)?;
-        let _ = t.remove(rev_key.as_str()).map_err(redb_err)?;
+        let _ = t.remove(rev_key.as_slice()).map_err(redb_err)?;
     }
     {
         let mut t = write_txn.open_table(BY_RELATION).map_err(redb_err)?;
-        let _ = t.remove(rel_key.as_str()).map_err(redb_err)?;
+        let _ = t.remove(rel_key.as_slice()).map_err(redb_err)?;
     }
     {
         let mut t = write_txn.open_table(BY_KAPPA).map_err(redb_err)?;
@@ -252,15 +304,16 @@ pub fn remove(root: &Path, ns: &str, edge_kappa: &str) -> Result<bool, StoreErro
 pub fn remove_by_node(root: &Path, ns: &str, kappa: &str) -> Result<(), StoreError> {
     // Collect all edge kappas where this node is source or target
     let mut to_remove: Vec<String> = Vec::new();
+    let pfx = prefix1(kappa);
     if let Ok(db) = open_db(root, ns) {
         if let Ok(read_txn) = db.begin_read() {
             if let Ok(fwd) = read_txn.open_table(FORWARD) {
-                if let Ok(vals) = prefix_scan_values(&fwd, &prefix1(kappa)) {
+                if let Ok(vals) = prefix_scan_values(&fwd, &pfx) {
                     to_remove.extend(vals);
                 }
             }
             if let Ok(rev) = read_txn.open_table(REVERSE) {
-                if let Ok(vals) = prefix_scan_values(&rev, &prefix1(kappa)) {
+                if let Ok(vals) = prefix_scan_values(&rev, &pfx) {
                     for v in vals {
                         if !to_remove.contains(&v) {
                             to_remove.push(v);
@@ -299,22 +352,22 @@ pub fn walk(
     let mut queue: VecDeque<String> = roots.iter().cloned().collect();
 
     while let Some(node) = queue.pop_front() {
-        let prefix = prefix1(&node);
-        let range = fwd.range(prefix.as_str()..).map_err(redb_err)?;
+        let pfx = prefix1(&node);
+        let upper = prefix_upper_bound(&pfx);
+        let range = fwd
+            .range(pfx.as_slice()..upper.as_slice())
+            .map_err(redb_err)?;
         for entry in range {
             let entry = entry.map_err(redb_err)?;
             let key = entry.0.value();
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let parts: Vec<&str> = key.split('\0').collect();
-            if parts.len() == 3 && rels.iter().any(|&r| r == parts[1]) {
-                let target = parts[2].to_string();
-                let edge_kappa = entry.1.value().to_string();
-                if visited.insert(target.clone()) {
-                    queue.push_back(target);
+            if let (Some(relation), Some(target)) = (parse_field2(key), parse_field3(key)) {
+                if rels.contains(&relation) {
+                    let edge_kappa = entry.1.value().to_string();
+                    if visited.insert(target.to_string()) {
+                        queue.push_back(target.to_string());
+                    }
+                    visited.insert(edge_kappa);
                 }
-                visited.insert(edge_kappa);
             }
         }
     }
@@ -354,22 +407,22 @@ pub fn diff(
             if want_set.contains(&node) && !have.contains(&node) {
                 continue;
             }
-            let prefix = prefix1(&node);
-            let range = fwd.range(prefix.as_str()..).map_err(redb_err)?;
+            let pfx = prefix1(&node);
+            let upper = prefix_upper_bound(&pfx);
+            let range = fwd
+                .range(pfx.as_slice()..upper.as_slice())
+                .map_err(redb_err)?;
             for entry in range {
                 let entry = entry.map_err(redb_err)?;
                 let key = entry.0.value();
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                let parts: Vec<&str> = key.split('\0').collect();
-                if parts.len() == 3 && rels.iter().any(|&r| r == parts[1]) {
-                    let target = parts[2].to_string();
-                    let edge_kappa = entry.1.value().to_string();
-                    if have_visited.insert(target.clone()) {
-                        have_queue.push_back(target);
+                if let (Some(relation), Some(target)) = (parse_field2(key), parse_field3(key)) {
+                    if rels.contains(&relation) {
+                        let edge_kappa = entry.1.value().to_string();
+                        if have_visited.insert(target.to_string()) {
+                            have_queue.push_back(target.to_string());
+                        }
+                        have_visited.insert(edge_kappa);
                     }
-                    have_visited.insert(edge_kappa);
                 }
             }
         }

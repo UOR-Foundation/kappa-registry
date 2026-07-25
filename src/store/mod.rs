@@ -31,6 +31,9 @@ pub enum StoreError {
     BundleDeltaInNoDeltaBundle,
     BundleKappaMismatch(String),
     BundleUnsupportedEntryType(u8),
+    RangeNotSatisfiable {
+        size: u64,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -70,6 +73,9 @@ impl std::fmt::Display for StoreError {
             StoreError::BundleKappaMismatch(k) => write!(f, "bundle entry kappa mismatch: {k}"),
             StoreError::BundleUnsupportedEntryType(t) => {
                 write!(f, "unsupported entry type 0x{t:02x}")
+            }
+            StoreError::RangeNotSatisfiable { size } => {
+                write!(f, "range not satisfiable, blob size: {size}")
             }
             StoreError::Conflict(msg) => write!(f, "conflict: {msg}"),
             StoreError::Io(e) => write!(f, "I/O error: {e}"),
@@ -129,6 +135,19 @@ pub struct TagPage {
 pub struct TagEntry {
     pub name: String,
     pub kappa: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u64>,
+}
+
+/// On-disk tag index entry. The tag index is a BTreeMap<String, IndexEntry>
+/// serialized as JSON. The `mtime` field records the last modification time
+/// in milliseconds since the Unix epoch. It is metadata about the tag, not
+/// part of the tag's identity -- the namespace root hash is computed over
+/// (name, value) pairs only, excluding mtime.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IndexEntry {
+    pub value: String,
+    pub mtime: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -160,6 +179,13 @@ pub struct NamespaceProof {
     pub proof_format: String,
     pub leaves: Vec<(String, String)>,
     pub root: String,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RemovalReport {
+    pub blobs_removed: Vec<String>,
+    pub edges_removed: usize,
+    pub tags_removed: Vec<String>,
 }
 
 /// A single tag update within an atomic batch. The namespace is not part of
@@ -223,6 +249,15 @@ pub trait KappaStore: Send + Sync + 'static {
     fn exists(&self, kappa: &str) -> Result<bool, StoreError>;
     fn remove(&self, kappa: &str) -> Result<(), StoreError>;
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
+    /// Read a byte range from a blob. Returns bytes in [offset..offset+length).
+    fn blob_get_range(&self, kappa: &str, offset: u64, length: u64) -> Result<Vec<u8>, StoreError>;
+
+    /// Returns the size in bytes of a blob, or None if it does not exist.
+    fn blob_size(&self, kappa: &str) -> Result<Option<u64>, StoreError>;
+
+    /// Returns a streaming reader for a blob.
+    fn blob_reader(&self, kappa: &str) -> Result<Box<dyn std::io::Read + Send>, StoreError>;
+
     fn put_meta(&self, kappa: &str, key: &str, val: &[u8]) -> Result<(), StoreError>;
     fn get_meta(&self, kappa: &str, key: &str) -> Result<Option<Vec<u8>>, StoreError>;
 
@@ -254,6 +289,13 @@ pub trait KappaStore: Send + Sync + 'static {
     /// Return the raw tag value without resolution. For direct tags this
     /// is the kappa-label string. For symbolic tags this is "ref:{target}".
     fn tag_get_raw(&self, ns: &str, name: &str) -> Result<Option<String>, StoreError>;
+
+    /// List tags whose names start with `prefix`.
+    fn tag_list_prefix(&self, ns: &str, prefix: &str) -> Result<Vec<TagEntry>, StoreError>;
+
+    /// Atomically delete all tags whose names start with `prefix`.
+    /// Returns the number of tags deleted.
+    fn tag_delete_prefix(&self, ns: &str, prefix: &str) -> Result<usize, StoreError>;
 
     // edge (scoped to namespace)
     #[allow(clippy::too_many_arguments)]
@@ -334,12 +376,88 @@ pub trait KappaStore: Send + Sync + 'static {
     fn filter_remove(&self, filter_kappa: &str) -> Result<bool, StoreError>;
     fn filter_evaluate(&self, ns: &str, content: &[u8]) -> Result<(), String>;
 
-    // metadata query
+    // metadata query (global, legacy -- content-type sidecar)
     fn list_by_meta(&self, key: &str, value: &str) -> Result<Vec<String>, StoreError>;
+
+    // namespace-scoped metadata (redb-backed)
+    /// Set metadata key-value pairs on a blob within a namespace.
+    fn meta_set(&self, ns: &str, kappa: &str, entries: &[(&str, &str)]) -> Result<(), StoreError>;
+    /// Get a metadata value for a blob within a namespace.
+    fn meta_get(&self, ns: &str, kappa: &str, key: &str) -> Result<Option<String>, StoreError>;
+    /// Query blobs by metadata key-value pair within a namespace.
+    fn meta_query(&self, ns: &str, key: &str, value: &str) -> Result<Vec<String>, StoreError>;
+    /// Query blobs that have any value for a given metadata key within a namespace.
+    fn meta_query_exists(&self, ns: &str, key: &str) -> Result<Vec<String>, StoreError>;
+    /// Query blobs matching ALL of the given (key, value) pairs (intersection).
+    fn meta_query_compound(
+        &self,
+        ns: &str,
+        filters: &[(&str, &str)],
+    ) -> Result<Vec<String>, StoreError>;
+    /// Query blobs whose metadata value for `key` starts with `value_prefix`.
+    fn meta_query_prefix(
+        &self,
+        ns: &str,
+        key: &str,
+        value_prefix: &str,
+    ) -> Result<Vec<String>, StoreError>;
+    /// Remove all metadata entries for `key` where value starts with `prefix`.
+    fn meta_remove_by_value_prefix(
+        &self,
+        ns: &str,
+        key: &str,
+        value_prefix: &str,
+    ) -> Result<usize, StoreError>;
+    /// Remove all metadata for a blob within a namespace.
+    fn meta_remove(&self, ns: &str, kappa: &str) -> Result<(), StoreError>;
 
     // bundle (bulk transfer)
     fn bundle_create(&self, kappas: &[String], delta: bool) -> Result<Vec<u8>, StoreError>;
     fn bundle_ingest(&self, bundle: &[u8]) -> Result<Vec<String>, StoreError>;
+
+    // cascade delete
+    /// Walk edges from roots along specified relation types and remove all
+    /// reachable blobs, their edges, tags pointing to them, and metadata.
+    /// `roots` can be blob kappa-labels. Returns a report of what was removed.
+    fn remove_reachable(
+        &self,
+        ns: &str,
+        roots: &[String],
+        rels: &[&str],
+    ) -> Result<RemovalReport, StoreError>;
+
+    /// Resolve all tags matching `prefix`, cascade delete from their target
+    /// blobs along `rels`, then delete the matching tags. Atomic operation
+    /// for collection-level drops.
+    fn remove_reachable_from_prefix(
+        &self,
+        ns: &str,
+        prefix: &str,
+        rels: &[&str],
+    ) -> Result<RemovalReport, StoreError> {
+        let tags = self.tag_list_prefix(ns, prefix)?;
+        let roots: Vec<String> = tags.iter().map(|t| t.kappa.clone()).collect();
+        let mut report = if roots.is_empty() {
+            RemovalReport::default()
+        } else {
+            self.remove_reachable(ns, &roots, rels)?
+        };
+        let deleted = self.tag_delete_prefix(ns, prefix)?;
+        // Tags removed by prefix that weren't already removed by cascade
+        for tag in &tags {
+            if !report.tags_removed.contains(&tag.name) {
+                report.tags_removed.push(tag.name.clone());
+            }
+        }
+        let _ = deleted;
+        Ok(report)
+    }
+
+    // sequence (scoped to namespace)
+    /// Atomically increment and return a named sequence counter.
+    fn sequence_next(&self, ns: &str, name: &str) -> Result<u64, StoreError>;
+    /// Return the current value of a named sequence without incrementing.
+    fn sequence_current(&self, ns: &str, name: &str) -> Result<u64, StoreError>;
 
     // namespace root (authenticated namespace state)
     fn namespace_root(&self, ns: &str) -> Result<(Option<String>, usize), StoreError>;

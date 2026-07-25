@@ -7,6 +7,7 @@ use axum::Json;
 use crate::auth;
 use crate::error::AppError;
 use crate::kappa::{axis_of, compute_kappa};
+use crate::routes::param_first;
 use crate::store::{Direction, KappaStore};
 use crate::AppState;
 
@@ -44,7 +45,8 @@ pub async fn put(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, Ap
 
     let s = state.store.clone();
     let k = edge_kappa.as_str().to_string();
-    tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"edge")).await??;
+    let n = ns.to_string();
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "edge")])).await??;
 
     let s = state.store.clone();
     let ek = edge_kappa.as_str().to_string();
@@ -79,13 +81,13 @@ pub async fn query(
     node: &str,
     direction: &str,
     relation: Option<&str>,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, Vec<String>>,
 ) -> Result<Response, AppError> {
     auth::authorize(ns, "edge.query")?;
 
     let dir = Direction::parse(direction);
-    let n: Option<usize> = params.get("n").and_then(|s| s.parse().ok());
-    let last = params.get("last").map(|s| s.as_str());
+    let n: Option<usize> = param_first(params, "n").and_then(|s| s.parse().ok());
+    let last = param_first(params, "last");
 
     let s = state.store.clone();
     let node_owned = node.to_string();

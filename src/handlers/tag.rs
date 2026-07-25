@@ -7,6 +7,7 @@ use axum::Json;
 use crate::auth;
 use crate::error::AppError;
 use crate::kappa::KappaLabel;
+use crate::routes::param_first;
 use crate::store::{KappaStore, TagListOpts, TagUpdate};
 use crate::AppState;
 
@@ -14,7 +15,7 @@ pub async fn manifest_put(
     state: &AppState,
     ns: &str,
     tag: &str,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, Vec<String>>,
     body: &[u8],
 ) -> Result<Response, AppError> {
     auth::authorize(ns, "manifest.put")?;
@@ -123,7 +124,7 @@ pub async fn manifest_put(
     }
 
     // Bind additional tags from ?tag= query parameters
-    for extra_tag in params.get("tag").into_iter() {
+    for extra_tag in params.get("tag").into_iter().flatten() {
         let s = state.store.clone();
         let p = ns.to_string();
         let et = extra_tag.clone();
@@ -132,19 +133,20 @@ pub async fn manifest_put(
     }
 
     // Store Content-Type metadata from the request or default to OCI manifest type
-    let ct_value = params
-        .get("_content_type")
-        .cloned()
-        .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+    let ct_value = param_first(params, "_content_type")
+        .unwrap_or("application/vnd.oci.image.manifest.v1+json")
+        .to_string();
     let s = state.store.clone();
     let k = kappa.as_str().to_string();
     let ct_bytes = ct_value.as_bytes().to_vec();
     tokio::task::spawn_blocking(move || s.put_meta(&k, "content-type", &ct_bytes)).await??;
 
-    // Store object-type metadata
+    // Store object-type metadata (namespace-scoped)
     let s = state.store.clone();
     let k = kappa.as_str().to_string();
-    tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"manifest")).await??;
+    let n = ns.to_string();
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "manifest")]))
+        .await??;
 
     // Detect subject field for OCI-Subject header
     let subject_digest: Option<String> = serde_json::from_slice::<serde_json::Value>(body)
@@ -332,16 +334,16 @@ pub async fn manifest_delete(state: &AppState, ns: &str, tag: &str) -> Result<Re
 pub async fn tag_list(
     state: &AppState,
     ns: &str,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, Vec<String>>,
 ) -> Result<Response, AppError> {
     auth::authorize(ns, "tag.list")?;
 
     let opts = TagListOpts {
-        n: params.get("n").and_then(|s| s.parse().ok()),
-        last: params.get("last").cloned(),
-        order: params.get("order").cloned(),
-        after: params.get("after").cloned(),
-        before: params.get("before").cloned(),
+        n: param_first(params, "n").and_then(|s| s.parse().ok()),
+        last: param_first(params, "last").map(|s| s.to_string()),
+        order: param_first(params, "order").map(|s| s.to_string()),
+        after: param_first(params, "after").map(|s| s.to_string()),
+        before: param_first(params, "before").map(|s| s.to_string()),
     };
 
     if opts.n == Some(0) {

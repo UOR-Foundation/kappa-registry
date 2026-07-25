@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::kappa::KappaLabel;
-use crate::store::fs::{atomic_write, escape_namespace};
+use crate::store::fs::{atomic_write, safe_name};
 use crate::store::StoreError;
 
 pub fn pin(root: &Path, protected: &str, ttl: u64, ctrl: &str) -> Result<String, StoreError> {
@@ -19,12 +19,11 @@ pub fn pin(root: &Path, protected: &str, ttl: u64, ctrl: &str) -> Result<String,
     });
     let data =
         serde_json::to_vec_pretty(&record).map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
-    let path = pins_dir.join(format!("{}.json", escape_namespace(pin_kappa.as_str())));
+    let path = pins_dir.join(format!("{}.json", safe_name(pin_kappa.as_str())));
     atomic_write(&path, &data)?;
 
     // Store pin blob itself
     super::blob::put(root, pin_kappa.as_str(), pin_content.as_bytes())?;
-    super::blob::put_meta(root, pin_kappa.as_str(), "object-type", b"pin")?;
 
     Ok(pin_kappa.as_str().to_string())
 }
@@ -33,7 +32,7 @@ pub fn unpin(root: &Path, pin_kappa: &str, release: bool) -> Result<(), StoreErr
     let path = root
         .join("gc")
         .join("pins")
-        .join(format!("{}.json", escape_namespace(pin_kappa)));
+        .join(format!("{}.json", safe_name(pin_kappa)));
 
     if !path.exists() {
         return Err(StoreError::NotFound);

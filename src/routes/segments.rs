@@ -30,6 +30,10 @@ pub const BUNDLE_INGEST: &str = "/_bundle/ingest";
 pub const TRANSACTION: &str = "/_transaction/";
 pub const TRANSACTION_BEGIN: &str = "/_transaction/begin";
 pub const TRANSACTION_COMMIT_SUFFIX: &str = "/commit";
+pub const TAGS_DELETE_PREFIX: &str = "/tags/_prefix";
+pub const SEQUENCE: &str = "/_sequence/";
+pub const SEQUENCE_NEXT_SUFFIX: &str = "/next";
+pub const CASCADE: &str = "/blobs/_cascade";
 pub const UPLOADS: &str = "/v2/_uploads/";
 pub const HEALTH: &str = "/v2/_health/";
 

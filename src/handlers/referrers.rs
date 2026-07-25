@@ -5,6 +5,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::auth;
 use crate::error::AppError;
+use crate::routes::param_first;
 use crate::store::{Direction, KappaStore};
 use crate::AppState;
 
@@ -12,7 +13,7 @@ pub async fn list(
     state: &AppState,
     ns: &str,
     digest: &str,
-    params: &HashMap<String, String>,
+    params: &HashMap<String, Vec<String>>,
 ) -> Result<Response, AppError> {
     auth::authorize(ns, "referrers.list")?;
 
@@ -24,7 +25,7 @@ pub async fn list(
     })
     .await??;
 
-    let artifact_type_filter = params.get("artifactType").map(|s| s.as_str());
+    let artifact_type_filter = param_first(params, "artifactType");
 
     let mut descriptors: Vec<serde_json::Value> = Vec::new();
     for edge in &edges {

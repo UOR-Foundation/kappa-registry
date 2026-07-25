@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::kappa::KappaLabel;
-use crate::store::fs::{atomic_write, escape_namespace};
+use crate::store::fs::{atomic_write, safe_name};
 use crate::store::{SchemaRecord, StoreError};
 
 pub fn register(root: &Path, ns: &str, scope: &str, content: &[u8]) -> Result<String, StoreError> {
@@ -9,7 +9,7 @@ pub fn register(root: &Path, ns: &str, scope: &str, content: &[u8]) -> Result<St
 
     super::blob::put(root, kappa.as_str(), content)?;
 
-    let schema_dir = root.join("schemas").join(escape_namespace(ns));
+    let schema_dir = root.join("schemas").join(safe_name(ns));
     std::fs::create_dir_all(&schema_dir)?;
 
     let record = serde_json::json!({
@@ -28,7 +28,7 @@ pub fn register(root: &Path, ns: &str, scope: &str, content: &[u8]) -> Result<St
 pub fn get(root: &Path, ns: &str, scope: &str) -> Result<Option<(String, Vec<u8>)>, StoreError> {
     let path = root
         .join("schemas")
-        .join(escape_namespace(ns))
+        .join(safe_name(ns))
         .join(format!("{scope}.json"));
     if !path.exists() {
         return Ok(None);
@@ -42,7 +42,7 @@ pub fn get(root: &Path, ns: &str, scope: &str) -> Result<Option<(String, Vec<u8>
 }
 
 pub fn list(root: &Path, ns: &str) -> Result<Vec<SchemaRecord>, StoreError> {
-    let schema_dir = root.join("schemas").join(escape_namespace(ns));
+    let schema_dir = root.join("schemas").join(safe_name(ns));
     if !schema_dir.exists() {
         return Ok(Vec::new());
     }

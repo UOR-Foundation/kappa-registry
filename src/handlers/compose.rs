@@ -80,7 +80,9 @@ pub async fn compose(
 
     let s = state.store.clone();
     let k = composed_kappa.as_str().to_string();
-    tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"composition")).await??;
+    let n = ns.to_string();
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "composition")]))
+        .await??;
 
     let witness = witness_blob(71, 32, &canon);
     let witness_kappa = compute_kappa(first_axis, &witness)?;
@@ -92,7 +94,9 @@ pub async fn compose(
 
     let s = state.store.clone();
     let k = witness_kappa.as_str().to_string();
-    tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"witness")).await??;
+    let n = ns.to_string();
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "witness")]))
+        .await??;
 
     for operand in &operand_strs {
         let edge_canon = super::edge::edge_canonical_pub(

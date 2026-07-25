@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::kappa::KappaLabel;
-use crate::store::fs::{atomic_write, escape_namespace};
+use crate::store::fs::{atomic_write, safe_name};
 use crate::store::{FilterRecord, StoreError};
 
 pub fn register(root: &Path, ns: &str, scope: &str, content: &[u8]) -> Result<String, StoreError> {
@@ -9,7 +9,7 @@ pub fn register(root: &Path, ns: &str, scope: &str, content: &[u8]) -> Result<St
 
     super::blob::put(root, kappa.as_str(), content)?;
 
-    let filter_dir = root.join("filters").join(escape_namespace(ns));
+    let filter_dir = root.join("filters").join(safe_name(ns));
     std::fs::create_dir_all(&filter_dir)?;
 
     let record = serde_json::json!({
@@ -26,7 +26,7 @@ pub fn register(root: &Path, ns: &str, scope: &str, content: &[u8]) -> Result<St
 }
 
 pub fn list(root: &Path, ns: &str) -> Result<Vec<FilterRecord>, StoreError> {
-    let filter_dir = root.join("filters").join(escape_namespace(ns));
+    let filter_dir = root.join("filters").join(safe_name(ns));
     if !filter_dir.exists() {
         return Ok(Vec::new());
     }
@@ -83,7 +83,7 @@ pub fn remove(root: &Path, filter_kappa: &str) -> Result<bool, StoreError> {
 }
 
 pub fn evaluate(root: &Path, ns: &str, content: &[u8]) -> Result<(), String> {
-    let filter_dir = root.join("filters").join(escape_namespace(ns));
+    let filter_dir = root.join("filters").join(safe_name(ns));
     if !filter_dir.exists() {
         return Ok(());
     }

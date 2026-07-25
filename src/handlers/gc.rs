@@ -22,6 +22,12 @@ pub async fn pin(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, Ap
     let ctrl = controller.to_string();
     let pin_kappa = tokio::task::spawn_blocking(move || s.pin(&k, ttl, &ctrl)).await??;
 
+    // Store object-type metadata (namespace-scoped)
+    let s = state.store.clone();
+    let pk = pin_kappa.clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &pk, &[("object-type", "pin")])).await??;
+
     Ok((
         StatusCode::CREATED,
         [

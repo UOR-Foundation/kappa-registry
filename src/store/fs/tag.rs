@@ -3,24 +3,40 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::store::fs::{atomic_write, escape_namespace};
-use crate::store::{StoreError, TagEntry, TagListOpts, TagPage};
+use crate::store::fs::{atomic_write, safe_name};
+use crate::store::{IndexEntry, StoreError, TagEntry, TagListOpts, TagPage};
 
-fn index_path(root: &Path, ns: &str) -> PathBuf {
-    root.join("tags")
-        .join(escape_namespace(ns))
-        .join("index.json")
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
-fn read_index(path: &Path) -> Result<BTreeMap<String, String>, StoreError> {
+fn index_path(root: &Path, ns: &str) -> PathBuf {
+    root.join("tags").join(safe_name(ns)).join("index.json")
+}
+
+fn read_index(path: &Path) -> Result<BTreeMap<String, IndexEntry>, StoreError> {
     match std::fs::read(path) {
-        Ok(data) => Ok(serde_json::from_slice(&data)?),
+        Ok(data) => {
+            // Try new format first (IndexEntry with value+mtime)
+            if let Ok(idx) = serde_json::from_slice::<BTreeMap<String, IndexEntry>>(&data) {
+                return Ok(idx);
+            }
+            // Fall back to old format (bare string values) for migration
+            let old: BTreeMap<String, String> = serde_json::from_slice(&data)?;
+            Ok(old
+                .into_iter()
+                .map(|(k, v)| (k, IndexEntry { value: v, mtime: 0 }))
+                .collect())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
         Err(e) => Err(e.into()),
     }
 }
 
-fn write_index(path: &Path, index: &BTreeMap<String, String>) -> Result<(), StoreError> {
+fn write_index(path: &Path, index: &BTreeMap<String, IndexEntry>) -> Result<(), StoreError> {
     let data =
         serde_json::to_vec_pretty(index).map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
     atomic_write(path, &data)
@@ -29,18 +45,17 @@ fn write_index(path: &Path, index: &BTreeMap<String, String>) -> Result<(), Stor
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 fn root_path(root: &Path, ns: &str) -> PathBuf {
-    root.join("tags")
-        .join(escape_namespace(ns))
-        .join("root.json")
+    root.join("tags").join(safe_name(ns)).join("root.json")
 }
 
-fn compute_root(index: &BTreeMap<String, String>) -> Option<String> {
+fn compute_root(index: &BTreeMap<String, IndexEntry>) -> Option<String> {
     if index.is_empty() {
         return None;
     }
     let mut hasher = Sha256::new();
-    for (name, value) in index {
-        let leaf = Sha256::digest(format!("{name}={value}").as_bytes());
+    for (name, entry) in index {
+        // Root hash is over (name, value) pairs only -- mtime is excluded.
+        let leaf = Sha256::digest(format!("{name}={}", entry.value).as_bytes());
         hasher.update(leaf);
     }
     let root_hash = hasher.finalize();
@@ -53,7 +68,11 @@ fn compute_root(index: &BTreeMap<String, String>) -> Option<String> {
     Some(std::str::from_utf8(&buf).unwrap().to_string())
 }
 
-fn write_root(root: &Path, ns: &str, index: &BTreeMap<String, String>) -> Result<(), StoreError> {
+fn write_root(
+    root: &Path,
+    ns: &str,
+    index: &BTreeMap<String, IndexEntry>,
+) -> Result<(), StoreError> {
     let root_kappa = compute_root(index);
     let count = index.len();
     let data = serde_json::json!({
@@ -68,7 +87,13 @@ fn write_root(root: &Path, ns: &str, index: &BTreeMap<String, String>) -> Result
 pub fn set(root: &Path, ns: &str, name: &str, kappa: &str) -> Result<(), StoreError> {
     let path = index_path(root, ns);
     let mut index = read_index(&path)?;
-    index.insert(name.to_string(), kappa.to_string());
+    index.insert(
+        name.to_string(),
+        IndexEntry {
+            value: kappa.to_string(),
+            mtime: now_millis(),
+        },
+    );
     write_index(&path, &index)?;
     write_root(root, ns, &index)
 }
@@ -91,11 +116,11 @@ pub fn get(root: &Path, ns: &str, name: &str) -> Result<Option<String>, StoreErr
     for _ in 0..SYMREF_MAXDEPTH {
         match index.get(&current_name) {
             None => return Ok(None),
-            Some(value) => {
-                if let Some(target) = value.strip_prefix(SYMREF_PREFIX) {
+            Some(entry) => {
+                if let Some(target) = entry.value.strip_prefix(SYMREF_PREFIX) {
                     current_name = target.to_string();
                 } else {
-                    return Ok(Some(value.clone()));
+                    return Ok(Some(entry.value.clone()));
                 }
             }
         }
@@ -108,14 +133,20 @@ pub fn get(root: &Path, ns: &str, name: &str) -> Result<Option<String>, StoreErr
 pub fn get_raw(root: &Path, ns: &str, name: &str) -> Result<Option<String>, StoreError> {
     let path = index_path(root, ns);
     let index = read_index(&path)?;
-    Ok(index.get(name).cloned())
+    Ok(index.get(name).map(|e| e.value.clone()))
 }
 
 /// Create a symbolic pointer: store "ref:{target}" as the value for `name`.
 pub fn set_symbolic(root: &Path, ns: &str, name: &str, target: &str) -> Result<(), StoreError> {
     let path = index_path(root, ns);
     let mut index = read_index(&path)?;
-    index.insert(name.to_string(), format!("{SYMREF_PREFIX}{target}"));
+    index.insert(
+        name.to_string(),
+        IndexEntry {
+            value: format!("{SYMREF_PREFIX}{target}"),
+            mtime: now_millis(),
+        },
+    );
     write_index(&path, &index)?;
     write_root(root, ns, &index)
 }
@@ -126,9 +157,10 @@ pub fn list(root: &Path, ns: &str, opts: &TagListOpts) -> Result<TagPage, StoreE
 
     let mut entries: Vec<TagEntry> = index
         .iter()
-        .map(|(name, kappa)| TagEntry {
+        .map(|(name, entry)| TagEntry {
             name: name.clone(),
-            kappa: kappa.clone(),
+            kappa: entry.value.clone(),
+            mtime: Some(entry.mtime),
         })
         .collect();
 
@@ -171,12 +203,13 @@ pub fn list(root: &Path, ns: &str, opts: &TagListOpts) -> Result<TagPage, StoreE
 pub fn delete(root: &Path, ns: &str, name: &str) -> Result<bool, StoreError> {
     let path = index_path(root, ns);
     let mut index = read_index(&path)?;
-    let removed = index.remove(name).is_some();
-    if removed {
+    if index.remove(name).is_some() {
         write_index(&path, &index)?;
         write_root(root, ns, &index)?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
-    Ok(removed)
 }
 
 pub fn set_if(
@@ -188,11 +221,11 @@ pub fn set_if(
 ) -> Result<bool, StoreError> {
     let path = index_path(root, ns);
     let mut index = read_index(&path)?;
-    let current = index.get(name).cloned();
+    let current = index.get(name);
 
     match expected {
         Some(exp) => {
-            if current.as_deref() != Some(exp) {
+            if current.map(|e| e.value.as_str()) != Some(exp) {
                 return Ok(false);
             }
         }
@@ -203,7 +236,13 @@ pub fn set_if(
         }
     }
 
-    index.insert(name.to_string(), kappa.to_string());
+    index.insert(
+        name.to_string(),
+        IndexEntry {
+            value: kappa.to_string(),
+            mtime: now_millis(),
+        },
+    );
     write_index(&path, &index)?;
     write_root(root, ns, &index)?;
     Ok(true)
@@ -214,7 +253,7 @@ pub fn find_by_kappa(root: &Path, ns: &str, kappa: &str) -> Result<Vec<String>, 
     let index = read_index(&path)?;
     let names: Vec<String> = index
         .iter()
-        .filter(|(_, v)| v.as_str() == kappa)
+        .filter(|(_, e)| e.value.as_str() == kappa)
         .map(|(k, _)| k.clone())
         .collect();
     Ok(names)
@@ -245,9 +284,11 @@ pub fn set_batch(
             }
             Some(exp) => {
                 let current = index.get(&update.name);
-                if current.map(|s| s.as_str()) != Some(exp.as_str()) {
+                if current.map(|e| e.value.as_str()) != Some(exp.as_str()) {
                     let reason = match current {
-                        Some(cur) => format!("expected {}, current is {}", exp, cur),
+                        Some(cur) => {
+                            format!("expected {}, current is {}", exp, cur.value)
+                        }
                         None => format!("expected {}, tag does not exist", exp),
                     };
                     return Ok(BatchResult::Failed { index: i, reason });
@@ -265,13 +306,77 @@ pub fn set_batch(
     }
 
     // Phase 2: all validations passed -- apply all updates.
+    let ts = now_millis();
     for update in updates {
-        index.insert(update.name.clone(), update.new_kappa.clone());
+        index.insert(
+            update.name.clone(),
+            IndexEntry {
+                value: update.new_kappa.clone(),
+                mtime: ts,
+            },
+        );
     }
     write_index(&path, &index)?;
     write_root(root, ns, &index)?;
 
     Ok(BatchResult::AllSucceeded)
+}
+
+/// Compute the exclusive upper bound for a prefix scan.
+/// "abc" -> "abd", "az" -> "a{", all-0xFF -> empty (unbounded).
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return String::from_utf8(bytes).ok();
+        }
+        bytes.pop();
+    }
+    None
+}
+
+pub fn list_prefix(root: &Path, ns: &str, prefix: &str) -> Result<Vec<TagEntry>, StoreError> {
+    let path = index_path(root, ns);
+    let index = read_index(&path)?;
+    let iter: Box<dyn Iterator<Item = (&String, &IndexEntry)>> =
+        if let Some(end) = prefix_successor(prefix) {
+            Box::new(index.range::<String, _>(prefix.to_string()..end))
+        } else {
+            Box::new(index.range::<String, _>(prefix.to_string()..))
+        };
+    Ok(iter
+        .map(|(name, entry)| TagEntry {
+            name: name.clone(),
+            kappa: entry.value.clone(),
+            mtime: Some(entry.mtime),
+        })
+        .collect())
+}
+
+pub fn delete_prefix(root: &Path, ns: &str, prefix: &str) -> Result<usize, StoreError> {
+    let path = index_path(root, ns);
+    let mut index = read_index(&path)?;
+    let keys: Vec<String> = if let Some(end) = prefix_successor(prefix) {
+        index
+            .range::<String, _>(prefix.to_string()..end)
+            .map(|(k, _)| k.clone())
+            .collect()
+    } else {
+        index
+            .range::<String, _>(prefix.to_string()..)
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    let count = keys.len();
+    if count > 0 {
+        for key in &keys {
+            index.remove(key);
+        }
+        write_index(&path, &index)?;
+        write_root(root, ns, &index)?;
+    }
+    Ok(count)
 }
 
 pub fn namespace_root(root: &Path, ns: &str) -> Result<(Option<String>, usize), StoreError> {
@@ -297,11 +402,11 @@ pub fn namespace_proof(
     let path = index_path(root, ns);
     let index = read_index(&path)?;
     let value = match index.get(name) {
-        Some(v) => v.clone(),
+        Some(e) => e.value.clone(),
         None => return Ok(None),
     };
     let root_kappa = compute_root(&index).unwrap_or_default();
-    let leaves: Vec<(String, String)> = index.into_iter().collect();
+    let leaves: Vec<(String, String)> = index.into_iter().map(|(k, e)| (k, e.value)).collect();
     Ok(Some(crate::store::NamespaceProof {
         tag: name.to_string(),
         value,
@@ -327,7 +432,7 @@ pub fn all_kappas_global(root: &Path) -> Result<Vec<String>, StoreError> {
             continue;
         }
         let index = read_index(&idx)?;
-        all.extend(index.values().cloned());
+        all.extend(index.values().map(|e| e.value.clone()));
     }
     all.sort();
     all.dedup();
