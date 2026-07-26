@@ -1,37 +1,60 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use topcoat::context::{app_context, Cx};
+use topcoat::router::{Body, Response, RouteFuture, StatusCode};
 
 use crate::auth;
-use crate::error::AppError;
-use crate::routes::param_first;
+use crate::store::fs::FsStore;
 use crate::store::{Direction, KappaStore};
-use crate::AppState;
 
-pub async fn list(
-    state: &AppState,
-    ns: &str,
-    digest: &str,
-    params: &HashMap<String, Vec<String>>,
-) -> Result<Response, AppError> {
+use super::path_param;
+
+fn query_param(cx: &Cx, key: &str) -> Option<String> {
+    let query = topcoat::router::uri(cx).query()?;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(super::tag::percent_decode(v));
+            }
+        }
+    }
+    None
+}
+
+fn store(cx: &Cx) -> &Arc<FsStore> {
+    app_context::<Arc<FsStore>>(cx)
+}
+
+pub fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        let digest = path_param(cx, "digest");
+        list(cx, ns, digest).await
+    })
+}
+
+async fn list(cx: &Cx, ns: &str, digest: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "referrers.list")?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let node = digest.to_string();
     let n = ns.to_string();
     let edges = tokio::task::spawn_blocking(move || {
         s.edge_query(&n, &node, Direction::Inbound, Some("refers-to"), None, None)
     })
-    .await??;
+    .await?
+    .map_err(super::store_err)?;
 
-    let artifact_type_filter = param_first(params, "artifactType");
+    let artifact_type_filter = query_param(cx, "artifactType");
 
     let mut descriptors: Vec<serde_json::Value> = Vec::new();
     for edge in &edges {
-        let s = state.store.clone();
+        let s = store(cx).clone();
         let source = edge.source.clone();
-        let manifest_bytes = tokio::task::spawn_blocking(move || s.get(&source)).await??;
+        let manifest_bytes = tokio::task::spawn_blocking(move || s.get(&source))
+            .await?
+            .map_err(super::store_err)?;
         if let Some(body) = manifest_bytes {
             let manifest: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             let media_type = manifest
@@ -48,29 +71,25 @@ pub async fn list(
                         .and_then(|m| m.as_str())
                 })
                 .unwrap_or("");
+            let size = body.len();
             let annotations = manifest
                 .get("annotations")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
-            if let Some(filter) = artifact_type_filter {
+            if let Some(ref filter) = artifact_type_filter {
                 if artifact_type != filter {
                     continue;
                 }
             }
 
-            let mut desc = serde_json::json!({
+            descriptors.push(serde_json::json!({
                 "mediaType": media_type,
                 "digest": edge.source,
-                "size": body.len(),
-            });
-            if !artifact_type.is_empty() {
-                desc["artifactType"] = serde_json::json!(artifact_type);
-            }
-            if !annotations.is_null() {
-                desc["annotations"] = annotations;
-            }
-            descriptors.push(desc);
+                "size": size,
+                "artifactType": artifact_type,
+                "annotations": annotations,
+            }));
         }
     }
 
@@ -80,15 +99,17 @@ pub async fn list(
         "manifests": descriptors,
     });
 
-    let body = serde_json::to_vec(&index).unwrap_or_default();
-    let mut resp = axum::http::Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/vnd.oci.image.index.v1+json");
+    let body_bytes = serde_json::to_vec(&index).unwrap_or_default();
+    let mut response = Response::new(Body::from(body_bytes));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        "content-type",
+        "application/vnd.oci.image.index.v1+json".parse().unwrap(),
+    );
     if artifact_type_filter.is_some() {
-        resp = resp.header("oci-filters-applied", "artifactType");
+        response
+            .headers_mut()
+            .insert("oci-filters-applied", "artifactType".parse().unwrap());
     }
-    Ok(resp
-        .body(axum::body::Body::from(body))
-        .unwrap()
-        .into_response())
+    Ok(response)
 }

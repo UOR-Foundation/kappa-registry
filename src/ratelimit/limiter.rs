@@ -5,13 +5,14 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
 use governor::clock::DefaultClock;
 use governor::middleware::StateInformationMiddleware;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use http::header::HeaderValue;
-use http::{Response, StatusCode};
+use http::StatusCode;
+
+use topcoat::router::{Body, Response};
 
 use super::OpClass;
 
@@ -87,15 +88,11 @@ impl TieredRateLimiter {
     }
 
     /// Check the request against the bucket for `class` and `ip`.
-    ///
-    /// Returns `Ok(snapshot)` if allowed -- the snapshot contains the
-    /// bucket state for response headers.
-    /// Returns `Err(response)` with a complete 429 response if rejected.
     pub fn check(
         &self,
         ip: IpAddr,
         class: OpClass,
-    ) -> Result<Option<RateLimitSnapshot>, Box<Response<Body>>> {
+    ) -> Result<Option<RateLimitSnapshot>, Box<Response>> {
         let (limiter, class_config) = match class {
             OpClass::Exempt => return Ok(None),
             OpClass::Read => (&self.read, &self.config.read),
@@ -122,7 +119,7 @@ impl TieredRateLimiter {
 }
 
 /// Attach rate limit headers to a successful response.
-pub fn attach_headers(response: &mut Response<Body>, snapshot: &RateLimitSnapshot) {
+pub fn attach_headers(response: &mut Response, snapshot: &RateLimitSnapshot) {
     let headers = response.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&snapshot.limit.to_string()) {
         headers.insert("x-ratelimit-limit", v);
@@ -132,9 +129,9 @@ pub fn attach_headers(response: &mut Response<Body>, snapshot: &RateLimitSnapsho
     }
 }
 
-fn build_429_response(wait_time: u64, burst: u32) -> Response<Body> {
-    let body = format!("Too Many Requests! Wait for {wait_time}s");
-    let mut resp = Response::new(Body::from(body));
+fn build_429_response(wait_time: u64, burst: u32) -> Response {
+    let body_str = format!("Too Many Requests! Wait for {wait_time}s");
+    let mut resp = Response::new(Body::from(body_str));
     *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
     let h = resp.headers_mut();
     h.insert("retry-after", HeaderValue::from(wait_time));
@@ -200,11 +197,9 @@ mod tests {
     fn classes_independent() {
         let limiter = TieredRateLimiter::new(&test_config(2));
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        // Exhaust read
         assert!(limiter.check(ip, OpClass::Read).is_ok());
         assert!(limiter.check(ip, OpClass::Read).is_ok());
         assert!(limiter.check(ip, OpClass::Read).is_err());
-        // Write still has capacity
         assert!(limiter.check(ip, OpClass::Write).is_ok());
         assert!(limiter.check(ip, OpClass::Write).is_ok());
         assert!(limiter.check(ip, OpClass::Write).is_err());
@@ -218,7 +213,6 @@ mod tests {
         assert!(limiter.check(ip1, OpClass::Read).is_ok());
         assert!(limiter.check(ip1, OpClass::Read).is_ok());
         assert!(limiter.check(ip1, OpClass::Read).is_err());
-        // ip2 unaffected
         assert!(limiter.check(ip2, OpClass::Read).is_ok());
     }
 
@@ -246,7 +240,7 @@ mod tests {
     fn rejected_response_has_headers() {
         let limiter = TieredRateLimiter::new(&test_config(1));
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        let _ = limiter.check(ip, OpClass::Read); // consume the 1 token
+        let _ = limiter.check(ip, OpClass::Read);
         let err = *limiter.check(ip, OpClass::Read).unwrap_err();
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(err.headers().get("retry-after").is_some());
@@ -256,7 +250,6 @@ mod tests {
 
     #[test]
     fn partial_class_config() {
-        // Only read is limited
         let config = RateLimitConfig {
             read: ClassConfig {
                 period_ms: 1000,
@@ -274,11 +267,9 @@ mod tests {
         assert!(config.is_enabled());
         let limiter = TieredRateLimiter::new(&config);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        // Read limited
         assert!(limiter.check(ip, OpClass::Read).is_ok());
         assert!(limiter.check(ip, OpClass::Read).is_ok());
         assert!(limiter.check(ip, OpClass::Read).is_err());
-        // Write unlimited
         for _ in 0..100 {
             assert!(limiter.check(ip, OpClass::Write).is_ok());
         }

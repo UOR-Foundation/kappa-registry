@@ -1,70 +1,116 @@
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use std::sync::Arc;
+
+use topcoat::context::{app_context, Cx};
+use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
 use crate::auth;
-use crate::error::AppError;
+use crate::store::fs::FsStore;
 use crate::store::{KappaStore, StoreError};
-use crate::AppState;
 
-pub async fn pin(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, AppError> {
+use super::path_param;
+
+fn store(cx: &Cx) -> &Arc<FsStore> {
+    app_context::<Arc<FsStore>>(cx)
+}
+
+pub fn pin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = super::read_body(body).await?;
+        let ns = path_param(cx, "ns");
+        pin(cx, ns, &bytes).await
+    })
+}
+
+pub fn unpin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = super::read_body(body).await?;
+        let ns = path_param(cx, "ns");
+        unpin(cx, ns, &bytes).await
+    })
+}
+
+pub fn sweep_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        sweep(cx, ns).await
+    })
+}
+
+pub fn status_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        status(cx, ns).await
+    })
+}
+
+async fn pin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     auth::authorize(ns, "gc.pin")?;
 
     let v: serde_json::Value = serde_json::from_slice(body)?;
     let kappa = v["kappa"]
         .as_str()
-        .ok_or_else(|| AppError::NameInvalid("missing kappa".to_string()))?;
+        .ok_or_else(|| bad_request("missing kappa"))?;
     let ttl = v["ttl"].as_u64().unwrap_or(0);
     let controller = v["controller"].as_str().unwrap_or("");
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa.to_string();
     let ctrl = controller.to_string();
-    let pin_kappa = tokio::task::spawn_blocking(move || s.pin(&k, ttl, &ctrl)).await??;
+    let pin_kappa = tokio::task::spawn_blocking(move || s.pin(&k, ttl, &ctrl))
+        .await?
+        .map_err(super::store_err)?;
 
-    // Store object-type metadata (namespace-scoped)
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let pk = pin_kappa.clone();
     let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.meta_set(&n, &pk, &[("object-type", "pin")])).await??;
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &pk, &[("object-type", "pin")]))
+        .await?
+        .map_err(super::store_err)?;
 
-    Ok((
+    (
         StatusCode::CREATED,
         [
             ("x-kappa-label", pin_kappa),
             ("content-length", "0".to_string()),
         ],
     )
-        .into_response())
+        .into_response(cx)
 }
 
-pub async fn unpin(state: &AppState, ns: &str, body: &[u8]) -> Result<Response, AppError> {
+async fn unpin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     auth::authorize(ns, "gc.unpin")?;
 
     let v: serde_json::Value = serde_json::from_slice(body)?;
     let pin_kappa = v["pin_kappa"]
         .as_str()
-        .ok_or_else(|| AppError::NameInvalid("missing pin_kappa".to_string()))?;
+        .ok_or_else(|| bad_request("missing pin_kappa"))?;
     let release = v["release"].as_str() == Some("true");
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let pk = pin_kappa.to_string();
     let result = tokio::task::spawn_blocking(move || s.unpin(&pk, release)).await?;
 
     match result {
-        Ok(()) => Ok(StatusCode::OK.into_response()),
-        Err(StoreError::Conflict(msg)) => Err(AppError::FinalizerOutstanding(msg)),
-        Err(StoreError::NotFound) => Err(AppError::BlobUnknown),
-        Err(e) => Err(AppError::Store(e)),
+        Ok(()) => StatusCode::OK.into_response(cx),
+        Err(StoreError::Conflict(msg)) => (
+            StatusCode::CONFLICT,
+            format!("finalizer {msg} blocks unpin"),
+        )
+            .into_response(cx),
+        Err(StoreError::NotFound) => Err(not_found().into()),
+        Err(e) => Err(e.into()),
     }
 }
 
-pub async fn sweep(state: &AppState, ns: &str) -> Result<Response, AppError> {
+async fn sweep(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "gc.sweep")?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let ns_owned = ns.to_string();
-    let store_root = state.store.root().to_path_buf();
+    let store_root = store(cx).root().to_path_buf();
 
     let sweep_id = uuid::Uuid::new_v4().to_string();
     let sid = sweep_id.clone();
@@ -78,14 +124,18 @@ pub async fn sweep(state: &AppState, ns: &str) -> Result<Response, AppError> {
     });
 
     let body = serde_json::json!({"sweep_id": sweep_id});
-    Ok((StatusCode::ACCEPTED, Json(body)).into_response())
+    (
+        StatusCode::ACCEPTED,
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response(cx)
 }
 
-pub async fn status(state: &AppState, ns: &str) -> Result<Response, AppError> {
+async fn status(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "gc.status")?;
 
-    let s = state.store.clone();
-    let store_root = state.store.root().to_path_buf();
+    let s = store(cx).clone();
+    let store_root = store(cx).root().to_path_buf();
     let body = tokio::task::spawn_blocking(move || {
         let status_path = store_root.join("gc").join("status.json");
         let mut status: serde_json::Value = if status_path.exists() {
@@ -114,12 +164,12 @@ pub async fn status(state: &AppState, ns: &str) -> Result<Response, AppError> {
     })
     .await?;
 
-    Ok((
+    (
         StatusCode::OK,
         [("content-type", "application/json".to_string())],
         body,
     )
-        .into_response())
+        .into_response(cx)
 }
 
 fn run_sweep(
@@ -153,9 +203,6 @@ fn run_sweep(
         }
     }
 
-    // Build a roaring bitmap of reachable blob positions for O(1) eviction checks.
-    // At scale (millions of objects), this replaces O(n) HashSet::contains per blob
-    // with a bitmap test that fits in cache.
     let mut reachable_bitmap = roaring::RoaringBitmap::new();
     for (i, kappa) in all_blobs.iter().enumerate() {
         if reachable.contains(kappa) {
@@ -165,7 +212,6 @@ fn run_sweep(
 
     let scanned = all_blobs.len();
     let mut evicted = 0usize;
-
     let mut evicted_set = Vec::new();
     for (i, kappa) in all_blobs.iter().enumerate() {
         if !reachable_bitmap.contains(i as u32) {
@@ -175,7 +221,6 @@ fn run_sweep(
         }
     }
 
-    // Clean up edge index entries referencing evicted blobs
     for kappa in &evicted_set {
         let _ = store.edge_remove_by_node(ns, kappa);
     }
@@ -209,11 +254,9 @@ fn run_sweep(
     let data =
         serde_json::to_vec_pretty(&status).map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
 
-    // Write per-sweep snapshot for post-mortem
     let snapshot_path = gc_dir.join(format!("status-{sweep_id}.json"));
     crate::store::fs::atomic_write(&snapshot_path, &data)?;
 
-    // Write current status (latest sweep wins)
     let status_path = gc_dir.join("status.json");
     crate::store::fs::atomic_write(&status_path, &data)?;
 

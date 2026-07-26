@@ -206,9 +206,9 @@ fn edge_source_must_exist() {
         &[("Content-Type", "application/json")],
         body.as_bytes(),
     );
-    assert_eq!(status, 409);
+    assert_eq!(status, 400);
     let text = String::from_utf8_lossy(&resp);
-    assert!(text.contains("EDGE_SOURCE_ABSENT"), "body: {text}");
+    assert!(text.contains("source kappa absent"), "body: {text}");
 }
 
 #[test]

@@ -3,608 +3,495 @@ pub mod bundle;
 pub mod config;
 pub mod crypto;
 pub mod delta;
-pub mod error;
 pub mod handlers;
 pub mod kappa;
 pub mod ratelimit;
-pub mod routes;
 pub mod store;
 pub mod transaction;
+pub mod urls;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode};
-use axum::middleware;
-use axum::response::{IntoResponse, Response};
-use axum::routing::any;
-use axum::Json;
-use axum::Router;
-use tower_http::trace::TraceLayer;
+use topcoat::context::CxBuilder;
+use topcoat::router::{Body, LayerFn, Method, Methods, Next, Path, RouteFn, Router};
 
 use crate::handlers::upload::SessionStore;
-use crate::ratelimit::TieredRateLimiter;
-use crate::routes::Endpoint;
+use crate::ratelimit::{OpClass, TieredRateLimiter};
 use crate::store::fs::FsStore;
-use crate::store::KappaStore;
 use crate::transaction::TransactionManager;
 
-#[derive(Clone)]
-pub struct AppState {
-    pub store: Arc<FsStore>,
-    pub sessions: Arc<SessionStore>,
-    pub transactions: Arc<TransactionManager>,
-    pub rate_limiter: Option<TieredRateLimiter>,
-    pub signer: Option<Arc<dyn crate::crypto::RegistrySigner>>,
-    pub max_blob_size: usize,
-    pub upload_timeout_secs: u64,
-}
+/// Build the registry router with all routes, layers, and app context.
+pub fn router(
+    store: Arc<FsStore>,
+    sessions: Arc<SessionStore>,
+    transactions: Arc<TransactionManager>,
+    rate_limiter: Option<TieredRateLimiter>,
+    signer: Option<Arc<dyn crate::crypto::RegistrySigner>>,
+    max_blob_size: usize,
+    upload_timeout_secs: u64,
+) -> Router {
+    let mut builder = Router::builder();
 
-pub fn app(state: AppState) -> Router {
-    Router::new()
-        .fallback(any(dispatch))
-        .layer(axum::extract::DefaultBodyLimit::max(state.max_blob_size))
-        .layer(middleware::map_response(add_warning_header))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
-}
+    // App context: type-keyed singletons accessible from any handler via
+    // app_context::<T>(cx).
+    builder = builder
+        .app_context(store)
+        .app_context(sessions)
+        .app_context(transactions)
+        .app_context(MaxBlobSize(max_blob_size))
+        .app_context(UploadTimeout(upload_timeout_secs))
+        .app_context(SignerHolder(signer));
 
-async fn add_warning_header(mut response: Response) -> Response {
-    response
-        .headers_mut()
-        .insert("warning", "299 - \"kappa-registry\"".parse().unwrap());
-    response
-}
-
-async fn dispatch(
-    method: Method,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: axum::http::Uri,
-    body: Bytes,
-) -> Response {
-    let path = uri.path();
-    let uri_str = uri.to_string();
-    let method_str = method.as_str();
-    let params = routes::query_params(&uri_str);
-    let p = |key: &str| -> Option<&str> { routes::param_first(&params, key) };
-
-    let endpoint = routes::parse(method_str, path);
-    tracing::debug!(
-        method = method_str,
-        path = path,
-        uri = uri_str.as_str(),
-        endpoint = ?endpoint,
-        "dispatch"
-    );
-
-    // Tiered rate limiting
-    let mut rate_snapshot = None;
-    if let Some(ref limiter) = state.rate_limiter {
-        let ip = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').find_map(|s| s.trim().parse().ok()))
-            .or_else(|| {
-                headers
-                    .get("x-real-ip")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        let op_class = endpoint.op_class();
-        match limiter.check(ip, op_class) {
-            Ok(snap) => rate_snapshot = snap,
-            Err(rejection) => return (*rejection).into_response(),
-        }
+    if let Some(limiter) = rate_limiter {
+        builder = builder.app_context(limiter);
     }
 
-    let mut response = match endpoint {
-        Endpoint::Version => handlers::blob::version_check().into_response(),
-        Endpoint::Health => {
-            let probe = path.strip_prefix("/v2/_health/").unwrap_or("live");
-            match probe {
-                "ready" => match tempfile::NamedTempFile::new_in(state.store.root()) {
-                    Ok(_) => StatusCode::OK.into_response(),
-                    Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                },
-                _ => StatusCode::OK.into_response(),
-            }
-        }
+    // Warning header layer at root -- wraps every response.
+    builder = builder.layer(LayerFn::new(Cow::Borrowed(Path::new("/")), warning_layer));
 
-        Endpoint::BlobPut { ns, kappa } => {
-            handlers::blob::put(&state, ns, kappa, &params, &headers, &body)
-                .await
-                .into_response()
-        }
-        Endpoint::BlobGet { ns, kappa } => handlers::blob::get(&state, ns, kappa, &headers)
-            .await
-            .into_response(),
-        Endpoint::BlobHead { ns, kappa } => handlers::blob::head(&state, ns, kappa)
-            .await
-            .into_response(),
-        Endpoint::BlobDelete { ns, kappa } => handlers::blob::delete(&state, ns, kappa)
-            .await
-            .into_response(),
-        Endpoint::BlobList { ns } => {
-            let prefix = p("prefix").unwrap_or("");
-            handlers::blob::list(&state, ns, prefix)
-                .await
-                .into_response()
-        }
-        Endpoint::MetaList { ns } => {
-            // Compound query: ?filter=key1:val1&filter=key2:val2
-            let filters: Vec<&str> = params
-                .get("filter")
-                .map(|v| v.iter().map(|s| s.as_str()).collect())
-                .unwrap_or_default();
-            if !filters.is_empty() {
-                let parsed: Vec<(String, String)> = filters
-                    .iter()
-                    .filter_map(|f| {
-                        let (k, v) = f.split_once(':')?;
-                        Some((k.to_string(), v.to_string()))
-                    })
-                    .collect();
-                if parsed.len() == 1 {
-                    let s = state.store.clone();
-                    let n = ns.to_string();
-                    let k = parsed[0].0.clone();
-                    let v = parsed[0].1.clone();
-                    match tokio::task::spawn_blocking(move || s.meta_query(&n, &k, &v)).await {
-                        Ok(Ok(kappas)) => {
-                            (StatusCode::OK, Json(serde_json::json!({"kappas": kappas})))
-                                .into_response()
-                        }
-                        Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                        Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                    }
-                } else {
-                    let s = state.store.clone();
-                    let n = ns.to_string();
-                    match tokio::task::spawn_blocking(move || {
-                        let refs: Vec<(&str, &str)> = parsed
-                            .iter()
-                            .map(|(k, v)| (k.as_str(), v.as_str()))
-                            .collect();
-                        s.meta_query_compound(&n, &refs)
-                    })
-                    .await
-                    {
-                        Ok(Ok(kappas)) => {
-                            (StatusCode::OK, Json(serde_json::json!({"kappas": kappas})))
-                                .into_response()
-                        }
-                        Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                        Err(e) => error::AppError::internal(&e.to_string()).into_response(),
+    // Rate limiting layer at root -- wraps every route.
+    builder = builder.layer(LayerFn::new(
+        Cow::Borrowed(Path::new("/")),
+        rate_limit_layer,
+    ));
+
+    // -- Health and version (exempt from rate limiting by OpClass::Exempt) --
+    builder = builder
+        .route(RouteFn::new(Methods::Any, p("/v2"), handlers::version))
+        .route(RouteFn::new(Methods::Any, p("/v2/"), handlers::version))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/_health/{probe}"),
+            handlers::health,
+        ));
+
+    // -- Uploads (global, not namespace-scoped) --
+    builder = builder
+        .route(RouteFn::new(
+            Method::PATCH,
+            p("/v2/_uploads/{id}"),
+            handlers::upload::chunk_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/_uploads/{id}"),
+            handlers::upload::recovery_route,
+        ))
+        .route(RouteFn::new(
+            Method::PUT,
+            p("/v2/_uploads/{id}"),
+            handlers::upload::complete_route,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            p("/v2/_uploads/{id}"),
+            handlers::upload::cancel_route,
+        ));
+
+    // -- Blobs --
+    builder = builder
+        .route(RouteFn::new(
+            Method::PUT,
+            p("/v2/{*ns}/blobs/{kappa}"),
+            handlers::blob::put_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/blobs/{kappa}"),
+            handlers::blob::get_route,
+        ))
+        .route(RouteFn::new(
+            Method::HEAD,
+            p("/v2/{*ns}/blobs/{kappa}"),
+            handlers::blob::head_route,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            p("/v2/{*ns}/blobs/{kappa}"),
+            handlers::blob::delete_route,
+        ));
+
+    // -- Blob list, meta, cascade --
+    builder = builder
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/blobs/"),
+            handlers::blob::list_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/blobs/_meta"),
+            handlers::blob::meta_list_route,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/blobs/_cascade"),
+            handlers::cascade_route,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/blobs/uploads/"),
+            handlers::upload::start_route,
+        ));
+
+    // -- Manifests --
+    builder = builder
+        .route(RouteFn::new(
+            Method::PUT,
+            p("/v2/{*ns}/manifests/{reference}"),
+            handlers::tag::manifest_put_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/manifests/{reference}"),
+            handlers::tag::manifest_get_route,
+        ))
+        .route(RouteFn::new(
+            Method::HEAD,
+            p("/v2/{*ns}/manifests/{reference}"),
+            handlers::tag::manifest_head_route,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            p("/v2/{*ns}/manifests/{reference}"),
+            handlers::tag::manifest_delete_route,
+        ));
+
+    // -- Tags --
+    builder = builder
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/tags/list"),
+            handlers::tag::tag_list_route,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/tags/_batch"),
+            handlers::tag::tag_batch_route,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            p("/v2/{*ns}/tags/_prefix"),
+            handlers::tag::tag_delete_prefix_route,
+        ))
+        .route(RouteFn::new(
+            &[Method::POST, Method::GET, Method::DELETE],
+            p("/v2/{*ns}/tags/"),
+            handlers::tag::tag_crud_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/tags/{name}"),
+            handlers::tag::tag_get_route,
+        ))
+        .route(RouteFn::new(
+            Method::PUT,
+            p("/v2/{*ns}/tags/{name}"),
+            handlers::tag::tag_put_route,
+        ));
+
+    // -- Referrers --
+    builder = builder.route(RouteFn::new(
+        Method::GET,
+        p("/v2/{*ns}/referrers/{digest}"),
+        handlers::referrers::list_route,
+    ));
+
+    // -- Edges --
+    builder = builder
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/edges/_diff"),
+            handlers::edge::diff_route,
+        ))
+        .route(RouteFn::new(
+            Method::PUT,
+            p("/v2/{*ns}/edges/"),
+            handlers::edge::put_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/edges/{edge_key}"),
+            handlers::edge::query_route,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            p("/v2/{*ns}/edges/{edge_key}"),
+            handlers::edge::delete_route,
+        ));
+
+    // -- Compose and witnesses --
+    builder = builder
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/compose/{op}"),
+            handlers::compose::compose_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/witnesses/{kappa}"),
+            handlers::compose::witness_route,
+        ));
+
+    // -- Schemas --
+    builder = builder
+        .route(RouteFn::new(
+            Method::PUT,
+            p("/v2/{*ns}/schemas/{scope}"),
+            handlers::schema::register_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/schemas/{scope}"),
+            handlers::schema::get_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/schemas/"),
+            handlers::schema::list_route,
+        ));
+
+    // -- GC --
+    builder = builder
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/gc/pin"),
+            handlers::gc::pin_route,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/gc/unpin"),
+            handlers::gc::unpin_route,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/gc/sweep"),
+            handlers::gc::sweep_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/gc/status"),
+            handlers::gc::status_route,
+        ));
+
+    // -- Filters --
+    builder = builder
+        .route(RouteFn::new(
+            Method::PUT,
+            p("/v2/{*ns}/filters/{filter_key}"),
+            handlers::filter::register_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/filters/"),
+            handlers::filter::list_route,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            p("/v2/{*ns}/filters/{filter_key}"),
+            handlers::filter::delete_route,
+        ));
+
+    // -- Bundles --
+    builder = builder
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/_bundle/create"),
+            handlers::bundle::create_route,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/_bundle/ingest"),
+            handlers::bundle::ingest_route,
+        ));
+
+    // -- Transactions --
+    builder = builder
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/_transaction/begin"),
+            handlers::transaction::begin_route,
+        ))
+        .route(RouteFn::new(
+            Method::PUT,
+            p("/v2/{*ns}/_transaction/{id}/{kappa}"),
+            handlers::transaction::put_route,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/_transaction/{id}/commit"),
+            handlers::transaction::commit_route,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            p("/v2/{*ns}/_transaction/{id}"),
+            handlers::transaction::abort_route,
+        ));
+
+    // -- Reconcile --
+    builder = builder.route(RouteFn::new(
+        Method::POST,
+        p("/v2/{*ns}/_reconcile"),
+        handlers::reconcile::handle_route,
+    ));
+
+    // -- Sequences --
+    builder = builder
+        .route(RouteFn::new(
+            Method::POST,
+            p("/v2/{*ns}/_sequence/{name}/next"),
+            handlers::sequence_next_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/_sequence/{name}"),
+            handlers::sequence_current_route,
+        ));
+
+    // -- Namespace root and proof --
+    builder = builder
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/_root/proof/{name}"),
+            handlers::namespace_proof_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/v2/{*ns}/_root"),
+            handlers::namespace_root_route,
+        ));
+
+    builder.build()
+}
+
+// -- App context wrapper types --
+
+/// Wrapper so max_blob_size can be registered as app_context.
+#[derive(Clone, Copy)]
+pub struct MaxBlobSize(pub usize);
+
+/// Wrapper so upload_timeout_secs can be registered as app_context.
+#[derive(Clone, Copy)]
+pub struct UploadTimeout(pub u64);
+
+/// Wrapper for the optional signer so it can be registered as a single
+/// app_context type regardless of whether signing is configured.
+pub struct SignerHolder(pub Option<Arc<dyn crate::crypto::RegistrySigner>>);
+
+// -- Helper --
+
+fn p(s: &'static str) -> Cow<'static, Path> {
+    Cow::Borrowed(Path::new(s))
+}
+
+// -- Warning header layer --
+
+fn warning_layer<'a>(
+    cx: &'a mut CxBuilder,
+    body: Body,
+    next: Next<'a>,
+) -> topcoat::router::LayerFuture<'a> {
+    Box::pin(async move {
+        let mut response = next.run(cx, body).await?;
+        response
+            .headers_mut()
+            .insert("warning", "299 - \"kappa-registry\"".parse().unwrap());
+        Ok(response)
+    })
+}
+
+// -- Rate limiting layer --
+//
+// Classifies each request by HTTP method into an OpClass, extracts the
+// client IP from headers, and checks the tiered rate limiter. Exempt
+// paths (/v2/, /v2, /v2/_health/*) are identified by URI. If the limiter
+// rejects the request, the 429 response is returned directly. On success,
+// rate limit headers are attached to the response after the inner chain
+// completes.
+
+fn rate_limit_layer<'a>(
+    cx: &'a mut CxBuilder,
+    body: Body,
+    next: Next<'a>,
+) -> topcoat::router::LayerFuture<'a> {
+    Box::pin(async move {
+        // Check if a limiter is registered (rate limiting may be disabled).
+        let snapshot =
+            if let Some(limiter) = topcoat::context::try_app_context::<TieredRateLimiter>(cx) {
+                let ip = ratelimit::extract_ip(cx);
+                let uri_path = topcoat::router::uri(cx).path();
+                let method = topcoat::router::method(cx);
+                let op_class = classify_request(method.as_str(), uri_path);
+                match limiter.check(ip, op_class) {
+                    Ok(snap) => snap,
+                    Err(rejection) => {
+                        return Ok(*rejection);
                     }
                 }
             } else {
-                // Single key+value query (legacy path)
-                let key = p("key").unwrap_or("");
-                let value = p("value").unwrap_or("");
-                if key.is_empty() {
-                    handlers::blob::list_by_meta(&state, ns, key, value)
-                        .await
-                        .into_response()
-                } else {
-                    let s = state.store.clone();
-                    let n = ns.to_string();
-                    let k = key.to_string();
-                    let v = value.to_string();
-                    match tokio::task::spawn_blocking(move || {
-                        if v.is_empty() {
-                            s.meta_query_exists(&n, &k)
-                        } else {
-                            s.meta_query(&n, &k, &v)
-                        }
-                    })
-                    .await
-                    {
-                        Ok(Ok(kappas)) => {
-                            (StatusCode::OK, Json(serde_json::json!({"kappas": kappas})))
-                                .into_response()
-                        }
-                        Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                        Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                    }
-                }
-            }
+                None
+            };
+
+        let mut response = next.run(cx, body).await?;
+
+        if let Some(snap) = snapshot {
+            ratelimit::limiter::attach_headers(&mut response, &snap);
         }
 
-        Endpoint::UploadStart { ns } => {
-            if let Some(digest) = p("digest") {
-                if !body.is_empty() {
-                    handlers::blob::put(&state, ns, digest, &params, &headers, &body)
-                        .await
-                        .into_response()
-                } else {
-                    let mount = p("mount");
-                    handlers::upload::start(&state, ns, mount)
-                        .await
-                        .into_response()
-                }
-            } else {
-                let mount = p("mount");
-                handlers::upload::start(&state, ns, mount)
-                    .await
-                    .into_response()
-            }
-        }
-        Endpoint::UploadChunk { id } => {
-            let range_start = headers
-                .get("content-range")
-                .and_then(|v| v.to_str().ok())
-                .and_then(handlers::upload::parse_range_start);
-            handlers::upload::chunk(&state, id, range_start, &body)
-                .await
-                .into_response()
-        }
-        Endpoint::UploadStatus { id } => {
-            handlers::upload::recovery(&state, id).await.into_response()
-        }
-        Endpoint::UploadComplete { id } => {
-            let kappa = p("kappa").or_else(|| p("digest")).unwrap_or("");
-            let range_start = headers
-                .get("content-range")
-                .and_then(|v| v.to_str().ok())
-                .and_then(handlers::upload::parse_range_start);
-            handlers::upload::complete(&state, id, kappa, range_start, &body)
-                .await
-                .into_response()
-        }
-        Endpoint::UploadCancel { id } => handlers::upload::cancel(&state, id).into_response(),
+        Ok(response)
+    })
+}
 
-        Endpoint::ManifestPut { ns, tag } => {
-            let mut manifest_params = params.clone();
-            if let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
-                manifest_params
-                    .entry("_content_type".to_string())
-                    .or_default()
-                    .push(ct.to_string());
-            }
-            handlers::tag::manifest_put(&state, ns, tag, &manifest_params, &body)
-                .await
-                .into_response()
-        }
-        Endpoint::ManifestHead { ns, version } => handlers::tag::manifest_head(&state, ns, version)
-            .await
-            .into_response(),
-        Endpoint::ManifestGet { ns, version } => handlers::tag::manifest_get(&state, ns, version)
-            .await
-            .into_response(),
-        Endpoint::ManifestDelete { ns, tag } => handlers::tag::manifest_delete(&state, ns, tag)
-            .await
-            .into_response(),
-        Endpoint::TagDeletePrefix { ns } => {
-            let prefix = p("prefix").unwrap_or("");
-            if prefix.is_empty() {
-                error::AppError::NameInvalid("missing prefix parameter".to_string()).into_response()
-            } else {
-                let s = state.store.clone();
-                let n = ns.to_string();
-                let pfx = prefix.to_string();
-                match tokio::task::spawn_blocking(move || s.tag_delete_prefix(&n, &pfx)).await {
-                    Ok(Ok(count)) => (StatusCode::OK, Json(serde_json::json!({"deleted": count})))
-                        .into_response(),
-                    Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                    Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                }
-            }
-        }
-        Endpoint::TagCreate { ns } => match method_str {
-            "POST" => {
-                let v: Result<serde_json::Value, _> = serde_json::from_slice(&body);
-                match v {
-                    Ok(v) => {
-                        let name = v["name"].as_str().unwrap_or("");
-                        let kappa = v["kappa"].as_str().unwrap_or("");
-                        if name.is_empty() || kappa.is_empty() {
-                            error::AppError::NameInvalid(
-                                "missing name or kappa in body".to_string(),
-                            )
-                            .into_response()
-                        } else {
-                            let s = state.store.clone();
-                            let n = ns.to_string();
-                            let nm = name.to_string();
-                            let k = kappa.to_string();
-                            match tokio::task::spawn_blocking({
-                                let s = s.clone();
-                                let k = k.clone();
-                                move || s.exists(&k)
-                            })
-                            .await
-                            {
-                                Ok(Ok(true)) => {}
-                                _ => return error::AppError::TagContentAbsent.into_response(),
-                            }
-                            match tokio::task::spawn_blocking(move || s.tag_set(&n, &nm, &k)).await
-                            {
-                                Ok(Ok(())) => {
-                                    (StatusCode::CREATED, [("content-length", "0".to_string())])
-                                        .into_response()
-                                }
-                                Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                                Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                            }
-                        }
-                    }
-                    Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                }
-            }
-            "GET" => match p("name") {
-                Some(name) => {
-                    let s = state.store.clone();
-                    let n = ns.to_string();
-                    let nm = name.to_string();
-                    match tokio::task::spawn_blocking(move || s.tag_get(&n, &nm)).await {
-                        Ok(Ok(Some(val))) => {
-                            let body = serde_json::json!({"name": name, "kappa": val});
-                            (StatusCode::OK, [("x-kappa-label", val)], Json(body)).into_response()
-                        }
-                        Ok(Ok(None)) => error::AppError::TagUnknown.into_response(),
-                        Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                        Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                    }
-                }
-                None => error::AppError::NameInvalid("missing name parameter".to_string())
-                    .into_response(),
-            },
-            "DELETE" => match p("name") {
-                Some(name) => {
-                    let s = state.store.clone();
-                    let n = ns.to_string();
-                    let nm = name.to_string();
-                    match tokio::task::spawn_blocking(move || s.tag_delete(&n, &nm)).await {
-                        Ok(Ok(true)) => StatusCode::ACCEPTED.into_response(),
-                        Ok(Ok(false)) => error::AppError::TagUnknown.into_response(),
-                        Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                        Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                    }
-                }
-                None => error::AppError::NameInvalid("missing name parameter".to_string())
-                    .into_response(),
-            },
-            _ => error::AppError::NameInvalid("method not allowed".to_string()).into_response(),
-        },
-        Endpoint::TagBatch { ns } => handlers::tag::tag_batch(&state, ns, &body)
-            .await
-            .into_response(),
-        Endpoint::TagList { ns } => {
-            if let Some(prefix) = p("prefix") {
-                let s = state.store.clone();
-                let n = ns.to_string();
-                let pfx = prefix.to_string();
-                match tokio::task::spawn_blocking(move || s.tag_list_prefix(&n, &pfx)).await {
-                    Ok(Ok(entries)) => {
-                        let names: Vec<&str> = entries.iter().map(|t| t.name.as_str()).collect();
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({"name": ns, "tags": names})),
-                        )
-                            .into_response()
-                    }
-                    Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                    Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                }
-            } else {
-                handlers::tag::tag_list(&state, ns, &params)
-                    .await
-                    .into_response()
-            }
-        }
-        Endpoint::TagGet { ns, name } => {
-            let raw = p("raw") == Some("true");
-            handlers::tag::tag_get(&state, ns, name, raw)
-                .await
-                .into_response()
-        }
-        Endpoint::TagPut { ns, name } => {
-            let kappa = p("kappa").unwrap_or("");
-            let symref = p("symref");
-            let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
-            let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
-            handlers::tag::tag_put(&state, ns, name, kappa, symref, if_match, if_none_match)
-                .await
-                .into_response()
-        }
-
-        Endpoint::Referrers { ns, digest } => {
-            handlers::referrers::list(&state, ns, digest, &params)
-                .await
-                .into_response()
-        }
-
-        Endpoint::EdgePut { ns } => handlers::edge::put(&state, ns, &body).await.into_response(),
-        Endpoint::EdgeQuery { ns, node } => {
-            let direction = p("direction").unwrap_or("outbound");
-            let relation = p("relation");
-            handlers::edge::query(&state, ns, node, direction, relation, &params)
-                .await
-                .into_response()
-        }
-        Endpoint::EdgeDelete { ns, kappa } => handlers::edge::delete(&state, ns, kappa)
-            .await
-            .into_response(),
-        Endpoint::EdgeDiff { ns } => handlers::edge::diff(&state, ns, &body)
-            .await
-            .into_response(),
-
-        Endpoint::Reconcile { ns } => handlers::reconcile::handle(&state, ns, &body)
-            .await
-            .into_response(),
-
-        Endpoint::BundleCreate { ns } => handlers::bundle::create(&state, ns, &body)
-            .await
-            .into_response(),
-        Endpoint::BundleIngest { ns } => handlers::bundle::ingest(&state, ns, &body)
-            .await
-            .into_response(),
-
-        Endpoint::TransactionBegin { ns } => handlers::transaction::begin(&state, ns)
-            .await
-            .into_response(),
-        Endpoint::TransactionPut { ns, id, kappa } => {
-            handlers::transaction::put(&state, ns, id, kappa, &body)
-                .await
-                .into_response()
-        }
-        Endpoint::TransactionCommit { ns, id } => handlers::transaction::commit(&state, ns, id)
-            .await
-            .into_response(),
-        Endpoint::TransactionAbort { ns, id } => handlers::transaction::abort(&state, ns, id)
-            .await
-            .into_response(),
-
-        Endpoint::Compose { ns, op } => handlers::compose::compose(&state, ns, op, &body)
-            .await
-            .into_response(),
-        Endpoint::Witness { ns, kappa } => handlers::compose::witness(&state, ns, kappa)
-            .await
-            .into_response(),
-
-        Endpoint::SchemaPut { ns, scope } => handlers::schema::register(&state, ns, scope, &body)
-            .await
-            .into_response(),
-        Endpoint::SchemaGet { ns, scope } => handlers::schema::get(&state, ns, scope)
-            .await
-            .into_response(),
-        Endpoint::SchemaList { ns } => handlers::schema::list(&state, ns).await.into_response(),
-
-        Endpoint::GcPin { ns } => handlers::gc::pin(&state, ns, &body).await.into_response(),
-        Endpoint::GcUnpin { ns } => handlers::gc::unpin(&state, ns, &body).await.into_response(),
-        Endpoint::GcSweep { ns } => handlers::gc::sweep(&state, ns).await.into_response(),
-        Endpoint::GcStatus { ns } => handlers::gc::status(&state, ns).await.into_response(),
-
-        Endpoint::FilterPut { ns, scope } => handlers::filter::register(&state, ns, scope, &body)
-            .await
-            .into_response(),
-        Endpoint::FilterList { ns } => handlers::filter::list(&state, ns).await.into_response(),
-        Endpoint::FilterDelete { ns, kappa } => handlers::filter::delete(&state, ns, kappa)
-            .await
-            .into_response(),
-
-        Endpoint::SequenceNext { ns, name } => {
-            let s = state.store.clone();
-            let n = ns.to_string();
-            let nm = name.to_string();
-            match tokio::task::spawn_blocking(move || s.sequence_next(&n, &nm)).await {
-                Ok(Ok(val)) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"name": name, "value": val})),
-                )
-                    .into_response(),
-                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
-        }
-        Endpoint::SequenceCurrent { ns, name } => {
-            let s = state.store.clone();
-            let n = ns.to_string();
-            let nm = name.to_string();
-            match tokio::task::spawn_blocking(move || s.sequence_current(&n, &nm)).await {
-                Ok(Ok(val)) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"name": name, "value": val})),
-                )
-                    .into_response(),
-                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
-        }
-        Endpoint::CascadeDelete { ns } => {
-            let v: Result<serde_json::Value, _> = serde_json::from_slice(&body);
-            match v {
-                Ok(v) => {
-                    let prefix = v["prefix"].as_str().map(String::from);
-                    let roots: Vec<String> = v["roots"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let rels: Vec<String> = v["relations"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let s = state.store.clone();
-                    let n = ns.to_string();
-                    match tokio::task::spawn_blocking(move || {
-                        let rel_refs: Vec<&str> = rels.iter().map(|s| s.as_str()).collect();
-                        if let Some(ref pfx) = prefix {
-                            s.remove_reachable_from_prefix(&n, pfx, &rel_refs)
-                        } else {
-                            s.remove_reachable(&n, &roots, &rel_refs)
-                        }
-                    })
-                    .await
-                    {
-                        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
-                        Ok(Err(e)) => error::AppError::Store(e).into_response(),
-                        Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-                    }
-                }
-                Err(e) => error::AppError::internal(&e.to_string()).into_response(),
-            }
-        }
-
-        Endpoint::NamespaceRoot { ns } => {
-            let s = state.store.clone();
-            let ns_str = ns.to_string();
-            match tokio::task::spawn_blocking(move || s.namespace_root(&ns_str)).await {
-                Ok(Ok((root, count))) => {
-                    let want_signed = p("signed") == Some("true");
-                    if want_signed {
-                        if let (Some(ref root_kappa), Some(ref signer)) = (&root, &state.signer) {
-                            let timestamp = chrono::Utc::now().to_rfc3339();
-                            let message = format!("{ns}\n{root_kappa}\n{timestamp}");
-                            let sig = signer.sign(message.as_bytes()).unwrap_or_default();
-                            let signed = crate::crypto::SignedRoot {
-                                namespace: ns.to_string(),
-                                root: root_kappa.clone(),
-                                timestamp,
-                                algorithm: signer.algorithm().to_string(),
-                                public_key: signer.public_key_bytes(),
-                                signature: sig,
-                                attestation: None,
-                            };
-                            return (StatusCode::OK, Json(signed)).into_response();
-                        }
-                    }
-                    (
-                        StatusCode::OK,
-                        Json(serde_json::json!({"root": root, "count": count})),
-                    )
-                        .into_response()
-                }
-                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
-        }
-        Endpoint::NamespaceProof { ns, name } => {
-            let s = state.store.clone();
-            let ns_str = ns.to_string();
-            let n = name.to_string();
-            match tokio::task::spawn_blocking(move || s.namespace_proof(&ns_str, &n)).await {
-                Ok(Ok(Some(proof))) => (StatusCode::OK, Json(proof)).into_response(),
-                Ok(Ok(None)) => error::AppError::TagUnknown.into_response(),
-                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
-        }
-
-        Endpoint::NotFound => {
-            error::AppError::NameInvalid("unknown route".to_string()).into_response()
-        }
-    };
-
-    if let Some(snap) = rate_snapshot {
-        ratelimit::limiter::attach_headers(&mut response, &snap);
+/// Classify an HTTP request into an OpClass based on method and path.
+///
+/// This is an exhaustive lookup covering every registered route.
+/// Adding a route to router() without a corresponding entry here
+/// defaults to method-based classification (GET/HEAD=Read,
+/// PUT/POST/PATCH=Write, DELETE=Admin). To maintain parity with the
+/// old compile-time enforcement, audit this function when adding routes.
+fn classify_request(method: &str, path: &str) -> OpClass {
+    // Exempt: version check and health probes
+    if path == "/v2" || path == "/v2/" || path.starts_with("/v2/_health/") {
+        return OpClass::Exempt;
     }
 
-    response
+    // Admin paths (POST/DELETE that are administrative, not content writes)
+    if path.contains("/gc/pin") || path.contains("/gc/unpin") || path.contains("/gc/sweep") {
+        return OpClass::Admin;
+    }
+    if path.contains("/_transaction/begin")
+        || path.ends_with("/commit")
+        || (path.contains("/_transaction/") && method == "DELETE")
+    {
+        return OpClass::Admin;
+    }
+    if path.contains("/_reconcile") {
+        return OpClass::Admin;
+    }
+    if path.contains("/blobs/_cascade") {
+        return OpClass::Admin;
+    }
+    if path.contains("/tags/_prefix") {
+        return OpClass::Admin;
+    }
+
+    // DELETE is always Admin
+    if method == "DELETE" {
+        return OpClass::Admin;
+    }
+
+    // Read: GET, HEAD (covers blob get/head, manifest get/head, tag list,
+    // tag get, edge query, schema get/list, filter list, gc status,
+    // referrers, namespace root/proof, sequence current, blob list,
+    // meta list, upload status, bundle create)
+    if matches!(method, "GET" | "HEAD") {
+        return OpClass::Read;
+    }
+
+    // Write: PUT, POST, PATCH (covers blob put, manifest put, tag put,
+    // tag batch, tag create, edge put, schema put, filter put,
+    // upload start/chunk/complete, bundle ingest, compose,
+    // transaction put, sequence next)
+    OpClass::Write
 }

@@ -1,43 +1,98 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::routes::param_first;
-use axum::http::HeaderMap;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use topcoat::context::{app_context, Cx};
+use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::{headers, uri, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
 use crate::auth;
-use crate::error::AppError;
 use crate::kappa::{verify_kappa, KappaLabel};
+use crate::store::fs::FsStore;
 use crate::store::KappaStore;
-use crate::AppState;
+use crate::MaxBlobSize;
 
-pub fn version_check() -> Response {
-    let body = serde_json::json!({"kappa-distribution": "2.0.0"});
-    (StatusCode::OK, Json(body)).into_response()
+use super::path_param;
+
+fn query_param(cx: &Cx, key: &str) -> Option<String> {
+    let query = uri(cx).query()?;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(super::tag::percent_decode(v));
+            }
+        }
+    }
+    None
 }
 
-pub async fn put(
-    state: &AppState,
+fn store(cx: &Cx) -> &Arc<FsStore> {
+    app_context::<Arc<FsStore>>(cx)
+}
+
+// -- Route entry points --
+
+pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = super::read_body(body).await?;
+        let ns = path_param(cx, "ns");
+        let kappa = path_param(cx, "kappa");
+        put(cx, ns, kappa, &bytes).await
+    })
+}
+
+pub fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        let kappa = path_param(cx, "kappa");
+        get(cx, ns, kappa).await
+    })
+}
+
+pub fn head_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        let kappa = path_param(cx, "kappa");
+        head(cx, ns, kappa).await
+    })
+}
+
+pub fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        let kappa = path_param(cx, "kappa");
+        delete(cx, ns, kappa).await
+    })
+}
+
+pub fn meta_list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        meta_list(cx, ns).await
+    })
+}
+
+// -- Domain logic --
+
+pub(crate) async fn put(
+    cx: &Cx,
     ns: &str,
     kappa_str: &str,
-    params: &HashMap<String, Vec<String>>,
-    headers: &HeaderMap,
     body: &[u8],
-) -> Result<Response, AppError> {
+) -> topcoat::Result<Response> {
     auth::authorize(ns, "blob.put")?;
 
-    if body.len() > state.max_blob_size {
-        return Err(AppError::NameInvalid(format!(
-            "body exceeds max blob size {}",
-            state.max_blob_size
-        )));
+    let max_size = app_context::<MaxBlobSize>(cx).0;
+    if body.len() > max_size {
+        return Err(bad_request(format!("body exceeds max blob size {max_size}")).into());
     }
 
-    KappaLabel::parse(kappa_str)?;
+    KappaLabel::parse(kappa_str).map_err(|e| bad_request(e.to_string()))?;
 
-    // Gate 1: admission filters (namespace-scoped)
-    let s = state.store.clone();
+    // Gate 1: admission filters
+    let s = store(cx).clone();
     let ns_owned = ns.to_string();
     let body_owned = body.to_vec();
     let filter_result = tokio::task::spawn_blocking({
@@ -48,52 +103,64 @@ pub async fn put(
     })
     .await?;
     if let Err(reason) = filter_result {
-        return Err(AppError::filter_rejected(&reason));
+        return Err(bad_request(format!("filter rejected: {reason}")).into());
     }
 
     // Gate 2: verify-on-put
     match verify_kappa(kappa_str, &body_owned) {
         Ok(true) => {}
         Ok(false) => {
-            return Err(AppError::digest_invalid(kappa_str, "content hash mismatch"));
+            return Err(bad_request(format!(
+                "digest invalid: expected {kappa_str}, got content hash mismatch"
+            ))
+            .into());
         }
-        Err(e) => return Err(AppError::from(e)),
+        Err(e) => return Err(e.into()),
     }
 
     // Gate 3: multi-label verification
-    if let Some(also_str) = param_first(params, "also") {
-        match verify_kappa(also_str, &body_owned) {
+    if let Some(also_str) = query_param(cx, "also") {
+        match verify_kappa(&also_str, &body_owned) {
             Ok(true) => {}
             Ok(false) => {
-                return Err(AppError::digest_invalid(also_str, "also kappa mismatch"));
+                return Err(bad_request(format!(
+                    "digest invalid: {also_str}, also kappa mismatch"
+                ))
+                .into());
             }
-            Err(e) => return Err(AppError::from(e)),
+            Err(e) => return Err(e.into()),
         }
     }
 
     // Store blob
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa_str.to_string();
     let content = body_owned.clone();
-    let created = tokio::task::spawn_blocking(move || s.put(&k, &content)).await??;
+    let created = tokio::task::spawn_blocking(move || s.put(&k, &content))
+        .await?
+        .map_err(super::store_err)?;
 
     // Store Content-Type metadata
-    if let Some(ct) = headers.get("content-type") {
-        if let Ok(ct_str) = ct.to_str() {
-            let s = state.store.clone();
-            let k = kappa_str.to_string();
-            let ct_bytes = ct_str.as_bytes().to_vec();
-            tokio::task::spawn_blocking(move || s.put_meta(&k, "content-type", &ct_bytes))
-                .await??;
-        }
+    if let Some(ct) = headers(cx)
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+    {
+        let s = store(cx).clone();
+        let k = kappa_str.to_string();
+        let ct_bytes = ct.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || s.put_meta(&k, "content-type", &ct_bytes))
+            .await?
+            .map_err(super::store_err)?;
     }
 
     // Store multi-label alias
-    if let Some(also_str) = param_first(params, "also") {
-        let s = state.store.clone();
-        let ak = also_str.to_string();
+    if let Some(also_str) = query_param(cx, "also") {
+        let s = store(cx).clone();
+        let ak = also_str;
         let content = body_owned;
-        tokio::task::spawn_blocking(move || s.put(&ak, &content)).await??;
+        tokio::task::spawn_blocking(move || s.put(&ak, &content))
+            .await?
+            .map_err(super::store_err)?;
     }
 
     let status = if created {
@@ -101,57 +168,56 @@ pub async fn put(
     } else {
         StatusCode::OK
     };
-    Ok((
+    (
         status,
         [
             ("x-kappa-label", kappa_str.to_string()),
-            ("location", crate::routes::segments::blob_url(ns, kappa_str)),
+            ("location", crate::urls::blob_url(ns, kappa_str)),
             ("content-length", "0".to_string()),
         ],
     )
-        .into_response())
+        .into_response(cx)
 }
 
-pub async fn get(
-    state: &AppState,
-    ns: &str,
-    kappa: &str,
-    headers: &HeaderMap,
-) -> Result<Response, AppError> {
+async fn get(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "blob.get")?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa.to_string();
     let ct = tokio::task::spawn_blocking(move || s.get_meta(&k, "content-type"))
-        .await??
+        .await?
+        .ok()
+        .flatten()
         .and_then(|v| String::from_utf8(v).ok())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
     let axis = kappa.split(':').next().unwrap_or("sha256");
 
     // Range request support
-    if let Some(range_header) = headers.get("range").and_then(|v| v.to_str().ok()) {
+    if let Some(range_header) = headers(cx).get("range").and_then(|v| v.to_str().ok()) {
         if let Some(range) = parse_range_header(range_header) {
-            let s = state.store.clone();
+            let s = store(cx).clone();
             let k = kappa.to_string();
             let total_size = tokio::task::spawn_blocking(move || s.blob_size(&k))
-                .await??
-                .ok_or(AppError::BlobUnknown)?;
-            // Reject: start >= total, or backwards range (start > end)
-            if range.0 >= total_size
-                || range.1.is_some_and(|end| end < range.0)
-            {
-                return Err(AppError::Store(
-                    crate::store::StoreError::RangeNotSatisfiable { size: total_size },
-                ));
+                .await?
+                .map_err(super::store_err)?
+                .ok_or_else(not_found)?;
+            if range.0 >= total_size || range.1.is_some_and(|end| end < range.0) {
+                return (
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [("content-range", format!("bytes */{total_size}"))],
+                    "range not satisfiable",
+                )
+                    .into_response(cx);
             }
             let (offset, length) = resolve_range(range, total_size);
             let end = offset + length - 1;
-            let s = state.store.clone();
+            let s = store(cx).clone();
             let k = kappa.to_string();
-            let content =
-                tokio::task::spawn_blocking(move || s.blob_get_range(&k, offset, length)).await??;
-            return Ok((
+            let content = tokio::task::spawn_blocking(move || s.blob_get_range(&k, offset, length))
+                .await?
+                .map_err(super::store_err)?;
+            return (
                 StatusCode::PARTIAL_CONTENT,
                 [
                     ("content-length", content.len().to_string()),
@@ -167,16 +233,18 @@ pub async fn get(
                 ],
                 content,
             )
-                .into_response());
+                .into_response(cx);
         }
     }
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa.to_string();
-    let content = tokio::task::spawn_blocking(move || s.get(&k)).await??;
-    let content = content.ok_or(AppError::BlobUnknown)?;
+    let content = tokio::task::spawn_blocking(move || s.get(&k))
+        .await?
+        .map_err(super::store_err)?;
+    let content = content.ok_or_else(not_found)?;
 
-    Ok((
+    (
         StatusCode::OK,
         [
             ("content-length", content.len().to_string()),
@@ -188,11 +256,9 @@ pub async fn get(
         ],
         content,
     )
-        .into_response())
+        .into_response(cx)
 }
 
-/// Parse "bytes=N-M" or "bytes=N-" from a Range header value.
-/// Returns (offset, optional end).
 fn parse_range_header(header: &str) -> Option<(u64, Option<u64>)> {
     let range = header.strip_prefix("bytes=")?;
     let (start_str, end_str) = range.split_once('-')?;
@@ -205,33 +271,34 @@ fn parse_range_header(header: &str) -> Option<(u64, Option<u64>)> {
     Some((start, end))
 }
 
-/// Resolve a parsed range against the total file size.
-/// Returns (offset, length).
 fn resolve_range(range: (u64, Option<u64>), total: u64) -> (u64, u64) {
     let (start, end) = range;
     let end = end.map_or(total - 1, |e| std::cmp::min(e, total - 1));
     (start, end - start + 1)
 }
 
-pub async fn head(state: &AppState, ns: &str, kappa: &str) -> Result<Response, AppError> {
+async fn head(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "blob.head")?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa.to_string();
     let size = tokio::task::spawn_blocking(move || s.blob_size(&k))
-        .await??
-        .ok_or(AppError::BlobUnknown)?;
+        .await?
+        .map_err(super::store_err)?
+        .ok_or_else(not_found)?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa.to_string();
     let ct = tokio::task::spawn_blocking(move || s.get_meta(&k, "content-type"))
-        .await??
+        .await?
+        .ok()
+        .flatten()
         .and_then(|v| String::from_utf8(v).ok())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
     let axis = kappa.split(':').next().unwrap_or("sha256");
 
-    Ok((
+    (
         StatusCode::OK,
         [
             ("content-length", size.to_string()),
@@ -242,40 +309,137 @@ pub async fn head(state: &AppState, ns: &str, kappa: &str) -> Result<Response, A
             ("docker-content-digest", kappa.to_string()),
         ],
     )
-        .into_response())
+        .into_response(cx)
 }
 
-pub async fn delete(state: &AppState, ns: &str, kappa: &str) -> Result<Response, AppError> {
+async fn delete(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "blob.delete")?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa.to_string();
-    tokio::task::spawn_blocking(move || s.remove(&k)).await??;
-    Ok(StatusCode::ACCEPTED.into_response())
+    tokio::task::spawn_blocking(move || s.remove(&k))
+        .await?
+        .map_err(super::store_err)?;
+    StatusCode::ACCEPTED.into_response(cx)
 }
 
-pub async fn list(state: &AppState, ns: &str, prefix: &str) -> Result<Response, AppError> {
-    auth::authorize(ns, "blob.list")?;
-
-    let s = state.store.clone();
-    let p = prefix.to_string();
-    let kappas = tokio::task::spawn_blocking(move || s.list(&p)).await??;
-    let body = serde_json::json!({"kappas": kappas});
-    Ok((StatusCode::OK, Json(body)).into_response())
-}
-
-pub async fn list_by_meta(
-    state: &AppState,
-    ns: &str,
-    key: &str,
-    value: &str,
-) -> Result<Response, AppError> {
+async fn meta_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "blob.list_by_meta")?;
 
-    let s = state.store.clone();
-    let k = key.to_string();
-    let v = value.to_string();
-    let kappas = tokio::task::spawn_blocking(move || s.list_by_meta(&k, &v)).await??;
+    let filters = query_params_multi(cx, "filter");
+    if !filters.is_empty() {
+        let parsed: Vec<(String, String)> = filters
+            .iter()
+            .filter_map(|f| {
+                let (k, v) = f.split_once(':')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect();
+        if parsed.len() == 1 {
+            let s = store(cx).clone();
+            let n = ns.to_string();
+            let k = parsed[0].0.clone();
+            let v = parsed[0].1.clone();
+            let kappas = tokio::task::spawn_blocking(move || s.meta_query(&n, &k, &v))
+                .await?
+                .map_err(super::store_err)?;
+            let body = serde_json::json!({"kappas": kappas});
+            return (
+                StatusCode::OK,
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response(cx);
+        } else {
+            let s = store(cx).clone();
+            let n = ns.to_string();
+            let kappas = tokio::task::spawn_blocking(move || {
+                let refs: Vec<(&str, &str)> = parsed
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                s.meta_query_compound(&n, &refs)
+            })
+            .await?
+            .map_err(super::store_err)?;
+            let body = serde_json::json!({"kappas": kappas});
+            return (
+                StatusCode::OK,
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response(cx);
+        }
+    }
+
+    let key = query_param(cx, "key").unwrap_or_default();
+    let value = query_param(cx, "value").unwrap_or_default();
+    if key.is_empty() {
+        let s = store(cx).clone();
+        let k = key;
+        let v = value;
+        let kappas = tokio::task::spawn_blocking(move || s.list_by_meta(&k, &v))
+            .await?
+            .map_err(super::store_err)?;
+        let body = serde_json::json!({"kappas": kappas});
+        return (
+            StatusCode::OK,
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response(cx);
+    }
+
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    let k = key;
+    let v = value;
+    let kappas = tokio::task::spawn_blocking(move || {
+        if v.is_empty() {
+            s.meta_query_exists(&n, &k)
+        } else {
+            s.meta_query(&n, &k, &v)
+        }
+    })
+    .await?
+    .map_err(super::store_err)?;
     let body = serde_json::json!({"kappas": kappas});
-    Ok((StatusCode::OK, Json(body)).into_response())
+    (
+        StatusCode::OK,
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response(cx)
+}
+
+pub fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        let prefix = query_param(cx, "prefix").unwrap_or_default();
+        auth::authorize(ns, "blob.list")?;
+        let s = store(cx).clone();
+        let kappas = tokio::task::spawn_blocking(move || s.list(&prefix))
+            .await?
+            .map_err(super::store_err)?;
+        let body = serde_json::json!({"kappas": kappas});
+        (
+            StatusCode::OK,
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+fn query_params_multi(cx: &Cx, key: &str) -> Vec<String> {
+    let Some(query) = uri(cx).query() else {
+        return Vec::new();
+    };
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == key {
+                Some(super::tag::percent_decode(v))
+            } else {
+                None
+            }
+        })
+        .collect()
 }

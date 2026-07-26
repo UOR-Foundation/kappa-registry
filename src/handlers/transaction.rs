@@ -1,78 +1,139 @@
-//! Multi-object transaction HTTP handlers (P3).
-//!
-//! POST   /v2/{ns}/_transaction/begin          Begin a new transaction
-//! PUT    /v2/{ns}/_transaction/{id}/{kappa}    Stage a blob in the transaction
-//! POST   /v2/{ns}/_transaction/{id}/commit     Commit (promote all staged objects)
-//! DELETE /v2/{ns}/_transaction/{id}            Abort (discard all staged objects)
+use std::sync::Arc;
 
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use topcoat::context::{app_context, Cx};
+use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
 use crate::auth;
-use crate::error::AppError;
-use crate::AppState;
+use crate::store::fs::FsStore;
+use crate::transaction::TransactionManager;
 
-pub async fn begin(state: &AppState, ns: &str) -> Result<Response, AppError> {
-    auth::authorize(ns, "transaction.begin")?;
+use super::path_param;
 
-    let txn_id = state
-        .transactions
-        .begin(ns)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let body = serde_json::json!({"transaction_id": txn_id});
-    Ok((StatusCode::CREATED, Json(body)).into_response())
+fn store(cx: &Cx) -> &Arc<FsStore> {
+    app_context::<Arc<FsStore>>(cx)
 }
 
-pub async fn put(
-    state: &AppState,
+fn transactions(cx: &Cx) -> &Arc<TransactionManager> {
+    app_context::<Arc<TransactionManager>>(cx)
+}
+
+pub fn begin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        begin(cx, ns).await
+    })
+}
+
+pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = super::read_body(body).await?;
+        let ns = path_param(cx, "ns");
+        let id = path_param(cx, "id");
+        let kappa = path_param(cx, "kappa");
+        put(cx, ns, id, kappa, &bytes).await
+    })
+}
+
+pub fn commit_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        let id = path_param(cx, "id");
+        commit(cx, ns, id).await
+    })
+}
+
+pub fn abort_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        let id = path_param(cx, "id");
+        abort(cx, ns, id).await
+    })
+}
+
+async fn begin(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+    auth::authorize(ns, "transaction.begin")?;
+
+    let txn_id = transactions(cx).begin(ns).map_err(topcoat::Error::from)?;
+
+    let body = serde_json::json!({"transaction_id": txn_id});
+    (
+        StatusCode::CREATED,
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response(cx)
+}
+
+async fn put(
+    cx: &Cx,
     ns: &str,
     txn_id: &str,
     kappa: &str,
     body: &[u8],
-) -> Result<Response, AppError> {
+) -> topcoat::Result<Response> {
     auth::authorize(ns, "transaction.put")?;
 
     let txn = txn_id.to_string();
     let k = kappa.to_string();
     let content = body.to_vec();
-    let txns = state.transactions.clone();
-    let created = tokio::task::spawn_blocking(move || txns.put(&txn, &k, &content)).await??;
+    let txns = transactions(cx).clone();
+    let created = tokio::task::spawn_blocking(move || txns.put(&txn, &k, &content))
+        .await?
+        .map_err(|e| match e {
+            crate::store::StoreError::NotFound => topcoat::Error::from(not_found()),
+            other => topcoat::Error::from(bad_request(other.to_string())),
+        })?;
 
     let status = if created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
-    Ok((
+    (
         status,
         [
             ("x-kappa-label", kappa.to_string()),
             ("content-length", "0".to_string()),
         ],
     )
-        .into_response())
+        .into_response(cx)
 }
 
-pub async fn commit(state: &AppState, ns: &str, txn_id: &str) -> Result<Response, AppError> {
+async fn commit(cx: &Cx, ns: &str, txn_id: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "transaction.commit")?;
 
     let txn = txn_id.to_string();
-    let txns = state.transactions.clone();
-    let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || txns.commit(&txn, &*store)).await??;
+    let txns = transactions(cx).clone();
+    let s = store(cx).clone();
+    let result = tokio::task::spawn_blocking(move || txns.commit(&txn, &*s))
+        .await?
+        .map_err(|e| match e {
+            crate::store::StoreError::NotFound => topcoat::Error::from(not_found()),
+            other => topcoat::Error::from(bad_request(other.to_string())),
+        })?;
 
     let body = serde_json::json!({"promoted": result.promoted});
-    Ok((StatusCode::OK, Json(body)).into_response())
+    (
+        StatusCode::OK,
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response(cx)
 }
 
-pub async fn abort(state: &AppState, ns: &str, txn_id: &str) -> Result<Response, AppError> {
+async fn abort(cx: &Cx, ns: &str, txn_id: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "transaction.abort")?;
 
     let txn = txn_id.to_string();
-    let txns = state.transactions.clone();
-    tokio::task::spawn_blocking(move || txns.abort(&txn)).await??;
+    let txns = transactions(cx).clone();
+    tokio::task::spawn_blocking(move || txns.abort(&txn))
+        .await?
+        .map_err(|e| match e {
+            crate::store::StoreError::NotFound => topcoat::Error::from(not_found()),
+            other => topcoat::Error::from(bad_request(other.to_string())),
+        })?;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    StatusCode::NO_CONTENT.into_response(cx)
 }

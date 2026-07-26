@@ -65,7 +65,7 @@ fn blob_verify_on_put_rejects_mismatch() {
     );
     assert_eq!(status, 400);
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("DIGEST_INVALID"), "body: {text}");
+    assert!(text.contains("digest invalid"), "body: {text}");
 }
 
 #[test]
