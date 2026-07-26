@@ -1,4 +1,6 @@
+pub mod akd_adapter;
 mod blob;
+pub mod db_cache;
 mod edge;
 mod filter;
 pub mod fingerprint;
@@ -105,9 +107,9 @@ impl KappaStore for FsStore {
         path: &str,
         name: &str,
         kappa: &str,
-        expected: Option<&str>,
+        expected_version: u64,
     ) -> Result<bool, StoreError> {
-        tag::set_if(&self.root, path, name, kappa, expected)
+        tag::set_if(&self.root, path, name, kappa, expected_version)
     }
     fn tag_all_kappas_global(&self) -> Result<Vec<String>, StoreError> {
         tag::all_kappas_global(&self.root)
@@ -134,6 +136,7 @@ impl KappaStore for FsStore {
     fn edge_put(
         &self,
         ns: &str,
+        asserter: &str,
         edge_kappa: &str,
         src: &str,
         rel: &str,
@@ -141,7 +144,9 @@ impl KappaStore for FsStore {
         canon: &[u8],
         metadata: serde_json::Value,
     ) -> Result<bool, StoreError> {
-        edge::put(&self.root, ns, edge_kappa, src, rel, tgt, canon, metadata)
+        edge::put(
+            &self.root, ns, asserter, edge_kappa, src, rel, tgt, canon, metadata,
+        )
     }
     fn edge_query(
         &self,
@@ -153,6 +158,15 @@ impl KappaStore for FsStore {
         last: Option<&str>,
     ) -> Result<Vec<EdgeRecord>, StoreError> {
         edge::query(&self.root, ns, node, dir, rel, n, last)
+    }
+    fn edge_query_by_asserter(
+        &self,
+        ns: &str,
+        node: &str,
+        asserter: Option<&str>,
+        rel: Option<&str>,
+    ) -> Result<Vec<EdgeRecord>, StoreError> {
+        edge::query_by_asserter(&self.root, ns, node, asserter, rel)
     }
     fn edge_remove(&self, ns: &str, edge_kappa: &str) -> Result<bool, StoreError> {
         edge::remove(&self.root, ns, edge_kappa)

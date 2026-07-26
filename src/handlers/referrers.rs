@@ -3,7 +3,8 @@ use std::sync::Arc;
 use topcoat::context::{app_context, Cx};
 use topcoat::router::{Body, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::{Direction, KappaStore};
 
@@ -35,28 +36,36 @@ pub fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 async fn list(cx: &Cx, ns: &str, digest: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "referrers.list")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
-    let node = digest.to_string();
     let n = ns.to_string();
-    let edges = tokio::task::spawn_blocking(move || {
-        s.edge_query(&n, &node, Direction::Inbound, Some("refers-to"), None, None)
+    let node = digest.to_string();
+    let edges = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        move || {
+            authorize(&*s, &n, OpClass::Read, &a)?;
+            s.edge_query(&n, &node, Direction::Inbound, Some("refers-to"), None, None)
+        }
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
 
     let artifact_type_filter = query_param(cx, "artifactType");
 
     let mut descriptors: Vec<serde_json::Value> = Vec::new();
     for edge in &edges {
-        let s = store(cx).clone();
         let source = edge.source.clone();
-        let manifest_bytes = tokio::task::spawn_blocking(move || s.get(&source))
-            .await?
-            .map_err(super::store_err)?;
+        let manifest_bytes = tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.get(&source)
+        })
+        .await??;
         if let Some(body) = manifest_bytes {
-            let manifest: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let manifest: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             let media_type = manifest
                 .get("mediaType")
                 .and_then(|m| m.as_str())

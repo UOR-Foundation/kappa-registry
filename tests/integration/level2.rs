@@ -11,8 +11,8 @@ fn batch_cas_all_succeed() {
 
     let body = format!(
         r#"{{"updates":[
-            {{"name":"ref-a","kappa":"{k1}","expected":null}},
-            {{"name":"ref-b","kappa":"{k2}","expected":null}}
+            {{"name":"ref-a","kappa":"{k1}","expected_version":null}},
+            {{"name":"ref-b","kappa":"{k2}","expected_version":null}}
         ]}}"#
     );
     let (status, _, resp) = request(
@@ -51,8 +51,8 @@ fn batch_cas_partial_failure_rolls_back() {
 
     let body = format!(
         r#"{{"updates":[
-            {{"name":"ref-a","kappa":"{k1}","expected":null}},
-            {{"name":"ref-b","kappa":"{k2}","expected":null}}
+            {{"name":"ref-a","kappa":"{k1}","expected_version":0}},
+            {{"name":"ref-b","kappa":"{k2}","expected_version":0}}
         ]}}"#
     );
     let (status, _, resp) = request(
@@ -91,7 +91,7 @@ fn batch_cas_update_with_expected() {
     // Batch update with correct expected value
     let body = format!(
         r#"{{"updates":[
-            {{"name":"versioned","kappa":"{k_new}","expected":"{k_old}"}}
+            {{"name":"versioned","kappa":"{k_new}","expected_version":1}}
         ]}}"#
     );
     let (status, _, resp) = request(
@@ -381,22 +381,22 @@ fn cas_if_match() {
     // Bind tag to k1
     request(&srv.addr, "PUT", &tag_put_uri(ns, "cas-tag", &k1), &[], b"");
 
-    // CAS success: If-Match k1, set to k2
+    // CAS success: If-Match version 1 (first creation), set to k2
     let (status, _, _) = request(
         &srv.addr,
         "PUT",
         &tag_put_uri(ns, "cas-tag", &k2),
-        &[("If-Match", &k1)],
+        &[("If-Match", "1")],
         b"",
     );
     assert!(status == 200 || status == 201, "CAS success: {status}");
 
-    // CAS failure: If-Match with wrong expected
+    // CAS failure: If-Match with wrong version
     let (status, _, _) = request(
         &srv.addr,
         "PUT",
         &tag_put_uri(ns, "cas-tag", &k1),
-        &[("If-Match", &absent_kappa())],
+        &[("If-Match", "999")],
         b"",
     );
     assert!(status == 409 || status == 412, "CAS conflict: {status}");

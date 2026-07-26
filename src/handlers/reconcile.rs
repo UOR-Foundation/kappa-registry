@@ -4,7 +4,8 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::KappaStore;
 
@@ -23,9 +24,13 @@ pub fn handle_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 async fn handle(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "reconcile")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking(move || authorize(&*s, &n, OpClass::Write, &asserter)).await??;
 
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let msg_type = v["type"]
         .as_str()
         .ok_or_else(|| bad_request("missing type field"))?;
@@ -58,8 +63,7 @@ async fn handle_fingerprint(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat
     let our = tokio::task::spawn_blocking(move || {
         s.range_fingerprint(&ns_owned, &lower_owned, &upper_owned)
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
 
     if peer_fp.len() == 32 && our.fingerprint[..] == peer_fp[..] {
         let resp = serde_json::json!({"type": "done", "lower": lower, "upper": upper});
@@ -79,8 +83,7 @@ async fn handle_fingerprint(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat
         let items = tokio::task::spawn_blocking(move || {
             s.range_items(&ns_owned, &lower_owned, &upper_owned)
         })
-        .await?
-        .map_err(super::store_err)?;
+        .await??;
 
         let resp =
             serde_json::json!({"type": "items", "lower": lower, "upper": upper, "items": items});
@@ -97,8 +100,7 @@ async fn handle_fingerprint(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat
     let upper_owned = upper.to_string();
     let items =
         tokio::task::spawn_blocking(move || s.range_items(&ns_owned, &lower_owned, &upper_owned))
-            .await?
-            .map_err(super::store_err)?;
+            .await??;
 
     const RANGE_DIVISION: usize = 4;
     let chunk_size = items.len().div_ceil(RANGE_DIVISION);
@@ -115,9 +117,8 @@ async fn handle_fingerprint(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat
         let ns_owned = ns.to_string();
         let sl = sub_lower.clone();
         let su = sub_upper.clone();
-        let sub_fp = tokio::task::spawn_blocking(move || s.range_fingerprint(&ns_owned, &sl, &su))
-            .await?
-            .map_err(super::store_err)?;
+        let sub_fp =
+            tokio::task::spawn_blocking(move || s.range_fingerprint(&ns_owned, &sl, &su)).await??;
 
         sub_ranges.push(serde_json::json!({
             "type": "fingerprint",
@@ -146,9 +147,8 @@ async fn handle_fingerprint(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat
         let su = sr["upper"].as_str().unwrap_or("").to_string();
         let s = store(cx).clone();
         let ns_owned = ns.to_string();
-        let fp = tokio::task::spawn_blocking(move || s.range_fingerprint(&ns_owned, &sl, &su))
-            .await?
-            .map_err(super::store_err)?;
+        let fp =
+            tokio::task::spawn_blocking(move || s.range_fingerprint(&ns_owned, &sl, &su)).await??;
         corrected.push(serde_json::json!({
             "type": "fingerprint",
             "lower": sr["lower"],
@@ -184,8 +184,7 @@ async fn handle_items_request(
     let upper_owned = upper.to_string();
     let items =
         tokio::task::spawn_blocking(move || s.range_items(&ns_owned, &lower_owned, &upper_owned))
-            .await?
-            .map_err(super::store_err)?;
+            .await??;
 
     let resp = serde_json::json!({"type": "items", "lower": lower, "upper": upper, "items": items});
     (
@@ -227,8 +226,7 @@ async fn handle_items(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat::Resu
     let upper_owned = upper.to_string();
     let our_items =
         tokio::task::spawn_blocking(move || s.range_items(&ns_owned, &lower_owned, &upper_owned))
-            .await?
-            .map_err(super::store_err)?;
+            .await??;
 
     let peer_set: std::collections::HashSet<&str> = peer_items.iter().map(|s| s.as_str()).collect();
     let new_for_peer: Vec<&str> = our_items

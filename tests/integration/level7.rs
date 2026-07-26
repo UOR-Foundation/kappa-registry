@@ -117,7 +117,7 @@ fn namespace_root_updates_on_batch() {
 
     // Batch add second tag
     let batch_body =
-        format!(r#"{{"updates":[{{"name":"second","kappa":"{ka}","expected":null}}]}}"#);
+        format!(r#"{{"updates":[{{"name":"second","kappa":"{ka}","expected_version":null}}]}}"#);
     request(
         &srv.addr,
         "POST",
@@ -226,8 +226,8 @@ fn batch_cas_rollback_on_failure() {
     //        create ref-b (fails, already exists)
     let batch_body = format!(
         r#"{{"updates":[
-            {{"name":"ref-a","kappa":"{ka}","expected":null}},
-            {{"name":"ref-b","kappa":"{kb}","expected":null}}
+            {{"name":"ref-a","kappa":"{ka}","expected_version":0}},
+            {{"name":"ref-b","kappa":"{kb}","expected_version":0}}
         ]}}"#
     );
     let (status, _, body) = request(

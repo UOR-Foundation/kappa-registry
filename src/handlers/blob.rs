@@ -4,8 +4,9 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{headers, uri, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
 use crate::kappa::{verify_kappa, KappaLabel};
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::KappaStore;
 use crate::MaxBlobSize;
@@ -27,8 +28,6 @@ fn query_param(cx: &Cx, key: &str) -> Option<String> {
 fn store(cx: &Cx) -> &Arc<FsStore> {
     app_context::<Arc<FsStore>>(cx)
 }
-
-// -- Route entry points --
 
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
@@ -74,40 +73,39 @@ pub fn meta_list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
-// -- Domain logic --
-
 pub(crate) async fn put(
     cx: &Cx,
     ns: &str,
     kappa_str: &str,
     body: &[u8],
 ) -> topcoat::Result<Response> {
-    auth::authorize(ns, "blob.put")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    let a = asserter;
+    let b = body.to_vec();
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = a.clone();
+        let b = b.clone();
+        move || {
+            authorize(&*s, &n, OpClass::Write, &a)?;
+            s.filter_evaluate(&n, &b).map_err(|reason| {
+                crate::store::StoreError::Rejected(format!("filter rejected: {reason}"))
+            })
+        }
+    })
+    .await??;
 
     let max_size = app_context::<MaxBlobSize>(cx).0;
-    if body.len() > max_size {
+    if b.len() > max_size {
         return Err(bad_request(format!("body exceeds max blob size {max_size}")).into());
     }
 
-    KappaLabel::parse(kappa_str).map_err(|e| bad_request(e.to_string()))?;
+    KappaLabel::parse(kappa_str)?;
 
-    // Gate 1: admission filters
-    let s = store(cx).clone();
-    let ns_owned = ns.to_string();
-    let body_owned = body.to_vec();
-    let filter_result = tokio::task::spawn_blocking({
-        let s = s.clone();
-        let n = ns_owned.clone();
-        let b = body_owned.clone();
-        move || s.filter_evaluate(&n, &b)
-    })
-    .await?;
-    if let Err(reason) = filter_result {
-        return Err(bad_request(format!("filter rejected: {reason}")).into());
-    }
-
-    // Gate 2: verify-on-put
-    match verify_kappa(kappa_str, &body_owned) {
+    match verify_kappa(kappa_str, &b) {
         Ok(true) => {}
         Ok(false) => {
             return Err(bad_request(format!(
@@ -118,9 +116,8 @@ pub(crate) async fn put(
         Err(e) => return Err(e.into()),
     }
 
-    // Gate 3: multi-label verification
     if let Some(also_str) = query_param(cx, "also") {
-        match verify_kappa(&also_str, &body_owned) {
+        match verify_kappa(&also_str, &b) {
             Ok(true) => {}
             Ok(false) => {
                 return Err(bad_request(format!(
@@ -132,35 +129,34 @@ pub(crate) async fn put(
         }
     }
 
-    // Store blob
-    let s = store(cx).clone();
     let k = kappa_str.to_string();
-    let content = body_owned.clone();
-    let created = tokio::task::spawn_blocking(move || s.put(&k, &content))
-        .await?
-        .map_err(super::store_err)?;
+    let content = b.clone();
+    let created = tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.put(&k, &content)
+    })
+    .await??;
 
-    // Store Content-Type metadata
     if let Some(ct) = headers(cx)
         .get("content-type")
         .and_then(|v| v.to_str().ok())
     {
-        let s = store(cx).clone();
         let k = kappa_str.to_string();
         let ct_bytes = ct.as_bytes().to_vec();
-        tokio::task::spawn_blocking(move || s.put_meta(&k, "content-type", &ct_bytes))
-            .await?
-            .map_err(super::store_err)?;
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.put_meta(&k, "content-type", &ct_bytes)
+        })
+        .await??;
     }
 
-    // Store multi-label alias
     if let Some(also_str) = query_param(cx, "also") {
-        let s = store(cx).clone();
-        let ak = also_str;
-        let content = body_owned;
-        tokio::task::spawn_blocking(move || s.put(&ak, &content))
-            .await?
-            .map_err(super::store_err)?;
+        let content = b;
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.put(&also_str, &content)
+        })
+        .await??;
     }
 
     let status = if created {
@@ -180,28 +176,35 @@ pub(crate) async fn put(
 }
 
 async fn get(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "blob.get")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let k = kappa.to_string();
-    let ct = tokio::task::spawn_blocking(move || s.get_meta(&k, "content-type"))
-        .await?
-        .ok()
-        .flatten()
-        .and_then(|v| String::from_utf8(v).ok())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let ct = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        let k = k.clone();
+        move || {
+            authorize(&*s, &n, OpClass::Read, &a)?;
+            s.get_meta(&k, "content-type")
+        }
+    })
+    .await??
+    .and_then(|v| String::from_utf8(v).ok())
+    .unwrap_or_else(|| "application/octet-stream".to_string());
 
     let axis = kappa.split(':').next().unwrap_or("sha256");
 
-    // Range request support
     if let Some(range_header) = headers(cx).get("range").and_then(|v| v.to_str().ok()) {
         if let Some(range) = parse_range_header(range_header) {
-            let s = store(cx).clone();
             let k = kappa.to_string();
-            let total_size = tokio::task::spawn_blocking(move || s.blob_size(&k))
-                .await?
-                .map_err(super::store_err)?
-                .ok_or_else(not_found)?;
+            let total_size = tokio::task::spawn_blocking({
+                let s = s.clone();
+                move || s.blob_size(&k)
+            })
+            .await??
+            .ok_or_else(not_found)?;
             if range.0 >= total_size || range.1.is_some_and(|end| end < range.0) {
                 return (
                     StatusCode::RANGE_NOT_SATISFIABLE,
@@ -212,11 +215,12 @@ async fn get(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
             }
             let (offset, length) = resolve_range(range, total_size);
             let end = offset + length - 1;
-            let s = store(cx).clone();
             let k = kappa.to_string();
-            let content = tokio::task::spawn_blocking(move || s.blob_get_range(&k, offset, length))
-                .await?
-                .map_err(super::store_err)?;
+            let content = tokio::task::spawn_blocking({
+                let s = s.clone();
+                move || s.blob_get_range(&k, offset, length)
+            })
+            .await??;
             return (
                 StatusCode::PARTIAL_CONTENT,
                 [
@@ -237,12 +241,10 @@ async fn get(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
         }
     }
 
-    let s = store(cx).clone();
     let k = kappa.to_string();
     let content = tokio::task::spawn_blocking(move || s.get(&k))
-        .await?
-        .map_err(super::store_err)?;
-    let content = content.ok_or_else(not_found)?;
+        .await??
+        .ok_or_else(not_found)?;
 
     (
         StatusCode::OK,
@@ -278,23 +280,30 @@ fn resolve_range(range: (u64, Option<u64>), total: u64) -> (u64, u64) {
 }
 
 async fn head(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "blob.head")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let k = kappa.to_string();
-    let size = tokio::task::spawn_blocking(move || s.blob_size(&k))
-        .await?
-        .map_err(super::store_err)?
-        .ok_or_else(not_found)?;
+    let size = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        let k = k.clone();
+        move || {
+            authorize(&*s, &n, OpClass::Read, &a)?;
+            s.blob_size(&k)
+        }
+    })
+    .await??
+    .ok_or_else(not_found)?;
 
-    let s = store(cx).clone();
-    let k = kappa.to_string();
-    let ct = tokio::task::spawn_blocking(move || s.get_meta(&k, "content-type"))
-        .await?
-        .ok()
-        .flatten()
-        .and_then(|v| String::from_utf8(v).ok())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let ct = tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.get_meta(&k, "content-type")
+    })
+    .await??
+    .and_then(|v| String::from_utf8(v).ok())
+    .unwrap_or_else(|| "application/octet-stream".to_string());
 
     let axis = kappa.split(':').next().unwrap_or("sha256");
 
@@ -313,18 +322,29 @@ async fn head(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
 }
 
 async fn delete(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "blob.delete")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let k = kappa.to_string();
-    tokio::task::spawn_blocking(move || s.remove(&k))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Admin, &asserter)?;
+        s.remove(&k)
+    })
+    .await??;
     StatusCode::ACCEPTED.into_response(cx)
 }
 
 async fn meta_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "blob.list_by_meta")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        move || authorize(&*s, &n, OpClass::Read, &a)
+    })
+    .await??;
 
     let filters = query_params_multi(cx, "filter");
     if !filters.is_empty() {
@@ -336,13 +356,14 @@ async fn meta_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
             })
             .collect();
         if parsed.len() == 1 {
-            let s = store(cx).clone();
-            let n = ns.to_string();
             let k = parsed[0].0.clone();
             let v = parsed[0].1.clone();
-            let kappas = tokio::task::spawn_blocking(move || s.meta_query(&n, &k, &v))
-                .await?
-                .map_err(super::store_err)?;
+            let kappas = tokio::task::spawn_blocking({
+                let s = s.clone();
+                let n = n.clone();
+                move || s.meta_query(&n, &k, &v)
+            })
+            .await??;
             let body = serde_json::json!({"kappas": kappas});
             return (
                 StatusCode::OK,
@@ -350,17 +371,18 @@ async fn meta_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
             )
                 .into_response(cx);
         } else {
-            let s = store(cx).clone();
-            let n = ns.to_string();
-            let kappas = tokio::task::spawn_blocking(move || {
-                let refs: Vec<(&str, &str)> = parsed
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect();
-                s.meta_query_compound(&n, &refs)
+            let kappas = tokio::task::spawn_blocking({
+                let s = s.clone();
+                let n = n.clone();
+                move || {
+                    let refs: Vec<(&str, &str)> = parsed
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    s.meta_query_compound(&n, &refs)
+                }
             })
-            .await?
-            .map_err(super::store_err)?;
+            .await??;
             let body = serde_json::json!({"kappas": kappas});
             return (
                 StatusCode::OK,
@@ -373,12 +395,13 @@ async fn meta_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
     let key = query_param(cx, "key").unwrap_or_default();
     let value = query_param(cx, "value").unwrap_or_default();
     if key.is_empty() {
-        let s = store(cx).clone();
         let k = key;
         let v = value;
-        let kappas = tokio::task::spawn_blocking(move || s.list_by_meta(&k, &v))
-            .await?
-            .map_err(super::store_err)?;
+        let kappas = tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.list_by_meta(&k, &v)
+        })
+        .await??;
         let body = serde_json::json!({"kappas": kappas});
         return (
             StatusCode::OK,
@@ -387,8 +410,6 @@ async fn meta_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
             .into_response(cx);
     }
 
-    let s = store(cx).clone();
-    let n = ns.to_string();
     let k = key;
     let v = value;
     let kappas = tokio::task::spawn_blocking(move || {
@@ -398,8 +419,7 @@ async fn meta_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
             s.meta_query(&n, &k, &v)
         }
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
     let body = serde_json::json!({"kappas": kappas});
     (
         StatusCode::OK,
@@ -412,12 +432,15 @@ pub fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
         let ns = path_param(cx, "ns");
-        let prefix = query_param(cx, "prefix").unwrap_or_default();
-        auth::authorize(ns, "blob.list")?;
+        let asserter = super::registry_anchor(cx);
         let s = store(cx).clone();
-        let kappas = tokio::task::spawn_blocking(move || s.list(&prefix))
-            .await?
-            .map_err(super::store_err)?;
+        let n = ns.to_string();
+        let prefix = query_param(cx, "prefix").unwrap_or_default();
+        let kappas = tokio::task::spawn_blocking(move || {
+            authorize(&*s, &n, OpClass::Read, &asserter)?;
+            s.list(&prefix)
+        })
+        .await??;
         let body = serde_json::json!({"kappas": kappas});
         (
             StatusCode::OK,

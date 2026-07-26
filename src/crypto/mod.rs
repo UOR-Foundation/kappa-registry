@@ -6,9 +6,12 @@
 //!
 //! No HTTP surface. Protocol layers decide what gets signed.
 
+pub mod anchor;
 pub mod ecdsa;
 pub mod ed25519;
 pub mod keystore;
+pub mod threshold;
+pub mod vrf;
 
 use sha2::{Digest, Sha256};
 
@@ -36,6 +39,20 @@ impl std::fmt::Display for CryptoError {
 }
 
 impl std::error::Error for CryptoError {}
+
+impl topcoat::HttpErrorResponse for CryptoError {
+    fn status_code(&self) -> http::StatusCode {
+        match self {
+            CryptoError::InvalidSignature => http::StatusCode::BAD_REQUEST,
+            CryptoError::InvalidKey => http::StatusCode::INTERNAL_SERVER_ERROR,
+            CryptoError::UnsupportedAlgorithm(_) => http::StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn response_body(&self) -> String {
+        format!("crypto error: {self}")
+    }
+}
 
 pub trait RegistrySigner: Send + Sync {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CryptoError>;
