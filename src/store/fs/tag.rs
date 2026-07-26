@@ -28,7 +28,16 @@ fn read_index(path: &Path) -> Result<BTreeMap<String, IndexEntry>, StoreError> {
             let old: BTreeMap<String, String> = serde_json::from_slice(&data)?;
             Ok(old
                 .into_iter()
-                .map(|(k, v)| (k, IndexEntry { value: v, mtime: 0 }))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        IndexEntry {
+                            value: v,
+                            mtime: 0,
+                            version: 0,
+                        },
+                    )
+                })
                 .collect())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
@@ -87,11 +96,13 @@ fn write_root(
 pub fn set(root: &Path, ns: &str, name: &str, kappa: &str) -> Result<(), StoreError> {
     let path = index_path(root, ns);
     let mut index = read_index(&path)?;
+    let new_version = index.get(name).map(|e| e.version + 1).unwrap_or(1);
     index.insert(
         name.to_string(),
         IndexEntry {
             value: kappa.to_string(),
             mtime: now_millis(),
+            version: new_version,
         },
     );
     write_index(&path, &index)?;
@@ -140,11 +151,13 @@ pub fn get_raw(root: &Path, ns: &str, name: &str) -> Result<Option<String>, Stor
 pub fn set_symbolic(root: &Path, ns: &str, name: &str, target: &str) -> Result<(), StoreError> {
     let path = index_path(root, ns);
     let mut index = read_index(&path)?;
+    let new_version = index.get(name).map(|e| e.version + 1).unwrap_or(1);
     index.insert(
         name.to_string(),
         IndexEntry {
             value: format!("{SYMREF_PREFIX}{target}"),
             mtime: now_millis(),
+            version: new_version,
         },
     );
     write_index(&path, &index)?;
@@ -212,35 +225,40 @@ pub fn delete(root: &Path, ns: &str, name: &str) -> Result<bool, StoreError> {
     }
 }
 
+/// Per-tag version CAS (D-5).
+/// expected_version = 0 means create-if-absent (tag must not exist).
+/// expected_version > 0 means the tag's current version must equal it.
 pub fn set_if(
     root: &Path,
     ns: &str,
     name: &str,
     kappa: &str,
-    expected: Option<&str>,
+    expected_version: u64,
 ) -> Result<bool, StoreError> {
     let path = index_path(root, ns);
     let mut index = read_index(&path)?;
     let current = index.get(name);
 
-    match expected {
-        Some(exp) => {
-            if current.map(|e| e.value.as_str()) != Some(exp) {
-                return Ok(false);
-            }
+    if expected_version == 0 {
+        // Create-if-absent: tag must not exist.
+        if current.is_some() {
+            return Ok(false);
         }
-        None => {
-            if current.is_some() {
-                return Ok(false);
-            }
+    } else {
+        // Per-tag version CAS: current version must match.
+        match current {
+            Some(entry) if entry.version == expected_version => {}
+            _ => return Ok(false),
         }
     }
 
+    let new_version = current.map(|e| e.version + 1).unwrap_or(1);
     index.insert(
         name.to_string(),
         IndexEntry {
             value: kappa.to_string(),
             mtime: now_millis(),
+            version: new_version,
         },
     );
     write_index(&path, &index)?;
@@ -276,30 +294,42 @@ pub fn set_batch(
     let path = index_path(root, ns);
     let mut index = read_index(&path)?;
 
-    // Phase 1: validate all CAS expectations before any writes.
+    // Phase 1: validate all CAS expectations before any writes (D-5: per-tag version).
     for (i, update) in updates.iter().enumerate() {
-        match &update.expected {
-            Some(exp) if exp.is_empty() => {
+        match update.expected_version {
+            None => {
                 // Unconditional -- no CAS check
             }
-            Some(exp) => {
-                let current = index.get(&update.name);
-                if current.map(|e| e.value.as_str()) != Some(exp.as_str()) {
-                    let reason = match current {
-                        Some(cur) => {
-                            format!("expected {}, current is {}", exp, cur.value)
-                        }
-                        None => format!("expected {}, tag does not exist", exp),
-                    };
-                    return Ok(BatchResult::Failed { index: i, reason });
-                }
+            Some(0) if index.contains_key(&update.name) => {
+                return Ok(BatchResult::Failed {
+                    index: i,
+                    reason: "tag already exists".to_string(),
+                });
             }
-            None => {
-                if index.contains_key(&update.name) {
-                    return Ok(BatchResult::Failed {
-                        index: i,
-                        reason: "tag already exists".to_string(),
-                    });
+            Some(0) => {}
+
+            Some(expected) => {
+                let current = index.get(&update.name);
+                match current {
+                    Some(entry) if entry.version == expected => {}
+                    Some(entry) => {
+                        return Ok(BatchResult::Failed {
+                            index: i,
+                            reason: format!(
+                                "version mismatch: expected {}, current is {}",
+                                expected, entry.version
+                            ),
+                        });
+                    }
+                    None => {
+                        return Ok(BatchResult::Failed {
+                            index: i,
+                            reason: format!(
+                                "version mismatch: expected {}, tag does not exist",
+                                expected
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -308,11 +338,13 @@ pub fn set_batch(
     // Phase 2: all validations passed -- apply all updates.
     let ts = now_millis();
     for update in updates {
+        let new_version = index.get(&update.name).map(|e| e.version + 1).unwrap_or(1);
         index.insert(
             update.name.clone(),
             IndexEntry {
                 value: update.new_kappa.clone(),
                 mtime: ts,
+                version: new_version,
             },
         );
     }

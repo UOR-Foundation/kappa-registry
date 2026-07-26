@@ -17,6 +17,8 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{to_bytes, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
+use crate::auth::authorize;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::KappaStore;
 
@@ -47,42 +49,26 @@ fn store(cx: &Cx) -> &Arc<FsStore> {
     app_context::<Arc<FsStore>>(cx)
 }
 
+/// Get the registry's own anchor kappa (D-1).
+///
+/// For unsigned writes (all OCI traffic), the asserter is the registry itself.
+/// The anchor is derived from the registry's default signing key. If no
+/// signer is configured, returns a deterministic fallback.
+pub(crate) fn registry_anchor(cx: &Cx) -> String {
+    let holder = app_context::<crate::SignerHolder>(cx);
+    match &holder.0 {
+        Some(signer) => {
+            crate::crypto::anchor::anchor_from_key(signer.algorithm(), &signer.public_key_bytes())
+        }
+        None => crate::crypto::anchor::anchor_from_key("none", &[]),
+    }
+}
+
 /// Read the request body, returning a bad-request error on failure.
 pub(crate) async fn read_body(body: Body) -> topcoat::Result<topcoat::router::Bytes> {
     to_bytes(body, usize::MAX)
         .await
         .map_err(|e| bad_request(format!("failed to read request body: {e}")).into())
-}
-
-/// Map a StoreError to the correct HTTP status code.
-///
-/// Used at every `.await?` boundary on store operations. Converts
-/// NotFound to 404, Conflict to 409, bundle/delta errors to 400,
-/// RangeNotSatisfiable to 400 (the 416 response with Content-Range
-/// header is handled explicitly in the blob handler), and Io to 500.
-pub(crate) fn store_err(e: crate::store::StoreError) -> topcoat::Error {
-    use crate::store::StoreError;
-    match e {
-        StoreError::NotFound => not_found().into(),
-        StoreError::Conflict(msg) => bad_request(format!("conflict: {msg}")).into(),
-        StoreError::Io(e) => topcoat::Error::from(e),
-        StoreError::RangeNotSatisfiable { size } => {
-            bad_request(format!("range not satisfiable: size {size}")).into()
-        }
-        StoreError::BundleTrailerMismatch
-        | StoreError::BundleDecodeLimitExceeded
-        | StoreError::BundleDeltaInNoDeltaBundle
-        | StoreError::BundleTruncated(_)
-        | StoreError::BundleKappaMismatch(_)
-        | StoreError::BundleUnsupportedEntryType(_) => bad_request(e.to_string()).into(),
-        StoreError::DeltaTruncated(_)
-        | StoreError::DeltaReservedOpcode
-        | StoreError::DeltaBaseSizeMismatch { .. }
-        | StoreError::DeltaResultSizeMismatch { .. }
-        | StoreError::DeltaCopyOutOfBounds { .. }
-        | StoreError::DeltaVarintOverflow
-        | StoreError::DeltaUnresolvableBase(_) => bad_request(e.to_string()).into(),
-    }
 }
 
 // -- Version check --
@@ -152,9 +138,11 @@ async fn cascade(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         })
         .unwrap_or_default();
 
+    let asserter = registry_anchor(cx);
     let s = store(cx).clone();
     let n = ns.to_string();
     let report = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Admin, &asserter)?;
         let rel_refs: Vec<&str> = rels.iter().map(|s| s.as_str()).collect();
         if let Some(ref pfx) = prefix {
             s.remove_reachable_from_prefix(&n, pfx, &rel_refs)
@@ -162,8 +150,7 @@ async fn cascade(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
             s.remove_reachable(&n, &roots, &rel_refs)
         }
     })
-    .await?
-    .map_err(store_err)?;
+    .await??;
 
     (
         StatusCode::OK,
@@ -179,12 +166,15 @@ pub fn sequence_next_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let _ = body;
         let ns = path_param(cx, "ns");
         let name = path_param(cx, "name");
+        let asserter = registry_anchor(cx);
         let s = store(cx).clone();
         let n = ns.to_string();
         let nm = name.to_string();
-        let val = tokio::task::spawn_blocking(move || s.sequence_next(&n, &nm))
-            .await?
-            .map_err(store_err)?;
+        let val = tokio::task::spawn_blocking(move || {
+            authorize(&*s, &n, OpClass::Write, &asserter)?;
+            s.sequence_next(&n, &nm)
+        })
+        .await??;
         let body = serde_json::json!({"name": name, "value": val});
         (
             StatusCode::OK,
@@ -199,12 +189,15 @@ pub fn sequence_current_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let _ = body;
         let ns = path_param(cx, "ns");
         let name = path_param(cx, "name");
+        let asserter = registry_anchor(cx);
         let s = store(cx).clone();
         let n = ns.to_string();
         let nm = name.to_string();
-        let val = tokio::task::spawn_blocking(move || s.sequence_current(&n, &nm))
-            .await?
-            .map_err(store_err)?;
+        let val = tokio::task::spawn_blocking(move || {
+            authorize(&*s, &n, OpClass::Read, &asserter)?;
+            s.sequence_current(&n, &nm)
+        })
+        .await??;
         let body = serde_json::json!({"name": name, "value": val});
         (
             StatusCode::OK,
@@ -220,11 +213,14 @@ pub fn namespace_root_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
         let ns = path_param(cx, "ns");
+        let asserter = registry_anchor(cx);
         let s = store(cx).clone();
         let ns_str = ns.to_string();
-        let (root, count) = tokio::task::spawn_blocking(move || s.namespace_root(&ns_str))
-            .await?
-            .map_err(store_err)?;
+        let (root, count) = tokio::task::spawn_blocking(move || {
+            authorize(&*s, &ns_str, OpClass::Read, &asserter)?;
+            s.namespace_root(&ns_str)
+        })
+        .await??;
 
         let want_signed = query_param(cx, "signed").as_deref() == Some("true");
         if want_signed {
@@ -265,12 +261,15 @@ pub fn namespace_proof_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let _ = body;
         let ns = path_param(cx, "ns");
         let name = path_param(cx, "name");
+        let asserter = registry_anchor(cx);
         let s = store(cx).clone();
         let ns_str = ns.to_string();
         let n = name.to_string();
-        let proof = tokio::task::spawn_blocking(move || s.namespace_proof(&ns_str, &n))
-            .await?
-            .map_err(store_err)?;
+        let proof = tokio::task::spawn_blocking(move || {
+            authorize(&*s, &ns_str, OpClass::Read, &asserter)?;
+            s.namespace_proof(&ns_str, &n)
+        })
+        .await??;
         match proof {
             Some(p) => (
                 StatusCode::OK,

@@ -4,6 +4,15 @@
 //! four tables with compound string keys. All edge operations within a
 //! namespace are atomic (single redb write transaction). Namespace
 //! isolation is structural -- different files, different Database handles.
+//!
+//! D-8: asserter goes LAST in the compound key so that existing prefix
+//! scans on source/target remain valid. `query_by_asserter` filters on
+//! field 4 of the compound key during the prefix scan, avoiding
+//! BY_KAPPA deserialization for non-matching asserters.
+//!
+//! Key layout (FORWARD): source | relation | target | asserter
+//! Key layout (REVERSE): target | relation | source | asserter
+//! Key layout (BY_RELATION): relation | source | target | asserter
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -38,16 +47,18 @@ fn is_table_missing(e: &TableError) -> bool {
     matches!(e, TableError::TableDoesNotExist(_))
 }
 
-/// Length-prefixed compound key: u16(a.len) + a + u16(b.len) + b + u16(c.len) + c.
-/// No delimiter character. Injection-immune regardless of field content.
-fn compound3(a: &str, b: &str, c: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + a.len() + b.len() + c.len());
+/// Length-prefixed compound key with 4 fields (D-8: asserter last).
+/// u16(a.len) + a + u16(b.len) + b + u16(c.len) + c + u16(d.len) + d.
+fn compound4(a: &str, b: &str, c: &str, d: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + a.len() + b.len() + c.len() + d.len());
     out.extend_from_slice(&(a.len() as u16).to_le_bytes());
     out.extend_from_slice(a.as_bytes());
     out.extend_from_slice(&(b.len() as u16).to_le_bytes());
     out.extend_from_slice(b.as_bytes());
     out.extend_from_slice(&(c.len() as u16).to_le_bytes());
     out.extend_from_slice(c.as_bytes());
+    out.extend_from_slice(&(d.len() as u16).to_le_bytes());
+    out.extend_from_slice(d.as_bytes());
     out
 }
 
@@ -69,29 +80,42 @@ fn prefix2(a: &str, b: &str) -> Vec<u8> {
     out
 }
 
-/// Parse the third field from a length-prefixed compound key.
-fn parse_field3(data: &[u8]) -> Option<&str> {
-    let mut pos = 0;
-    // Skip field 1
-    let len1 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
-    pos += 2 + len1;
-    // Skip field 2
-    let len2 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
-    pos += 2 + len2;
-    // Read field 3
-    let len3 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
-    pos += 2;
-    std::str::from_utf8(data.get(pos..pos + len3)?).ok()
+/// Parse a single field from a length-prefixed compound key at the given offset.
+/// Returns (field_str, bytes_consumed).
+fn parse_field_at(data: &[u8], pos: usize) -> Option<(&str, usize)> {
+    if data.len() < pos + 2 {
+        return None;
+    }
+    let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+    if data.len() < pos + 2 + len {
+        return None;
+    }
+    let field = std::str::from_utf8(&data[pos + 2..pos + 2 + len]).ok()?;
+    Some((field, 2 + len))
 }
 
 /// Parse field 2 (relation) from a length-prefixed compound key.
 fn parse_field2(data: &[u8]) -> Option<&str> {
-    let mut pos = 0;
-    let len1 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
-    pos += 2 + len1;
-    let len2 = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
-    pos += 2;
-    std::str::from_utf8(data.get(pos..pos + len2)?).ok()
+    let (_, skip1) = parse_field_at(data, 0)?;
+    let (field2, _) = parse_field_at(data, skip1)?;
+    Some(field2)
+}
+
+/// Parse field 3 (target in FORWARD, source in REVERSE) from a compound key.
+fn parse_field3(data: &[u8]) -> Option<&str> {
+    let (_, skip1) = parse_field_at(data, 0)?;
+    let (_, skip2) = parse_field_at(data, skip1)?;
+    let (field3, _) = parse_field_at(data, skip1 + skip2)?;
+    Some(field3)
+}
+
+/// Parse field 4 (asserter) from a compound key.
+fn parse_field4(data: &[u8]) -> Option<&str> {
+    let (_, skip1) = parse_field_at(data, 0)?;
+    let (_, skip2) = parse_field_at(data, skip1)?;
+    let (_, skip3) = parse_field_at(data, skip1 + skip2)?;
+    let (field4, _) = parse_field_at(data, skip1 + skip2 + skip3)?;
+    Some(field4)
 }
 
 /// Compute exclusive upper bound for prefix range scan.
@@ -120,11 +144,29 @@ fn prefix_scan_values(
     table: &impl ReadableTable<&'static [u8], &'static str>,
     prefix: &[u8],
 ) -> Result<Vec<String>, StoreError> {
+    prefix_scan_values_filtered(table, prefix, None)
+}
+
+/// Collect values from a table where keys start with the given prefix,
+/// optionally filtering by asserter (field 4 of the compound key).
+/// When `asserter` is Some, only keys whose field 4 matches are returned.
+/// This avoids BY_KAPPA deserialization for non-matching asserters.
+fn prefix_scan_values_filtered(
+    table: &impl ReadableTable<&'static [u8], &'static str>,
+    prefix: &[u8],
+    asserter: Option<&str>,
+) -> Result<Vec<String>, StoreError> {
     let mut results = Vec::new();
     let upper = prefix_upper_bound(prefix);
     let range = table.range(prefix..upper.as_slice()).map_err(redb_err)?;
     for entry in range {
         let entry = entry.map_err(redb_err)?;
+        if let Some(filter_asserter) = asserter {
+            let key = entry.0.value();
+            if parse_field4(key) != Some(filter_asserter) {
+                continue;
+            }
+        }
         results.push(entry.1.value().to_string());
     }
     Ok(results)
@@ -134,6 +176,7 @@ fn prefix_scan_values(
 pub fn put(
     root: &Path,
     ns: &str,
+    asserter: &str,
     edge_kappa: &str,
     src: &str,
     rel: &str,
@@ -153,6 +196,7 @@ pub fn put(
 
     let record = EdgeRecord {
         edge_kappa: edge_kappa.to_string(),
+        asserter: asserter.to_string(),
         source: src.to_string(),
         relation: rel.to_string(),
         target: tgt.to_string(),
@@ -160,9 +204,10 @@ pub fn put(
     };
     let record_bytes = serialize_record(&record)?;
 
-    let fwd_key = compound3(src, rel, tgt);
-    let rev_key = compound3(tgt, rel, src);
-    let rel_key = compound3(rel, src, tgt);
+    // D-8: asserter-last key layout
+    let fwd_key = compound4(src, rel, tgt, asserter);
+    let rev_key = compound4(tgt, rel, src, asserter);
+    let rel_key = compound4(rel, src, tgt, asserter);
 
     {
         let mut t = write_txn.open_table(FORWARD).map_err(redb_err)?;
@@ -259,6 +304,54 @@ pub fn query(
     Ok(results)
 }
 
+/// Query edges with asserter filtering at the scan level (D-8).
+/// Filters on field 4 of the compound key during prefix scan,
+/// avoiding BY_KAPPA deserialization for non-matching asserters.
+pub fn query_by_asserter(
+    root: &Path,
+    ns: &str,
+    node: &str,
+    asserter: Option<&str>,
+    rel: Option<&str>,
+) -> Result<Vec<EdgeRecord>, StoreError> {
+    let db = match open_db(root, ns) {
+        Ok(db) => db,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let read_txn = db.begin_read().map_err(redb_err)?;
+
+    let mut edge_kappas: Vec<String> = Vec::new();
+
+    match read_txn.open_table(FORWARD) {
+        Ok(table) => {
+            let pfx = match rel {
+                Some(r) => prefix2(node, r),
+                None => prefix1(node),
+            };
+            edge_kappas.extend(prefix_scan_values_filtered(&table, &pfx, asserter)?);
+        }
+        Err(e) if is_table_missing(&e) => {}
+        Err(e) => return Err(redb_err(e)),
+    }
+
+    let mut seen = HashSet::new();
+    edge_kappas.retain(|ek| seen.insert(ek.clone()));
+
+    let by_kappa = match read_txn.open_table(BY_KAPPA) {
+        Ok(t) => t,
+        Err(e) if is_table_missing(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(redb_err(e)),
+    };
+    let mut results = Vec::new();
+    for ek in &edge_kappas {
+        if let Some(guard) = by_kappa.get(ek.as_str()).map_err(redb_err)? {
+            results.push(deserialize_record(guard.value())?);
+        }
+    }
+
+    Ok(results)
+}
+
 pub fn remove(root: &Path, ns: &str, edge_kappa: &str) -> Result<bool, StoreError> {
     let db = match open_db(root, ns) {
         Ok(db) => db,
@@ -276,9 +369,24 @@ pub fn remove(root: &Path, ns: &str, edge_kappa: &str) -> Result<bool, StoreErro
     };
     let record = deserialize_record(&record_bytes)?;
 
-    let fwd_key = compound3(&record.source, &record.relation, &record.target);
-    let rev_key = compound3(&record.target, &record.relation, &record.source);
-    let rel_key = compound3(&record.relation, &record.source, &record.target);
+    let fwd_key = compound4(
+        &record.source,
+        &record.relation,
+        &record.target,
+        &record.asserter,
+    );
+    let rev_key = compound4(
+        &record.target,
+        &record.relation,
+        &record.source,
+        &record.asserter,
+    );
+    let rel_key = compound4(
+        &record.relation,
+        &record.source,
+        &record.target,
+        &record.asserter,
+    );
 
     {
         let mut t = write_txn.open_table(FORWARD).map_err(redb_err)?;
@@ -302,7 +410,6 @@ pub fn remove(root: &Path, ns: &str, edge_kappa: &str) -> Result<bool, StoreErro
 }
 
 pub fn remove_by_node(root: &Path, ns: &str, kappa: &str) -> Result<(), StoreError> {
-    // Collect all edge kappas where this node is source or target
     let mut to_remove: Vec<String> = Vec::new();
     let pfx = prefix1(kappa);
     if let Ok(db) = open_db(root, ns) {
@@ -446,6 +553,8 @@ mod tests {
         (dir, root)
     }
 
+    const TEST_ASSERTER: &str = "sha256:test_asserter";
+
     #[test]
     fn put_and_query_roundtrip() {
         let (_dir, root) = tmp_root();
@@ -453,6 +562,7 @@ mod tests {
         let created = put(
             &root,
             ns,
+            TEST_ASSERTER,
             "ek1",
             "src1",
             "owns",
@@ -475,6 +585,7 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].edge_kappa, "ek1");
+        assert_eq!(results[0].asserter, TEST_ASSERTER);
         assert_eq!(results[0].source, "src1");
         assert_eq!(results[0].target, "tgt1");
     }
@@ -508,7 +619,6 @@ mod tests {
     fn diff_identical_have_want_returns_empty() {
         let (_dir, root) = tmp_root();
         let ns = "diff-ns";
-        // No edges -- just blobs. have=[A], want=[A], diff should be empty.
         let result = diff(&root, ns, &["A".into()], &["A".into()], &["owns"]).unwrap();
         assert!(result.is_empty(), "identical have/want: {result:?}");
     }
@@ -520,6 +630,7 @@ mod tests {
         put(
             &root,
             ns,
+            TEST_ASSERTER,
             "e1",
             "A",
             "owns",
@@ -531,6 +642,7 @@ mod tests {
         put(
             &root,
             ns,
+            TEST_ASSERTER,
             "e2",
             "B",
             "owns",
@@ -540,13 +652,11 @@ mod tests {
         )
         .unwrap();
 
-        // want=[A], have=[] -- should get A, B, C, e1, e2
         let result = diff(&root, ns, &[], &["A".into()], &["owns"]).unwrap();
         assert!(result.contains(&"A".to_string()));
         assert!(result.contains(&"B".to_string()));
         assert!(result.contains(&"C".to_string()));
 
-        // want=[A], have=[B] -- B and C reachable from have, but A and e1 only from want
         let result = diff(&root, ns, &["B".into()], &["A".into()], &["owns"]).unwrap();
         assert!(
             result.contains(&"A".to_string()),
@@ -561,6 +671,7 @@ mod tests {
         put(
             &root,
             ns,
+            TEST_ASSERTER,
             "ek1",
             "s",
             "owns",
@@ -581,6 +692,7 @@ mod tests {
         assert!(put(
             &root,
             ns,
+            TEST_ASSERTER,
             "ek1",
             "s",
             "owns",
@@ -592,6 +704,7 @@ mod tests {
         assert!(!put(
             &root,
             ns,
+            TEST_ASSERTER,
             "ek1",
             "s",
             "owns",
@@ -608,6 +721,7 @@ mod tests {
         put(
             &root,
             "ns-a",
+            TEST_ASSERTER,
             "ek1",
             "s",
             "owns",
@@ -618,5 +732,175 @@ mod tests {
         .unwrap();
         let results = query(&root, "ns-b", "s", Direction::Outbound, None, None, None).unwrap();
         assert!(results.is_empty(), "ns-b should not see ns-a edges");
+    }
+
+    #[test]
+    fn asserter_stored_and_retrievable() {
+        let (_dir, root) = tmp_root();
+        let ns = "asserter-ns";
+        put(
+            &root,
+            ns,
+            "sha256:alice",
+            "ek1",
+            "s",
+            "owns",
+            "t",
+            b"",
+            serde_json::json!({}),
+        )
+        .unwrap();
+        let results = query(
+            &root,
+            ns,
+            "s",
+            Direction::Outbound,
+            Some("owns"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].asserter, "sha256:alice");
+    }
+
+    #[test]
+    fn different_asserters_same_edge_both_stored() {
+        let (_dir, root) = tmp_root();
+        let ns = "multi-asserter";
+        put(
+            &root,
+            ns,
+            "sha256:alice",
+            "ek1",
+            "s",
+            "owns",
+            "t",
+            b"",
+            serde_json::json!({}),
+        )
+        .unwrap();
+        put(
+            &root,
+            ns,
+            "sha256:bob",
+            "ek2",
+            "s",
+            "owns",
+            "t",
+            b"",
+            serde_json::json!({}),
+        )
+        .unwrap();
+        let results = query(
+            &root,
+            ns,
+            "s",
+            Direction::Outbound,
+            Some("owns"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        let asserters: HashSet<&str> = results.iter().map(|r| r.asserter.as_str()).collect();
+        assert!(asserters.contains("sha256:alice"));
+        assert!(asserters.contains("sha256:bob"));
+    }
+
+    #[test]
+    fn query_by_asserter_filters_at_scan_level() {
+        let (_dir, root) = tmp_root();
+        let ns = "qba-ns";
+        put(
+            &root,
+            ns,
+            "sha256:alice",
+            "ek1",
+            "s",
+            "owns",
+            "t",
+            b"",
+            serde_json::json!({}),
+        )
+        .unwrap();
+        put(
+            &root,
+            ns,
+            "sha256:bob",
+            "ek2",
+            "s",
+            "owns",
+            "t",
+            b"",
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        // Filter to alice only
+        let results =
+            query_by_asserter(&root, ns, "s", Some("sha256:alice"), Some("owns")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].asserter, "sha256:alice");
+
+        // Filter to bob only
+        let results = query_by_asserter(&root, ns, "s", Some("sha256:bob"), Some("owns")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].asserter, "sha256:bob");
+
+        // No filter returns both
+        let results = query_by_asserter(&root, ns, "s", None, Some("owns")).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Non-existent asserter returns empty
+        let results = query_by_asserter(&root, ns, "s", Some("sha256:eve"), Some("owns")).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn query_by_asserter_empty_namespace() {
+        let (_dir, root) = tmp_root();
+        let results = query_by_asserter(&root, "empty-ns", "node", None, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn query_by_asserter_with_relation_filter() {
+        let (_dir, root) = tmp_root();
+        let ns = "qba-rel-ns";
+        put(
+            &root,
+            ns,
+            "sha256:alice",
+            "ek1",
+            "s",
+            "owns",
+            "t1",
+            b"",
+            serde_json::json!({}),
+        )
+        .unwrap();
+        put(
+            &root,
+            ns,
+            "sha256:alice",
+            "ek2",
+            "s",
+            "refers-to",
+            "t2",
+            b"",
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        // Filter by asserter + relation
+        let results =
+            query_by_asserter(&root, ns, "s", Some("sha256:alice"), Some("owns")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].target, "t1");
+
+        // No relation filter returns both
+        let results = query_by_asserter(&root, ns, "s", Some("sha256:alice"), None).unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

@@ -6,8 +6,9 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
 use crate::kappa::KappaLabel;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::KappaStore;
 use crate::UploadTimeout;
@@ -116,8 +117,6 @@ impl Default for SessionStore {
     }
 }
 
-// -- Route entry points --
-
 pub fn start_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = super::read_body(body).await?;
@@ -158,6 +157,7 @@ pub fn recovery_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn complete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = super::read_body(body).await?;
+        let ns = path_param(cx, "ns");
         let id = path_param(cx, "id");
         let kappa = query_param(cx, "kappa")
             .or_else(|| query_param(cx, "digest"))
@@ -166,7 +166,7 @@ pub fn complete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
             .get("content-range")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_range_start);
-        complete(cx, id, &kappa, range_start, &bytes).await
+        complete(cx, ns, id, &kappa, range_start, &bytes).await
     })
 }
 
@@ -179,17 +179,25 @@ pub fn cancel_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
-// -- Domain logic --
-
 async fn start(cx: &Cx, ns: &str, mount_kappa: Option<&str>) -> topcoat::Result<Response> {
-    auth::authorize(ns, "upload.start")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        move || authorize(&*s, &n, OpClass::Write, &a)
+    })
+    .await??;
 
     if let Some(kappa) = mount_kappa {
-        let s = store(cx).clone();
         let k = kappa.to_string();
-        let exists = tokio::task::spawn_blocking(move || s.exists(&k))
-            .await?
-            .map_err(super::store_err)?;
+        let exists = tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.exists(&k)
+        })
+        .await??;
         if exists {
             return (
                 StatusCode::CREATED,
@@ -273,6 +281,7 @@ async fn recovery(cx: &Cx, id: &str) -> topcoat::Result<Response> {
 
 async fn complete(
     cx: &Cx,
+    ns: &str,
     id: &str,
     kappa_str: &str,
     range_start: Option<usize>,
@@ -314,11 +323,15 @@ async fn complete(
         .into());
     }
 
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let k = kappa_str.to_string();
-    tokio::task::spawn_blocking(move || s.put(&k, &data))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Write, &asserter)?;
+        s.put(&k, &data)
+    })
+    .await??;
 
     (
         StatusCode::CREATED,

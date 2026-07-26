@@ -34,6 +34,9 @@ pub enum StoreError {
     RangeNotSatisfiable {
         size: u64,
     },
+    /// Input validation failure (filter rejection, schema mismatch).
+    /// Maps to HTTP 400 Bad Request.
+    Rejected(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -79,6 +82,7 @@ impl std::fmt::Display for StoreError {
             }
             StoreError::Conflict(msg) => write!(f, "conflict: {msg}"),
             StoreError::Io(e) => write!(f, "I/O error: {e}"),
+            StoreError::Rejected(msg) => write!(f, "rejected: {msg}"),
         }
     }
 }
@@ -94,6 +98,43 @@ impl From<std::io::Error> for StoreError {
 impl From<serde_json::Error> for StoreError {
     fn from(e: serde_json::Error) -> Self {
         StoreError::Io(std::io::Error::other(e))
+    }
+}
+
+/// StoreError implements HttpErrorResponse so it can be converted to
+/// topcoat::Error via `From` and render with the correct HTTP status.
+///
+/// Handlers can now use `?` directly on StoreError-returning calls.
+/// No `store_err` helper, no `.map_err`.
+///
+/// Status mapping:
+/// - NotFound -> 404
+/// - Conflict("forbidden:...") -> 403
+/// - Conflict -> 409
+/// - RangeNotSatisfiable -> 400 (416 with Content-Range handled in blob handler)
+/// - Io -> 500
+/// - Rejected -> 400
+/// - Bundle/Delta errors -> 400
+impl topcoat::HttpErrorResponse for StoreError {
+    fn status_code(&self) -> http::StatusCode {
+        use http::StatusCode;
+        match self {
+            StoreError::NotFound => StatusCode::NOT_FOUND,
+            StoreError::Conflict(msg) if msg.starts_with("forbidden:") => StatusCode::FORBIDDEN,
+            StoreError::Conflict(_) => StatusCode::CONFLICT,
+            StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            StoreError::RangeNotSatisfiable { .. } => StatusCode::BAD_REQUEST,
+            _ => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn response_body(&self) -> String {
+        match self {
+            StoreError::NotFound => "not found".to_owned(),
+            StoreError::Conflict(msg) if msg.starts_with("forbidden:") => "forbidden".to_owned(),
+            StoreError::Io(_) => "internal server error".to_owned(),
+            other => other.to_string(),
+        }
     }
 }
 
@@ -141,18 +182,26 @@ pub struct TagEntry {
 
 /// On-disk tag index entry. The tag index is a BTreeMap<String, IndexEntry>
 /// serialized as JSON. The `mtime` field records the last modification time
-/// in milliseconds since the Unix epoch. It is metadata about the tag, not
-/// part of the tag's identity -- the namespace root hash is computed over
-/// (name, value) pairs only, excluding mtime.
+/// in milliseconds since the Unix epoch. The `version` field is a per-tag
+/// monotonic counter incremented on each mutation of that tag (D-5).
+///
+/// Both `mtime` and `version` are metadata about the tag, not part of the
+/// tag's identity -- the namespace root hash is computed over (name, value)
+/// pairs only, excluding mtime and version.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexEntry {
     pub value: String,
     pub mtime: u64,
+    #[serde(default)]
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeRecord {
     pub edge_kappa: String,
+    /// Anchor kappa of the asserter (D-1: derived from signature, not from auth).
+    #[serde(default)]
+    pub asserter: String,
     pub source: String,
     pub relation: String,
     pub target: String,
@@ -197,10 +246,11 @@ pub struct TagUpdate {
     pub name: String,
     /// New kappa-label to bind.
     pub new_kappa: String,
-    /// CAS expectation. None = create-if-absent (tag must not exist).
-    /// Some(kappa) = tag must currently equal kappa.
-    /// Some("") = unconditional (no CAS check).
-    pub expected: Option<String>,
+    /// Per-tag version CAS (D-5).
+    /// 0 = create-if-absent (tag must not exist).
+    /// N > 0 = tag's current version must equal N.
+    /// None = unconditional (no CAS check).
+    pub expected_version: Option<u64>,
 }
 
 /// Result of an atomic batch tag update.
@@ -266,12 +316,15 @@ pub trait KappaStore: Send + Sync + 'static {
     fn tag_get(&self, ns: &str, name: &str) -> Result<Option<String>, StoreError>;
     fn tag_list(&self, ns: &str, opts: &TagListOpts) -> Result<TagPage, StoreError>;
     fn tag_delete(&self, ns: &str, name: &str) -> Result<bool, StoreError>;
+    /// Conditionally set a tag if the tag's current version matches
+    /// `expected_version`. Per-tag CAS (D-5), not per-namespace.
+    /// `expected_version = 0` means create-if-absent (tag must not exist).
     fn tag_set_if(
         &self,
         ns: &str,
         name: &str,
         kappa: &str,
-        expected: Option<&str>,
+        expected_version: u64,
     ) -> Result<bool, StoreError>;
     fn tag_all_kappas_global(&self) -> Result<Vec<String>, StoreError>;
     fn tag_find_by_kappa(&self, ns: &str, kappa: &str) -> Result<Vec<String>, StoreError>;
@@ -302,6 +355,7 @@ pub trait KappaStore: Send + Sync + 'static {
     fn edge_put(
         &self,
         ns: &str,
+        asserter: &str,
         edge_kappa: &str,
         src: &str,
         rel: &str,
@@ -462,4 +516,22 @@ pub trait KappaStore: Send + Sync + 'static {
     // namespace root (authenticated namespace state)
     fn namespace_root(&self, ns: &str) -> Result<(Option<String>, usize), StoreError>;
     fn namespace_proof(&self, ns: &str, name: &str) -> Result<Option<NamespaceProof>, StoreError>;
+
+    // edge query by asserter (D-8: asserter-last compound key)
+    /// Query edges filtering by asserter. The default implementation
+    /// post-filters on the deserialized asserter field. FsStore overrides
+    /// with scan-level filtering on field 4 of the compound key.
+    fn edge_query_by_asserter(
+        &self,
+        ns: &str,
+        node: &str,
+        asserter: Option<&str>,
+        rel: Option<&str>,
+    ) -> Result<Vec<EdgeRecord>, StoreError> {
+        let edges = self.edge_query(ns, node, Direction::Outbound, rel, None, None)?;
+        match asserter {
+            Some(a) => Ok(edges.into_iter().filter(|e| e.asserter == a).collect()),
+            None => Ok(edges),
+        }
+    }
 }

@@ -16,12 +16,11 @@ name = "kappa-registry"
 path = "src/main.rs"
 
 [dependencies]
-topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+topcoat = { path = "/workspace/usrbinkat/github.com/tokio-rs/topcoat/crates/topcoat", features = ["router", "serve", "tower"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
 tower = "0.5"
 governor = "0.10"
 http = "1"
-anyhow = "1"
 
 # Hashing -- all RustCrypto digest-trait compatible
 sha2 = "0.10"
@@ -58,6 +57,18 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 p256 = { version = "0.14", features = ["ecdsa"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
 signature = "3"
+
+# FROST threshold signing (P11 extension)
+frost-core = "2"
+frost-ed25519 = "2"
+frost-p256 = "2"
+frost-secp256k1 = "2"
+
+# Merkle search tree for tag-name reconciliation
+merkle-search-tree = "0.8"
+
+# RNG compatible with frost-core's rand_core 0.6
+rand = "0.8"
 
 # Optional
 reqwest = { version = "0.12", features = ["blocking"], optional = true }

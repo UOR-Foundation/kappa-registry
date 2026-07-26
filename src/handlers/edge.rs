@@ -4,8 +4,9 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
 use crate::kappa::{axis_of, compute_kappa};
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::{Direction, KappaStore};
 
@@ -26,8 +27,6 @@ fn query_param(cx: &Cx, key: &str) -> Option<String> {
 fn store(cx: &Cx) -> &Arc<FsStore> {
     app_context::<Arc<FsStore>>(cx)
 }
-
-// -- Route entry points --
 
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
@@ -76,12 +75,9 @@ pub fn diff_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
-// -- Domain logic --
-
 async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "edge.put")?;
-
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let source = v["source"]
         .as_str()
         .ok_or_else(|| bad_request("missing source"))?;
@@ -92,11 +88,20 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         .as_str()
         .ok_or_else(|| bad_request("missing target"))?;
 
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let src = source.to_string();
-    let exists = tokio::task::spawn_blocking(move || s.exists(&src))
-        .await?
-        .map_err(super::store_err)?;
+    let exists = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter.clone();
+        move || {
+            authorize(&*s, &n, OpClass::Write, &a)?;
+            s.exists(&src)
+        }
+    })
+    .await??;
     if !exists {
         return Err(bad_request("source kappa absent").into());
     }
@@ -106,32 +111,32 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     let axis = axis_of(source).unwrap_or("sha256");
     let edge_kappa = compute_kappa(axis, &canonical)?;
 
-    let s = store(cx).clone();
     let ek = edge_kappa.as_str().to_string();
     let canon = canonical.clone();
-    tokio::task::spawn_blocking(move || s.put(&ek, &canon))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.put(&ek, &canon)
+    })
+    .await??;
 
-    let s = store(cx).clone();
     let k = edge_kappa.as_str().to_string();
-    let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "edge")]))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        move || s.meta_set(&n, &k, &[("object-type", "edge")])
+    })
+    .await??;
 
-    let s = store(cx).clone();
     let ek = edge_kappa.as_str().to_string();
     let src = source.to_string();
     let rel = relation.to_string();
     let tgt = target.to_string();
     let canon = canonical;
     let meta = serde_json::json!({});
-    let n = ns.to_string();
-    let is_new =
-        tokio::task::spawn_blocking(move || s.edge_put(&n, &ek, &src, &rel, &tgt, &canon, meta))
-            .await?
-            .map_err(super::store_err)?;
+    let is_new = tokio::task::spawn_blocking(move || {
+        s.edge_put(&n, &asserter, &ek, &src, &rel, &tgt, &canon, meta)
+    })
+    .await??;
 
     let status = if is_new {
         StatusCode::CREATED
@@ -157,16 +162,15 @@ async fn query(
     n: Option<usize>,
     last: Option<&str>,
 ) -> topcoat::Result<Response> {
-    auth::authorize(ns, "edge.query")?;
-
     let dir = Direction::parse(direction);
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let node_owned = node.to_string();
     let rel = relation.map(String::from);
     let last_owned = last.map(String::from);
     let n_owned = ns.to_string();
     let edges = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n_owned, OpClass::Read, &asserter)?;
         s.edge_query(
             &n_owned,
             &node_owned,
@@ -176,8 +180,7 @@ async fn query(
             last_owned.as_deref(),
         )
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
 
     let body = serde_json::json!({"edges": edges});
     (
@@ -188,14 +191,15 @@ async fn query(
 }
 
 async fn delete(cx: &Cx, ns: &str, edge_kappa: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "edge.delete")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let ek = edge_kappa.to_string();
     let n = ns.to_string();
-    let removed = tokio::task::spawn_blocking(move || s.edge_remove(&n, &ek))
-        .await?
-        .map_err(super::store_err)?;
+    let removed = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Admin, &asserter)?;
+        s.edge_remove(&n, &ek)
+    })
+    .await??;
     if removed {
         StatusCode::ACCEPTED.into_response(cx)
     } else {
@@ -204,9 +208,8 @@ async fn delete(cx: &Cx, ns: &str, edge_kappa: &str) -> topcoat::Result<Response
 }
 
 async fn diff(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "edge.diff")?;
-
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let have: Vec<String> = v["have"]
         .as_array()
         .map(|a| {
@@ -232,14 +235,15 @@ async fn diff(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         })
         .unwrap_or_default();
 
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let n = ns.to_string();
     let result = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Read, &asserter)?;
         let rel_refs: Vec<&str> = rels.iter().map(|s| s.as_str()).collect();
         s.edge_diff(&n, &have, &want, &rel_refs)
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
 
     let body = serde_json::json!({"diff": result});
     (

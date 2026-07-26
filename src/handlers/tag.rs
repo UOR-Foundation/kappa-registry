@@ -4,8 +4,9 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
 use crate::kappa::KappaLabel;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::{KappaStore, TagListOpts, TagUpdate};
 
@@ -76,8 +77,6 @@ fn store(cx: &Cx) -> &Arc<FsStore> {
     app_context::<Arc<FsStore>>(cx)
 }
 
-// -- Route entry points --
-
 pub fn manifest_put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = super::read_body(body).await?;
@@ -147,12 +146,15 @@ pub fn tag_delete_prefix_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
         if prefix.is_empty() {
             return Err(bad_request("missing prefix parameter").into());
         }
+        let asserter = super::registry_anchor(cx);
         let s = store(cx).clone();
         let n = ns.to_string();
         let pfx = prefix;
-        let count = tokio::task::spawn_blocking(move || s.tag_delete_prefix(&n, &pfx))
-            .await?
-            .map_err(super::store_err)?;
+        let count = tokio::task::spawn_blocking(move || {
+            authorize(&*s, &n, OpClass::Admin, &asserter)?;
+            s.tag_delete_prefix(&n, &pfx)
+        })
+        .await??;
         let body = serde_json::json!({"deleted": count});
         (
             StatusCode::OK,
@@ -230,8 +232,6 @@ pub fn tag_put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
-// -- Domain logic --
-
 async fn manifest_put(
     cx: &Cx,
     ns: &str,
@@ -239,8 +239,9 @@ async fn manifest_put(
     content_type: &str,
     body: &[u8],
 ) -> topcoat::Result<Response> {
-    auth::authorize(ns, "manifest.put")?;
-
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
     let content = body.to_vec();
 
     let kappa = if let Ok(ref_label) = KappaLabel::parse(tag) {
@@ -252,39 +253,37 @@ async fn manifest_put(
         KappaLabel::sha256(&content)
     };
 
-    // Gate 1: admission filters
-    let s = store(cx).clone();
-    let ns_owned = ns.to_string();
-    let body_owned = content.clone();
-    let filter_result = tokio::task::spawn_blocking({
+    // Gate 1: authorize + admission filters
+    tokio::task::spawn_blocking({
         let s = s.clone();
-        let n = ns_owned.clone();
-        let b = body_owned.clone();
-        move || s.filter_evaluate(&n, &b)
+        let n = n.clone();
+        let a = asserter.clone();
+        let b = content.clone();
+        move || {
+            authorize(&*s, &n, OpClass::Write, &a)?;
+            s.filter_evaluate(&n, &b).map_err(|reason| {
+                crate::store::StoreError::Rejected(format!("filter rejected: {reason}"))
+            })
+        }
     })
-    .await?;
-    if let Err(reason) = filter_result {
-        return Err(bad_request(format!("filter rejected: {reason}")).into());
-    }
+    .await??;
 
     // Gate 2: schema validation
-    let s = store(cx).clone();
-    let ns_for_schema = ns.to_string();
     let body_for_schema = content.clone();
     let schemas = tokio::task::spawn_blocking({
         let s = s.clone();
-        let n = ns_for_schema.clone();
+        let n = n.clone();
         move || s.schema_list(&n)
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
     for schema_record in &schemas {
-        let s = store(cx).clone();
-        let n = ns_for_schema.clone();
         let sc = schema_record.scope.clone();
-        let schema_result = tokio::task::spawn_blocking(move || s.schema_get(&n, &sc))
-            .await?
-            .map_err(super::store_err)?;
+        let schema_result = tokio::task::spawn_blocking({
+            let s = s.clone();
+            let n = n.clone();
+            move || s.schema_get(&n, &sc)
+        })
+        .await??;
         if let Some((_schema_kappa, schema_bytes)) = schema_result {
             if let Ok(wrapper) = serde_json::from_slice::<serde_json::Value>(&schema_bytes) {
                 let format = wrapper.get("format").and_then(|f| f.as_str()).unwrap_or("");
@@ -304,12 +303,13 @@ async fn manifest_put(
     }
 
     // Gate 3: store blob
-    let s = store(cx).clone();
     let k = kappa.as_str().to_string();
     let c = content;
-    tokio::task::spawn_blocking(move || s.put(&k, &c))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.put(&k, &c)
+    })
+    .await??;
 
     // Gate 4: digest vs tag
     let ref_is_valid_digest = KappaLabel::parse(tag).is_ok();
@@ -337,38 +337,41 @@ async fn manifest_put(
     }
 
     if !ref_is_valid_digest {
-        let s = store(cx).clone();
-        let p = ns.to_string();
         let t = tag.to_string();
         let k = kappa.as_str().to_string();
-        tokio::task::spawn_blocking(move || s.tag_set(&p, &t, &k))
-            .await?
-            .map_err(super::store_err)?;
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            let n = n.clone();
+            move || s.tag_set(&n, &t, &k)
+        })
+        .await??;
     }
 
     for extra_tag in query_params_multi(cx, "tag") {
-        let s = store(cx).clone();
-        let p = ns.to_string();
         let k = kappa.as_str().to_string();
-        tokio::task::spawn_blocking(move || s.tag_set(&p, &extra_tag, &k))
-            .await?
-            .map_err(super::store_err)?;
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            let n = n.clone();
+            move || s.tag_set(&n, &extra_tag, &k)
+        })
+        .await??;
     }
 
-    let ct_value = content_type.to_string();
-    let s = store(cx).clone();
+    let ct_bytes = content_type.as_bytes().to_vec();
     let k = kappa.as_str().to_string();
-    let ct_bytes = ct_value.as_bytes().to_vec();
-    tokio::task::spawn_blocking(move || s.put_meta(&k, "content-type", &ct_bytes))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.put_meta(&k, "content-type", &ct_bytes)
+    })
+    .await??;
 
-    let s = store(cx).clone();
     let k = kappa.as_str().to_string();
-    let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "manifest")]))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        move || s.meta_set(&n, &k, &[("object-type", "manifest")])
+    })
+    .await??;
 
     let subject_digest: Option<String> = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -389,7 +392,6 @@ async fn manifest_put(
         );
         let axis = kappa.as_str().split(':').next().unwrap_or("sha256");
         if let Ok(edge_kappa) = crate::kappa::compute_kappa(axis, &edge_canon) {
-            let s = store(cx).clone();
             let ek = edge_kappa.as_str().to_string();
             let ec = edge_canon.clone();
             let _ = tokio::task::spawn_blocking({
@@ -398,13 +400,13 @@ async fn manifest_put(
                 move || s.put(&ek, &ec)
             })
             .await;
-            let s = store(cx).clone();
+            let a = asserter;
             let src = kappa.as_str().to_string();
             let tgt = subj.clone();
-            let n = ns.to_string();
             let _ = tokio::task::spawn_blocking(move || {
                 s.edge_put(
                     &n,
+                    &a,
                     &ek,
                     &src,
                     "refers-to",
@@ -436,33 +438,41 @@ async fn manifest_put(
 }
 
 async fn manifest_get(cx: &Cx, ns: &str, version: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "manifest.get")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        move || authorize(&*s, &n, OpClass::Read, &a)
+    })
+    .await??;
 
     let kappa_str = if version.contains(':') {
         version.to_string()
     } else {
-        let s = store(cx).clone();
-        let p = ns.to_string();
         let v = version.to_string();
-        let result = tokio::task::spawn_blocking(move || s.tag_get(&p, &v))
-            .await?
-            .map_err(super::store_err)?;
+        let result = tokio::task::spawn_blocking({
+            let s = s.clone();
+            let n = n.clone();
+            move || s.tag_get(&n, &v)
+        })
+        .await??;
         result.ok_or_else(not_found)?
     };
 
-    let s = store(cx).clone();
     let k = kappa_str.clone();
-    let content = tokio::task::spawn_blocking(move || s.get(&k))
-        .await?
-        .map_err(super::store_err)?;
-    let content = content.ok_or_else(not_found)?;
+    let content = tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.get(&k)
+    })
+    .await??
+    .ok_or_else(not_found)?;
 
-    let s = store(cx).clone();
     let k = kappa_str.clone();
     let ct = tokio::task::spawn_blocking(move || s.get_meta(&k, "content-type"))
-        .await?
-        .ok()
-        .flatten()
+        .await??
         .and_then(|v| String::from_utf8(v).ok())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -480,33 +490,41 @@ async fn manifest_get(cx: &Cx, ns: &str, version: &str) -> topcoat::Result<Respo
 }
 
 async fn manifest_head(cx: &Cx, ns: &str, version: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "manifest.head")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        move || authorize(&*s, &n, OpClass::Read, &a)
+    })
+    .await??;
 
     let kappa_str = if version.contains(':') {
         version.to_string()
     } else {
-        let s = store(cx).clone();
-        let p = ns.to_string();
         let v = version.to_string();
-        let result = tokio::task::spawn_blocking(move || s.tag_get(&p, &v))
-            .await?
-            .map_err(super::store_err)?;
+        let result = tokio::task::spawn_blocking({
+            let s = s.clone();
+            let n = n.clone();
+            move || s.tag_get(&n, &v)
+        })
+        .await??;
         result.ok_or_else(not_found)?
     };
 
-    let s = store(cx).clone();
     let k = kappa_str.clone();
-    let content = tokio::task::spawn_blocking(move || s.get(&k))
-        .await?
-        .map_err(super::store_err)?;
-    let content = content.ok_or_else(not_found)?;
+    let content = tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.get(&k)
+    })
+    .await??
+    .ok_or_else(not_found)?;
 
-    let s = store(cx).clone();
     let k = kappa_str.clone();
     let ct = tokio::task::spawn_blocking(move || s.get_meta(&k, "content-type"))
-        .await?
-        .ok()
-        .flatten()
+        .await??
         .and_then(|v| String::from_utf8(v).ok())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -523,41 +541,46 @@ async fn manifest_head(cx: &Cx, ns: &str, version: &str) -> topcoat::Result<Resp
 }
 
 async fn manifest_delete(cx: &Cx, ns: &str, tag: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "manifest.delete")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
 
     if tag.contains(':') {
-        let s = store(cx).clone();
-        let p = ns.to_string();
         let digest = tag.to_string();
         let tags = tokio::task::spawn_blocking({
             let s = s.clone();
-            let p = p.clone();
+            let n = n.clone();
             let d = digest.clone();
-            move || s.tag_find_by_kappa(&p, &d)
+            let a = asserter;
+            move || {
+                authorize(&*s, &n, OpClass::Admin, &a)?;
+                s.tag_find_by_kappa(&n, &d)
+            }
         })
-        .await?
-        .map_err(super::store_err)?;
+        .await??;
         for t in &tags {
-            let s = store(cx).clone();
-            let p = ns.to_string();
             let t = t.clone();
-            tokio::task::spawn_blocking(move || s.tag_delete(&p, &t))
-                .await?
-                .map_err(super::store_err)?;
+            tokio::task::spawn_blocking({
+                let s = s.clone();
+                let n = n.clone();
+                move || s.tag_delete(&n, &t)
+            })
+            .await??;
         }
-        let s = store(cx).clone();
-        tokio::task::spawn_blocking(move || s.remove(&digest))
-            .await?
-            .map_err(super::store_err)?;
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.remove(&digest)
+        })
+        .await??;
         return StatusCode::ACCEPTED.into_response(cx);
     }
 
-    let s = store(cx).clone();
-    let p = ns.to_string();
     let t = tag.to_string();
-    let deleted = tokio::task::spawn_blocking(move || s.tag_delete(&p, &t))
-        .await?
-        .map_err(super::store_err)?;
+    let deleted = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Admin, &asserter)?;
+        s.tag_delete(&n, &t)
+    })
+    .await??;
     if deleted {
         StatusCode::ACCEPTED.into_response(cx)
     } else {
@@ -566,7 +589,9 @@ async fn manifest_delete(cx: &Cx, ns: &str, tag: &str) -> topcoat::Result<Respon
 }
 
 async fn tag_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "tag.list")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let p = ns.to_string();
 
     let opts = TagListOpts {
         n: query_param(cx, "n").and_then(|s| s.parse().ok()),
@@ -577,6 +602,13 @@ async fn tag_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
     };
 
     if opts.n == Some(0) {
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            let p = p.clone();
+            let a = asserter;
+            move || authorize(&*s, &p, OpClass::Read, &a)
+        })
+        .await??;
         let body = serde_json::json!({"name": ns, "tags": []});
         return (
             StatusCode::OK,
@@ -585,11 +617,11 @@ async fn tag_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
             .into_response(cx);
     }
 
-    let s = store(cx).clone();
-    let p = ns.to_string();
-    let page = tokio::task::spawn_blocking(move || s.tag_list(&p, &opts))
-        .await?
-        .map_err(super::store_err)?;
+    let page = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &p, OpClass::Read, &asserter)?;
+        s.tag_list(&p, &opts)
+    })
+    .await??;
 
     let tag_names: Vec<&str> = page.tags.iter().map(|t| t.name.as_str()).collect();
     let body = serde_json::json!({"name": ns, "tags": tag_names});
@@ -606,14 +638,15 @@ async fn tag_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
 }
 
 async fn tag_list_prefix(cx: &Cx, ns: &str, prefix: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "tag.list")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let n = ns.to_string();
     let pfx = prefix.to_string();
-    let entries = tokio::task::spawn_blocking(move || s.tag_list_prefix(&n, &pfx))
-        .await?
-        .map_err(super::store_err)?;
+    let entries = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Read, &asserter)?;
+        s.tag_list_prefix(&n, &pfx)
+    })
+    .await??;
 
     let names: Vec<&str> = entries.iter().map(|t| t.name.as_str()).collect();
     let body = serde_json::json!({"name": ns, "tags": names});
@@ -625,19 +658,22 @@ async fn tag_list_prefix(cx: &Cx, ns: &str, prefix: &str) -> topcoat::Result<Res
 }
 
 async fn tag_get(cx: &Cx, ns: &str, name: &str, raw: bool) -> topcoat::Result<Response> {
-    auth::authorize(ns, "tag.get")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let p = ns.to_string();
-    let n = name.to_string();
+    let nm = name.to_string();
     let result = if raw {
-        tokio::task::spawn_blocking(move || s.tag_get_raw(&p, &n))
-            .await?
-            .map_err(super::store_err)?
+        tokio::task::spawn_blocking(move || {
+            authorize(&*s, &p, OpClass::Read, &asserter)?;
+            s.tag_get_raw(&p, &nm)
+        })
+        .await??
     } else {
-        tokio::task::spawn_blocking(move || s.tag_get(&p, &n))
-            .await?
-            .map_err(super::store_err)?
+        tokio::task::spawn_blocking(move || {
+            authorize(&*s, &p, OpClass::Read, &asserter)?;
+            s.tag_get(&p, &nm)
+        })
+        .await??
     };
     let value = result.ok_or_else(not_found)?;
 
@@ -666,16 +702,23 @@ async fn tag_put(
     if_match: Option<&str>,
     if_none_match: Option<&str>,
 ) -> topcoat::Result<Response> {
-    auth::authorize(ns, "tag.put")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let p = ns.to_string();
 
     if let Some(target) = symref {
-        let s = store(cx).clone();
-        let p = ns.to_string();
-        let n = name.to_string();
+        let nm = name.to_string();
         let t = target.to_string();
-        tokio::task::spawn_blocking(move || s.tag_set_symbolic(&p, &n, &t))
-            .await?
-            .map_err(super::store_err)?;
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            let p = p.clone();
+            let a = asserter;
+            move || {
+                authorize(&*s, &p, OpClass::Write, &a)?;
+                s.tag_set_symbolic(&p, &nm, &t)
+            }
+        })
+        .await??;
         return (
             StatusCode::CREATED,
             [
@@ -686,24 +729,35 @@ async fn tag_put(
             .into_response(cx);
     }
 
-    let s = store(cx).clone();
     let k = kappa.to_string();
-    let exists = tokio::task::spawn_blocking(move || s.exists(&k))
-        .await?
-        .map_err(super::store_err)?;
+    let exists = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let p = p.clone();
+        let a = asserter.clone();
+        let k = k.clone();
+        move || {
+            authorize(&*s, &p, OpClass::Write, &a)?;
+            s.exists(&k)
+        }
+    })
+    .await??;
     if !exists {
         return Err(not_found().into());
     }
 
-    if let Some(expected) = if_match {
-        let s = store(cx).clone();
-        let p = ns.to_string();
-        let n = name.to_string();
+    // D-5: If-Match uses per-tag version CAS.
+    if let Some(expected_str) = if_match {
+        let expected_version: u64 = expected_str
+            .parse()
+            .map_err(|_| bad_request("If-Match must be a version number"))?;
+        let nm = name.to_string();
         let k = kappa.to_string();
-        let exp = expected.to_string();
-        let ok = tokio::task::spawn_blocking(move || s.tag_set_if(&p, &n, &k, Some(&exp)))
-            .await?
-            .map_err(super::store_err)?;
+        let ok = tokio::task::spawn_blocking({
+            let s = s.clone();
+            let p = p.clone();
+            move || s.tag_set_if(&p, &nm, &k, expected_version)
+        })
+        .await??;
         if ok {
             return (
                 StatusCode::OK,
@@ -714,18 +768,21 @@ async fn tag_put(
             )
                 .into_response(cx);
         } else {
-            return (StatusCode::CONFLICT, "If-Match precondition failed").into_response(cx);
+            return (StatusCode::CONFLICT, "If-Match version precondition failed")
+                .into_response(cx);
         }
     }
 
+    // D-5: If-None-Match: * uses version 0 (create-if-absent).
     if if_none_match == Some("*") {
-        let s = store(cx).clone();
-        let p = ns.to_string();
-        let n = name.to_string();
+        let nm = name.to_string();
         let k = kappa.to_string();
-        let ok = tokio::task::spawn_blocking(move || s.tag_set_if(&p, &n, &k, None))
-            .await?
-            .map_err(super::store_err)?;
+        let ok = tokio::task::spawn_blocking({
+            let s = s.clone();
+            let p = p.clone();
+            move || s.tag_set_if(&p, &nm, &k, 0)
+        })
+        .await??;
         if ok {
             return (
                 StatusCode::CREATED,
@@ -740,25 +797,17 @@ async fn tag_put(
         }
     }
 
-    let s = store(cx).clone();
-    let p = ns.to_string();
-    let n = name.to_string();
+    let nm = name.to_string();
     let current = tokio::task::spawn_blocking({
         let s = s.clone();
         let p = p.clone();
-        let n = n.clone();
-        move || s.tag_get(&p, &n)
+        let nm = nm.clone();
+        move || s.tag_get(&p, &nm)
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
 
-    let s2 = store(cx).clone();
-    let p2 = ns.to_string();
-    let n2 = name.to_string();
-    let k2 = kappa.to_string();
-    tokio::task::spawn_blocking(move || s2.tag_set(&p2, &n2, &k2))
-        .await?
-        .map_err(super::store_err)?;
+    let k = kappa.to_string();
+    tokio::task::spawn_blocking(move || s.tag_set(&p, &nm, &k)).await??;
 
     let status = if current.is_some() {
         StatusCode::OK
@@ -776,9 +825,8 @@ async fn tag_put(
 }
 
 async fn tag_batch(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "tag.batch")?;
-
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let raw_updates = v["updates"]
         .as_array()
         .ok_or_else(|| bad_request("missing updates array"))?;
@@ -791,23 +839,28 @@ async fn tag_batch(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> 
         let new_kappa = entry["kappa"]
             .as_str()
             .ok_or_else(|| bad_request("update missing kappa"))?;
-        let expected = if entry["expected"].is_null() {
+        // D-5: expected_version replaces expected value.
+        // null = unconditional, 0 = create-if-absent, N = version CAS.
+        let expected_version = if entry["expected_version"].is_null() {
             None
         } else {
-            Some(entry["expected"].as_str().unwrap_or("").to_string())
+            entry["expected_version"].as_u64()
         };
         updates.push(TagUpdate {
             name: name.to_string(),
             new_kappa: new_kappa.to_string(),
-            expected,
+            expected_version,
         });
     }
 
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let n = ns.to_string();
-    let result = tokio::task::spawn_blocking(move || s.tag_set_batch(&n, &updates))
-        .await?
-        .map_err(super::store_err)?;
+    let result = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Write, &asserter)?;
+        s.tag_set_batch(&n, &updates)
+    })
+    .await??;
 
     (
         StatusCode::OK,
@@ -817,43 +870,49 @@ async fn tag_batch(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> 
 }
 
 async fn tag_create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let name = v["name"].as_str().unwrap_or("");
     let kappa = v["kappa"].as_str().unwrap_or("");
     if name.is_empty() || kappa.is_empty() {
         return Err(bad_request("missing name or kappa in body").into());
     }
 
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let k = kappa.to_string();
     let exists = tokio::task::spawn_blocking({
         let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
         let k = k.clone();
-        move || s.exists(&k)
+        move || {
+            authorize(&*s, &n, OpClass::Write, &a)?;
+            s.exists(&k)
+        }
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
     if !exists {
         return Err(not_found().into());
     }
 
-    let s = store(cx).clone();
-    let n = ns.to_string();
     let nm = name.to_string();
-    tokio::task::spawn_blocking(move || s.tag_set(&n, &nm, &k))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking(move || s.tag_set(&n, &nm, &k)).await??;
 
     (StatusCode::CREATED, [("content-length", "0")]).into_response(cx)
 }
 
 async fn tag_get_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Response> {
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let n = ns.to_string();
     let nm = name.to_string();
-    let result = tokio::task::spawn_blocking(move || s.tag_get(&n, &nm))
-        .await?
-        .map_err(super::store_err)?;
+    let result = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Read, &asserter)?;
+        s.tag_get(&n, &nm)
+    })
+    .await??;
     let val = result.ok_or_else(not_found)?;
     let body = serde_json::json!({"name": name, "kappa": val});
     (
@@ -865,12 +924,15 @@ async fn tag_get_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Resp
 }
 
 async fn tag_delete_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Response> {
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let n = ns.to_string();
     let nm = name.to_string();
-    let deleted = tokio::task::spawn_blocking(move || s.tag_delete(&n, &nm))
-        .await?
-        .map_err(super::store_err)?;
+    let deleted = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Admin, &asserter)?;
+        s.tag_delete(&n, &nm)
+    })
+    .await??;
     if deleted {
         StatusCode::ACCEPTED.into_response(cx)
     } else {

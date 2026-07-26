@@ -4,7 +4,8 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::not_found;
 use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::KappaStore;
 
@@ -41,22 +42,25 @@ pub fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 async fn register(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "filter.register")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let p = ns.to_string();
     let sc = scope.to_string();
     let content = body.to_vec();
-    let kappa = tokio::task::spawn_blocking(move || s.filter_register(&p, &sc, &content))
-        .await?
-        .map_err(super::store_err)?;
+    let kappa = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let p = p.clone();
+        let a = asserter;
+        move || {
+            authorize(&*s, &p, OpClass::Write, &a)?;
+            s.filter_register(&p, &sc, &content)
+        }
+    })
+    .await??;
 
-    let s = store(cx).clone();
     let k = kappa.clone();
     let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "filter")]))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "filter")])).await??;
 
     (
         StatusCode::CREATED,
@@ -69,13 +73,14 @@ async fn register(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat::Resul
 }
 
 async fn list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "filter.list")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let p = ns.to_string();
-    let records = tokio::task::spawn_blocking(move || s.filter_list(&p))
-        .await?
-        .map_err(super::store_err)?;
+    let records = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &p, OpClass::Read, &asserter)?;
+        s.filter_list(&p)
+    })
+    .await??;
     let body = serde_json::json!({"filters": records});
     (
         StatusCode::OK,
@@ -85,13 +90,15 @@ async fn list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
 }
 
 async fn delete(cx: &Cx, ns: &str, filter_kappa: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "filter.delete")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let fk = filter_kappa.to_string();
-    let removed = tokio::task::spawn_blocking(move || s.filter_remove(&fk))
-        .await?
-        .map_err(super::store_err)?;
+    let removed = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Admin, &asserter)?;
+        s.filter_remove(&fk)
+    })
+    .await??;
     if removed {
         StatusCode::ACCEPTED.into_response(cx)
     } else {

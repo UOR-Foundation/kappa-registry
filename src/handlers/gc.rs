@@ -4,7 +4,8 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::{KappaStore, StoreError};
 
@@ -47,28 +48,31 @@ pub fn status_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 async fn pin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "gc.pin")?;
-
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let kappa = v["kappa"]
         .as_str()
         .ok_or_else(|| bad_request("missing kappa"))?;
     let ttl = v["ttl"].as_u64().unwrap_or(0);
     let controller = v["controller"].as_str().unwrap_or("");
 
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let k = kappa.to_string();
     let ctrl = controller.to_string();
-    let pin_kappa = tokio::task::spawn_blocking(move || s.pin(&k, ttl, &ctrl))
-        .await?
-        .map_err(super::store_err)?;
+    let pin_kappa = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        move || {
+            authorize(&*s, &n, OpClass::Write, &asserter)?;
+            s.pin(&k, ttl, &ctrl)
+        }
+    })
+    .await??;
 
-    let s = store(cx).clone();
     let pk = pin_kappa.clone();
-    let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.meta_set(&n, &pk, &[("object-type", "pin")]))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &pk, &[("object-type", "pin")])).await??;
 
     (
         StatusCode::CREATED,
@@ -81,17 +85,22 @@ async fn pin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 }
 
 async fn unpin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "gc.unpin")?;
-
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let pin_kappa = v["pin_kappa"]
         .as_str()
         .ok_or_else(|| bad_request("missing pin_kappa"))?;
     let release = v["release"].as_str() == Some("true");
 
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let pk = pin_kappa.to_string();
-    let result = tokio::task::spawn_blocking(move || s.unpin(&pk, release)).await?;
+    let result = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Write, &asserter)?;
+        s.unpin(&pk, release)
+    })
+    .await?;
 
     match result {
         Ok(()) => StatusCode::OK.into_response(cx),
@@ -106,11 +115,18 @@ async fn unpin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 }
 
 async fn sweep(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "gc.sweep")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let ns_owned = ns.to_string();
     let store_root = store(cx).root().to_path_buf();
+
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = ns_owned.clone();
+        let a = asserter;
+        move || authorize(&*s, &n, OpClass::Admin, &a)
+    })
+    .await??;
 
     let sweep_id = uuid::Uuid::new_v4().to_string();
     let sid = sweep_id.clone();
@@ -132,11 +148,13 @@ async fn sweep(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
 }
 
 async fn status(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "gc.status")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let store_root = store(cx).root().to_path_buf();
     let body = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Read, &asserter)?;
+
         let status_path = store_root.join("gc").join("status.json");
         let mut status: serde_json::Value = if status_path.exists() {
             std::fs::read(&status_path)
@@ -160,9 +178,9 @@ async fn status(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
             status["objects_evicted"] = serde_json::json!(0);
         }
 
-        serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string())
+        Ok::<_, StoreError>(serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string()))
     })
-    .await?;
+    .await??;
 
     (
         StatusCode::OK,
@@ -171,6 +189,16 @@ async fn status(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
     )
         .into_response(cx)
 }
+
+/// D-7: GC walk relations include identity relations.
+const GC_WALK_RELATIONS: &[&str] = &[
+    "owns",
+    "composed-of",
+    "assertion",
+    "revocation",
+    "recovery-share",
+    "capability",
+];
 
 fn run_sweep(
     store: &dyn KappaStore,
@@ -186,7 +214,7 @@ fn run_sweep(
     roots.sort();
     roots.dedup();
 
-    let reachable = store.edge_walk(ns, &roots, &["owns", "composed-of"])?;
+    let reachable = store.edge_walk(ns, &roots, GC_WALK_RELATIONS)?;
 
     let mut all_blobs = Vec::new();
     for axis in &[

@@ -4,8 +4,9 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
 use crate::kappa::{axis_of, compute_kappa, KappaLabel};
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::{Direction, KappaStore};
 
@@ -34,9 +35,10 @@ pub fn witness_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "compose")?;
+    let asserter = super::registry_anchor(cx);
 
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let operand_strs: Vec<String> = v["operands"]
         .as_array()
         .map(|a| {
@@ -94,35 +96,46 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
     let composed_kappa = compute_kappa(first_axis, &canon)?;
 
     let s = store(cx).clone();
+    let n = ns.to_string();
     let ck = composed_kappa.as_str().to_string();
     let c = canon.clone();
-    tokio::task::spawn_blocking(move || s.put(&ck, &c))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter.clone();
+        move || {
+            authorize(&*s, &n, OpClass::Write, &a)?;
+            s.put(&ck, &c)
+        }
+    })
+    .await??;
 
-    let s = store(cx).clone();
     let k = composed_kappa.as_str().to_string();
-    let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "composition")]))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        move || s.meta_set(&n, &k, &[("object-type", "composition")])
+    })
+    .await??;
 
     let witness_data = witness_blob(71, 32, &canon);
     let witness_kappa = compute_kappa(first_axis, &witness_data)?;
 
-    let s = store(cx).clone();
     let wk = witness_kappa.as_str().to_string();
     let w = witness_data.clone();
-    tokio::task::spawn_blocking(move || s.put(&wk, &w))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.put(&wk, &w)
+    })
+    .await??;
 
-    let s = store(cx).clone();
     let k = witness_kappa.as_str().to_string();
-    let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "witness")]))
-        .await?
-        .map_err(super::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        move || s.meta_set(&n, &k, &[("object-type", "witness")])
+    })
+    .await??;
 
     for operand in &operand_strs {
         let edge_canon = super::edge::edge_canonical_pub(
@@ -132,7 +145,6 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
             op_token.as_bytes(),
         );
         let ek = compute_kappa(first_axis, &edge_canon)?;
-        let s = store(cx).clone();
         let ek_str = ek.as_str().to_string();
         let ec = edge_canon.clone();
         tokio::task::spawn_blocking({
@@ -140,17 +152,28 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
             let ek = ek_str.clone();
             move || s.put(&ek, &ec)
         })
-        .await?
-        .map_err(super::store_err)?;
+        .await??;
         let ck = composed_kappa.as_str().to_string();
         let op = operand.clone();
         let edge_meta = serde_json::json!({"operation": op_token});
-        let n = ns.to_string();
-        tokio::task::spawn_blocking(move || {
-            s.edge_put(&n, &ek_str, &ck, "composed-of", &op, &edge_canon, edge_meta)
+        let a = asserter.clone();
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            let n = n.clone();
+            move || {
+                s.edge_put(
+                    &n,
+                    &a,
+                    &ek_str,
+                    &ck,
+                    "composed-of",
+                    &op,
+                    &edge_canon,
+                    edge_meta,
+                )
+            }
         })
-        .await?
-        .map_err(super::store_err)?;
+        .await??;
     }
 
     let wit_edge = super::edge::edge_canonical_pub(
@@ -160,7 +183,6 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
         b"",
     );
     let wit_ek = compute_kappa(first_axis, &wit_edge)?;
-    let s = store(cx).clone();
     let wek = wit_ek.as_str().to_string();
     let we = wit_edge.clone();
     tokio::task::spawn_blocking({
@@ -168,17 +190,16 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
         let wek = wek.clone();
         move || s.put(&wek, &we)
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
     let wk = witness_kappa.as_str().to_string();
     let ck = composed_kappa.as_str().to_string();
-    let n = ns.to_string();
     let wit_meta = serde_json::json!({});
-    tokio::task::spawn_blocking(move || {
-        s.edge_put(&n, &wek, &wk, "witness-of", &ck, &wit_edge, wit_meta)
+    let a = asserter;
+    tokio::task::spawn_blocking({
+        let n = n.clone();
+        move || s.edge_put(&n, &a, &wek, &wk, "witness-of", &ck, &wit_edge, wit_meta)
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
 
     let operands_json: Vec<serde_json::Value> = operand_strs
         .iter()
@@ -200,27 +221,30 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
 }
 
 async fn witness(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "witness.get")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
     let k = kappa.to_string();
     let n = ns.to_string();
-    let edges: Vec<crate::store::EdgeRecord> = tokio::task::spawn_blocking(move || {
-        s.edge_find(&n, &k, Direction::Inbound, Some("witness-of"))
+    let edges: Vec<crate::store::EdgeRecord> = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        let k = k.clone();
+        move || {
+            authorize(&*s, &n, OpClass::Read, &a)?;
+            s.edge_find(&n, &k, Direction::Inbound, Some("witness-of"))
+        }
     })
-    .await?
-    .map_err(super::store_err)?;
+    .await??;
 
     let witness_kappa = edges
         .first()
         .map(|e| e.source.clone())
         .ok_or_else(not_found)?;
 
-    let s = store(cx).clone();
     let wk = witness_kappa.clone();
     let content: Vec<u8> = tokio::task::spawn_blocking(move || s.get(&wk))
-        .await?
-        .map_err(super::store_err)?
+        .await??
         .ok_or_else(not_found)?;
 
     (

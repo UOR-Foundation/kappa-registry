@@ -49,6 +49,16 @@ impl fmt::Display for LabelError {
 
 impl std::error::Error for LabelError {}
 
+impl topcoat::HttpErrorResponse for LabelError {
+    fn status_code(&self) -> http::StatusCode {
+        http::StatusCode::BAD_REQUEST
+    }
+
+    fn response_body(&self) -> String {
+        format!("bad request: {self}")
+    }
+}
+
 impl KappaLabel {
     pub fn parse(s: &str) -> Result<Self, LabelError> {
         let bytes = s.as_bytes();

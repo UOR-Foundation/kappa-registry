@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use topcoat::context::{app_context, Cx};
-use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::transaction::TransactionManager;
 
@@ -55,9 +55,12 @@ pub fn abort_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 async fn begin(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "transaction.begin")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking(move || authorize(&*s, &n, OpClass::Write, &asserter)).await??;
 
-    let txn_id = transactions(cx).begin(ns).map_err(topcoat::Error::from)?;
+    let txn_id = transactions(cx).begin(ns)?;
 
     let body = serde_json::json!({"transaction_id": txn_id});
     (
@@ -74,18 +77,22 @@ async fn put(
     kappa: &str,
     body: &[u8],
 ) -> topcoat::Result<Response> {
-    auth::authorize(ns, "transaction.put")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        move || authorize(&*s, &n, OpClass::Write, &a)
+    })
+    .await??;
 
     let txn = txn_id.to_string();
     let k = kappa.to_string();
     let content = body.to_vec();
     let txns = transactions(cx).clone();
-    let created = tokio::task::spawn_blocking(move || txns.put(&txn, &k, &content))
-        .await?
-        .map_err(|e| match e {
-            crate::store::StoreError::NotFound => topcoat::Error::from(not_found()),
-            other => topcoat::Error::from(bad_request(other.to_string())),
-        })?;
+    let created = tokio::task::spawn_blocking(move || txns.put(&txn, &k, &content)).await??;
 
     let status = if created {
         StatusCode::CREATED
@@ -103,17 +110,20 @@ async fn put(
 }
 
 async fn commit(cx: &Cx, ns: &str, txn_id: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "transaction.commit")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        move || authorize(&*s, &n, OpClass::Write, &a)
+    })
+    .await??;
 
     let txn = txn_id.to_string();
     let txns = transactions(cx).clone();
-    let s = store(cx).clone();
-    let result = tokio::task::spawn_blocking(move || txns.commit(&txn, &*s))
-        .await?
-        .map_err(|e| match e {
-            crate::store::StoreError::NotFound => topcoat::Error::from(not_found()),
-            other => topcoat::Error::from(bad_request(other.to_string())),
-        })?;
+    let result = tokio::task::spawn_blocking(move || txns.commit(&txn, &*s)).await??;
 
     let body = serde_json::json!({"promoted": result.promoted});
     (
@@ -124,16 +134,20 @@ async fn commit(cx: &Cx, ns: &str, txn_id: &str) -> topcoat::Result<Response> {
 }
 
 async fn abort(cx: &Cx, ns: &str, txn_id: &str) -> topcoat::Result<Response> {
-    auth::authorize(ns, "transaction.abort")?;
+    let asserter = super::registry_anchor(cx);
+    let s = store(cx).clone();
+    let n = ns.to_string();
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = n.clone();
+        let a = asserter;
+        move || authorize(&*s, &n, OpClass::Write, &a)
+    })
+    .await??;
 
     let txn = txn_id.to_string();
     let txns = transactions(cx).clone();
-    tokio::task::spawn_blocking(move || txns.abort(&txn))
-        .await?
-        .map_err(|e| match e {
-            crate::store::StoreError::NotFound => topcoat::Error::from(not_found()),
-            other => topcoat::Error::from(bad_request(other.to_string())),
-        })?;
+    tokio::task::spawn_blocking(move || txns.abort(&txn)).await??;
 
     StatusCode::NO_CONTENT.into_response(cx)
 }

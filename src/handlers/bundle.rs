@@ -4,7 +4,8 @@ use topcoat::context::{app_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use crate::auth;
+use crate::auth::authorize;
+use crate::ratelimit::OpClass;
 use crate::store::fs::FsStore;
 use crate::store::KappaStore;
 
@@ -31,9 +32,8 @@ pub fn ingest_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 async fn create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "bundle.create")?;
-
-    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let kappas: Vec<String> = v["kappas"]
         .as_array()
         .map(|a| {
@@ -48,10 +48,14 @@ async fn create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         return Err(bad_request("empty kappas list").into());
     }
 
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
-    let bundle = tokio::task::spawn_blocking(move || s.bundle_create(&kappas, delta))
-        .await?
-        .map_err(super::store_err)?;
+    let n = ns.to_string();
+    let bundle = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Read, &asserter)?;
+        s.bundle_create(&kappas, delta)
+    })
+    .await??;
 
     (
         StatusCode::OK,
@@ -62,13 +66,15 @@ async fn create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 }
 
 async fn ingest(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
-    auth::authorize(ns, "bundle.ingest")?;
-
+    let asserter = super::registry_anchor(cx);
     let s = store(cx).clone();
+    let n = ns.to_string();
     let data = body.to_vec();
-    let ingested = tokio::task::spawn_blocking(move || s.bundle_ingest(&data))
-        .await?
-        .map_err(super::store_err)?;
+    let ingested = tokio::task::spawn_blocking(move || {
+        authorize(&*s, &n, OpClass::Write, &asserter)?;
+        s.bundle_ingest(&data)
+    })
+    .await??;
 
     let resp = serde_json::json!({"ingested": ingested});
     (
