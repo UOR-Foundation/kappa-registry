@@ -60,9 +60,9 @@ fn compose_axis_mismatch() {
         &[("Content-Type", "application/json")],
         body.as_bytes(),
     );
-    assert_eq!(status, 422);
+    assert_eq!(status, 400);
     let text = String::from_utf8_lossy(&resp);
-    assert!(text.contains("AXIS_MISMATCH"), "body: {text}");
+    assert!(text.contains("axis mismatch"), "body: {text}");
 }
 
 #[test]

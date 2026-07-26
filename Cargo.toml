@@ -1,11 +1,8 @@
-[workspace]
-members = ["crates/kappa-macros"]
-
 [package]
 name = "kappa-registry"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.92"
+rust-version = "1.95"
 publish = false
 license = "MIT OR Apache-2.0"
 description = "A conforming kappa-Distribution /v2/ registry. Filesystem-backed, single-node, all five conformance levels."
@@ -19,17 +16,12 @@ name = "kappa-registry"
 path = "src/main.rs"
 
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
-utoipa = "5"
-scalar_api_reference = { version = "0.2.2", features = ["axum"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
-tower-http = { version = "0.6", features = ["trace", "limit"] }
-tower = { version = "0.5", features = ["util"] }
+topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tower = "0.5"
 governor = "0.10"
 http = "1"
-
-# Proc macros
-kappa-macros = { path = "crates/kappa-macros" }
+anyhow = "1"
 
 # Hashing -- all RustCrypto digest-trait compatible
 sha2 = "0.10"
@@ -50,9 +42,6 @@ tempfile = "3"
 # Identifiers
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-
-# CLI
-clap = { version = "4", features = ["derive", "env"] }
 
 # Observability
 tracing = "0.1"
@@ -82,7 +71,9 @@ federation = ["reqwest"]
 [dev-dependencies]
 cucumber = "0.21"
 reqwest = { version = "0.12", features = ["blocking"] }
-http-body-util = "0.1"
+
+[patch.crates-io]
+matchit = { git = "https://github.com/usrbinkat/matchit", branch = "usrbinkat/feat/non-terminal-catch-all" }
 
 [[test]]
 name = "bdd"

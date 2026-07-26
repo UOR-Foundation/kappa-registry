@@ -1,15 +1,42 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use topcoat::context::{app_context, Cx};
+use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
 use crate::auth;
-use crate::error::AppError;
 use crate::kappa::KappaLabel;
+use crate::store::fs::FsStore;
 use crate::store::KappaStore;
-use crate::AppState;
+use crate::UploadTimeout;
+
+use super::path_param;
+
+fn query_param(cx: &Cx, key: &str) -> Option<String> {
+    let query = topcoat::router::uri(cx).query()?;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(super::tag::percent_decode(v));
+            }
+        }
+    }
+    None
+}
+
+fn store(cx: &Cx) -> &Arc<FsStore> {
+    app_context::<Arc<FsStore>>(cx)
+}
+
+fn sessions(cx: &Cx) -> &Arc<SessionStore> {
+    app_context::<Arc<SessionStore>>(cx)
+}
+
+fn upload_timeout(cx: &Cx) -> u64 {
+    app_context::<UploadTimeout>(cx).0
+}
 
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, UploadSession>>,
@@ -89,125 +116,186 @@ impl Default for SessionStore {
     }
 }
 
-pub async fn start(
-    state: &AppState,
-    ns: &str,
-    mount_kappa: Option<&str>,
-) -> Result<Response, AppError> {
+// -- Route entry points --
+
+pub fn start_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = super::read_body(body).await?;
+        let ns = path_param(cx, "ns");
+        let digest = query_param(cx, "digest");
+        let mount = query_param(cx, "mount");
+
+        if let Some(ref digest) = digest {
+            if !bytes.is_empty() {
+                return super::blob::put(cx, ns, digest, &bytes).await;
+            }
+        }
+
+        start(cx, ns, mount.as_deref()).await
+    })
+}
+
+pub fn chunk_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = super::read_body(body).await?;
+        let id = path_param(cx, "id");
+        let range_start = headers(cx)
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_range_start);
+        chunk(cx, id, range_start, &bytes).await
+    })
+}
+
+pub fn recovery_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let id = path_param(cx, "id");
+        recovery(cx, id).await
+    })
+}
+
+pub fn complete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = super::read_body(body).await?;
+        let id = path_param(cx, "id");
+        let kappa = query_param(cx, "kappa")
+            .or_else(|| query_param(cx, "digest"))
+            .unwrap_or_default();
+        let range_start = headers(cx)
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_range_start);
+        complete(cx, id, &kappa, range_start, &bytes).await
+    })
+}
+
+pub fn cancel_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let id = path_param(cx, "id");
+        sessions(cx).remove(id);
+        StatusCode::NO_CONTENT.into_response(cx)
+    })
+}
+
+// -- Domain logic --
+
+async fn start(cx: &Cx, ns: &str, mount_kappa: Option<&str>) -> topcoat::Result<Response> {
     auth::authorize(ns, "upload.start")?;
 
     if let Some(kappa) = mount_kappa {
-        let s = state.store.clone();
+        let s = store(cx).clone();
         let k = kappa.to_string();
-        let exists = tokio::task::spawn_blocking(move || s.exists(&k)).await??;
+        let exists = tokio::task::spawn_blocking(move || s.exists(&k))
+            .await?
+            .map_err(super::store_err)?;
         if exists {
-            return Ok((
+            return (
                 StatusCode::CREATED,
                 [
-                    ("location", crate::routes::segments::blob_url(ns, kappa)),
+                    ("location", crate::urls::blob_url(ns, kappa)),
                     ("content-length", "0".to_string()),
                 ],
             )
-                .into_response());
+                .into_response(cx);
         }
     }
 
-    let id = state.sessions.create(ns);
-    Ok((
+    let id = sessions(cx).create(ns);
+    (
         StatusCode::ACCEPTED,
         [
-            ("location", crate::routes::segments::upload_url(&id)),
+            ("location", crate::urls::upload_url(&id)),
             ("x-kappa-upload-session", id.clone()),
             ("x-kappa-chunk-min-length", "0".to_string()),
             ("oci-chunk-min-length", "0".to_string()),
             ("content-length", "0".to_string()),
         ],
     )
-        .into_response())
+        .into_response(cx)
 }
 
-pub async fn chunk(
-    state: &AppState,
+async fn chunk(
+    cx: &Cx,
     id: &str,
     range_start: Option<usize>,
     body: &[u8],
-) -> Result<Response, AppError> {
-    if state.sessions.is_expired(id, state.upload_timeout_secs) {
-        state.sessions.remove(id);
-        return Err(AppError::UploadNotFound);
+) -> topcoat::Result<Response> {
+    let timeout = upload_timeout(cx);
+    if sessions(cx).is_expired(id, timeout) {
+        sessions(cx).remove(id);
+        return Err(not_found().into());
     }
 
-    let offset = match (range_start, state.sessions.bytes_received(id)) {
+    let offset = match (range_start, sessions(cx).bytes_received(id)) {
         (Some(start), Some(_)) => start,
         (None, Some(received)) => received,
-        (_, None) => {
-            return Err(AppError::UploadNotFound);
-        }
+        (_, None) => return Err(not_found().into()),
     };
 
-    match state.sessions.append(id, offset, body) {
+    match sessions(cx).append(id, offset, body) {
         Ok(total) => {
             let range = format!("0-{}", total.saturating_sub(1));
-            Ok((
+            (
                 StatusCode::ACCEPTED,
                 [
                     ("range", range),
-                    ("location", crate::routes::segments::upload_url(id)),
+                    ("location", crate::urls::upload_url(id)),
                     ("content-length", "0".to_string()),
                 ],
             )
-                .into_response())
+                .into_response(cx)
         }
-        Err(()) => Err(AppError::RangeNotSatisfiable),
+        Err(()) => (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk").into_response(cx),
     }
 }
 
-pub async fn recovery(state: &AppState, id: &str) -> Result<Response, AppError> {
-    if state.sessions.is_expired(id, state.upload_timeout_secs) {
-        state.sessions.remove(id);
-        return Err(AppError::UploadNotFound);
+async fn recovery(cx: &Cx, id: &str) -> topcoat::Result<Response> {
+    let timeout = upload_timeout(cx);
+    if sessions(cx).is_expired(id, timeout) {
+        sessions(cx).remove(id);
+        return Err(not_found().into());
     }
 
-    let received = state
-        .sessions
-        .bytes_received(id)
-        .ok_or(AppError::UploadNotFound)?;
+    let received = sessions(cx).bytes_received(id).ok_or_else(not_found)?;
     let range = format!("0-{}", received.saturating_sub(1));
-    Ok((
+    (
         StatusCode::NO_CONTENT,
         [
             ("range", range),
-            ("location", crate::routes::segments::upload_url(id)),
+            ("location", crate::urls::upload_url(id)),
             ("content-length", "0".to_string()),
         ],
     )
-        .into_response())
+        .into_response(cx)
 }
 
-pub async fn complete(
-    state: &AppState,
+async fn complete(
+    cx: &Cx,
     id: &str,
     kappa_str: &str,
     range_start: Option<usize>,
     final_body: &[u8],
-) -> Result<Response, AppError> {
-    if state.sessions.is_expired(id, state.upload_timeout_secs) {
-        state.sessions.remove(id);
-        return Err(AppError::UploadNotFound);
+) -> topcoat::Result<Response> {
+    let timeout = upload_timeout(cx);
+    if sessions(cx).is_expired(id, timeout) {
+        sessions(cx).remove(id);
+        return Err(not_found().into());
     }
 
     if !final_body.is_empty() {
-        let offset = match (range_start, state.sessions.bytes_received(id)) {
+        let offset = match (range_start, sessions(cx).bytes_received(id)) {
             (Some(start), Some(_)) => start,
             (None, Some(received)) => received,
-            (_, None) => return Err(AppError::UploadNotFound),
+            (_, None) => return Err(not_found().into()),
         };
-        if state.sessions.append(id, offset, final_body).is_err() {
-            return Err(AppError::RangeNotSatisfiable);
+        if sessions(cx).append(id, offset, final_body).is_err() {
+            return (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk").into_response(cx);
         }
     }
 
-    let (path, data) = state.sessions.take(id).ok_or(AppError::UploadNotFound)?;
+    let (path, data) = sessions(cx).take(id).ok_or_else(not_found)?;
 
     let kappa = KappaLabel::parse(kappa_str)?;
     let computed = match kappa.axis() {
@@ -215,33 +303,32 @@ pub async fn complete(
         "sha256" => KappaLabel::sha256(&data),
         "blake3" => KappaLabel::blake3(&data),
         "sha512" => KappaLabel::sha512(&data),
-        _ => return Err(AppError::NameInvalid("unsupported axis".to_string())),
+        _ => return Err(bad_request("unsupported axis").into()),
     };
     if computed != kappa {
-        return Err(AppError::digest_invalid(kappa.as_str(), computed.as_str()));
+        return Err(bad_request(format!(
+            "digest invalid: expected {}, got {}",
+            kappa.as_str(),
+            computed.as_str()
+        ))
+        .into());
     }
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa_str.to_string();
-    tokio::task::spawn_blocking(move || s.put(&k, &data)).await??;
+    tokio::task::spawn_blocking(move || s.put(&k, &data))
+        .await?
+        .map_err(super::store_err)?;
 
-    Ok((
+    (
         StatusCode::CREATED,
         [
             ("x-kappa-label", kappa_str.to_string()),
-            (
-                "location",
-                crate::routes::segments::blob_url(&path, kappa_str),
-            ),
+            ("location", crate::urls::blob_url(&path, kappa_str)),
             ("content-length", "0".to_string()),
         ],
     )
-        .into_response())
-}
-
-pub fn cancel(state: &AppState, id: &str) -> Response {
-    state.sessions.remove(id);
-    StatusCode::NO_CONTENT.into_response()
+        .into_response(cx)
 }
 
 pub fn parse_range_start(v: &str) -> Option<usize> {

@@ -1,7 +1,3 @@
-use crate::error::AppError;
-
-pub fn authorize(ns: &str, operation: &str) -> Result<(), AppError> {
-    let _ = ns;
-    let _ = operation;
+pub fn authorize(_ns: &str, _operation: &str) -> topcoat::Result<()> {
     Ok(())
 }

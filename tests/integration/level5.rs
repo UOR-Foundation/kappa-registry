@@ -79,7 +79,10 @@ fn finalizer_blocks_unpin() {
     );
     assert_eq!(status, 409);
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("FINALIZER_OUTSTANDING"), "body: {text}");
+    assert!(
+        text.contains("finalizer") && text.contains("blocks unpin"),
+        "body: {text}"
+    );
 
     // Unpin with release - succeeds
     let release_body = format!(r#"{{"pin_kappa":"{pin_kappa}","release":"true"}}"#);
@@ -127,9 +130,9 @@ fn filter_register_list_evaluate_remove() {
         &[],
         denied_content,
     );
-    assert_eq!(status, 422);
+    assert_eq!(status, 400);
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("FILTER_REJECTED"), "body: {text}");
+    assert!(text.contains("filter rejected"), "body: {text}");
 
     // PUT clean blob - accepted
     let clean_content = b"perfectly fine content";

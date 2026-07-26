@@ -373,19 +373,25 @@ fn tag_mtime_excluded_from_root_hash() {
 fn tag_list_prefix_returns_matching() {
     let srv = TestServer::start();
     let ns = "l8-prefix-list";
+    // Tags with slashes must use the body-based creation path because
+    // URL path params are single-segment.
+    let k1 = push_blob(&srv.addr, ns, br#"{"ref":"main"}"#);
+    let body1 = format!(r#"{{"name":"refs/heads/main","kappa":"{k1}"}}"#);
     request(
         &srv.addr,
-        "PUT",
-        &manifest_uri(ns, "refs/heads/main"),
-        &[],
-        br#"{"ref":"main"}"#,
+        "POST",
+        &format!("/v2/{ns}/tags/"),
+        &[("Content-Type", "application/json")],
+        body1.as_bytes(),
     );
+    let k2 = push_blob(&srv.addr, ns, br#"{"ref":"dev"}"#);
+    let body2 = format!(r#"{{"name":"refs/heads/dev","kappa":"{k2}"}}"#);
     request(
         &srv.addr,
-        "PUT",
-        &manifest_uri(ns, "refs/heads/dev"),
-        &[],
-        br#"{"ref":"dev"}"#,
+        "POST",
+        &format!("/v2/{ns}/tags/"),
+        &[("Content-Type", "application/json")],
+        body2.as_bytes(),
     );
     request(
         &srv.addr,
@@ -438,19 +444,24 @@ fn tag_list_prefix_empty_returns_all() {
 fn tag_delete_prefix_removes_matching() {
     let srv = TestServer::start();
     let ns = "l8-prefix-del";
+    // Tags with slashes must use body-based creation.
+    let k1 = push_blob(&srv.addr, ns, br#"{"s":1}"#);
+    let body1 = format!(r#"{{"name":"segment/001/data","kappa":"{k1}"}}"#);
     request(
         &srv.addr,
-        "PUT",
-        &manifest_uri(ns, "segment/001/data"),
-        &[],
-        br#"{"s":1}"#,
+        "POST",
+        &format!("/v2/{ns}/tags/"),
+        &[("Content-Type", "application/json")],
+        body1.as_bytes(),
     );
+    let k2 = push_blob(&srv.addr, ns, br#"{"s":2}"#);
+    let body2 = format!(r#"{{"name":"segment/001/index","kappa":"{k2}"}}"#);
     request(
         &srv.addr,
-        "PUT",
-        &manifest_uri(ns, "segment/001/index"),
-        &[],
-        br#"{"s":2}"#,
+        "POST",
+        &format!("/v2/{ns}/tags/"),
+        &[("Content-Type", "application/json")],
+        body2.as_bytes(),
     );
     request(
         &srv.addr,

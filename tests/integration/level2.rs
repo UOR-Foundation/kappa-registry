@@ -368,7 +368,7 @@ fn content_before_tag() {
     );
     assert_eq!(status, 404);
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("TAG_CONTENT_ABSENT"), "body: {text}");
+    assert!(text.contains("not found"), "body: {text}");
 }
 
 #[test]

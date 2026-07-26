@@ -1,60 +1,100 @@
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use std::sync::Arc;
+
+use topcoat::context::{app_context, Cx};
+use topcoat::router::error::not_found;
+use topcoat::router::{Body, IntoResponse, Response, RouteFuture, StatusCode};
 
 use crate::auth;
-use crate::error::AppError;
+use crate::store::fs::FsStore;
 use crate::store::KappaStore;
-use crate::AppState;
 
-pub async fn register(
-    state: &AppState,
-    ns: &str,
-    scope: &str,
-    body: &[u8],
-) -> Result<Response, AppError> {
+use super::path_param;
+
+fn store(cx: &Cx) -> &Arc<FsStore> {
+    app_context::<Arc<FsStore>>(cx)
+}
+
+pub fn register_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = super::read_body(body).await?;
+        let ns = path_param(cx, "ns");
+        let scope = path_param(cx, "filter_key");
+        register(cx, ns, scope, &bytes).await
+    })
+}
+
+pub fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        list(cx, ns).await
+    })
+}
+
+pub fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let ns = path_param(cx, "ns");
+        let kappa = path_param(cx, "filter_key");
+        delete(cx, ns, kappa).await
+    })
+}
+
+async fn register(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat::Result<Response> {
     auth::authorize(ns, "filter.register")?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let p = ns.to_string();
     let sc = scope.to_string();
     let content = body.to_vec();
-    let kappa = tokio::task::spawn_blocking(move || s.filter_register(&p, &sc, &content)).await??;
+    let kappa = tokio::task::spawn_blocking(move || s.filter_register(&p, &sc, &content))
+        .await?
+        .map_err(super::store_err)?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let k = kappa.clone();
     let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "filter")])).await??;
+    tokio::task::spawn_blocking(move || s.meta_set(&n, &k, &[("object-type", "filter")]))
+        .await?
+        .map_err(super::store_err)?;
 
-    Ok((
+    (
         StatusCode::CREATED,
         [
             ("x-kappa-label", kappa),
             ("content-length", "0".to_string()),
         ],
     )
-        .into_response())
+        .into_response(cx)
 }
 
-pub async fn list(state: &AppState, ns: &str) -> Result<Response, AppError> {
+async fn list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "filter.list")?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let p = ns.to_string();
-    let records = tokio::task::spawn_blocking(move || s.filter_list(&p)).await??;
+    let records = tokio::task::spawn_blocking(move || s.filter_list(&p))
+        .await?
+        .map_err(super::store_err)?;
     let body = serde_json::json!({"filters": records});
-    Ok((StatusCode::OK, Json(body)).into_response())
+    (
+        StatusCode::OK,
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response(cx)
 }
 
-pub async fn delete(state: &AppState, ns: &str, filter_kappa: &str) -> Result<Response, AppError> {
+async fn delete(cx: &Cx, ns: &str, filter_kappa: &str) -> topcoat::Result<Response> {
     auth::authorize(ns, "filter.delete")?;
 
-    let s = state.store.clone();
+    let s = store(cx).clone();
     let fk = filter_kappa.to_string();
-    let removed = tokio::task::spawn_blocking(move || s.filter_remove(&fk)).await??;
+    let removed = tokio::task::spawn_blocking(move || s.filter_remove(&fk))
+        .await?
+        .map_err(super::store_err)?;
     if removed {
-        Ok(StatusCode::ACCEPTED.into_response())
+        StatusCode::ACCEPTED.into_response(cx)
     } else {
-        Err(AppError::BlobUnknown)
+        Err(not_found().into())
     }
 }

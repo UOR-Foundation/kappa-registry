@@ -7,7 +7,6 @@ use kappa_registry::handlers::upload::SessionStore;
 use kappa_registry::kappa::KappaLabel;
 use kappa_registry::store::fs::FsStore;
 use kappa_registry::transaction::TransactionManager;
-use kappa_registry::AppState;
 
 // Test blob fixtures - computed once, used everywhere.
 pub struct TestBlob {
@@ -209,9 +208,6 @@ pub fn absent_kappa() -> String {
 }
 
 // Test server that starts on an ephemeral port with a temp data dir.
-// Field drop order is reverse declaration. _handle must be declared before
-// _shutdown so _shutdown drops first (sends signal to the server), then
-// _handle drops (joins the now-exiting thread). Reversing this deadlocks.
 pub struct TestServer {
     pub addr: String,
     pub _data_dir: tempfile::TempDir,
@@ -223,12 +219,13 @@ impl TestServer {
     pub fn start() -> Self {
         let data_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(FsStore::new(data_dir.path().to_path_buf()).unwrap());
+        let sessions = Arc::new(SessionStore::new());
         let transactions = Arc::new(TransactionManager::new(
             data_dir.path().to_path_buf(),
-            64,                // max concurrent
-            64 * 1024 * 1024,  // max bytes per txn (same as max_blob_size)
-            256 * 1024 * 1024, // max global staging bytes
-            3600,              // timeout secs
+            64,
+            64 * 1024 * 1024,
+            256 * 1024 * 1024,
+            3600,
         ));
 
         let signer: Option<Arc<dyn kappa_registry::crypto::RegistrySigner>> = {
@@ -238,15 +235,15 @@ impl TestServer {
                 .map(|s| Arc::from(s) as Arc<dyn kappa_registry::crypto::RegistrySigner>)
         };
 
-        let state = AppState {
+        let router = kappa_registry::router(
             store,
-            sessions: Arc::new(SessionStore::new()),
+            sessions,
             transactions,
-            rate_limiter: None,
+            None,
             signer,
-            max_blob_size: 64 * 1024 * 1024,
-            upload_timeout_secs: 3600,
-        };
+            64 * 1024 * 1024,
+            3600,
+        );
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
@@ -260,13 +257,11 @@ impl TestServer {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap().to_string();
                 addr_tx.send(addr).unwrap();
-                let app = kappa_registry::app(state);
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
-                        rx.await.ok();
-                    })
-                    .await
-                    .unwrap();
+                topcoat::serve_until(listener, router, async {
+                    rx.await.ok();
+                })
+                .await
+                .unwrap();
             });
         });
 
@@ -291,6 +286,7 @@ impl TestServer {
 
         let data_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(FsStore::new(data_dir.path().to_path_buf()).unwrap());
+        let sessions = Arc::new(SessionStore::new());
         let transactions = Arc::new(TransactionManager::new(
             data_dir.path().to_path_buf(),
             64,
@@ -299,22 +295,21 @@ impl TestServer {
             3600,
         ));
 
-        // Apply the same config to all classes for integration test simplicity.
         let rl_config = RateLimitConfig {
             read: ClassConfig { period_ms, burst },
             write: ClassConfig { period_ms, burst },
             admin: ClassConfig { period_ms, burst },
         };
 
-        let state = AppState {
+        let router = kappa_registry::router(
             store,
-            sessions: Arc::new(SessionStore::new()),
+            sessions,
             transactions,
-            rate_limiter: Some(TieredRateLimiter::new(&rl_config)),
-            signer: None,
-            max_blob_size: 64 * 1024 * 1024,
-            upload_timeout_secs: 3600,
-        };
+            Some(TieredRateLimiter::new(&rl_config)),
+            None,
+            64 * 1024 * 1024,
+            3600,
+        );
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
@@ -328,13 +323,11 @@ impl TestServer {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap().to_string();
                 addr_tx.send(addr).unwrap();
-                let app = kappa_registry::app(state);
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
-                        rx.await.ok();
-                    })
-                    .await
-                    .unwrap();
+                topcoat::serve_until(listener, router, async {
+                    rx.await.ok();
+                })
+                .await
+                .unwrap();
             });
         });
 
