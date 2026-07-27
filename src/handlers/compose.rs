@@ -30,9 +30,14 @@ pub async fn compose(
         return Err(AppError::NameInvalid("no operands".to_string()));
     }
 
-    let first_axis = axis_of(&operand_strs[0]).unwrap_or("sha256");
-    for op in &operand_strs[1..] {
-        if axis_of(op) != Some(first_axis) {
+    let operand_labels = operand_strs
+        .iter()
+        .map(|operand| KappaLabel::parse(operand))
+        .collect::<Result<Vec<_>, _>>()?;
+    let first_label = operand_labels[0];
+    let first_axis = first_label.axis();
+    for label in &operand_labels[1..] {
+        if label.axis() != first_axis {
             return Err(AppError::AxisMismatch);
         }
     }
@@ -82,7 +87,11 @@ pub async fn compose(
     let k = composed_kappa.as_str().to_string();
     tokio::task::spawn_blocking(move || s.put_meta(&k, "object-type", b"composition")).await??;
 
-    let witness = witness_blob(71, 32, &canon);
+    let witness = witness_blob(
+        first_label.label_width(),
+        first_label.fingerprint_width(),
+        &canon,
+    );
     let witness_kappa = compute_kappa(first_axis, &witness)?;
 
     let s = state.store.clone();

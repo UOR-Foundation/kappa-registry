@@ -1,5 +1,6 @@
 use sha1_checked::Sha1 as Sha1Checked;
 use sha2::{Digest, Sha256, Sha512};
+use sha3::{Keccak256, Sha3_256};
 use std::fmt;
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -111,6 +112,28 @@ impl KappaLabel {
         KappaLabel { buf, len: 71 }
     }
 
+    pub fn sha3_256(content: &[u8]) -> Self {
+        let hash = Sha3_256::digest(content);
+        let mut buf = [0u8; 135];
+        buf[..9].copy_from_slice(b"sha3-256:");
+        for (i, &byte) in hash.iter().enumerate() {
+            buf[9 + 2 * i] = HEX[(byte >> 4) as usize];
+            buf[9 + 2 * i + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        KappaLabel { buf, len: 73 }
+    }
+
+    pub fn keccak256(content: &[u8]) -> Self {
+        let hash = Keccak256::digest(content);
+        let mut buf = [0u8; 135];
+        buf[..10].copy_from_slice(b"keccak256:");
+        for (i, &byte) in hash.iter().enumerate() {
+            buf[10 + 2 * i] = HEX[(byte >> 4) as usize];
+            buf[10 + 2 * i + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        KappaLabel { buf, len: 74 }
+    }
+
     pub fn sha512(content: &[u8]) -> Self {
         let hash = Sha512::digest(content);
         let mut buf = [0u8; 135];
@@ -149,6 +172,15 @@ impl KappaLabel {
     pub fn axis(&self) -> &str {
         let s = self.as_str();
         &s[..s.find(':').unwrap()]
+    }
+
+    pub fn label_width(&self) -> u16 {
+        u16::from(self.len)
+    }
+
+    pub fn fingerprint_width(&self) -> u16 {
+        let prefix_width = self.axis().len() + 1;
+        ((usize::from(self.len) - prefix_width) / 2) as u16
     }
 
     pub fn complement(&self) -> Self {
@@ -203,6 +235,8 @@ pub fn compute_kappa(axis: &str, content: &[u8]) -> Result<KappaLabel, LabelErro
         "sha1" => KappaLabel::sha1(content),
         "sha256" => Ok(KappaLabel::sha256(content)),
         "blake3" => Ok(KappaLabel::blake3(content)),
+        "sha3-256" => Ok(KappaLabel::sha3_256(content)),
+        "keccak256" => Ok(KappaLabel::keccak256(content)),
         "sha512" => Ok(KappaLabel::sha512(content)),
         _ => Err(LabelError::UnknownAxis),
     }
@@ -235,6 +269,14 @@ mod tests {
         "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
     const HELLO_BLAKE3: &str =
         "blake3:ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
+    const EMPTY_SHA3_256: &str =
+        "sha3-256:a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a";
+    const HELLO_SHA3_256: &str =
+        "sha3-256:3338be694f50c5f338814986cdf0686453a888b84f424d792af4b9202398f392";
+    const EMPTY_KECCAK256: &str =
+        "keccak256:c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
+    const HELLO_KECCAK256: &str =
+        "keccak256:1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8";
 
     #[test]
     fn sha1_empty() {
@@ -306,6 +348,51 @@ mod tests {
     #[test]
     fn blake3_hello() {
         assert_eq!(KappaLabel::blake3(b"hello").as_str(), HELLO_BLAKE3);
+    }
+
+    #[test]
+    fn sha3_256_vectors() {
+        assert_eq!(KappaLabel::sha3_256(b"").as_str(), EMPTY_SHA3_256);
+        assert_eq!(KappaLabel::sha3_256(b"hello").as_str(), HELLO_SHA3_256);
+    }
+
+    #[test]
+    fn keccak256_vectors() {
+        assert_eq!(KappaLabel::keccak256(b"").as_str(), EMPTY_KECCAK256);
+        assert_eq!(KappaLabel::keccak256(b"hello").as_str(), HELLO_KECCAK256);
+    }
+
+    #[test]
+    fn every_parsed_axis_can_be_computed_and_verified() {
+        for axis in [
+            "sha1",
+            "sha256",
+            "blake3",
+            "sha3-256",
+            "keccak256",
+            "sha512",
+        ] {
+            let label = compute_kappa(axis, b"axis parity").unwrap();
+            assert_eq!(KappaLabel::parse(label.as_str()).unwrap(), label);
+            assert_eq!(verify_kappa(label.as_str(), b"axis parity"), Ok(true));
+        }
+    }
+
+    #[test]
+    fn label_and_fingerprint_widths_follow_the_axis() {
+        let cases = [
+            ("sha1", 45, 20),
+            ("sha256", 71, 32),
+            ("blake3", 71, 32),
+            ("sha3-256", 73, 32),
+            ("keccak256", 74, 32),
+            ("sha512", 135, 64),
+        ];
+        for (axis, label_width, fingerprint_width) in cases {
+            let label = compute_kappa(axis, b"axis widths").unwrap();
+            assert_eq!(label.label_width(), label_width);
+            assert_eq!(label.fingerprint_width(), fingerprint_width);
+        }
     }
 
     #[test]

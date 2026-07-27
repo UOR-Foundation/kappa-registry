@@ -31,6 +31,7 @@ kappa-macros = { path = "crates/kappa-macros" }
 
 # Hashing -- all RustCrypto digest-trait compatible
 sha2 = "0.10"
+sha3 = "0.10"
 sha1-checked = { version = "0.10", default-features = false }
 blake3 = "1"
 hex = "0.4"
