@@ -16,7 +16,7 @@ name = "kappa-registry"
 path = "src/main.rs"
 
 [dependencies]
-topcoat = { path = "/workspace/usrbinkat/github.com/tokio-rs/topcoat/crates/topcoat", features = ["router", "serve", "tower"] }
+topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
 tower = "0.5"
 governor = "0.10"
