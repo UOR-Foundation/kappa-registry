@@ -25,12 +25,14 @@ use crate::store::fs::FsStore;
 use crate::transaction::TransactionManager;
 
 /// Build the registry router with all routes, layers, and app context.
+#[allow(clippy::too_many_arguments)]
 pub fn router(
     store: Arc<FsStore>,
     sessions: Arc<SessionStore>,
     transactions: Arc<TransactionManager>,
     rate_limiter: Option<TieredRateLimiter>,
     signer: Option<Arc<dyn crate::crypto::RegistrySigner>>,
+    node_identity: Option<Arc<identity::NodeIdentity>>,
     max_blob_size: usize,
     upload_timeout_secs: u64,
 ) -> Router {
@@ -45,6 +47,10 @@ pub fn router(
         .app_context(MaxBlobSize(max_blob_size))
         .app_context(UploadTimeout(upload_timeout_secs))
         .app_context(SignerHolder(signer));
+
+    if let Some(ni) = node_identity {
+        builder = builder.app_context(ni);
+    }
 
     if let Some(limiter) = rate_limiter {
         builder = builder.app_context(limiter);
@@ -364,6 +370,13 @@ pub fn router(
             p("/v2/{*ns}/_root"),
             handlers::namespace_root_route,
         ));
+
+    // -- Identity --
+    builder = builder.route(RouteFn::new(
+        Method::GET,
+        p("/v2/{*ns}/_identity/whoami"),
+        handlers::identity::whoami_route,
+    ));
 
     builder.build()
 }

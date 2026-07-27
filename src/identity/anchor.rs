@@ -1,17 +1,107 @@
-//! Identity anchor -- immutable genesis record.
+//! Identity anchors -- immutable origin records and typed anchor newtypes.
 //!
-//! The anchor IS the identity. It is minimal, immutable, and permanent.
-//! Nothing about a subject lives here. It has no attributes. Kind is a
-//! query result over the assertion graph, not a stored field.
+//! Three anchor newtypes enforce role separation at compile time:
+//! - `NodeAnchor`: this process's own identity, derived from its signing key
+//! - `AsserterAnchor`: verified signer of an assertion (no public constructor)
+//! - `SubjectAnchor`: the party an assertion is about (freely constructible)
+//!
+//! `AsserterAnchor` having no public constructor is load-bearing: it makes
+//! "forgot to verify the signature" a compile error. The only path to one
+//! is `crypto::anchor::asserter_from_signature`.
 
 use serde::{Deserialize, Serialize};
 
 use crate::kappa::KappaLabel;
 
+// ── Typed anchor newtypes ───────────────────────────────────────────
+
+/// This process's own identity. Derived from the signing key.
+/// Constructible only via `crypto::anchor::anchor_from_key`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeAnchor(String);
+
+impl NodeAnchor {
+    /// Create from a raw anchor string. Only called by `crypto::anchor`.
+    pub(crate) fn from_raw(s: String) -> Self {
+        Self(s)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Derive the namespace name for this node's own assertions.
+    pub fn as_namespace(&self) -> String {
+        self.0.clone()
+    }
+}
+
+impl std::fmt::Display for NodeAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The party that signed an assertion. Constructible ONLY by successful
+/// signature verification -- there is no `from_str`, no `From<String>`,
+/// and no public constructor.
+///
+/// If you find yourself wanting another constructor, you are about to
+/// skip verification.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AsserterAnchor(String);
+
+impl AsserterAnchor {
+    /// Create from a raw anchor string after signature verification.
+    /// Only called by `crypto::anchor::asserter_from_signature`.
+    pub(crate) fn from_verified(s: String) -> Self {
+        Self(s)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Test-only constructor. Do not use outside of #[cfg(test)].
+    #[cfg(test)]
+    pub fn test_only(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl std::fmt::Display for AsserterAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The party an assertion is about. Freely constructible: you may
+/// legitimately refer to a subject whose key you have never seen.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SubjectAnchor(String);
+
+impl SubjectAnchor {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SubjectAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ── AnchorSpec (origin record) ──────────────────────────────────────
+
 /// Specification for creating a new identity anchor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnchorSpec {
-    /// CSPRNG entropy at genesis (32 bytes).
+    /// CSPRNG entropy at origin (32 bytes).
     pub entropy: [u8; 32],
     /// SHA-256 of initial rotation key set (commitment, not the keys).
     /// The keys themselves arrive as assertion #1.
@@ -23,15 +113,9 @@ pub struct AnchorSpec {
 /// The anchor kappa is `sha256(canonical(axis, entropy, key_commitment))`.
 /// This is deterministic: the same spec always produces the same anchor.
 pub fn anchor_canonical_bytes(spec: &AnchorSpec) -> Vec<u8> {
-    // Canonical form: CBOR-like deterministic encoding.
-    // For now, use a simple concatenation with length prefixes.
-    // This MUST be frozen before any anchor is created in production.
     let mut buf = Vec::with_capacity(128);
-    // axis = sha256 (always, for anchors)
     buf.extend_from_slice(b"sha256:");
-    // entropy
     buf.extend_from_slice(&spec.entropy);
-    // key_commitment (32 bytes or absent)
     match &spec.key_commitment {
         Some(kc) => {
             buf.push(0x01);
@@ -101,5 +185,24 @@ mod tests {
         let b1 = anchor_canonical_bytes(&spec);
         let b2 = anchor_canonical_bytes(&spec);
         assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn node_anchor_as_namespace() {
+        let a = NodeAnchor::from_raw("sha256:abc".to_owned());
+        assert_eq!(a.as_namespace(), "sha256:abc");
+        assert_eq!(a.as_str(), "sha256:abc");
+    }
+
+    #[test]
+    fn subject_anchor_freely_constructible() {
+        let s = SubjectAnchor::new("sha256:unknown_subject");
+        assert_eq!(s.as_str(), "sha256:unknown_subject");
+    }
+
+    #[test]
+    fn asserter_anchor_test_only_available_in_tests() {
+        let a = AsserterAnchor::test_only("sha256:verified");
+        assert_eq!(a.as_str(), "sha256:verified");
     }
 }

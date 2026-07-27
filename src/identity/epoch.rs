@@ -20,7 +20,7 @@ pub struct EpochRoot {
     pub namespace: String,
     /// Monotonically increasing epoch counter (per-asserter Lamport).
     pub epoch: u64,
-    /// Kappa of the previous epoch root (None for genesis).
+    /// Kappa of the previous epoch root (None for origin).
     pub prev_epoch_root: Option<String>,
     /// Hash of current tag/assertion state (excludes epoch/current tag).
     pub state_root: String,
@@ -55,7 +55,7 @@ pub enum MutationOp {
     TagBatchItem,
     AssertionPublish,
     RevocationPublish,
-    AnchorGenesis,
+    AnchorOrigin,
 }
 
 impl EpochRoot {

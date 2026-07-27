@@ -4,14 +4,17 @@
 //! Authentication is "which key signed this." Authorization is "may this
 //! key write here." This module handles the first; auth/policy.rs handles
 //! the second.
+//!
+//! `asserter_from_signature` returns `AsserterAnchor` -- the ONLY
+//! constructor for that type. If you find yourself wanting another
+//! path to an `AsserterAnchor`, you are about to skip verification.
 
 use super::{verifier_for, CryptoError};
+use crate::identity::anchor::{AsserterAnchor, NodeAnchor};
 use crate::kappa::KappaLabel;
 
-/// Derive the canonical anchor bytes from a public key.
-///
-/// Length-prefixed to prevent injection: `("ed25519", key)` and
-/// `("ed2551", [0x39] + key)` must not collide.
+/// Length-prefixed so ("ed25519", key) and ("ed2551", [0x39] + key)
+/// cannot collide. Do not change without a format version bump.
 ///
 /// Format: u16(algorithm.len) BE + algorithm + u16(public_key.len) BE + public_key
 pub fn canonical_anchor_from_key(algorithm: &str, public_key: &[u8]) -> Vec<u8> {
@@ -23,8 +26,13 @@ pub fn canonical_anchor_from_key(algorithm: &str, public_key: &[u8]) -> Vec<u8> 
     buf
 }
 
-/// Verify a signature and derive the asserter anchor kappa from the
-/// signing public key.
+fn compute_anchor_string(algorithm: &str, public_key: &[u8]) -> String {
+    let canonical = canonical_anchor_from_key(algorithm, public_key);
+    KappaLabel::sha256(&canonical).as_str().to_owned()
+}
+
+/// Verify a signature and derive the asserter anchor from the signing
+/// public key. This is the ONLY constructor for `AsserterAnchor`.
 ///
 /// # Errors
 ///
@@ -32,25 +40,36 @@ pub fn canonical_anchor_from_key(algorithm: &str, public_key: &[u8]) -> Vec<u8> 
 /// verify against the provided public key.
 /// Returns `CryptoError::UnsupportedAlgorithm` if the algorithm is
 /// not recognized.
+#[must_use = "discarding a verification result is a security bug"]
 pub fn asserter_from_signature(
     algorithm: &str,
     public_key: &[u8],
     message: &[u8],
     sig: &[u8],
-) -> Result<String, CryptoError> {
+) -> Result<AsserterAnchor, CryptoError> {
     let v = verifier_for(algorithm)?;
     if !v.verify(message, sig, public_key)? {
         return Err(CryptoError::InvalidSignature);
     }
-    Ok(anchor_from_key(algorithm, public_key))
+    Ok(AsserterAnchor::from_verified(compute_anchor_string(
+        algorithm, public_key,
+    )))
 }
 
-/// Derive the anchor kappa from a public key without signature
-/// verification. Used when the key is already trusted (e.g., loaded
-/// from the local keystore).
-pub fn anchor_from_key(algorithm: &str, public_key: &[u8]) -> String {
-    let canonical = canonical_anchor_from_key(algorithm, public_key);
-    KappaLabel::sha256(&canonical).as_str().to_owned()
+/// Derive the anchor from a public key without signature verification.
+/// Used when the key is already trusted (loaded from the local keystore).
+///
+/// Returns `NodeAnchor` -- this process's own identity.
+pub fn anchor_from_key(algorithm: &str, public_key: &[u8]) -> NodeAnchor {
+    NodeAnchor::from_raw(compute_anchor_string(algorithm, public_key))
+}
+
+/// Derive an anchor string from a public key. Returns a raw String
+/// for use in contexts where the caller manages its own type safety
+/// (e.g., `registry_anchor` in handlers, which passes the result as
+/// `&str` to `authorize`).
+pub fn anchor_from_key_str(algorithm: &str, public_key: &[u8]) -> String {
+    compute_anchor_string(algorithm, public_key)
 }
 
 #[cfg(test)]
@@ -66,8 +85,8 @@ mod tests {
         let a1 = anchor_from_key("ed25519", &pk);
         let a2 = anchor_from_key("ed25519", &pk);
         assert_eq!(a1, a2);
-        assert!(a1.starts_with("sha256:"));
-        assert_eq!(a1.len(), 71);
+        assert!(a1.as_str().starts_with("sha256:"));
+        assert_eq!(a1.as_str().len(), 71);
     }
 
     #[test]
@@ -78,7 +97,7 @@ mod tests {
         let sig = signer.sign(msg).unwrap();
         let asserter = asserter_from_signature("ed25519", &pk, msg, &sig).unwrap();
         let expected = anchor_from_key("ed25519", &pk);
-        assert_eq!(asserter, expected);
+        assert_eq!(asserter.as_str(), expected.as_str());
     }
 
     #[test]
@@ -102,12 +121,20 @@ mod tests {
 
     #[test]
     fn length_prefix_prevents_injection() {
-        // "ed25519" + key vs "ed2551" + [0x39] + key must differ
         let key = [0xAA; 32];
         let c1 = canonical_anchor_from_key("ed25519", &key);
-        let mut injected_key = vec![0x39u8]; // '9' byte
+        let mut injected_key = vec![0x39u8];
         injected_key.extend_from_slice(&key);
         let c2 = canonical_anchor_from_key("ed2551", &injected_key);
         assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn anchor_from_key_str_matches_typed() {
+        let signer = Ed25519Signer::generate();
+        let pk = signer.public_key_bytes();
+        let typed = anchor_from_key("ed25519", &pk);
+        let raw = anchor_from_key_str("ed25519", &pk);
+        assert_eq!(typed.as_str(), raw.as_str());
     }
 }

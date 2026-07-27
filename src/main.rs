@@ -96,12 +96,37 @@ async fn main() {
         }
     });
 
+    // Bootstrap node identity (I-1: never touches the network)
+    let node_identity: Option<Arc<kappa_registry::identity::NodeIdentity>> = {
+        let keystore = kappa_registry::crypto::keystore::KeyStore::new(store.root());
+        match keystore {
+            Ok(ks) => {
+                match kappa_registry::identity::NodeIdentity::bootstrap(
+                    &ks,
+                    &*store,
+                    &cfg.signing_algorithm,
+                ) {
+                    Ok(ni) => Some(Arc::new(ni)),
+                    Err(e) => {
+                        tracing::warn!("node identity bootstrap failed: {e}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("keystore unavailable for identity bootstrap: {e}");
+                None
+            }
+        }
+    };
+
     let router = kappa_registry::router(
         store,
         sessions,
         transactions,
         rate_limiter,
         signer,
+        node_identity,
         cfg.max_blob_size,
         cfg.upload_timeout_secs,
     );

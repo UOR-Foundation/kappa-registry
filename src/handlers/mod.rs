@@ -4,6 +4,7 @@ pub mod compose;
 pub mod edge;
 pub mod filter;
 pub mod gc;
+pub mod identity;
 pub mod reconcile;
 pub mod referrers;
 pub mod schema;
@@ -57,10 +58,11 @@ fn store(cx: &Cx) -> &Arc<FsStore> {
 pub(crate) fn registry_anchor(cx: &Cx) -> String {
     let holder = app_context::<crate::SignerHolder>(cx);
     match &holder.0 {
-        Some(signer) => {
-            crate::crypto::anchor::anchor_from_key(signer.algorithm(), &signer.public_key_bytes())
-        }
-        None => crate::crypto::anchor::anchor_from_key("none", &[]),
+        Some(signer) => crate::crypto::anchor::anchor_from_key_str(
+            signer.algorithm(),
+            &signer.public_key_bytes(),
+        ),
+        None => crate::crypto::anchor::anchor_from_key_str("none", &[]),
     }
 }
 

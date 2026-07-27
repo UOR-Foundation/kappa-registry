@@ -114,6 +114,11 @@ impl KeyStore {
         signer_from_bytes(alg.trim(), &key_bytes)
     }
 
+    /// The keys directory path.
+    pub fn keys_dir(&self) -> &std::path::Path {
+        &self.keys_dir
+    }
+
     /// Read a public key without loading the private key.
     pub fn public_key(&self, name: &str) -> Result<Vec<u8>, CryptoError> {
         std::fs::read(self.keys_dir.join(format!("{name}.pub")))
