@@ -235,12 +235,22 @@ impl TestServer {
                 .map(|s| Arc::from(s) as Arc<dyn kappa_registry::crypto::RegistrySigner>)
         };
 
+        let node_identity: Option<Arc<kappa_registry::identity::NodeIdentity>> = {
+            let ks = kappa_registry::crypto::keystore::KeyStore::new(data_dir.path());
+            ks.ok()
+                .and_then(|k| {
+                    kappa_registry::identity::NodeIdentity::bootstrap(&k, &*store, "ed25519").ok()
+                })
+                .map(Arc::new)
+        };
+
         let router = kappa_registry::router(
             store,
             sessions,
             transactions,
             None,
             signer,
+            node_identity,
             64 * 1024 * 1024,
             3600,
         );
@@ -306,6 +316,7 @@ impl TestServer {
             sessions,
             transactions,
             Some(TieredRateLimiter::new(&rl_config)),
+            None,
             None,
             64 * 1024 * 1024,
             3600,

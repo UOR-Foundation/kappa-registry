@@ -14,7 +14,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let listen_addr: SocketAddr = env_or("KAPPA_LISTEN_ADDR", "127.0.0.1:8080")
+        let listen_addr: SocketAddr = env_or("KAPPA_LISTEN_ADDR", "127.0.0.1:5000")
             .parse()
             .unwrap_or_else(|e| config_exit(&format!("KAPPA_LISTEN_ADDR: {e}")));
 

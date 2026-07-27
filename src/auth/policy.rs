@@ -13,7 +13,7 @@ use crate::store::{EdgeRecord, KappaStore, StoreError};
 /// capability edge -- reads included. Protocol module bytecode,
 /// identity assertions, VRF key paths, and recovery share locations
 /// are not public by default.
-const RESERVED_PREFIXES: &[&str] = &[
+pub const RESERVED_PREFIXES: &[&str] = &[
     "kappa/protocols",
     "kappa/runtimes",
     "kappa/os",
