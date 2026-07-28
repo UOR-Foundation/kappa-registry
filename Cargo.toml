@@ -20,9 +20,11 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
+utoipa = "5"
+scalar_api_reference = { version = "0.2.2", features = ["axum"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tower-http = { version = "0.6", features = ["trace", "limit"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 governor = "0.10"
 http = "1"
 
@@ -78,8 +80,13 @@ default = []
 federation = ["reqwest"]
 
 [dev-dependencies]
+cucumber = "0.21"
 reqwest = { version = "0.12", features = ["blocking"] }
 http-body-util = "0.1"
+
+[[test]]
+name = "bdd"
+harness = false
 
 [profile.release]
 lto = true

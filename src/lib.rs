@@ -6,6 +6,7 @@ pub mod delta;
 pub mod error;
 pub mod handlers;
 pub mod kappa;
+pub mod openapi;
 pub mod ratelimit;
 pub mod routes;
 pub mod store;
@@ -42,7 +43,7 @@ pub struct AppState {
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    openapi::router()
         .fallback(any(dispatch))
         .layer(axum::extract::DefaultBodyLimit::max(state.max_blob_size))
         .layer(middleware::map_response(add_warning_header))
