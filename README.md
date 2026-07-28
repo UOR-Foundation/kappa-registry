@@ -16,12 +16,13 @@ operations.
 - Content-addressed blobs using `sha1`, `sha256`, `blake3`, and `sha512` labels.
   SHA-1 collision detection is enabled through `sha1-checked`.
 - OCI-style manifests, tags, symbolic references, conditional tag updates,
-  referrers, and tag pagination.
+  referrers, metadata queries, and tag pagination.
 - Resumable uploads with recovery, ordered chunks, mount support, and a
   configurable body limit.
 - Namespace-scoped edges, graph queries, graph diffs, range-based set
   reconciliation, and deterministic namespace roots with optional signatures.
-- Kappa composition operations and witness blobs.
+- Kappa composition operations (`g2`, `f4`, `e6`, `e7`, and `e8`) and witness
+  blobs.
 - Validation schemas and admission filters.
 - Multi-object transactions with staging limits, TTL cleanup, and atomic
   promotion into the filesystem store.
@@ -52,8 +53,8 @@ The main route groups are:
 | Group                    | Routes                                                                                           |
 | ------------------------ | ------------------------------------------------------------------------------------------------ |
 | System                   | `GET /v2/`, `GET /v2/_health/{live\|ready\|startup}`                                             |
-| Blobs                    | `GET`, `HEAD`, `PUT`, `DELETE /v2/{namespace}/blobs/{kappa}`                                     |
-| Uploads                  | `POST /v2/{namespace}/blobs/uploads/`, then `PATCH`, `GET`, `PUT`, or `DELETE /v2/_uploads/{id}` |
+| Blobs                    | `GET`, `HEAD`, `PUT`, `DELETE /v2/{namespace}/blobs/{kappa}`; list and metadata query routes     |
+| Uploads                  | `POST /v2/{namespace}/blobs/uploads/` or bare `/blobs/uploads`, then `PATCH`, `GET`, `PUT`, or `DELETE /v2/_uploads/{id}` |
 | Manifests and tags       | `/manifests/`, `/tags/`, and `/referrers/`                                                       |
 | Graph and replication    | `/edges/` and `/_reconcile`                                                                      |
 | Transactions and bundles | `/_transaction/` and `/_bundle/`                                                                 |

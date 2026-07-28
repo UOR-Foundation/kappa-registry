@@ -33,7 +33,7 @@ where
 pub fn document() -> OpenApi {
     // Format: method|path|operation id|summary|tag|params|request type|response type.
     // Parameter syntax is name:location, with ! marking a required parameter.
-    // Type codes are - (none), t (text), h (HTML), b (binary), j (JSON), or k (bundle).
+    // Type codes are - (none), t (text), h (HTML), b (binary), j (JSON), k (bundle), or s (script).
     const ROUTES: &[&str] = &[
         "get|/openapi.json|openapi_json|Get the OpenAPI document|Documentation||-|j",
         "get|/docs|scalar|Browse the API with Scalar|Documentation||-|h",
@@ -46,20 +46,20 @@ pub fn document() -> OpenApi {
         "head|/v2/{namespace}/blobs/{kappa}|head_blob|Check a blob|Blobs|namespace:path!,kappa:path!|-|t",
         "delete|/v2/{namespace}/blobs/{kappa}|delete_blob|Delete a blob|Blobs|namespace:path!,kappa:path!|-|t",
         "get|/v2/{namespace}/blobs/|list_blobs|List blob labels|Blobs|namespace:path!,prefix:query|-|j",
-        "get|/v2/{namespace}/blobs/_meta|list_blobs_by_metadata|List blobs by metadata|Blobs|namespace:path!,key:query!,value:query!|-|j",
+        "get|/v2/{namespace}/blobs/_meta|list_blobs_by_metadata|List blobs by metadata|Blobs|namespace:path!,key:query,value:query|-|j",
         "post|/v2/{namespace}/blobs/uploads/|start_upload|Start or mount a blob upload|Uploads|namespace:path!,mount:query,digest:query|b|t",
         "post|/v2/{namespace}/blobs/uploads|start_upload_bare|Start or mount a blob upload|Uploads|namespace:path!,mount:query,digest:query|b|t",
         "patch|/v2/_uploads/{id}|append_upload|Append an upload chunk|Uploads|id:path!|b|t",
         "get|/v2/_uploads/{id}|inspect_upload|Inspect an upload|Uploads|id:path!|-|t",
-        "put|/v2/_uploads/{id}|complete_upload|Complete an upload|Uploads|id:path!,kappa:query!|b|t",
+        "put|/v2/_uploads/{id}|complete_upload|Complete an upload|Uploads|id:path!,kappa:query,digest:query|b|t",
         "delete|/v2/_uploads/{id}|cancel_upload|Cancel an upload|Uploads|id:path!|-|t",
-        "put|/v2/{namespace}/manifests/{reference}|put_manifest|Store a manifest and bind its reference|Manifests and tags|namespace:path!,reference:path!|b|t",
+        "put|/v2/{namespace}/manifests/{reference}|put_manifest|Store a manifest and bind its reference|Manifests and tags|namespace:path!,reference:path!,tag:query|b|t",
         "get|/v2/{namespace}/manifests/{reference}|get_manifest|Read a manifest|Manifests and tags|namespace:path!,reference:path!|-|b",
         "head|/v2/{namespace}/manifests/{reference}|head_manifest|Check a manifest|Manifests and tags|namespace:path!,reference:path!|-|t",
         "delete|/v2/{namespace}/manifests/{reference}|delete_manifest|Delete a manifest reference|Manifests and tags|namespace:path!,reference:path!|-|t",
         "get|/v2/{namespace}/tags/list|list_tags|List namespace tags|Manifests and tags|namespace:path!,n:query,last:query,order:query,after:query,before:query|-|j",
         "get|/v2/{namespace}/tags/{name}|get_tag|Resolve a tag|Manifests and tags|namespace:path!,name:path!,raw:query|-|j",
-        "put|/v2/{namespace}/tags/{name}|put_tag|Create or update a tag|Manifests and tags|namespace:path!,name:path!,kappa:query!,symref:query|-|t",
+        "put|/v2/{namespace}/tags/{name}|put_tag|Create or update a tag|Manifests and tags|namespace:path!,name:path!,kappa:query,symref:query,if-match:header,if-none-match:header|-|t",
         "post|/v2/{namespace}/tags/_batch|batch_tags|Apply an atomic tag batch|Manifests and tags|namespace:path!|j|j",
         "get|/v2/{namespace}/referrers/{digest}|list_referrers|List OCI referrers|Manifests and tags|namespace:path!,digest:path!,artifactType:query|-|o",
         "put|/v2/{namespace}/edges/|put_edge|Create an edge|Graph|namespace:path!|j|t",
