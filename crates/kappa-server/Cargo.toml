@@ -28,12 +28,14 @@ kappa-module-identity = { path = "../kappa-module-identity", optional = true }
 kappa-module-distribution = { path = "../kappa-module-distribution", optional = true }
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+blake3 = { workspace = true }
+libc = "0.2"
 
 [[test]]
 name = "smoke"
@@ -42,6 +44,50 @@ path = "tests/integration/smoke.rs"
 [[test]]
 name = "operational"
 path = "tests/integration/operational.rs"
+
+[[test]]
+name = "persistence"
+path = "tests/integration/persistence.rs"
+
+[[test]]
+name = "streaming"
+path = "tests/integration/streaming.rs"
+
+[[test]]
+name = "auth"
+path = "tests/integration/auth.rs"
+
+[[test]]
+name = "federation"
+path = "tests/integration/federation.rs"
+
+[[test]]
+name = "disk_pressure"
+path = "tests/integration/disk_pressure.rs"
+
+[[test]]
+name = "tls"
+path = "tests/integration/tls.rs"
+
+[[test]]
+name = "akd"
+path = "tests/integration/akd.rs"
+
+[[test]]
+name = "oci_protocol"
+path = "tests/integration/oci_protocol.rs"
+
+[[test]]
+name = "lifecycle"
+path = "tests/integration/lifecycle.rs"
+
+[[test]]
+name = "security"
+path = "tests/integration/security.rs"
+
+[[test]]
+name = "correctness"
+path = "tests/integration/correctness.rs"
 
 [features]
 default = ["oci", "identity-http", "distribution"]
