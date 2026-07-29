@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::auth;
 use crate::error::AppError;
-use crate::kappa::KappaLabel;
+use crate::kappa::{compute_kappa, KappaLabel};
 use crate::store::KappaStore;
 use crate::AppState;
 
@@ -210,13 +210,7 @@ pub async fn complete(
     let (path, data) = state.sessions.take(id).ok_or(AppError::UploadNotFound)?;
 
     let kappa = KappaLabel::parse(kappa_str)?;
-    let computed = match kappa.axis() {
-        "sha1" => KappaLabel::sha1(&data)?,
-        "sha256" => KappaLabel::sha256(&data),
-        "blake3" => KappaLabel::blake3(&data),
-        "sha512" => KappaLabel::sha512(&data),
-        _ => return Err(AppError::NameInvalid("unsupported axis".to_string())),
-    };
+    let computed = compute_kappa(kappa.axis(), &data)?;
     if computed != kappa {
         return Err(AppError::digest_invalid(kappa.as_str(), computed.as_str()));
     }

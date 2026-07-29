@@ -94,6 +94,53 @@ fn witness_retrievable() {
 }
 
 #[test]
+fn every_axis_composes_with_its_own_witness_widths() {
+    let srv = TestServer::start();
+    let cases = [
+        ("sha1", 45, 20),
+        ("sha256", 71, 32),
+        ("blake3", 71, 32),
+        ("sha3-256", 73, 32),
+        ("keccak256", 74, 32),
+        ("sha512", 135, 64),
+    ];
+
+    for (axis, label_width, fingerprint_width) in cases {
+        let ns = format!("l4-{axis}");
+        let content = format!("{axis} witness operand");
+        let operand = kappa_registry::kappa::compute_kappa(axis, content.as_bytes())
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            push_blob_with_kappa(&srv.addr, &ns, &operand, content.as_bytes()),
+            201
+        );
+
+        let body = format!(r#"{{"operands":["{operand}"]}}"#);
+        let (status, _, response) = request(
+            &srv.addr,
+            "POST",
+            &compose_uri(&ns, "e8"),
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+        );
+        assert_eq!(status, 200, "compose failed for {axis}");
+        let composed = json_str(&response, "composed").unwrap();
+        assert!(composed.starts_with(&format!("{axis}:")));
+
+        let (status, _, witness) =
+            request(&srv.addr, "GET", &witness_uri(&ns, &composed), &[], b"");
+        assert_eq!(status, 200, "witness lookup failed for {axis}");
+        assert!(witness.len() >= 6);
+        assert_eq!(u16::from_le_bytes([witness[0], witness[1]]), label_width);
+        assert_eq!(
+            u16::from_le_bytes([witness[2], witness[3]]),
+            fingerprint_width
+        );
+    }
+}
+
+#[test]
 fn schema_register_get_list() {
     let srv = TestServer::start();
     let ns = "l4-schema";

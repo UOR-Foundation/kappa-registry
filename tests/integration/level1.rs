@@ -188,6 +188,37 @@ fn chunked_upload_and_cancel() {
 }
 
 #[test]
+fn resumable_upload_completion_accepts_every_parsed_axis() {
+    let srv = TestServer::start();
+    for axis in [
+        "sha1",
+        "sha256",
+        "blake3",
+        "sha3-256",
+        "keccak256",
+        "sha512",
+    ] {
+        let ns = format!("l1-upload-{axis}");
+        let content = format!("{axis} resumable upload");
+        let kappa = kappa_registry::kappa::compute_kappa(axis, content.as_bytes())
+            .unwrap()
+            .to_string();
+        let (status, headers, _) = request(&srv.addr, "POST", &upload_start_uri(&ns), &[], b"");
+        assert_eq!(status, 202);
+        let location = header(&headers, "location").unwrap();
+        let complete = format!("{location}?kappa={kappa}");
+
+        let (status, headers, _) = request(&srv.addr, "PUT", &complete, &[], content.as_bytes());
+        assert_eq!(status, 201, "resumable upload failed for {axis}");
+        assert_eq!(header(&headers, "x-kappa-label"), Some(kappa.as_str()));
+
+        let (status, _, stored) = request(&srv.addr, "GET", &blob_uri(&ns, &kappa), &[], b"");
+        assert_eq!(status, 200);
+        assert_eq!(stored, content.as_bytes());
+    }
+}
+
+#[test]
 fn mount_existing_blob() {
     let srv = TestServer::start();
     let ns = "l1-mount";
