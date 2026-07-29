@@ -1,0 +1,36 @@
+[package]
+name = "kappa-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Content-addressed graph database primitives."
+
+[lib]
+name = "kappa_core"
+path = "src/lib.rs"
+
+[dependencies]
+dcbor = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
+k256 = { workspace = true }
+signature = { workspace = true }
+frost-core = { workspace = true }
+frost-ed25519 = { workspace = true }
+frost-p256 = { workspace = true }
+frost-secp256k1 = { workspace = true }
+rand_core = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
