@@ -1,27 +1,41 @@
 //! kappa-core: content-addressed graph database primitives.
-//!
-//! Provides canonical dCBOR serialization, kappa-label computation,
-//! binary Merkle trees with proofs, epoch roots as Merkle trees of
-//! dCBOR fields, the KappaStore trait, InMemoryStore, cryptographic
-//! signing traits, identity types, and GC reachability.
 
-pub(crate) mod canonical;
+// Seam modules (S1-S11, S13)
+pub mod availability;
+pub mod chunks;
 pub mod clock;
+pub mod coordinator;
+pub mod counter;
+pub mod events;
+pub mod membership;
+pub mod offload;
+pub mod transport;
+pub mod witness;
+
+// Core modules
+pub mod bundle;
+pub mod canonical;
 pub mod crypto;
+pub mod delta;
 pub mod epoch;
 pub mod gc;
 pub mod identity;
 pub mod kappa;
 pub mod merkle;
 pub mod store;
+pub mod transaction;
 pub mod types;
 pub mod version;
 
+pub use canonical::{canonical_bytes, from_canonical};
 pub use crypto::{
-    CryptoError, Signer, ThresholdSigner, Verifier,
     anchor::{AsserterAnchor, NodeAnchor, SubjectAnchor},
+    verifier_for, CryptoError, Signer, ThresholdSigner, Verifier,
 };
-pub use epoch::EpochRoot;
-pub use kappa::{kappa_from_bytes, kappa_from_value, split_kappa, verify_kappa};
+pub use epoch::{EpochRoot, EpochRootFields};
+pub use kappa::{
+    axis_of, compute_kappa, kappa_from_bytes, kappa_from_value, sha256_raw, split_kappa,
+    verify_kappa, KappaLabel, LabelError,
+};
 pub use store::KappaStore;
 pub use types::*;

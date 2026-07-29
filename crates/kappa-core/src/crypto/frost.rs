@@ -22,7 +22,10 @@ impl FrostEd25519Signer {
             .verifying_key()
             .serialize()
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
-        Ok(Self { key_package, group_public_key_bytes })
+        Ok(Self {
+            key_package,
+            group_public_key_bytes,
+        })
     }
 
     pub fn identifier(&self) -> Vec<u8> {
@@ -31,19 +34,23 @@ impl FrostEd25519Signer {
 }
 
 impl ThresholdSigner for FrostEd25519Signer {
-    fn algorithm(&self) -> &'static str { "frost-ed25519" }
+    fn algorithm(&self) -> &'static str {
+        "frost-ed25519"
+    }
 
-    fn group_public_key(&self) -> &[u8] { &self.group_public_key_bytes }
+    fn group_public_key(&self) -> &[u8] {
+        &self.group_public_key_bytes
+    }
 
     fn precompute_round1(&mut self) -> Result<Round1State, CryptoError> {
-        let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
-        let (nonces, commitments) = frost_ed::round1::commit(
-            self.key_package.signing_share(),
-            &mut rng,
-        );
-        let nonce_bytes = nonces.serialize()
+        let mut rng = rand_core_06::OsRng;
+        let (nonces, commitments) =
+            frost_ed::round1::commit(self.key_package.signing_share(), &mut rng);
+        let nonce_bytes = nonces
+            .serialize()
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
-        let commit_bytes = commitments.serialize()
+        let commit_bytes = commitments
+            .serialize()
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
         Ok(Round1State {
             nonces: nonce_bytes,
@@ -88,14 +95,15 @@ pub struct FrostEd25519Coordinator {
 }
 
 impl FrostEd25519Coordinator {
-    pub fn new(
-        public_key_package: frost_ed::keys::PublicKeyPackage,
-    ) -> Result<Self, CryptoError> {
+    pub fn new(public_key_package: frost_ed::keys::PublicKeyPackage) -> Result<Self, CryptoError> {
         let group_public_key_bytes = public_key_package
             .verifying_key()
             .serialize()
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
-        Ok(Self { public_key_package, group_public_key_bytes })
+        Ok(Self {
+            public_key_package,
+            group_public_key_bytes,
+        })
     }
 
     pub fn group_public_key(&self) -> &[u8] {
@@ -128,12 +136,8 @@ impl FrostEd25519Coordinator {
             share_map.insert(id, ss);
         }
 
-        let sig = frost_ed::aggregate(
-            &signing_package,
-            &share_map,
-            &self.public_key_package,
-        )
-        .map_err(|e| CryptoError::SigningFailed(e.to_string()))?;
+        let sig = frost_ed::aggregate(&signing_package, &share_map, &self.public_key_package)
+            .map_err(|e| CryptoError::SigningFailed(e.to_string()))?;
 
         sig.serialize()
             .map_err(|e| CryptoError::Serialization(e.to_string()))
@@ -142,19 +146,20 @@ impl FrostEd25519Coordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ed25519::Ed25519Verifier;
     use super::super::Verifier;
+    use super::*;
 
     fn keygen_2_of_3() -> (
         frost_ed::keys::PublicKeyPackage,
         Vec<frost_ed::keys::KeyPackage>,
     ) {
-        let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
+        let rng = rand_core_06::OsRng;
         let (shares, pubkey_package) = frost_ed::keys::generate_with_dealer(
-            3, 2,
+            3,
+            2,
             frost_ed::keys::IdentifierList::Default,
-            &mut rng,
+            rng,
         )
         .unwrap();
 
@@ -188,23 +193,32 @@ mod tests {
             round1_states.push(r1);
         }
 
-        // 2 of 3 sign
+        // Build participating commitments (2 of 3)
+        let participating_commitments: Vec<Commitment> = (0..2)
+            .map(|i| Commitment {
+                signer_id: all_commitments[i].signer_id.clone(),
+                data: all_commitments[i].data.clone(),
+            })
+            .collect();
+
+        // 2 of 3 sign -- each signer gets only participating commitments
         let mut shares = Vec::new();
         for i in 0..2 {
             let r1 = std::mem::replace(
                 &mut round1_states[i],
-                Round1State { nonces: vec![], commitments: vec![] },
+                Round1State {
+                    nonces: vec![],
+                    commitments: vec![],
+                },
             );
             let share = signers[i]
-                .sign_share(r1, message, &all_commitments)
+                .sign_share(r1, message, &participating_commitments)
                 .unwrap();
             shares.push(share);
         }
-
-        // Coordinator aggregates
         let coordinator = FrostEd25519Coordinator::new(pubkey_pkg).unwrap();
         let group_sig = coordinator
-            .aggregate(message, &all_commitments, &shares)
+            .aggregate(message, &participating_commitments, &shares)
             .unwrap();
 
         // Verify with standard Ed25519Verifier
@@ -235,26 +249,39 @@ mod tests {
             round1_states.push(r1);
         }
 
+        let participating_commitments: Vec<Commitment> = (0..2)
+            .map(|i| Commitment {
+                signer_id: all_commitments[i].signer_id.clone(),
+                data: all_commitments[i].data.clone(),
+            })
+            .collect();
+
         let mut shares = Vec::new();
         for i in 0..2 {
             let r1 = std::mem::replace(
                 &mut round1_states[i],
-                Round1State { nonces: vec![], commitments: vec![] },
+                Round1State {
+                    nonces: vec![],
+                    commitments: vec![],
+                },
             );
             let share = signers[i]
-                .sign_share(r1, b"signed message", &all_commitments)
+                .sign_share(r1, b"signed message", &participating_commitments)
                 .unwrap();
             shares.push(share);
         }
-
         let coordinator = FrostEd25519Coordinator::new(pubkey_pkg).unwrap();
         let group_sig = coordinator
-            .aggregate(b"signed message", &all_commitments, &shares)
+            .aggregate(b"signed message", &participating_commitments, &shares)
             .unwrap();
 
         let verifier = Ed25519Verifier;
         assert!(!verifier
-            .verify(coordinator.group_public_key(), b"different message", &group_sig)
+            .verify(
+                coordinator.group_public_key(),
+                b"different message",
+                &group_sig
+            )
             .unwrap());
     }
 }

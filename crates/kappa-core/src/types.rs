@@ -13,6 +13,13 @@
 
 use dcbor::prelude::*;
 
+// -- Server config types (shared across crates) ------------------------------
+
+/// Maximum blob size for PUT requests. Registered as app_context by
+/// kappa-server, enforced by kappa-module-oci blob handler. Defined
+/// here so both crates import the same type -- no TypeId mismatch.
+pub struct MaxBlobSize(pub usize);
+
 // -- Errors -----------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -95,9 +102,62 @@ pub enum EdgeRelation {
     EvidenceProvenance,
     #[cbor(n = 14)]
     SectionOf,
+    #[cbor(n = 15)]
+    RefersTo,
 }
 
 impl EdgeRelation {
+    /// Canonical string name for this relation type.
+    /// Used for HTTP JSON serialization in protocol modules.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Owns => "owns",
+            Self::ComposedOf => "composed-of",
+            Self::Assertion => "assertion",
+            Self::Revocation => "revocation",
+            Self::Capability => "capability",
+            Self::RecoveryShare => "recovery-share",
+            Self::EpochRoot => "epoch-root",
+            Self::AkdTreeNode => "akd-tree-node",
+            Self::ChunkManifest => "chunk-manifest",
+            Self::WitnessReceipt => "witness-receipt",
+            Self::OffloadReceipt => "offload-receipt",
+            Self::DerivedFrom => "derived-from",
+            Self::CertifiedBy => "certified-by",
+            Self::EvidenceProvenance => "evidence-provenance",
+            Self::SectionOf => "section-of",
+            Self::RefersTo => "refers-to",
+        }
+    }
+
+    /// Parse a relation string into an EdgeRelation.
+    /// Accepts both canonical names and backward-compatible aliases:
+    /// - "witness-of" -> WitnessReceipt
+    /// - "derives-from" -> DerivedFrom
+    ///
+    ///   Returns None for unrecognized strings.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "owns" => Some(Self::Owns),
+            "composed-of" => Some(Self::ComposedOf),
+            "assertion" => Some(Self::Assertion),
+            "revocation" => Some(Self::Revocation),
+            "capability" => Some(Self::Capability),
+            "recovery-share" => Some(Self::RecoveryShare),
+            "epoch-root" => Some(Self::EpochRoot),
+            "akd-tree-node" => Some(Self::AkdTreeNode),
+            "chunk-manifest" => Some(Self::ChunkManifest),
+            "witness-receipt" | "witness-of" => Some(Self::WitnessReceipt),
+            "offload-receipt" => Some(Self::OffloadReceipt),
+            "derived-from" | "derives-from" => Some(Self::DerivedFrom),
+            "certified-by" => Some(Self::CertifiedBy),
+            "evidence-provenance" => Some(Self::EvidenceProvenance),
+            "section-of" => Some(Self::SectionOf),
+            "refers-to" => Some(Self::RefersTo),
+            _ => None,
+        }
+    }
+
     /// Whether GC follows edges of this relation type.
     /// Exhaustive match -- adding a variant without handling it
     /// is a compile error.
@@ -118,6 +178,7 @@ impl EdgeRelation {
             Self::CertifiedBy => true,
             Self::EvidenceProvenance => true,
             Self::SectionOf => true,
+            Self::RefersTo => true,
         }
     }
 }
@@ -234,8 +295,7 @@ pub fn namespace_hash(ns: &str) -> u64 {
     let hash = blake3::hash(ns.as_bytes());
     let bytes = hash.as_bytes();
     u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
 }
 
@@ -263,8 +323,16 @@ mod tests {
 
     #[test]
     fn tag_entry_deterministic() {
-        let e1 = TagEntry { name: "v1.0".into(), kappa: "sha256:1234".into(), version: 1 };
-        let e2 = TagEntry { name: "v1.0".into(), kappa: "sha256:1234".into(), version: 1 };
+        let e1 = TagEntry {
+            name: "v1.0".into(),
+            kappa: "sha256:1234".into(),
+            version: 1,
+        };
+        let e2 = TagEntry {
+            name: "v1.0".into(),
+            kappa: "sha256:1234".into(),
+            version: 1,
+        };
         assert_eq!(canonical_bytes(&e1), canonical_bytes(&e2));
     }
 
@@ -363,8 +431,16 @@ mod tests {
 
     #[test]
     fn tag_update_optional_version() {
-        let a = TagUpdate { name: "t".into(), kappa: "k".into(), expected_version: None };
-        let b = TagUpdate { name: "t".into(), kappa: "k".into(), expected_version: Some(5) };
+        let a = TagUpdate {
+            name: "t".into(),
+            kappa: "k".into(),
+            expected_version: None,
+        };
+        let b = TagUpdate {
+            name: "t".into(),
+            kappa: "k".into(),
+            expected_version: Some(5),
+        };
         assert_ne!(canonical_bytes(&a), canonical_bytes(&b));
     }
 }

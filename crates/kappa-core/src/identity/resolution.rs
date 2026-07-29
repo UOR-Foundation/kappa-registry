@@ -46,21 +46,20 @@ pub fn resolve_at(
             }
         }
 
-        let assertion_kappa = crate::kappa::kappa_from_bytes(
-            &crate::canonical::canonical_bytes(assertion),
-        );
+        let assertion_kappa =
+            crate::kappa::kappa_from_bytes(&crate::canonical::canonical_bytes(assertion));
 
-        let rev = revocations.iter().find(|r| {
-            r.assertion_kappa == assertion_kappa && r.asserter == assertion.asserter
-        });
+        let rev = revocations
+            .iter()
+            .find(|r| r.assertion_kappa == assertion_kappa && r.asserter == assertion.asserter);
         if let Some(r) = rev {
             revoked.push((assertion.clone(), r.clone()));
             continue;
         }
 
-        let wm = watermarks.iter().find(|w| {
-            w.asserter == assertion.asserter && w.invalidates(assertion.valid_from_ms)
-        });
+        let wm = watermarks
+            .iter()
+            .find(|w| w.asserter == assertion.asserter && w.invalidates(assertion.valid_from_ms));
         if let Some(w) = wm {
             watermarked.push((assertion.clone(), w.clone()));
             continue;
@@ -92,7 +91,12 @@ mod tests {
     use super::*;
     use crate::identity::revocation::RevocationReason;
 
-    fn make_assertion(asserter: &str, facet: &str, from: u64, until: Option<u64>) -> IdentityAssertion {
+    fn make_assertion(
+        asserter: &str,
+        facet: &str,
+        from: u64,
+        until: Option<u64>,
+    ) -> IdentityAssertion {
         IdentityAssertion {
             asserter: asserter.into(),
             subject: "subject-1".into(),
@@ -126,9 +130,8 @@ mod tests {
     #[test]
     fn resolve_at_excludes_revoked() {
         let assertion = make_assertion("a", "f1", 100, None);
-        let assertion_kappa = crate::kappa::kappa_from_bytes(
-            &crate::canonical::canonical_bytes(&assertion),
-        );
+        let assertion_kappa =
+            crate::kappa::kappa_from_bytes(&crate::canonical::canonical_bytes(&assertion));
         let revocation = Revocation {
             asserter: "a".into(),
             assertion_kappa,

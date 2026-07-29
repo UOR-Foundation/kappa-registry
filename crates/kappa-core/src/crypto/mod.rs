@@ -12,7 +12,7 @@ pub mod vrf_trait;
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("unsupported algorithm: {0}")]
-    UnsupportedAlgorithm(&'static str),
+    UnsupportedAlgorithm(String),
     #[error("invalid key")]
     InvalidKey,
     #[error("invalid signature")]
@@ -86,14 +86,14 @@ pub trait Verifier: Send + Sync {
 }
 
 /// Get a verifier for the given algorithm.
-pub fn verifier_for(algorithm: &'static str) -> Result<Box<dyn Verifier>, CryptoError> {
+pub fn verifier_for(algorithm: &str) -> Result<Box<dyn Verifier>, CryptoError> {
     match algorithm {
         "ed25519" | "frost-ed25519" => Ok(Box::new(ed25519::Ed25519Verifier)),
         "p256" => Ok(Box::new(ecdsa::P256EcdsaVerifier)),
         "k256" => Ok(Box::new(ecdsa::K256EcdsaVerifier)),
         "frost-p256" => Ok(Box::new(ecdsa::P256SchnorrVerifier)),
         "frost-secp256k1" => Ok(Box::new(ecdsa::K256SchnorrVerifier)),
-        _ => Err(CryptoError::UnsupportedAlgorithm(algorithm)),
+        _ => Err(CryptoError::UnsupportedAlgorithm(algorithm.to_string())),
     }
 }
 

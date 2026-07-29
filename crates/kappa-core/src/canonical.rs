@@ -19,13 +19,13 @@ pub enum CanonicalError {
 }
 
 /// Encode a value to canonical dCBOR bytes.
-pub(crate) fn canonical_bytes<T: Into<CBOR> + Clone>(value: &T) -> Vec<u8> {
+pub fn canonical_bytes<T: Into<CBOR> + Clone>(value: &T) -> Vec<u8> {
     value.clone().into().to_cbor_data()
 }
 
 /// Decode canonical dCBOR bytes back to a value.
 /// Rejects non-canonical input.
-pub(crate) fn from_canonical<T>(bytes: &[u8]) -> Result<T, CanonicalError>
+pub fn from_canonical<T>(bytes: &[u8]) -> Result<T, CanonicalError>
 where
     T: TryFrom<CBOR, Error = dcbor::Error>,
 {

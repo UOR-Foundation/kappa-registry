@@ -1,0 +1,17 @@
+[package]
+name = "kappa-reconcile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MST reconciliation for kappa-registry federation."
+
+[lib]
+name = "kappa_reconcile"
+path = "src/lib.rs"
+
+[dependencies]
+blake3 = { workspace = true }
+merkle-search-tree = { workspace = true }
+thiserror = { workspace = true }

@@ -80,18 +80,10 @@ impl DegradeReason {
 
     pub fn detail(&self) -> &'static str {
         match self {
-            DegradeReason::SignatureInvalid => {
-                "A peer's signature failed verification"
-            }
-            DegradeReason::AnchorMismatch => {
-                "A peer's anchor does not match its signing key"
-            }
-            DegradeReason::Equivocation => {
-                "A peer signed two conflicting epoch roots"
-            }
-            DegradeReason::MalformedResponse => {
-                "A peer returned an unparseable response"
-            }
+            DegradeReason::SignatureInvalid => "A peer's signature failed verification",
+            DegradeReason::AnchorMismatch => "A peer's anchor does not match its signing key",
+            DegradeReason::Equivocation => "A peer signed two conflicting epoch roots",
+            DegradeReason::MalformedResponse => "A peer returned an unparseable response",
         }
     }
 }

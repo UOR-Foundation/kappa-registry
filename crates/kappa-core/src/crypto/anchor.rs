@@ -95,7 +95,7 @@ impl std::fmt::Display for SubjectAnchor {
 
 /// Verify a signature and return the asserter anchor if valid.
 pub fn asserter_from_signature(
-    algorithm: &'static str,
+    algorithm: &str,
     public_key: &[u8],
     message: &[u8],
     signature: &[u8],
@@ -152,9 +152,7 @@ mod tests {
         let signer = Ed25519Signer::generate(&mut rng);
         let msg = b"prove identity";
         let sig = signer.sign(msg).unwrap();
-        let asserter = asserter_from_signature(
-            "ed25519", signer.public_key(), msg, &sig,
-        ).unwrap();
+        let asserter = asserter_from_signature("ed25519", signer.public_key(), msg, &sig).unwrap();
         let expected = NodeAnchor::from_key("ed25519", signer.public_key());
         assert_eq!(asserter.as_str(), expected.as_str());
     }
@@ -163,9 +161,7 @@ mod tests {
     fn asserter_from_invalid_signature_fails() {
         let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
         let signer = Ed25519Signer::generate(&mut rng);
-        let result = asserter_from_signature(
-            "ed25519", signer.public_key(), b"msg", &[0u8; 64],
-        );
+        let result = asserter_from_signature("ed25519", signer.public_key(), b"msg", &[0u8; 64]);
         assert!(result.is_err());
     }
 
