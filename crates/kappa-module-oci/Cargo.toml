@@ -1,0 +1,23 @@
+[package]
+name = "kappa-module-oci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "OCI distribution protocol module for kappa-registry."
+
+[lib]
+name = "kappa_module_oci"
+path = "src/lib.rs"
+
+[dependencies]
+kappa-core = { workspace = true }
+topcoat = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+jsonschema = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }

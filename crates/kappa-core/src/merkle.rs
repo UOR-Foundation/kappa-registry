@@ -50,7 +50,7 @@ pub fn merkle_root(leaves: &[&[u8]]) -> Option<[u8; 32]> {
     }
     let mut level: Vec<[u8; 32]> = leaves.iter().map(|l| hash_leaf(l)).collect();
     while level.len() > 1 {
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
         while i < level.len() {
             if i + 1 < level.len() {
@@ -80,7 +80,11 @@ pub fn merkle_proof(leaves: &[&[u8]], index: usize) -> Option<Vec<([u8; 32], boo
     let mut idx = index;
 
     while level.len() > 1 {
-        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling_idx = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         let sibling = if sibling_idx < level.len() {
             level[sibling_idx]
         } else {
@@ -91,7 +95,7 @@ pub fn merkle_proof(leaves: &[&[u8]], index: usize) -> Option<Vec<([u8; 32], boo
         let is_left = idx % 2 == 1;
         proof.push((sibling, is_left));
 
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
         while i < level.len() {
             if i + 1 < level.len() {
@@ -112,11 +116,7 @@ pub fn merkle_proof(leaves: &[&[u8]], index: usize) -> Option<Vec<([u8; 32], boo
 ///
 /// Given a leaf's data, its proof path, and the expected root hash,
 /// recompute the root and check equality.
-pub fn merkle_verify(
-    root: &[u8; 32],
-    leaf_data: &[u8],
-    proof: &[([u8; 32], bool)],
-) -> bool {
+pub fn merkle_verify(root: &[u8; 32], leaf_data: &[u8], proof: &[([u8; 32], bool)]) -> bool {
     let mut current = hash_leaf(leaf_data);
     for (sibling, is_left) in proof {
         if *is_left {

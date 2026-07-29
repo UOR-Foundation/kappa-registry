@@ -12,11 +12,11 @@ set -euo pipefail
 #   ./scripts/service.sh --clean --force      Also remove the store directory
 #
 # Prerequisites:
-#   cargo build --release
+#   cargo build --release -p kappa-server
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REGISTRY_BIN="${REPO_ROOT}/target/release/kappa-registry"
+REGISTRY_BIN="${REPO_ROOT}/target/release/kappa-server"
 RUN_DIR="${REPO_ROOT}/tmp"
 PID_FILE="${RUN_DIR}/registry.pid"
 LOG_FILE="${RUN_DIR}/registry.log"
@@ -31,7 +31,7 @@ usage() {
 require_binary() {
     if [[ ! -x "${REGISTRY_BIN}" ]]; then
         echo "error: registry binary not found at ${REGISTRY_BIN}"
-        echo "run: cargo build --release"
+        echo "run: cargo build --release -p kappa-server"
         exit 1
     fi
 }
@@ -76,7 +76,7 @@ do_start() {
     KAPPA_RATELIMIT_READ_PERIOD_MS="${KAPPA_RATELIMIT_READ_PERIOD_MS:-0}" \
     KAPPA_RATELIMIT_WRITE_PERIOD_MS="${KAPPA_RATELIMIT_WRITE_PERIOD_MS:-0}" \
     KAPPA_RATELIMIT_ADMIN_PERIOD_MS="${KAPPA_RATELIMIT_ADMIN_PERIOD_MS:-0}" \
-    RUST_LOG="${RUST_LOG:-kappa_registry=info}" \
+    RUST_LOG="${RUST_LOG:-kappa_server=info}" \
         "${REGISTRY_BIN}" >"${LOG_FILE}" 2>&1 &
     local pid=$!
     echo "${pid}" > "${PID_FILE}"

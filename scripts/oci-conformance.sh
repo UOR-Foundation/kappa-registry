@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the OCI distribution-spec conformance binary against a locally started kappa-registry.
+# Run the OCI distribution-spec conformance binary against a locally started kappa-server.
 # Usage: ./scripts/oci-conformance.sh
 #
 # Prerequisites:
-#   - kappa-registry built:  cargo build --release
+#   - kappa-server built:  cargo build --release -p kappa-server
 #   - OCI conformance binary built:
 #       cd ../distribution-spec/conformance && go build -o /tmp/oci-conformance .
 
@@ -13,12 +13,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OCI_SPEC_ROOT="${REPO_ROOT}/../../opencontainers/distribution-spec/conformance"
 
-REGISTRY_BIN="${REPO_ROOT}/target/release/kappa-registry"
+REGISTRY_BIN="${REPO_ROOT}/target/release/kappa-server"
 OCI_BIN="${OCI_BIN:-/tmp/oci-conformance}"
 
 if [[ ! -x "${REGISTRY_BIN}" ]]; then
     echo "error: registry binary not found at ${REGISTRY_BIN}"
-    echo "run: cargo build --release"
+    echo "run: cargo build --release -p kappa-server"
     exit 1
 fi
 
@@ -49,12 +49,13 @@ trap cleanup EXIT
 
 echo "starting registry on ${ADDR} with store at ${STORE_DIR}"
 REG_LOG="${REPORT_DIR}/registry.log"
+mkdir -p "${REPORT_DIR}"
 KAPPA_STORE_ROOT="${STORE_DIR}" \
 KAPPA_LISTEN_ADDR="${ADDR}" \
 KAPPA_RATELIMIT_READ_PERIOD_MS=0 \
 KAPPA_RATELIMIT_WRITE_PERIOD_MS=0 \
 KAPPA_RATELIMIT_ADMIN_PERIOD_MS=0 \
-RUST_LOG="${RUST_LOG:-kappa_registry=warn}" \
+RUST_LOG="${RUST_LOG:-kappa_server=warn}" \
     "${REGISTRY_BIN}" 2>"${REG_LOG}" &
 REGISTRY_PID=$!
 
@@ -73,8 +74,6 @@ echo "registry running (pid ${REGISTRY_PID})"
 echo "running OCI distribution-spec conformance suite..."
 echo ""
 
-mkdir -p "${REPORT_DIR}"
-
 OCI_REGISTRY="${ADDR}" \
 OCI_TLS=disabled \
 OCI_REPO1=conformance/repo1 \
@@ -86,6 +85,9 @@ OCI_API_TAG_DELETE=true \
 OCI_API_MANIFEST_DELETE=true \
 OCI_API_BLOB_DELETE=true \
 OCI_API_REFERRER=true \
+OCI_API_BLOBS_UPLOAD_CANCEL=true \
+OCI_API_MANIFESTS_TAG_PARAM=true \
+OCI_DATA_SPARSE=true \
 OCI_RESULTS_DIR="${REPORT_DIR}" \
 OCI_LOG=warn \
     "${OCI_BIN}"

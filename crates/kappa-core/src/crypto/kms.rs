@@ -13,20 +13,12 @@ pub trait KeyManagementService: Send + Sync {
     /// The same (namespace, subject) pair always returns the same key.
     /// Erasing the key for a subject makes all data encrypted under
     /// it unrecoverable (GDPR crypto-shredding).
-    fn derive_subject_key(
-        &self,
-        namespace: &str,
-        subject: &str,
-    ) -> Result<Vec<u8>, CryptoError>;
+    fn derive_subject_key(&self, namespace: &str, subject: &str) -> Result<Vec<u8>, CryptoError>;
 
     /// Erase the key material for a subject.
     ///
     /// After erasure, derive_subject_key returns SubjectKeyErased.
-    fn erase_subject_key(
-        &self,
-        namespace: &str,
-        subject: &str,
-    ) -> Result<(), CryptoError>;
+    fn erase_subject_key(&self, namespace: &str, subject: &str) -> Result<(), CryptoError>;
 
     /// Check whether a subject's key has been erased.
     fn is_erased(&self, namespace: &str, subject: &str) -> Result<bool, CryptoError>;
@@ -45,21 +37,21 @@ pub struct FileKms {
 impl FileKms {
     pub fn new(root_secret: [u8; 32], erased_dir: std::path::PathBuf) -> Result<Self, CryptoError> {
         std::fs::create_dir_all(&erased_dir)?;
-        Ok(Self { root_secret, erased_dir })
+        Ok(Self {
+            root_secret,
+            erased_dir,
+        })
     }
 
     fn erased_marker_path(&self, namespace: &str, subject: &str) -> std::path::PathBuf {
         let context_hash = blake3::hash(format!("{}/{}", namespace, subject).as_bytes());
-        self.erased_dir.join(format!("{}.erased", context_hash.to_hex()))
+        self.erased_dir
+            .join(format!("{}.erased", context_hash.to_hex()))
     }
 }
 
 impl KeyManagementService for FileKms {
-    fn derive_subject_key(
-        &self,
-        namespace: &str,
-        subject: &str,
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn derive_subject_key(&self, namespace: &str, subject: &str) -> Result<Vec<u8>, CryptoError> {
         if self.is_erased(namespace, subject)? {
             return Err(CryptoError::InvalidKey);
         }
@@ -68,11 +60,7 @@ impl KeyManagementService for FileKms {
         Ok(derived.to_vec())
     }
 
-    fn erase_subject_key(
-        &self,
-        namespace: &str,
-        subject: &str,
-    ) -> Result<(), CryptoError> {
+    fn erase_subject_key(&self, namespace: &str, subject: &str) -> Result<(), CryptoError> {
         let marker = self.erased_marker_path(namespace, subject);
         std::fs::write(&marker, b"erased")?;
         Ok(())

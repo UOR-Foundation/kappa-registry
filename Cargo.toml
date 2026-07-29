@@ -7,6 +7,8 @@ members = [
     "crates/kappa-store-redb",
     "crates/kappa-module-oci",
     "crates/kappa-module-identity",
+    "crates/kappa-module-distribution",
+    "crates/kappa-akd",
     "crates/kappa-reconcile",
     "crates/kappa-conformance",
 ]
@@ -25,6 +27,7 @@ dcbor = { git = "https://github.com/usrbinkat/bc-dcbor-rust", branch = "feat/dcb
 # Hashing
 sha2 = "0.11"
 blake3 = "1"
+sha1-checked = "0.10"
 hex = "0.4"
 
 # Crypto ecosystem -- rand 0.10 lineage (frost 3.0.0 + ed25519-dalek 3.0.0)
@@ -53,6 +56,9 @@ thiserror = "2"
 # Observability
 tracing = "0.1"
 
+# HTTP types
+http = "1"
+
 # HTTP framework
 topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower"] }
 
@@ -74,12 +80,29 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
 
+# Rate limiting
+governor = "0.6"
+
+# Concurrent hash map
+dashmap = "6"
+
+# AKD (std-only, kappa-akd crate only)
+akd = { version = "0.12", features = ["serde_serialization"] }
+async-trait = "0.1"
+
+# JSON Schema validation
+jsonschema = "0.28"
+
+# Merkle search tree for reconciliation
+merkle-search-tree = "0.8"
+
 # Inter-crate
 kappa-core = { path = "crates/kappa-core" }
 kappa-types = { path = "crates/kappa-types" }
 kappa-store-redb = { path = "crates/kappa-store-redb" }
 kappa-module-oci = { path = "crates/kappa-module-oci" }
 kappa-module-identity = { path = "crates/kappa-module-identity" }
+kappa-akd = { path = "crates/kappa-akd" }
 kappa-reconcile = { path = "crates/kappa-reconcile" }
 
 [patch.crates-io]

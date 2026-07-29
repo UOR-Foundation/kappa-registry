@@ -26,10 +26,7 @@ pub fn check_or_write_version(store_root: &Path) -> Result<(), StoreError> {
     if path.exists() {
         let stored = std::fs::read_to_string(&path)?;
         let stored_version: u32 = stored.trim().parse().map_err(|_| {
-            StoreError::Rejected(format!(
-                "corrupt format version file: {:?}",
-                stored.trim()
-            ))
+            StoreError::Rejected(format!("corrupt format version file: {:?}", stored.trim()))
         })?;
         if stored_version != STORE_FORMAT_VERSION {
             return Err(StoreError::Rejected(format!(

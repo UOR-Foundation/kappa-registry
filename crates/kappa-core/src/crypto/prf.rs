@@ -51,8 +51,7 @@ impl PrfKeyMaterial {
         std::fs::create_dir_all(keys_dir)?;
 
         let mut secret = vec![0u8; 32];
-        getrandom::fill(&mut secret)
-            .map_err(|e| CryptoError::KeyGeneration(e.to_string()))?;
+        getrandom::fill(&mut secret).map_err(|e| CryptoError::KeyGeneration(e.to_string()))?;
 
         let public = blake3::derive_key("kappa-registry prf public", &secret).to_vec();
         let hash = blake3::hash(&secret);

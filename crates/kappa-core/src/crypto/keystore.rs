@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::CryptoError;
+use super::{CryptoError, Signer};
 
 pub struct KeyStore {
     keys_dir: PathBuf,
@@ -72,9 +72,7 @@ impl KeyStore {
 
         let stored_hash = std::fs::read_to_string(&hash_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                CryptoError::IntegrityFailure(
-                    format!("missing integrity hash for key '{}'", name),
-                )
+                CryptoError::IntegrityFailure(format!("missing integrity hash for key '{}'", name))
             } else {
                 CryptoError::Io(e)
             }
@@ -82,14 +80,12 @@ impl KeyStore {
 
         let computed_hash = blake3::hash(&secret_bytes);
         if computed_hash.to_hex().as_str() != stored_hash.trim() {
-            return Err(CryptoError::IntegrityFailure(
-                format!(
-                    "key '{}' integrity check failed: expected {} got {}",
-                    name,
-                    stored_hash.trim(),
-                    computed_hash.to_hex()
-                ),
-            ));
+            return Err(CryptoError::IntegrityFailure(format!(
+                "key '{}' integrity check failed: expected {} got {}",
+                name,
+                stored_hash.trim(),
+                computed_hash.to_hex()
+            )));
         }
 
         let algorithm = std::fs::read_to_string(&algo_path).map_err(|e| {

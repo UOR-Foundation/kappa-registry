@@ -1,0 +1,20 @@
+[package]
+name = "kappa-store-redb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Optional redb query accelerator for kappa-registry."
+
+[lib]
+name = "kappa_store_redb"
+path = "src/lib.rs"
+
+[dependencies]
+kappa-core = { workspace = true }
+redb = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

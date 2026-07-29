@@ -15,6 +15,7 @@ path = "src/lib.rs"
 dcbor = { workspace = true }
 sha2 = { workspace = true }
 blake3 = { workspace = true }
+sha1-checked = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 p256 = { workspace = true }
@@ -25,9 +26,12 @@ frost-ed25519 = { workspace = true }
 frost-p256 = { workspace = true }
 frost-secp256k1 = { workspace = true }
 rand_core = { workspace = true }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
+dashmap = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

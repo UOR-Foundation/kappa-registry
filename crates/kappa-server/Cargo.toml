@@ -1,0 +1,50 @@
+[package]
+name = "kappa-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "kappa-registry HTTP server."
+
+[[bin]]
+name = "kappa-server"
+path = "src/main.rs"
+
+[dependencies]
+kappa-core = { workspace = true }
+topcoat = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+governor = { workspace = true }
+http = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+
+kappa-module-oci = { path = "../kappa-module-oci", optional = true }
+kappa-module-identity = { path = "../kappa-module-identity", optional = true }
+kappa-module-distribution = { path = "../kappa-module-distribution", optional = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+
+[[test]]
+name = "smoke"
+path = "tests/integration/smoke.rs"
+
+[[test]]
+name = "operational"
+path = "tests/integration/operational.rs"
+
+[features]
+default = ["oci", "identity-http", "distribution"]
+oci = ["dep:kappa-module-oci"]
+identity-http = ["dep:kappa-module-identity"]
+distribution = ["dep:kappa-module-distribution"]

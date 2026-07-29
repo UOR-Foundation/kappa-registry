@@ -12,32 +12,40 @@ pub struct P256Signer {
 
 impl P256Signer {
     pub fn new(signing_key: p256::ecdsa::SigningKey) -> Self {
-        let public_key_bytes = signing_key
-            .verifying_key()
-            .to_sec1_bytes()
-            .to_vec();
-        Self { signing_key, public_key_bytes }
+        let public_key_bytes = signing_key.verifying_key().to_sec1_bytes().to_vec();
+        Self {
+            signing_key,
+            public_key_bytes,
+        }
     }
 
-    pub fn generate(rng: &mut impl rand_core::CryptoRng) -> Self {
-        Self::new(p256::ecdsa::SigningKey::random(rng))
+    pub fn generate(rng: &mut (impl rand_core::CryptoRng + ?Sized)) -> Self {
+        use p256::elliptic_curve::Generate;
+        Self::new(
+            p256::ecdsa::SigningKey::try_generate_from_rng(rng)
+                .expect("ECDSA key generation from CryptoRng is infallible"),
+        )
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        let key = p256::ecdsa::SigningKey::from_bytes(bytes.into())
-            .map_err(|_| CryptoError::InvalidKey)?;
+        let key =
+            p256::ecdsa::SigningKey::from_slice(bytes).map_err(|_| CryptoError::InvalidKey)?;
         Ok(Self::new(key))
     }
 }
 
 impl Signer for P256Signer {
-    fn algorithm(&self) -> &'static str { "p256" }
-    fn public_key(&self) -> &[u8] { &self.public_key_bytes }
+    fn algorithm(&self) -> &'static str {
+        "p256"
+    }
+    fn public_key(&self) -> &[u8] {
+        &self.public_key_bytes
+    }
 
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
         use p256::ecdsa::signature::Signer as _;
         let sig: p256::ecdsa::Signature = self.signing_key.sign(message);
-        let normalized = sig.normalize_s().unwrap_or(sig);
+        let normalized = sig.normalize_s();
         Ok(normalized.to_der().as_bytes().to_vec())
     }
 }
@@ -69,32 +77,40 @@ pub struct K256Signer {
 
 impl K256Signer {
     pub fn new(signing_key: k256::ecdsa::SigningKey) -> Self {
-        let public_key_bytes = signing_key
-            .verifying_key()
-            .to_sec1_bytes()
-            .to_vec();
-        Self { signing_key, public_key_bytes }
+        let public_key_bytes = signing_key.verifying_key().to_sec1_bytes().to_vec();
+        Self {
+            signing_key,
+            public_key_bytes,
+        }
     }
 
-    pub fn generate(rng: &mut impl rand_core::CryptoRng) -> Self {
-        Self::new(k256::ecdsa::SigningKey::random(rng))
+    pub fn generate(rng: &mut (impl rand_core::CryptoRng + ?Sized)) -> Self {
+        use k256::elliptic_curve::Generate;
+        Self::new(
+            k256::ecdsa::SigningKey::try_generate_from_rng(rng)
+                .expect("ECDSA key generation from CryptoRng is infallible"),
+        )
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        let key = k256::ecdsa::SigningKey::from_bytes(bytes.into())
-            .map_err(|_| CryptoError::InvalidKey)?;
+        let key =
+            k256::ecdsa::SigningKey::from_slice(bytes).map_err(|_| CryptoError::InvalidKey)?;
         Ok(Self::new(key))
     }
 }
 
 impl Signer for K256Signer {
-    fn algorithm(&self) -> &'static str { "k256" }
-    fn public_key(&self) -> &[u8] { &self.public_key_bytes }
+    fn algorithm(&self) -> &'static str {
+        "k256"
+    }
+    fn public_key(&self) -> &[u8] {
+        &self.public_key_bytes
+    }
 
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
         use k256::ecdsa::signature::Signer as _;
         let sig: k256::ecdsa::Signature = self.signing_key.sign(message);
-        let normalized = sig.normalize_s().unwrap_or(sig);
+        let normalized = sig.normalize_s();
         Ok(normalized.to_der().as_bytes().to_vec())
     }
 }
@@ -203,5 +219,23 @@ mod tests {
     fn k256_algorithm() {
         let s = K256Signer::generate(&mut test_rng());
         assert_eq!(s.algorithm(), "k256");
+    }
+
+    #[test]
+    fn p256_from_bytes_roundtrip() {
+        let signer = P256Signer::generate(&mut test_rng());
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"test").unwrap();
+        let v = P256EcdsaVerifier;
+        assert!(v.verify(&pk, b"test", &sig).unwrap());
+    }
+
+    #[test]
+    fn k256_from_bytes_roundtrip() {
+        let signer = K256Signer::generate(&mut test_rng());
+        let pk = signer.public_key().to_vec();
+        let sig = signer.sign(b"test").unwrap();
+        let v = K256EcdsaVerifier;
+        assert!(v.verify(&pk, b"test", &sig).unwrap());
     }
 }

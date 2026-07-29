@@ -4,11 +4,12 @@
 //! forward (by source), reverse (by target), by relation, by asserter.
 //! Indexes are maintained on put/delete and rebuilt from blobs on recovery.
 
-use std::sync::RwLock;
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use crate::canonical::canonical_bytes;
 use crate::kappa::kappa_from_bytes;
+use crate::store::KappaStore;
 use crate::types::*;
 
 use super::InMemoryStore;
@@ -32,25 +33,26 @@ fn relation_index(relation: &EdgeRelation) -> u64 {
         EdgeRelation::CertifiedBy => 12,
         EdgeRelation::EvidenceProvenance => 13,
         EdgeRelation::SectionOf => 14,
+        EdgeRelation::RefersTo => 15,
     }
 }
 
-pub(super) fn edge_put(
-    store: &InMemoryStore,
-    ns: &str,
-    edge: &Edge,
-) -> Result<String, StoreError> {
+pub(super) fn edge_put(store: &InMemoryStore, ns: &str, edge: &Edge) -> Result<(), StoreError> {
     store.ensure_namespace(ns);
 
     let edge_bytes = canonical_bytes(edge);
     let edge_kappa = kappa_from_bytes(&edge_bytes);
-    store.blob_put(&edge_bytes)?;
+    store.blob_put(&edge_kappa, &edge_bytes)?;
 
     let ns_hash = namespace_hash(ns);
     let ek_hash = item_hash(&edge_kappa);
 
     {
-        store.edges.write().unwrap().insert((ns_hash, ek_hash), edge.clone());
+        store
+            .edges
+            .write()
+            .unwrap()
+            .insert((ns_hash, ek_hash), edge.clone());
     }
 
     fn push_index(
@@ -59,18 +61,40 @@ pub(super) fn edge_put(
         key_hash: u64,
         edge_kappa: &str,
     ) {
-        index.write().unwrap()
+        index
+            .write()
+            .unwrap()
             .entry((ns_hash, key_hash))
             .or_default()
             .push(edge_kappa.to_string());
     }
 
-    push_index(&store.fwd_index, ns_hash, item_hash(&edge.source), &edge_kappa);
-    push_index(&store.rev_index, ns_hash, item_hash(&edge.target), &edge_kappa);
-    push_index(&store.rel_index, ns_hash, relation_index(&edge.relation), &edge_kappa);
-    push_index(&store.asr_index, ns_hash, item_hash(&edge.asserter), &edge_kappa);
+    push_index(
+        &store.fwd_index,
+        ns_hash,
+        item_hash(&edge.source),
+        &edge_kappa,
+    );
+    push_index(
+        &store.rev_index,
+        ns_hash,
+        item_hash(&edge.target),
+        &edge_kappa,
+    );
+    push_index(
+        &store.rel_index,
+        ns_hash,
+        relation_index(&edge.relation),
+        &edge_kappa,
+    );
+    push_index(
+        &store.asr_index,
+        ns_hash,
+        item_hash(&edge.asserter),
+        &edge_kappa,
+    );
 
-    Ok(edge_kappa)
+    Ok(())
 }
 
 pub(super) fn edge_query(
@@ -82,18 +106,20 @@ pub(super) fn edge_query(
     let anchor_hash = item_hash(&query.anchor);
 
     let kappas = match query.direction {
-        Direction::Outbound => {
-            store.fwd_index.read().unwrap()
-                .get(&(ns_hash, anchor_hash))
-                .cloned()
-                .unwrap_or_default()
-        }
-        Direction::Inbound => {
-            store.rev_index.read().unwrap()
-                .get(&(ns_hash, anchor_hash))
-                .cloned()
-                .unwrap_or_default()
-        }
+        Direction::Outbound => store
+            .fwd_index
+            .read()
+            .unwrap()
+            .get(&(ns_hash, anchor_hash))
+            .cloned()
+            .unwrap_or_default(),
+        Direction::Inbound => store
+            .rev_index
+            .read()
+            .unwrap()
+            .get(&(ns_hash, anchor_hash))
+            .cloned()
+            .unwrap_or_default(),
     };
 
     let edges = store.edges.read().unwrap();
@@ -120,11 +146,37 @@ pub(super) fn edge_query(
 pub(super) fn edge_delete(
     store: &InMemoryStore,
     ns: &str,
-    edge_kappa: &str,
+    source: &str,
+    target: &str,
+    relation: EdgeRelation,
 ) -> Result<(), StoreError> {
     let ns_hash = namespace_hash(ns);
-    let ek_hash = item_hash(edge_kappa);
 
+    // Find the edge kappa by scanning the source's forward index
+    let edges = store.edges.read().unwrap();
+    let edge_kappa = {
+        let fwd = store.fwd_index.read().unwrap();
+        let src_hash = item_hash(source);
+        let candidates = fwd.get(&(ns_hash, src_hash)).cloned().unwrap_or_default();
+        let mut found = None;
+        for ek in &candidates {
+            let ek_hash = item_hash(ek);
+            if let Some(edge) = edges.get(&(ns_hash, ek_hash)) {
+                if edge.source == source && edge.target == target && edge.relation == relation {
+                    found = Some(ek.clone());
+                    break;
+                }
+            }
+        }
+        found
+    };
+    drop(edges);
+
+    let Some(edge_kappa) = edge_kappa else {
+        return Ok(());
+    };
+
+    let ek_hash = item_hash(&edge_kappa);
     let edge = store.edges.write().unwrap().remove(&(ns_hash, ek_hash));
 
     if let Some(edge) = edge {
@@ -139,12 +191,32 @@ pub(super) fn edge_delete(
             }
         }
 
-        remove_from(&store.fwd_index, ns_hash, item_hash(&edge.source), edge_kappa);
-        remove_from(&store.rev_index, ns_hash, item_hash(&edge.target), edge_kappa);
-        remove_from(&store.rel_index, ns_hash, relation_index(&edge.relation), edge_kappa);
-        remove_from(&store.asr_index, ns_hash, item_hash(&edge.asserter), edge_kappa);
+        remove_from(
+            &store.fwd_index,
+            ns_hash,
+            item_hash(&edge.source),
+            &edge_kappa,
+        );
+        remove_from(
+            &store.rev_index,
+            ns_hash,
+            item_hash(&edge.target),
+            &edge_kappa,
+        );
+        remove_from(
+            &store.rel_index,
+            ns_hash,
+            relation_index(&edge.relation),
+            &edge_kappa,
+        );
+        remove_from(
+            &store.asr_index,
+            ns_hash,
+            item_hash(&edge.asserter),
+            &edge_kappa,
+        );
     }
 
-    store.blob_delete(edge_kappa)?;
+    store.blob_delete(&edge_kappa)?;
     Ok(())
 }

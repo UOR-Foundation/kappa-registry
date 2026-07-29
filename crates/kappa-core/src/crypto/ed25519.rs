@@ -3,7 +3,7 @@
 //! FROST Ed25519 produces standard Ed25519 signatures, so
 //! Ed25519Verifier handles both single-signer and threshold cases.
 
-use ed25519_dalek::{SigningKey, VerifyingKey, Signer as DalekSigner, Verifier as DalekVerifier};
+use ed25519_dalek::{Signer as DalekSigner, SigningKey, VerifyingKey};
 
 use super::{CryptoError, Signer, Verifier};
 
@@ -15,7 +15,10 @@ pub struct Ed25519Signer {
 impl Ed25519Signer {
     pub fn new(signing_key: SigningKey) -> Self {
         let public_key_bytes = signing_key.verifying_key().to_bytes();
-        Self { signing_key, public_key_bytes }
+        Self {
+            signing_key,
+            public_key_bytes,
+        }
     }
 
     pub fn from_bytes(secret: &[u8; 32]) -> Self {
@@ -32,9 +35,13 @@ impl Ed25519Signer {
 }
 
 impl Signer for Ed25519Signer {
-    fn algorithm(&self) -> &'static str { "ed25519" }
+    fn algorithm(&self) -> &'static str {
+        "ed25519"
+    }
 
-    fn public_key(&self) -> &[u8] { &self.public_key_bytes }
+    fn public_key(&self) -> &[u8] {
+        &self.public_key_bytes
+    }
 
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let sig = self.signing_key.sign(message);
@@ -51,11 +58,8 @@ impl Verifier for Ed25519Verifier {
         message: &[u8],
         signature: &[u8],
     ) -> Result<bool, CryptoError> {
-        let pk_bytes: [u8; 32] = public_key
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKey)?;
-        let vk = VerifyingKey::from_bytes(&pk_bytes)
-            .map_err(|_| CryptoError::InvalidKey)?;
+        let pk_bytes: [u8; 32] = public_key.try_into().map_err(|_| CryptoError::InvalidKey)?;
+        let vk = VerifyingKey::from_bytes(&pk_bytes).map_err(|_| CryptoError::InvalidKey)?;
         let sig = ed25519_dalek::Signature::from_slice(signature)
             .map_err(|_| CryptoError::InvalidSignature)?;
         Ok(vk.verify_strict(message, &sig).is_ok())
@@ -84,7 +88,9 @@ mod tests {
         let signer = Ed25519Signer::generate(&mut test_rng());
         let sig = signer.sign(b"correct").unwrap();
         let verifier = Ed25519Verifier;
-        assert!(!verifier.verify(signer.public_key(), b"wrong", &sig).unwrap());
+        assert!(!verifier
+            .verify(signer.public_key(), b"wrong", &sig)
+            .unwrap());
     }
 
     #[test]
