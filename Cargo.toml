@@ -1,86 +1,86 @@
-[package]
-name = "kappa-registry"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = [
+    "crates/kappa-core",
+    "crates/kappa-types",
+    "crates/kappa-server",
+    "crates/kappa-store-redb",
+    "crates/kappa-module-oci",
+    "crates/kappa-module-identity",
+    "crates/kappa-reconcile",
+    "crates/kappa-conformance",
+]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.95"
-publish = false
 license = "MIT OR Apache-2.0"
-description = "A conforming kappa-Distribution /v2/ registry. Filesystem-backed, single-node, all five conformance levels."
+publish = false
 
-[lib]
-name = "kappa_registry"
-path = "src/lib.rs"
+[workspace.dependencies]
+# Deterministic CBOR (dCBOR, draft-mcnally-deterministic-cbor)
+dcbor = { git = "https://github.com/usrbinkat/bc-dcbor-rust", branch = "feat/dcbor-derive", features = ["derive", "multithreaded"] }
 
-[[bin]]
-name = "kappa-registry"
-path = "src/main.rs"
-
-[dependencies]
-topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
-tower = "0.5"
-governor = "0.10"
-http = "1"
-
-# Hashing -- all RustCrypto digest-trait compatible
-sha2 = "0.10"
-sha1-checked = { version = "0.10", default-features = false }
+# Hashing
+sha2 = "0.11"
 blake3 = "1"
 hex = "0.4"
 
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Crypto ecosystem -- rand 0.10 lineage (frost 3.0.0 + ed25519-dalek 3.0.0)
+rand = { version = "0.10", default-features = false }
+rand_core = { version = "0.10", default-features = false }
+getrandom = { version = "0.4", features = ["sys_rng"] }
 
-# Schema validation
-jsonschema = { version = "0.46", default-features = false }
-
-# Filesystem / temp
-tempfile = "3"
-
-# Identifiers
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-
-# Observability
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Embedded KV store for edge index (P9)
-redb = "4"
-
-# Reachability acceleration (P4)
-roaring = "0.11"
-
-# Cryptographic signing and verification (P11)
-ed25519-dalek = { version = "3", features = ["rand_core"] }
+# Signing -- single-signer
+ed25519-dalek = { version = "3", default-features = false, features = ["rand_core"] }
 p256 = { version = "0.14", features = ["ecdsa"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
 signature = "3"
 
-# FROST threshold signing (P11 extension)
-frost-core = "2"
-frost-ed25519 = "2"
-frost-p256 = "2"
-frost-secp256k1 = "2"
+# Signing -- threshold (all no_std+alloc, NCC-audited v3.0.0)
+frost-core = { version = "3", features = ["serialization"] }
+frost-ed25519 = { version = "3", features = ["serialization"] }
+frost-p256 = { version = "3", features = ["serialization"] }
+frost-secp256k1 = { version = "3", features = ["serialization"] }
 
-# Merkle search tree for tag-name reconciliation
-merkle-search-tree = "0.8"
+# Key management
+zeroize = "1.9"
 
-# RNG compatible with frost-core's rand_core 0.6
-rand = "0.8"
+# Errors
+thiserror = "2"
 
-# Optional
-reqwest = { version = "0.12", features = ["blocking"], optional = true }
-getrandom = "0.4.3"
-zeroize = "1.9.0"
+# Observability
+tracing = "0.1"
 
-[features]
-default = []
-federation = ["reqwest"]
+# HTTP framework
+topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower"] }
 
-[dev-dependencies]
-reqwest = { version = "0.12", features = ["blocking"] }
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+
+# Embedded KV store (optional query accelerator)
+redb = "4"
+
+# Identifiers
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+
+# Filesystem / temp
+tempfile = "3"
+
+# Serialization for non-canonical paths (checkpoints, HTTP JSON compat)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+
+# Inter-crate
+kappa-core = { path = "crates/kappa-core" }
+kappa-types = { path = "crates/kappa-types" }
+kappa-store-redb = { path = "crates/kappa-store-redb" }
+kappa-module-oci = { path = "crates/kappa-module-oci" }
+kappa-module-identity = { path = "crates/kappa-module-identity" }
+kappa-reconcile = { path = "crates/kappa-reconcile" }
 
 [patch.crates-io]
 matchit = { git = "https://github.com/usrbinkat/matchit", branch = "usrbinkat/feat/non-terminal-catch-all" }
