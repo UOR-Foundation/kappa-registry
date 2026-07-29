@@ -42,6 +42,7 @@
         {
           default = pkgs.mkShell {
             nativeBuildInputs = with pkgs; [
+              just
               (rust-bin.stable."1.92.0".minimal.override {
                 extensions = [
                   "rust-src"

@@ -43,7 +43,7 @@ pub fn encode(objects: &[(&str, &[u8])], use_deltas: bool) -> Vec<u8> {
         .enumerate()
         .map(|(i, (k, c))| (i, *k, *c))
         .collect();
-    indexed.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+    indexed.sort_by_key(|b| std::cmp::Reverse(b.2.len()));
 
     struct EntryPlan<'a> {
         kappa: &'a str,
