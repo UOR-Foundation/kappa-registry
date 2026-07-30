@@ -1,6 +1,6 @@
 //! WebSocket event streaming endpoint.
 //!
-//! GET /v2/{*ns}/_ws -- bidirectional namespace event stream.
+//! GET /v2/{*ns}/_events/_ws -- bidirectional namespace event stream.
 //! Subprotocol: kappa-events.v1
 //!
 //! Clients receive events and can send commands:

@@ -36,7 +36,7 @@ kappa-module-identity = { path = "../kappa-module-identity", optional = true }
 kappa-module-distribution = { path = "../kappa-module-distribution", optional = true }
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -44,6 +44,7 @@ hex = { workspace = true }
 rand = { workspace = true }
 blake3 = { workspace = true }
 rcgen = "0.14"
+tungstenite = "0.30"
 libc = "0.2"
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
@@ -101,6 +102,10 @@ path = "tests/integration/security.rs"
 [[test]]
 name = "correctness"
 path = "tests/integration/correctness.rs"
+
+[[test]]
+name = "websocket"
+path = "tests/integration/websocket.rs"
 
 [features]
 default = ["oci", "identity-http", "distribution"]

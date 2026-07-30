@@ -60,13 +60,13 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder
         .route(RouteFn::new(
             Method::GET,
-            Cow::Borrowed(Path::new("/v2/{*ns}/_ws")),
-            ws_events::ws_events_route,
+            Cow::Borrowed(Path::new("/v2/{*ns}/_crdt/{doc}/_ws")),
+            ws_crdt::ws_crdt_route,
         ))
         .route(RouteFn::new(
             Method::GET,
-            Cow::Borrowed(Path::new("/v2/{*ns}/_crdt/{doc}/_ws")),
-            ws_crdt::ws_crdt_route,
+            Cow::Borrowed(Path::new("/v2/{*ns}/_events/_ws")),
+            ws_events::ws_events_route,
         ))
 }
 

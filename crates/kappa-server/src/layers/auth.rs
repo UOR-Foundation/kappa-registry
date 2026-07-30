@@ -87,7 +87,7 @@ fn extract_namespace(path: &str) -> Option<String> {
         "/blobs/", "/manifests/", "/tags/", "/edges/", "/filters/",
         "/schemas/", "/gc/", "/_transaction/", "/_sequence/", "/_root",
         "/_events", "/_bundle/", "/_reconcile", "/compose/", "/witnesses/",
-        "/referrers/", "/_uploads/", "/_ws", "/_crdt/",
+        "/referrers/", "/_uploads/", "/_events/", "/_crdt/",
     ];
     for boundary in boundaries {
         if let Some(idx) = path.find(boundary) {
