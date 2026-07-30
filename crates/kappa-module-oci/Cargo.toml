@@ -23,3 +23,8 @@ blake3 = { workspace = true }
 sha1-checked = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
+bytes = "1"
+tokio-util = { version = "0.7", features = ["io"] }
+http-body-util = "0.1"
+http-body = "1"
+futures-util = "0.3"

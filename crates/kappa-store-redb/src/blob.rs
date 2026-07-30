@@ -90,6 +90,17 @@ impl PersistentStore {
             })
     }
 
+    pub(crate) fn blob_open_impl(&self, kappa: &str) -> Result<std::fs::File, StoreError> {
+        let path = self.blob_path_for(kappa)?;
+        std::fs::File::open(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(kappa.to_string())
+            } else {
+                StoreError::Io(e)
+            }
+        })
+    }
+
     pub(crate) fn blob_get_range_impl(
         &self,
         kappa: &str,

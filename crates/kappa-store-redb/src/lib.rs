@@ -220,6 +220,9 @@ impl KappaStore for PersistentStore {
     fn epoch_get(&self, kappa: &str) -> Result<EpochRoot, StoreError> {
         self.epoch_get_impl(kappa)
     }
+    fn blob_open(&self, kappa: &str) -> Result<std::fs::File, StoreError> {
+        self.blob_open_impl(kappa)
+    }
     fn namespace_list(&self) -> Result<Vec<String>, StoreError> {
         self.namespace_list_impl()
     }
@@ -441,6 +444,53 @@ mod tests {
             let r = s.meta_query("ns", "object-type", "manifest").unwrap();
             assert_eq!(r.len(), 1);
         }
+    }
+
+    // -- blob_open --------------------------------------------------------------
+
+    #[test]
+    fn blob_open_returns_file_for_existing() {
+        let (s, _d) = new_store();
+        let k = kappa_from_bytes(b"open-test");
+        s.blob_put(&k, b"open-test").unwrap();
+        let mut file = s.blob_open(&k).unwrap();
+        let mut buf = Vec::new();
+        use std::io::Read;
+        file.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"open-test");
+    }
+
+    #[test]
+    fn blob_open_not_found_for_missing() {
+        let (s, _d) = new_store();
+        let result = s.blob_open("sha256:0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn blob_open_content_matches_blob_get() {
+        let (s, _d) = new_store();
+        let content: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let k = kappa_from_bytes(&content);
+        s.blob_put(&k, &content).unwrap();
+
+        let get_result = s.blob_get(&k).unwrap();
+        let mut file = s.blob_open(&k).unwrap();
+        let mut open_result = Vec::new();
+        use std::io::Read;
+        file.read_to_end(&mut open_result).unwrap();
+        assert_eq!(get_result, open_result);
+    }
+
+    #[test]
+    fn blob_open_file_at_start() {
+        let (s, _d) = new_store();
+        let k = kappa_from_bytes(b"position-test");
+        s.blob_put(&k, b"position-test").unwrap();
+        let mut file = s.blob_open(&k).unwrap();
+        use std::io::Seek;
+        let pos = file.stream_position().unwrap();
+        assert_eq!(pos, 0, "file should be positioned at start");
     }
 
     // -- Prefix successor -----------------------------------------------------

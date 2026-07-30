@@ -2254,13 +2254,18 @@ name = "kappa-module-oci"
 version = "0.2.0"
 dependencies = [
  "blake3",
+ "bytes",
+ "futures-util",
  "hex",
+ "http-body",
+ "http-body-util",
  "jsonschema",
  "kappa-core",
  "serde_json",
  "sha1-checked",
  "sha2 0.11.0",
  "tokio",
+ "tokio-util",
  "topcoat",
  "tracing",
  "uuid",

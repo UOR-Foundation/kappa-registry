@@ -114,6 +114,26 @@ pub trait KappaStore: Send + Sync {
     fn epoch_current(&self, ns: &str) -> Result<Option<String>, StoreError>;
     fn epoch_get(&self, kappa: &str) -> Result<EpochRoot, StoreError>;
 
+    // -- Blob file handle for streaming (1) ------------------------------------
+
+    /// Open a blob file for streaming reads. Returns a file handle
+    /// positioned at the start. The caller owns the read lifecycle.
+    ///
+    /// Use for HTTP response streaming where the blob could be any size.
+    /// Use blob_get for small reads (metadata, edges, epochs) where
+    /// allocation is acceptable.
+    fn blob_open(&self, kappa: &str) -> Result<std::fs::File, StoreError> {
+        let content = self.blob_get(kappa)?;
+        let mut tmp = tempfile::NamedTempFile::new().map_err(StoreError::Io)?;
+        use std::io::Write;
+        tmp.write_all(&content).map_err(StoreError::Io)?;
+        use std::io::Seek;
+        tmp.as_file_mut()
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(StoreError::Io)?;
+        Ok(tmp.into_file())
+    }
+
     // -- Namespace (2) --------------------------------------------------------
 
     fn namespace_list(&self) -> Result<Vec<String>, StoreError>;
