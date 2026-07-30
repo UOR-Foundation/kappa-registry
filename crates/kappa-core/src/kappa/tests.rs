@@ -14,6 +14,14 @@ mod tests {
         "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
     const HELLO_BLAKE3: &str =
         "blake3:ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
+    const EMPTY_SHA3_256: &str =
+        "sha3-256:a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a";
+    const HELLO_SHA3_256: &str =
+        "sha3-256:3338be694f50c5f338814986cdf0686453a888b84f424d792af4b9202398f392";
+    const EMPTY_KECCAK256: &str =
+        "keccak256:c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
+    const HELLO_KECCAK256: &str =
+        "keccak256:1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8";
 
     // -- SHA-1 ----------------------------------------------------------------
 
@@ -101,6 +109,108 @@ mod tests {
     #[test]
     fn blake3_hello() {
         assert_eq!(KappaLabel::blake3(b"hello").as_str(), HELLO_BLAKE3);
+    }
+
+    // -- SHA-3-256 -------------------------------------------------------------
+
+    #[test]
+    fn sha3_256_empty() {
+        assert_eq!(KappaLabel::sha3_256(b"").as_str(), EMPTY_SHA3_256);
+    }
+
+    #[test]
+    fn sha3_256_hello() {
+        assert_eq!(KappaLabel::sha3_256(b"hello").as_str(), HELLO_SHA3_256);
+    }
+
+    #[test]
+    fn sha3_256_label_length() {
+        assert_eq!(KappaLabel::sha3_256(b"x").as_str().len(), 73);
+    }
+
+    #[test]
+    fn parse_roundtrip_sha3_256() {
+        let k = KappaLabel::sha3_256(b"test");
+        let parsed = KappaLabel::parse(k.as_str()).unwrap();
+        assert_eq!(k, parsed);
+    }
+
+    #[test]
+    fn verify_sha3_256() {
+        assert_eq!(verify_kappa(HELLO_SHA3_256, b"hello"), Ok(true));
+    }
+
+    #[test]
+    fn verify_sha3_256_mismatch() {
+        assert_eq!(verify_kappa(HELLO_SHA3_256, b"wrong"), Ok(false));
+    }
+
+    #[test]
+    fn complement_sha3_256_roundtrip() {
+        let k = KappaLabel::sha3_256(b"involution test");
+        assert_eq!(k.complement().complement(), k);
+    }
+
+    // -- Keccak-256 -----------------------------------------------------------
+
+    #[test]
+    fn keccak256_empty() {
+        assert_eq!(KappaLabel::keccak256(b"").as_str(), EMPTY_KECCAK256);
+    }
+
+    #[test]
+    fn keccak256_hello() {
+        assert_eq!(KappaLabel::keccak256(b"hello").as_str(), HELLO_KECCAK256);
+    }
+
+    #[test]
+    fn keccak256_label_length() {
+        assert_eq!(KappaLabel::keccak256(b"x").as_str().len(), 74);
+    }
+
+    #[test]
+    fn parse_roundtrip_keccak256() {
+        let k = KappaLabel::keccak256(b"test");
+        let parsed = KappaLabel::parse(k.as_str()).unwrap();
+        assert_eq!(k, parsed);
+    }
+
+    #[test]
+    fn verify_keccak256() {
+        assert_eq!(verify_kappa(HELLO_KECCAK256, b"hello"), Ok(true));
+    }
+
+    #[test]
+    fn verify_keccak256_mismatch() {
+        assert_eq!(verify_kappa(HELLO_KECCAK256, b"wrong"), Ok(false));
+    }
+
+    #[test]
+    fn complement_keccak256_roundtrip() {
+        let k = KappaLabel::keccak256(b"involution test");
+        assert_eq!(k.complement().complement(), k);
+    }
+
+    // -- SHA-3-256 vs Keccak-256 distinction ----------------------------------
+
+    #[test]
+    fn sha3_256_differs_from_keccak256() {
+        // Same input, different padding, different output
+        let sha3 = KappaLabel::sha3_256(b"distinct");
+        let keccak = KappaLabel::keccak256(b"distinct");
+        assert_ne!(sha3.as_str(), keccak.as_str());
+        assert_ne!(sha3.axis(), keccak.axis());
+    }
+
+    // -- Every axis computes and verifies -------------------------------------
+
+    #[test]
+    fn every_parsed_axis_can_be_computed_and_verified() {
+        for axis in ["sha1", "sha256", "blake3", "sha3-256", "keccak256", "sha512"] {
+            let label = compute_kappa(axis, b"axis parity").unwrap();
+            assert_eq!(KappaLabel::parse(label.as_str()).unwrap(), label);
+            assert_eq!(verify_kappa(label.as_str(), b"axis parity"), Ok(true));
+        }
     }
 
     // -- Parse and verify -----------------------------------------------------
@@ -214,6 +324,18 @@ mod tests {
     fn compute_kappa_sha1() {
         let k = compute_kappa("sha1", b"hello").unwrap();
         assert_eq!(k.as_str(), HELLO_SHA1);
+    }
+
+    #[test]
+    fn compute_kappa_sha3_256() {
+        let k = compute_kappa("sha3-256", b"hello").unwrap();
+        assert_eq!(k.as_str(), HELLO_SHA3_256);
+    }
+
+    #[test]
+    fn compute_kappa_keccak256() {
+        let k = compute_kappa("keccak256", b"hello").unwrap();
+        assert_eq!(k.as_str(), HELLO_KECCAK256);
     }
 
     #[test]

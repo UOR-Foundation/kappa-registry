@@ -382,6 +382,60 @@ fn chunked_upload_blake3_axis() {
     drop(guard);
 }
 
+#[test]
+fn chunked_upload_sha3_256_axis() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+    let content: Vec<u8> = (0..8192).map(|i| (i % 199) as u8).collect();
+    let digest = sha3_256_digest(&content);
+
+    let upload_url = start_upload(&c, &base, "sha3-256-up");
+    let upload_url = send_chunk(&c, &base, &upload_url, 0, &content);
+    let complete_url = format!("{}?digest={}", upload_url, digest);
+    let resp = c.put(&complete_url).send().unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "sha3-256 upload failed: {}",
+        resp.text().unwrap()
+    );
+
+    let get = c
+        .get(format!("{}/v2/sha3-256-up/blobs/{}", base, digest))
+        .send()
+        .unwrap();
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().unwrap().as_ref(), content.as_slice());
+    drop(guard);
+}
+
+#[test]
+fn chunked_upload_keccak256_axis() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+    let content: Vec<u8> = (0..8192).map(|i| (i % 173) as u8).collect();
+    let digest = keccak256_digest(&content);
+
+    let upload_url = start_upload(&c, &base, "keccak256-up");
+    let upload_url = send_chunk(&c, &base, &upload_url, 0, &content);
+    let complete_url = format!("{}?digest={}", upload_url, digest);
+    let resp = c.put(&complete_url).send().unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "keccak256 upload failed: {}",
+        resp.text().unwrap()
+    );
+
+    let get = c
+        .get(format!("{}/v2/keccak256-up/blobs/{}", base, digest))
+        .send()
+        .unwrap();
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().unwrap().as_ref(), content.as_slice());
+    drop(guard);
+}
+
 // =============================================================================
 // Upload recovery
 // =============================================================================

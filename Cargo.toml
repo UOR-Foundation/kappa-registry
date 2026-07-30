@@ -26,6 +26,7 @@ dcbor = { git = "https://github.com/usrbinkat/bc-dcbor-rust", branch = "feat/dcb
 
 # Hashing
 sha2 = "0.11"
+sha3 = "0.12"
 blake3 = "1"
 sha1-checked = "0.10"
 hex = "0.4"
