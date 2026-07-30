@@ -519,3 +519,35 @@ fn test_transaction_lifecycle() {
     );
     drop(guard);
 }
+
+#[test]
+fn test_openapi_json() {
+    let (guard, base) = start_server();
+    let resp = client()
+        .get(format!("{}/openapi.json", base))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    assert!(ct.contains("application/json"), "content-type: {}", ct);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["openapi"], "3.1.0");
+    assert!(body["paths"].as_object().unwrap().len() >= 50);
+    drop(guard);
+}
+
+#[test]
+fn test_docs_scalar() {
+    let (guard, base) = start_server();
+    let resp = client()
+        .get(format!("{}/docs", base))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    assert!(ct.contains("text/html"), "content-type: {}", ct);
+    let body = resp.text().unwrap();
+    assert!(body.contains("api-reference"), "missing Scalar script tag");
+    assert!(body.contains("openapi"), "missing OpenAPI spec in HTML");
+    drop(guard);
+}

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod broadcast;
 pub mod config;
 pub mod layers;
+pub mod openapi;
 pub mod ratelimit;
 pub mod tls;
 
@@ -261,6 +262,16 @@ async fn main() {
             Method::GET,
             p("/v2/_health/{probe}"),
             health_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/openapi.json"),
+            openapi::openapi_json_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/docs"),
+            openapi::docs_handler,
         ));
 
     // App context

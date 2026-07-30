@@ -21,10 +21,12 @@ pub fn security_headers_layer<'a>(
         h.insert("x-content-type-options", "nosniff".parse().unwrap());
         h.insert("x-frame-options", "DENY".parse().unwrap());
         h.insert("referrer-policy", "no-referrer".parse().unwrap());
-        h.insert(
-            "content-security-policy",
-            "default-src 'none'".parse().unwrap(),
-        );
+        if !h.contains_key("content-security-policy") {
+            h.insert(
+                "content-security-policy",
+                "default-src 'none'".parse().unwrap(),
+            );
+        }
         if tls {
             h.insert(
                 "strict-transport-security",

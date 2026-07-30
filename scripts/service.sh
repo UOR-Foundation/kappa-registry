@@ -99,6 +99,13 @@ do_start() {
     echo "  listen: ${ADDR}"
     echo "  store:  ${store_dir}"
     echo "  log:    ${LOG_FILE}"
+    echo ""
+    echo "endpoints:"
+    echo "  API:     http://${ADDR}/v2/"
+    echo "  Docs:    http://${ADDR}/docs"
+    echo "  OpenAPI: http://${ADDR}/openapi.json"
+    echo "  Health:  http://${ADDR}/v2/_health/ready"
+    echo "  Status:  http://${ADDR}/_status"
 }
 
 do_stop() {
