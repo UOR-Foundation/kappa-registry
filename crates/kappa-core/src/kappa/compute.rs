@@ -9,6 +9,7 @@
 
 use sha1_checked::Sha1 as Sha1Checked;
 use sha2::{Digest, Sha256, Sha512};
+use sha3::{Keccak256, Sha3_256};
 
 use super::label::{KappaLabel, LabelError, HEX};
 
@@ -49,6 +50,37 @@ impl KappaLabel {
         Self::from_parts(buf, 135)
     }
 
+    /// Compute the SHA-3-256 kappa-label of content. Infallible.
+    ///
+    /// SHA-3-256 is the FIPS 202 standardized version of Keccak with
+    /// domain separation padding (pad byte 0x06). 32-byte output.
+    pub fn sha3_256(content: &[u8]) -> Self {
+        let hash = Sha3_256::digest(content);
+        let mut buf = [0u8; 135];
+        buf[..9].copy_from_slice(b"sha3-256:");
+        for (i, &byte) in hash.iter().enumerate() {
+            buf[9 + 2 * i] = HEX[(byte >> 4) as usize];
+            buf[9 + 2 * i + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        Self::from_parts(buf, 73)
+    }
+
+    /// Compute the Keccak-256 kappa-label of content. Infallible.
+    ///
+    /// Keccak-256 is the original Keccak submission (pad byte 0x01),
+    /// used by Ethereum and other blockchain systems. 32-byte output.
+    /// Distinct from SHA-3-256 despite both using the Keccak permutation.
+    pub fn keccak256(content: &[u8]) -> Self {
+        let hash = Keccak256::digest(content);
+        let mut buf = [0u8; 135];
+        buf[..10].copy_from_slice(b"keccak256:");
+        for (i, &byte) in hash.iter().enumerate() {
+            buf[10 + 2 * i] = HEX[(byte >> 4) as usize];
+            buf[10 + 2 * i + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        Self::from_parts(buf, 74)
+    }
+
     /// Compute a SHA-1 kappa-label with collision detection.
     ///
     /// Returns Err(LabelError::CollisionDetected) if the content
@@ -84,6 +116,8 @@ pub fn compute_kappa(axis: &str, content: &[u8]) -> Result<KappaLabel, LabelErro
         "sha1" => KappaLabel::sha1(content),
         "sha256" => Ok(KappaLabel::sha256(content)),
         "blake3" => Ok(KappaLabel::blake3(content)),
+        "sha3-256" => Ok(KappaLabel::sha3_256(content)),
+        "keccak256" => Ok(KappaLabel::keccak256(content)),
         "sha512" => Ok(KappaLabel::sha512(content)),
         _ => Err(LabelError::UnknownAxis),
     }

@@ -239,6 +239,30 @@ pub fn verify_staged_digest(
             }
             h.finalize().to_hex().to_string()
         }
+        "sha3-256" => {
+            use sha3::{Digest, Sha3_256};
+            let mut h = Sha3_256::new();
+            loop {
+                let n = file.read(&mut buf).map_err(VerifyError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            hex::encode(h.finalize())
+        }
+        "keccak256" => {
+            use sha3::{Digest, Keccak256};
+            let mut h = Keccak256::new();
+            loop {
+                let n = file.read(&mut buf).map_err(VerifyError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            hex::encode(h.finalize())
+        }
         "sha1" => {
             // sha1_checked wraps Marc Stevens' sha1collisiondetection.
             // Incremental update via the digest crate's Update trait.

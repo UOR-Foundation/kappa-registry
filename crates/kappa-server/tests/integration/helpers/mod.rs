@@ -216,6 +216,18 @@ pub fn sha512_digest(content: &[u8]) -> String {
     format!("sha512:{}", hex::encode(hash))
 }
 
+pub fn sha3_256_digest(content: &[u8]) -> String {
+    use sha3::{Digest, Sha3_256};
+    let hash = Sha3_256::digest(content);
+    format!("sha3-256:{}", hex::encode(hash))
+}
+
+pub fn keccak256_digest(content: &[u8]) -> String {
+    use sha3::{Digest, Keccak256};
+    let hash = Keccak256::digest(content);
+    format!("keccak256:{}", hex::encode(hash))
+}
+
 pub fn blake3_digest(content: &[u8]) -> String {
     let hash = blake3::hash(content);
     format!("blake3:{}", hash.to_hex())

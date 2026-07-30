@@ -43,6 +43,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 blake3 = { workspace = true }
+sha3 = { workspace = true }
 rcgen = "0.14"
 tungstenite = "0.30"
 libc = "0.2"
