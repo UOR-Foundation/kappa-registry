@@ -62,20 +62,7 @@ impl InMemoryStore {
     }
 
     fn blob_path(&self, kappa: &str) -> Result<PathBuf, StoreError> {
-        let (algo, digest) = crate::kappa::split_kappa(kappa)
-            .ok_or_else(|| StoreError::Rejected(format!("invalid kappa-label: {}", kappa)))?;
-        if digest.len() < 4 {
-            return Err(StoreError::Rejected(format!(
-                "kappa digest too short: {}",
-                kappa
-            )));
-        }
-        Ok(self
-            .blob_root
-            .join(algo)
-            .join(&digest[..2])
-            .join(&digest[2..4])
-            .join(digest))
+        crate::kappa::blob_path_for(&self.blob_root, kappa)
     }
 
     fn ensure_namespace(&self, ns: &str) {

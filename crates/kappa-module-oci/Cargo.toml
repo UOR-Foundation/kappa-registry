@@ -19,5 +19,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 jsonschema = { workspace = true }
 sha2 = { workspace = true }
+blake3 = { workspace = true }
+sha1-checked = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }

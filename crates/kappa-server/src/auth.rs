@@ -112,6 +112,69 @@ fn cap_permits(edge: &Edge, op: OpClass) -> bool {
     false
 }
 
+// -- Bearer token authentication --------------------------------------------
+
+/// Bearer token authentication middleware.
+///
+/// Checks the Authorization header for a valid Bearer token.
+/// Exempt paths (/_status, /v2/, /v2/_health/*) bypass auth.
+/// When auth_required is false or the token list is empty, all
+/// requests pass (permissive default for backward compatibility).
+pub struct BearerAuth {
+    tokens: std::collections::HashSet<String>,
+    required: bool,
+}
+
+impl BearerAuth {
+    pub fn new(tokens: Vec<String>, required: bool) -> Self {
+        Self {
+            tokens: tokens.into_iter().collect(),
+            required,
+        }
+    }
+
+    /// Check if a request is authorized.
+    /// Returns Ok(()) if allowed, Err(Response) with 401 if not.
+    #[allow(clippy::result_large_err)] // Response constructed once per 401, not a hot path
+    pub fn check(
+        &self,
+        path: &str,
+        headers: &topcoat::router::HeaderMap,
+    ) -> Result<(), topcoat::router::Response> {
+        if !self.required || self.tokens.is_empty() {
+            return Ok(());
+        }
+        // Exempt paths: health, status, version check
+        if path == "/_status"
+            || path == "/v2/"
+            || path == "/v2"
+            || path.starts_with("/v2/_health/")
+        {
+            return Ok(());
+        }
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match token {
+            Some(t) if self.tokens.contains(t) => Ok(()),
+            _ => {
+                let body = r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
+                let mut resp =
+                    topcoat::router::Response::new(topcoat::router::Body::from(body));
+                *resp.status_mut() = topcoat::router::StatusCode::UNAUTHORIZED;
+                resp.headers_mut().insert(
+                    "www-authenticate",
+                    r#"Bearer realm="kappa-registry""#.parse().unwrap(),
+                );
+                resp.headers_mut()
+                    .insert("content-type", "application/json".parse().unwrap());
+                Err(resp)
+            }
+        }
+    }
+}
+
 // -- Trust policy -----------------------------------------------------------
 
 /// Trust policy applied to assertion resolution.

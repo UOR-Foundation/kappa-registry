@@ -26,6 +26,8 @@ pub mod reconcile;
 pub mod schema;
 pub mod sequence;
 pub mod transaction;
+pub mod ws_crdt;
+pub mod ws_events;
 
 use std::sync::Arc;
 
@@ -38,6 +40,9 @@ use kappa_core::store::KappaStore;
 
 /// Register all kappa-distribution extension routes.
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
+    use std::borrow::Cow;
+    use topcoat::router::{Method, Path, RouteFn};
+
     let builder = edge::register(builder);
     let builder = compose::register(builder);
     let builder = bundle::register(builder);
@@ -49,8 +54,23 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
     let builder = sequence::register(builder);
     let builder = namespace::register(builder);
     let builder = cascade::register(builder);
-    events_sse::register(builder)
+    let builder = events_sse::register(builder);
+
+    // WebSocket endpoints
+    builder
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/v2/{*ns}/_ws")),
+            ws_events::ws_events_route,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/v2/{*ns}/_crdt/{doc}/_ws")),
+            ws_crdt::ws_crdt_route,
+        ))
 }
+
+pub use ws_crdt::CrdtManager;
 
 /// Get the store from app context.
 pub(crate) fn store(cx: &Cx) -> &Arc<dyn KappaStore> {

@@ -156,6 +156,47 @@ pub fn start_server_expect_failure(store_root: &std::path::Path, port: u16) -> S
     }
 }
 
+/// Start a TLS-enabled server. Polls readiness via HTTPS with
+/// danger_accept_invalid_certs (self-signed test certs).
+pub fn start_server_tls(
+    store_root: &std::path::Path,
+    port: u16,
+    extra_env: &[(&str, &str)],
+) -> ServerGuard {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kappa-server"));
+    cmd.env("KAPPA_LISTEN_ADDR", format!("127.0.0.1:{}", port))
+        .env("KAPPA_STORE_ROOT", store_root.to_str().unwrap())
+        .env("KAPPA_RATELIMIT_READ_PERIOD_MS", "0")
+        .env("KAPPA_RATELIMIT_WRITE_PERIOD_MS", "0")
+        .env("KAPPA_RATELIMIT_ADMIN_PERIOD_MS", "0")
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("failed to start kappa-server");
+    let guard = ServerGuard {
+        child,
+        port,
+        store_root: store_root.to_path_buf(),
+    };
+
+    let c = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let base = format!("https://127.0.0.1:{}", port);
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if c.get(format!("{}/_status", base)).send().is_ok() {
+            return guard;
+        }
+    }
+    panic!("TLS kappa-server did not become ready within 5 seconds");
+}
+
 pub fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -266,7 +307,14 @@ pub fn send_chunk(
         .body(data.to_vec())
         .send()
         .unwrap();
-    assert_eq!(resp.status(), 202, "chunk PATCH failed: {}", resp.status());
+    if resp.status() != 202 {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        panic!(
+            "chunk PATCH failed: {} -- body: {} -- url: {} -- offset: {} -- data_len: {}",
+            status, body, upload_url, offset, data.len()
+        );
+    }
     let loc = resp.headers().get("location").unwrap().to_str().unwrap();
     resolve_location(base, loc)
 }
@@ -288,6 +336,73 @@ pub fn assert_oci_error(body: &str, expected_code: &str) {
         "expected error code '{}', got '{}' in: {}",
         expected_code, code, body
     );
+}
+
+/// Build a properly signed identity assertion JSON body.
+///
+/// Generates an ed25519 keypair, constructs the IdentityAssertion with
+/// the same structure the server's assert_handler uses, computes
+/// signable_bytes via kappa_core, signs it, and returns the full JSON
+/// body ready for POST /identity/assert.
+pub fn signed_assertion(subject: &str, facet: &str, value: &str) -> serde_json::Value {
+    signed_assertion_with_key(subject, facet, value, None).0
+}
+
+/// Build a signed assertion, optionally reusing an existing keypair.
+/// Returns (json_body, signing_key_bytes) so the key can be reused
+/// for multiple assertions from the same asserter.
+pub fn signed_assertion_with_key(
+    subject: &str,
+    facet: &str,
+    value: &str,
+    existing_key: Option<&[u8; 32]>,
+) -> (serde_json::Value, [u8; 32]) {
+    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+    use kappa_core::identity::assertion::IdentityAssertion;
+
+    let secret_bytes: [u8; 32] = match existing_key {
+        Some(k) => *k,
+        None => {
+            let mut bytes = [0u8; 32];
+            getrandom::fill(&mut bytes).unwrap();
+            bytes
+        }
+    };
+    let signing_key = SigningKey::from_bytes(&secret_bytes);
+    let verifying_key: VerifyingKey = (&signing_key).into();
+    let public_key_bytes = verifying_key.to_bytes();
+
+    let value_bytes = hex::decode(value).unwrap_or_else(|_| value.as_bytes().to_vec());
+
+    // Build the assertion with asserter="" -- the server fills this AFTER
+    // signature verification via asserter_from_signature. The signable_bytes
+    // method produces canonical dCBOR of fields 0-6 (excluding signature).
+    let assertion = IdentityAssertion {
+        asserter: String::new(),
+        subject: subject.to_owned(),
+        facet: facet.to_owned(),
+        value: value_bytes.clone(),
+        basis: "self-asserted".to_owned(),
+        valid_from_ms: 0,
+        valid_until_ms: None,
+        signature: vec![], // placeholder, replaced below
+    };
+
+    let signable = assertion.signable_bytes();
+    let signature = signing_key.sign(&signable);
+
+    let body = serde_json::json!({
+        "algorithm": "ed25519",
+        "public_key": hex::encode(public_key_bytes),
+        "subject": subject,
+        "facet": facet,
+        "value": hex::encode(&value_bytes),
+        "basis": "self-asserted",
+        "valid_from_ms": 0,
+        "signature": hex::encode(signature.to_bytes()),
+    });
+
+    (body, secret_bytes)
 }
 
 /// Recursively list all files under a directory.

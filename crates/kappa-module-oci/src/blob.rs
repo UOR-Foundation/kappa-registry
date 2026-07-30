@@ -5,6 +5,8 @@
 //! Content-type is per-blob metadata via blob_put_meta/blob_get_meta.
 //! No _ct/ tags. No _also/ tags. Every digest algorithm is first-class.
 
+use std::sync::Arc;
+
 use topcoat::context::{try_app_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
@@ -12,6 +14,10 @@ use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, Status
 use kappa_core::kappa::verify_kappa;
 
 use crate::{path_param, query_param, read_body, store, MaxBlobSize};
+
+/// Disk pressure flag set by periodic background check.
+/// When true, blob writes are rejected with 507.
+pub struct DiskPressure(pub std::sync::atomic::AtomicBool);
 
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
@@ -80,6 +86,17 @@ pub(crate) async fn put(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "SIZE_EXCEEDED",
                 &format!("body exceeds max blob size {}", max.0),
+            );
+        }
+    }
+
+    // Disk pressure check -- reject writes when disk below threshold
+    if let Some(pressure) = try_app_context::<Arc<DiskPressure>>(cx) {
+        if pressure.0.load(std::sync::atomic::Ordering::Relaxed) {
+            return crate::oci_error(
+                StatusCode::from_u16(507).unwrap(),
+                "INSUFFICIENT_STORAGE",
+                "disk pressure: insufficient space for write",
             );
         }
     }

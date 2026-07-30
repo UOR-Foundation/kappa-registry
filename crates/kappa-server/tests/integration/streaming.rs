@@ -306,10 +306,11 @@ fn chunked_upload_empty_blob() {
     let complete_url = format!("{}?digest={}", upload_url, digest);
     let resp = c.put(&complete_url).send().unwrap();
     let status = resp.status().as_u16();
+    let resp_body = resp.text().unwrap_or_default();
     assert!(
         status == 201 || status == 200,
-        "empty blob via chunked upload should succeed, got {}",
-        status
+        "empty blob via chunked upload should succeed, got {} body: {}",
+        status, resp_body
     );
 
     let get = c

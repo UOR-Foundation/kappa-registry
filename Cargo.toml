@@ -60,7 +60,7 @@ tracing = "0.1"
 http = "1"
 
 # HTTP framework
-topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower"] }
+topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower", "websocket"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
@@ -87,7 +87,7 @@ governor = "0.6"
 dashmap = "6"
 
 # AKD (std-only, kappa-akd crate only)
-akd = { version = "0.12", features = ["serde_serialization"] }
+akd = { version = "0.12", features = ["serde_serialization", "whatsapp_v1"] }
 async-trait = "0.1"
 
 # JSON Schema validation
