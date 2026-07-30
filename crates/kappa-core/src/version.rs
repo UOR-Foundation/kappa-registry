@@ -11,7 +11,7 @@ use crate::types::StoreError;
 ///
 /// v3: dCBOR canonical encoding, hashbrown store, Merkle epoch roots,
 ///     EdgeRelation enum, ThresholdSigner/ThresholdCoordinator split.
-pub const STORE_FORMAT_VERSION: u32 = 3;
+pub const STORE_FORMAT_VERSION: u32 = 4;
 
 const VERSION_FILE: &str = "format_version";
 

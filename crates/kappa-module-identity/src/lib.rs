@@ -16,6 +16,7 @@ use topcoat::router::{
     to_bytes, Body, IntoResponse, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
+use kappa_akd::AkdManager;
 use kappa_core::canonical;
 use kappa_core::identity::assertion::IdentityAssertion;
 use kappa_core::identity::node::NodeIdentity;
@@ -159,7 +160,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let ab = assertion_bytes;
-            let ns = asserter_ns;
+            let ns = asserter_ns.clone();
             move || {
                 s.blob_put(&k, &ab)?;
                 s.blob_put_meta(&k, "object-type", b"assertion")?;
@@ -170,6 +171,26 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         .await
         .map_err(|e| bad_request(e.to_string()))?
         .map_err(store_err)?;
+
+        // Publish to AKD directory for proof generation.
+        // The label is subject/facet, the value is the assertion kappa.
+        // This advances the AKD epoch, enabling lookup and audit proofs.
+        if let Some(akd) = try_app_context::<Arc<AkdManager>>(cx) {
+            let label = format!("{}/{}", subject, assertion.facet);
+            let k = kappa.clone();
+            if let Err(e) = akd
+                .publish(vec![(
+                    akd::AkdLabel::from(label.as_str()),
+                    akd::AkdValue::from(k.as_str()),
+                )])
+                .await
+            {
+                tracing::warn!("AKD publish failed for assertion {}: {e}", kappa);
+                // AKD publish failure is non-fatal for the assertion itself.
+                // The assertion is stored and tagged. Proofs will be unavailable
+                // until the next successful publish.
+            }
+        }
 
         let resp = serde_json::json!({"kappa": kappa});
         (
@@ -327,11 +348,88 @@ fn absence_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let subject = path_param(cx, "subject");
         let facet = path_param(cx, "facet");
 
+        let Some(akd) = try_app_context::<Arc<AkdManager>>(cx) else {
+            let resp = serde_json::json!({
+                "subject": subject,
+                "facet": facet,
+                "proof_available": false,
+                "reason": "AKD directory not initialized"
+            });
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("content-type", "application/json".to_string())],
+                serde_json::to_string(&resp).unwrap_or_default(),
+            )
+                .into_response(cx);
+        };
+
+        let label = format!("{}/{}", subject, facet);
+        match akd.lookup(akd::AkdLabel::from(label.as_str())).await {
+            Ok(result) => {
+                // Subject+facet EXISTS -- this is not absence
+                let resp = serde_json::json!({
+                    "subject": subject,
+                    "facet": facet,
+                    "exists": true,
+                    "epoch": result.epoch,
+                    "proof": result.proof_json,
+                });
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json".to_string())],
+                    serde_json::to_string(&resp).unwrap_or_default(),
+                )
+                    .into_response(cx)
+            }
+            Err(_) => {
+                // Subject+facet does NOT exist in the AKD tree.
+                // This IS the absence proof -- the lookup failure means
+                // the label was never published.
+                let resp = serde_json::json!({
+                    "subject": subject,
+                    "facet": facet,
+                    "exists": false,
+                    "proof": "nonmembership",
+                });
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json".to_string())],
+                    serde_json::to_string(&resp).unwrap_or_default(),
+                )
+                    .into_response(cx)
+            }
+        }
+    })
+}
+
+// -- Audit ------------------------------------------------------------------
+
+fn audit_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let start_str = path_param(cx, "start");
+        let end_str = path_param(cx, "end");
+
+        let start: u64 = start_str
+            .parse()
+            .map_err(|_| bad_request(format!("invalid start epoch: {}", start_str)))?;
+        let end: u64 = end_str
+            .parse()
+            .map_err(|_| bad_request(format!("invalid end epoch: {}", end_str)))?;
+
+        let Some(akd) = try_app_context::<Arc<AkdManager>>(cx) else {
+            return Err(bad_request("AKD directory not initialized").into());
+        };
+
+        let result = akd
+            .audit(start, end)
+            .await
+            .map_err(|e| bad_request(format!("audit proof generation failed: {e}")))?;
+
         let resp = serde_json::json!({
-            "subject": subject,
-            "facet": facet,
-            "proof_available": false,
-            "reason": "AKD integration required for cryptographic absence proofs"
+            "start_epoch": result.start_epoch,
+            "end_epoch": result.end_epoch,
+            "proof": result.proof_json,
         });
 
         (
@@ -368,7 +466,12 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
         ))
         .route(RouteFn::new(
             Method::GET,
-            Cow::Borrowed(Path::new("/identity/absence/{subject}/{facet}")),
+            Cow::Borrowed(Path::new("/identity/absence/{subject}/{*facet}")),
             absence_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/audit/{start}/{end}")),
+            audit_handler,
         ))
 }

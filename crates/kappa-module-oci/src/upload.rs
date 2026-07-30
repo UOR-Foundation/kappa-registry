@@ -1,115 +1,27 @@
 //! OCI chunked upload handlers: start, chunk, recovery, complete, cancel.
 //!
-//! Upload complete computes the digest under the client's axis via
-//! compute_kappa(label.axis(), &data), verifies, then stores at the
-//! client's address via blob_put(client_digest, &data).
-//! GC pins use blob_put_computed (sha256 internally).
+//! Chunks are written to disk-backed staging files. At complete time,
+//! the staging file is verified via streaming digest computation and
+//! renamed to the blob path. No in-memory buffering of upload content.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use kappa_core::kappa::{compute_kappa, KappaLabel};
+use kappa_core::kappa::{KappaLabel, Sha1Policy};
 use kappa_core::store::blob_put_computed;
 
+use crate::upload_session::{
+    place_blob, verify_staged_digest, AppendError, SessionStore, VerifyError,
+};
 use crate::{path_param, query_param, read_body, store};
 
-const DEFAULT_MAX_UPLOAD_SIZE: usize = 256 * 1024 * 1024;
-
-pub struct SessionStore {
-    sessions: RwLock<HashMap<String, UploadSession>>,
-    max_upload_size: usize,
-}
-
-struct UploadSession {
-    namespace: String,
-    data: Vec<u8>,
-    created_at: Instant,
-}
-
-impl SessionStore {
-    pub fn new() -> Self {
-        SessionStore {
-            sessions: RwLock::new(HashMap::new()),
-            max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
-        }
-    }
-
-    fn create(&self, namespace: &str) -> String {
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut map = self.sessions.write().unwrap();
-        map.insert(
-            id.clone(),
-            UploadSession {
-                namespace: namespace.to_string(),
-                data: Vec::new(),
-                created_at: Instant::now(),
-            },
-        );
-        id
-    }
-
-    fn is_expired(&self, id: &str, timeout_secs: u64) -> bool {
-        let map = self.sessions.read().unwrap();
-        map.get(id)
-            .map(|s| s.created_at.elapsed().as_secs() > timeout_secs)
-            .unwrap_or(true)
-    }
-
-    fn bytes_received(&self, id: &str) -> Option<usize> {
-        self.sessions.read().unwrap().get(id).map(|s| s.data.len())
-    }
-
-    fn namespace_for(&self, id: &str) -> Option<String> {
-        self.sessions
-            .read()
-            .unwrap()
-            .get(id)
-            .map(|s| s.namespace.clone())
-    }
-
-    fn append(&self, id: &str, offset: usize, chunk: &[u8]) -> Result<usize, ()> {
-        let mut map = self.sessions.write().unwrap();
-        let session = map.get_mut(id).ok_or(())?;
-        if offset != session.data.len() {
-            return Err(());
-        }
-        if session.data.len() + chunk.len() > self.max_upload_size {
-            return Err(());
-        }
-        session.data.extend_from_slice(chunk);
-        Ok(session.data.len())
-    }
-
-    fn take(&self, id: &str) -> Option<(String, Vec<u8>)> {
-        self.sessions
-            .write()
-            .unwrap()
-            .remove(id)
-            .map(|s| (s.namespace, s.data))
-    }
-
-    fn remove(&self, id: &str) -> bool {
-        self.sessions.write().unwrap().remove(id).is_some()
-    }
-
-    pub fn evict_expired(&self, timeout_secs: u64) -> usize {
-        let mut map = self.sessions.write().unwrap();
-        let before = map.len();
-        map.retain(|_, s| s.created_at.elapsed().as_secs() <= timeout_secs);
-        before - map.len()
-    }
-}
-
-impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Blob root path, registered as app_context by kappa-server.
+/// Used by the complete handler to compute blob paths for rename.
+pub struct BlobRoot(pub PathBuf);
 
 pub struct UploadTimeout(pub u64);
 
@@ -130,7 +42,6 @@ pub fn start_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let digest = query_param(cx, "digest");
         let mount = query_param(cx, "mount");
 
-        // Monolithic upload: digest provided with body
         if let Some(ref digest) = digest {
             if !bytes.is_empty() {
                 return crate::blob::put(cx, ns, digest, &bytes).await;
@@ -203,7 +114,6 @@ pub fn cancel_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 async fn start(cx: &Cx, ns: &str, mount_kappa: Option<&str>) -> topcoat::Result<Response> {
     let s = store(cx).clone();
 
-    // Cross-repository mount: if the blob already exists, return 201
     if let Some(kappa) = mount_kappa {
         let k = kappa.to_string();
         let exists = tokio::task::spawn_blocking({
@@ -228,7 +138,6 @@ async fn start(cx: &Cx, ns: &str, mount_kappa: Option<&str>) -> topcoat::Result<
 
     let id = sessions(cx).create(ns);
 
-    // Create upload session GC pin
     let pin_ns = ns.to_string();
     let pin_id = id.clone();
     tokio::task::spawn_blocking({
@@ -269,7 +178,7 @@ async fn chunk(
     }
 
     let offset = match (range_start, sessions(cx).bytes_received(id)) {
-        (Some(start), Some(_)) => start,
+        (Some(start), Some(_)) => start as u64,
         (None, Some(received)) => received,
         (_, None) => return Err(not_found().into()),
     };
@@ -287,7 +196,18 @@ async fn chunk(
             )
                 .into_response(cx)
         }
-        Err(()) => (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk").into_response(cx),
+        Err(AppendError::NotFound) => Err(not_found().into()),
+        Err(AppendError::OutOfOrder { .. }) => {
+            (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk").into_response(cx)
+        }
+        Err(AppendError::SizeExceeded(max)) => {
+            crate::oci_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "SIZE_EXCEEDED",
+                &format!("upload exceeds max size {max}"),
+            )
+        }
+        Err(AppendError::Io(e)) => Err(bad_request(e.to_string()).into()),
     }
 }
 
@@ -330,48 +250,84 @@ async fn complete(
     // Append final chunk if present
     if !final_body.is_empty() {
         let offset = match (range_start, sessions(cx).bytes_received(id)) {
-            (Some(start), Some(_)) => start,
+            (Some(start), Some(_)) => start as u64,
             (None, Some(received)) => received,
             (_, None) => return Err(not_found().into()),
         };
-        if sessions(cx).append(id, offset, final_body).is_err() {
-            return (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk").into_response(cx);
+        match sessions(cx).append(id, offset, final_body) {
+            Ok(_) => {}
+            Err(AppendError::OutOfOrder { .. }) => {
+                return (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk")
+                    .into_response(cx);
+            }
+            Err(AppendError::SizeExceeded(max)) => {
+                return crate::oci_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "SIZE_EXCEEDED",
+                    &format!("upload exceeds max size {max}"),
+                );
+            }
+            Err(AppendError::NotFound) => return Err(not_found().into()),
+            Err(AppendError::Io(e)) => return Err(bad_request(e.to_string()).into()),
         }
     }
 
-    let (session_ns, data) = sessions(cx).take(id).ok_or_else(not_found)?;
+    // Validate digest format before taking the staging path
+    let _label = KappaLabel::parse(client_digest).map_err(|e| bad_request(e.to_string()))?;
 
-    // Compute digest under client's axis, verify
-    let label = KappaLabel::parse(client_digest).map_err(|e| bad_request(e.to_string()))?;
-    let computed = compute_kappa(label.axis(), &data).map_err(|e| bad_request(e.to_string()))?;
+    // Take staging path. Session removed. File NOT deleted.
+    let (session_ns, staging_path) = sessions(cx).take(id).ok_or_else(not_found)?;
 
-    if computed.as_str() != client_digest {
-        release_upload_pin(cx, id).await;
-        return Err(bad_request(format!(
-            "digest invalid: expected {}, got {}",
-            client_digest,
-            computed.as_str()
-        ))
-        .into());
-    }
-
-    // Store blob at client's address
     let s = store(cx).clone();
-    let d = client_digest.to_string();
-    let c = data;
-    tokio::task::spawn_blocking({
+    let blob_root = app_context::<BlobRoot>(cx).0.clone();
+    let digest = client_digest.to_string();
+    let ct = content_type.map(|s| s.to_string());
+    let ns = session_ns.clone();
+
+    // Streaming verify + rename in spawn_blocking (filesystem IO)
+    let result = tokio::task::spawn_blocking({
         let s = s.clone();
-        let d = d.clone();
-        move || s.blob_put(&d, &c)
+        let digest = digest.clone();
+        let staging = staging_path.clone();
+        move || -> Result<String, topcoat::Error> {
+            // Streaming digest verification. No memory spike.
+            let sha1_policy = Sha1Policy::for_namespace(&*s, &ns);
+            let verified = verify_staged_digest(&staging, &digest, sha1_policy)
+                .map_err(|e| match &e {
+                    VerifyError::Mismatch { .. } | VerifyError::Sha1Collision(_) => {
+                        let _ = std::fs::remove_file(&staging);
+                        bad_request(e.to_string())
+                    }
+                    VerifyError::AlgorithmDenied(_) => {
+                        let _ = std::fs::remove_file(&staging);
+                        bad_request(e.to_string())
+                    }
+                    _ => {
+                        let _ = std::fs::remove_file(&staging);
+                        bad_request(e.to_string())
+                    }
+                })?;
+
+            // Rename staging file to blob path. Zero-copy.
+            place_blob(&blob_root, &staging, &verified)
+                .map_err(|e| bad_request(e.to_string()))?;
+
+            // Store metadata for upgrade digest if present
+            if let Some(ref upgrade) = verified.upgrade {
+                let _ = s.blob_put_meta(upgrade, "content-type", b"application/octet-stream");
+                let _ = s.blob_put_meta(upgrade, "upgrade-from", verified.primary.as_bytes());
+            }
+
+            Ok(verified.primary)
+        }
     })
     .await
-    .map_err(|e| bad_request(e.to_string()))?
-    .map_err(crate::store_err)?;
+    .map_err(|e| bad_request(e.to_string()))??;
 
     // Store content-type metadata
-    if let Some(ct) = content_type {
+    if let Some(ct) = ct {
         let ct_bytes = ct.as_bytes().to_vec();
-        let d = d.clone();
+        let d = result.clone();
         tokio::task::spawn_blocking({
             let s = s.clone();
             move || s.blob_put_meta(&d, "content-type", &ct_bytes)
@@ -381,19 +337,14 @@ async fn complete(
         .map_err(crate::store_err)?;
     }
 
-    // Release the upload session GC pin
     release_upload_pin(cx, id).await;
 
-    let url_ns = &session_ns;
     (
         StatusCode::CREATED,
         [
-            ("x-kappa-label", client_digest.to_string()),
-            ("docker-content-digest", client_digest.to_string()),
-            (
-                "location",
-                format!("/v2/{}/blobs/{}", url_ns, client_digest),
-            ),
+            ("x-kappa-label", result.clone()),
+            ("docker-content-digest", result.clone()),
+            ("location", format!("/v2/{}/blobs/{}", session_ns, result)),
             ("content-length", "0".to_string()),
         ],
     )

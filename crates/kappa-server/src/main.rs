@@ -1,48 +1,36 @@
 //! kappa-registry HTTP server.
-//!
-//! Startup sequence:
-//! 1. Parse config from environment
-//! 2. Initialize tracing
-//! 3. Initialize store, clock, signing, identity
-//! 4. Initialize event system, transactions, rate limiter
-//! 5. Build router with layers and module routes
-//! 6. Spawn periodic cleanup
-//! 7. Start serving
-//!
-//! Graceful shutdown on Ctrl+C and SIGTERM is handled by topcoat::start().
 
 pub mod auth;
 pub mod broadcast;
 pub mod config;
+pub mod layers;
 pub mod ratelimit;
+pub mod tls;
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
-use topcoat::context::{app_context, try_app_context, Cx, CxBuilder};
+use topcoat::context::{app_context, try_app_context, Cx};
 use topcoat::router::{
-    Body, Compression, IntoResponse, LayerFn, Method, Next, Path, Response, RouteFn, RouteFuture,
-    Router, StatusCode,
+    Body, Compression, IntoResponse, LayerFn, Method, Path, RouteFn, RouteFuture, Router,
+    StatusCode,
 };
 
 use kappa_core::clock::ntp_lamport::NtpLamportClock;
 use kappa_core::crypto::keystore::KeyStore;
 use kappa_core::events::InMemoryEventLog;
-use kappa_core::store::memory::{InMemoryStore, MemoryStoreConfig};
 use kappa_core::store::KappaStore;
 use kappa_core::transaction::TransactionManager;
+use kappa_core::types::MaxBlobSize;
+use kappa_store_redb::PersistentStore;
 
 use broadcast::EventBroadcaster;
 use config::Config;
-use ratelimit::{attach_headers, classify_request, extract_client_ip, TieredRateLimiter};
+use layers::*;
+use ratelimit::TieredRateLimiter;
 
-// -- App context wrapper types ----------------------------------------------
-
-// MaxBlobSize is defined in kappa-core::types -- the single source of
-// truth. Both kappa-server and kappa-module-oci import it from there.
-use kappa_core::types::MaxBlobSize;
-
-// -- Always-present route handlers ------------------------------------------
+// -- Route handlers -----------------------------------------------------------
 
 fn status_handler(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move { "ok".into_response(cx) })
@@ -73,11 +61,19 @@ fn health_handler(cx: &Cx, _body: Body) -> RouteFuture<'_> {
         };
         match probe.as_str() {
             "ready" => {
-                // Ready probe: verify the store root is writable by creating
-                // and immediately deleting a tempfile. Failure = 503.
+                #[cfg(feature = "oci")]
+                if let Some(pressure) =
+                    try_app_context::<Arc<kappa_module_oci::blob::DiskPressure>>(cx)
+                {
+                    if pressure
+                        .0
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response(cx);
+                    }
+                }
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let ok = tokio::task::spawn_blocking(move || {
-                    // blob_put with empty content tests the write path
                     store.blob_exists("sha256:0000000000000000000000000000000000000000000000000000000000000000").is_ok()
                 })
                 .await
@@ -88,86 +84,40 @@ fn health_handler(cx: &Cx, _body: Body) -> RouteFuture<'_> {
                     StatusCode::SERVICE_UNAVAILABLE.into_response(cx)
                 }
             }
-            // live, startup, and any unknown probe: 200 if the process is running
             _ => StatusCode::OK.into_response(cx),
         }
     })
 }
 
-// -- Layers -----------------------------------------------------------------
-
-/// Warning header layer: attaches Warning: 299 - "kappa-registry" to every
-/// response per the kappa-distribution spec section 6.1.
-fn warning_layer<'a>(
-    cx: &'a mut CxBuilder,
-    body: Body,
-    next: Next<'a>,
-) -> topcoat::router::LayerFuture<'a> {
-    Box::pin(async move {
-        let mut response = next.run(cx, body).await?;
-        response
-            .headers_mut()
-            .insert("warning", "299 - \"kappa-registry\"".parse().unwrap());
-        Ok(response)
-    })
-}
-
-/// Rate limiting layer: classifies each request by method+path into an
-/// OpClass, extracts client IP, checks the tiered limiter. Exempt paths
-/// bypass. If rejected, returns 429 with retry-after. On success, rate
-/// limit headers are attached after the inner chain completes.
-fn rate_limit_layer<'a>(
-    cx: &'a mut CxBuilder,
-    body: Body,
-    next: Next<'a>,
-) -> topcoat::router::LayerFuture<'a> {
-    Box::pin(async move {
-        let snapshot = if let Some(limiter) = try_app_context::<Arc<TieredRateLimiter>>(cx) {
-            let hdrs = topcoat::router::headers(cx);
-            let ip = extract_client_ip(hdrs);
-            let uri_path = topcoat::router::uri(cx).path();
-            let method = topcoat::router::method(cx);
-            let op_class = classify_request(method.as_str(), uri_path);
-            match limiter.check(ip, op_class) {
-                Ok(snap) => snap,
-                Err(rejection) => {
-                    return Ok(*rejection);
-                }
-            }
-        } else {
-            None
-        };
-
-        let mut response = match next.run(cx, body).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Convert error to response so rate limit headers are still attached.
-                // Without this, error responses (404, 400, etc.) bypass header attachment
-                // and the conformance test sees no x-ratelimit-limit header.
-                let mut r = Response::new(Body::from(e.response_body()));
-                *r.status_mut() = e.status_code();
-                if let Some(ref snap) = snapshot {
-                    attach_headers(&mut r, snap);
-                }
-                return Ok(r);
-            }
-        };
-
-        if let Some(ref snap) = snapshot {
-            attach_headers(&mut response, snap);
-        }
-
-        Ok(response)
-    })
-}
-
-// -- Helper -----------------------------------------------------------------
-
 fn p(s: &'static str) -> Cow<'static, Path> {
     Cow::Borrowed(Path::new(s))
 }
 
-// -- Main -------------------------------------------------------------------
+/// kappa-distribution spec section 6.1: Warning header on every response.
+fn kappa_warning_header(mut response: topcoat::router::Response) -> topcoat::router::Response {
+    response
+        .headers_mut()
+        .insert("warning", "299 - \"kappa-registry\"".parse().unwrap());
+    response
+}
+
+#[cfg(unix)]
+fn available_bytes(path: &std::path::Path) -> Option<u64> {
+    let c_path = std::ffi::CString::new(path.to_str()?).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn available_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+// -- Main ---------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -180,25 +130,22 @@ async fn main() {
         )
         .init();
 
-    // Set HOST/PORT for topcoat from our config
     std::env::set_var("HOST", cfg.listen_host());
     std::env::set_var("PORT", cfg.listen_port());
 
     // -- Store --
     let clock = Arc::new(NtpLamportClock::new());
-    let store_config = MemoryStoreConfig {
-        blob_root: cfg.store_root.join("blobs"),
-    };
-    let store: Arc<dyn KappaStore> =
-        Arc::new(InMemoryStore::new(store_config, clock).expect("failed to initialize store"));
+    let blob_root = cfg.store_root.join("blobs");
+    let db_path = cfg.store_root.join("state.redb");
+    let store: Arc<dyn KappaStore> = Arc::new(
+        PersistentStore::new(blob_root, db_path, clock.clone(), cfg.fsync)
+            .expect("failed to initialize persistent store"),
+    );
 
     kappa_core::version::check_or_write_version(&cfg.store_root)
         .expect("store format version check failed");
 
     // -- Signing + Identity --
-    // NodeIdentity owns the signing key. bootstrap() loads or generates
-    // the key, stores the anchor in the store, and retains the signer
-    // for epoch root signatures and identity assertions.
     let key_store = match KeyStore::new(cfg.store_root.join("keys")) {
         Ok(ks) => ks,
         Err(e) => {
@@ -206,7 +153,6 @@ async fn main() {
             std::process::exit(2);
         }
     };
-
     let node_identity =
         match kappa_core::identity::node::NodeIdentity::bootstrap(&key_store, &*store) {
             Ok(ni) => {
@@ -255,14 +201,58 @@ async fn main() {
         None
     };
 
+    // -- Bearer auth --
+    let bearer_auth = Arc::new(auth::BearerAuth::new(
+        cfg.auth_tokens.clone(),
+        cfg.auth_required,
+    ));
+
+    // -- Disk pressure monitor --
+    #[cfg(feature = "oci")]
+    let disk_pressure = {
+        let dp = Arc::new(kappa_module_oci::blob::DiskPressure(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let pressure = dp.clone();
+        let store_path = cfg.store_root.clone();
+        let threshold_bytes = cfg.disk_pressure_threshold_mb * 1024 * 1024;
+        let interval = cfg.disk_pressure_check_interval_secs;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                let under = available_bytes(&store_path)
+                    .map(|avail| avail < threshold_bytes)
+                    .unwrap_or(false);
+                pressure
+                    .0
+                    .store(under, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        dp
+    };
+
+    // -- TLS detection --
+    let tls_config = tls::TlsConfig::from_env();
+
     // -- Router --
-    let mut builder = Router::builder().compression(Compression::off());
+    let mut builder = Router::builder()
+        .compression(Compression::off())
+        .response_hook(kappa_warning_header);
 
-    // Layers: warning header on every response, rate limiting on every request
-    builder = builder.layer(LayerFn::new(p("/"), warning_layer));
+    // Layer chain: outermost to innermost
+    builder = builder.layer(LayerFn::new(p("/"), cache_layer));
+    builder = builder.layer(LayerFn::new(p("/"), response_compliance_layer));
+    builder = builder.layer(LayerFn::new(p("/"), request_id_layer));
+    builder = builder.layer(LayerFn::new(p("/"), proxy_trust_layer));
+    builder = builder.layer(LayerFn::new(p("/"), request_log_layer));
+    builder = builder.layer(LayerFn::new(p("/"), security_headers_layer));
+    builder = builder.layer(LayerFn::new(p("/"), cors_layer));
+    builder = builder.layer(LayerFn::new(p("/"), timeout_layer));
     builder = builder.layer(LayerFn::new(p("/"), rate_limit_layer));
+    builder = builder.layer(LayerFn::new(p("/"), body_limit_layer));
+    builder = builder.layer(LayerFn::new(p("/"), auth_layer));
 
-    // Always-present routes
+    // Routes
     builder = builder
         .route(RouteFn::new(Method::GET, p("/_status"), status_handler))
         .route(RouteFn::new(Method::GET, p("/v2/"), version_check))
@@ -275,8 +265,23 @@ async fn main() {
     // App context
     builder = builder.app_context(store.clone());
     builder = builder.app_context(MaxBlobSize(cfg.max_blob_size));
+    builder = builder.app_context(bearer_auth);
     builder = builder.app_context(broadcaster.clone());
     builder = builder.app_context(txn_manager.clone());
+    builder = builder.app_context(RequestTimeout(Duration::from_secs(
+        cfg.request_timeout_secs,
+    )));
+    builder = builder.app_context(MaxApiBodyBytes(cfg.max_api_body_bytes));
+
+    if let Some(proxy_header) = &cfg.proxy_trusted_header {
+        builder = builder.app_context(ProxyTrustConfig {
+            trusted_header: Some(proxy_header.clone()),
+        });
+    }
+
+    if tls_config.is_some() {
+        builder = builder.app_context(TlsEnabled);
+    }
 
     if let Some(ref ni) = node_identity {
         builder = builder.app_context(ni.clone());
@@ -286,17 +291,60 @@ async fn main() {
         builder = builder.app_context(rl.clone());
     }
 
+    // -- Upload session store --
+    #[cfg(feature = "oci")]
+    {
+        builder = builder.app_context(disk_pressure.clone());
+        let staging_root = cfg.store_root.join("upload-staging");
+        let session_store = Arc::new(
+            kappa_module_oci::upload_session::SessionStore::new(staging_root, cfg.max_blob_size),
+        );
+        let eviction_store = session_store.clone();
+        let upload_timeout_secs = cfg.upload_timeout_secs;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                eviction_store.evict_expired(upload_timeout_secs);
+            }
+        });
+        builder = builder.app_context(session_store);
+        builder = builder.app_context(kappa_module_oci::upload::UploadTimeout(
+            cfg.upload_timeout_secs,
+        ));
+        builder = builder.app_context(kappa_module_oci::upload::BlobRoot(
+            cfg.store_root.join("blobs"),
+        ));
+    }
+
     // Feature-gated module routes
     #[cfg(feature = "oci")]
     {
         builder = kappa_module_oci::register(builder);
     }
-
     #[cfg(feature = "identity-http")]
     {
+        // Initialize AKD directory for identity proof generation
+        let akd_manager = match kappa_akd::AkdManager::new(
+            store.clone(),
+            "_akd/identity".to_string(),
+        )
+        .await
+        {
+            Ok(mgr) => {
+                tracing::info!("AKD directory initialized for identity proofs");
+                Some(Arc::new(mgr))
+            }
+            Err(e) => {
+                tracing::warn!("AKD directory initialization failed: {e}");
+                None
+            }
+        };
+        if let Some(ref akd) = akd_manager {
+            builder = builder.app_context(akd.clone());
+        }
         builder = kappa_module_identity::register(builder);
     }
-
     #[cfg(feature = "distribution")]
     {
         builder = kappa_module_distribution::register(builder);
@@ -307,7 +355,7 @@ async fn main() {
     // -- Periodic cleanup --
     let cleanup_txn = txn_manager.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
             let evicted = cleanup_txn.evict_expired();
@@ -318,11 +366,31 @@ async fn main() {
     });
 
     // -- Start --
-    tracing::info!(
-        listen = %cfg.listen_addr,
-        store = %cfg.store_root.display(),
-        "kappa-registry starting"
-    );
-
-    topcoat::start(router).await.expect("server error");
+    match tls_config {
+        Some(tls_cfg) => {
+            let acceptor = tls::build_acceptor(&tls_cfg);
+            let tcp = tokio::net::TcpListener::bind(&cfg.listen_addr)
+                .await
+                .expect("failed to bind TCP listener for TLS");
+            let listener = tls::TlsListener::new(tcp, acceptor, tls_cfg.handshake_timeout);
+            tracing::info!(
+                listen = %cfg.listen_addr,
+                store = %cfg.store_root.display(),
+                tls = true,
+                mtls = tls_cfg.client_ca_path.is_some(),
+                "kappa-registry starting with TLS"
+            );
+            topcoat::serve(listener, router)
+                .await
+                .expect("TLS server error");
+        }
+        None => {
+            tracing::info!(
+                listen = %cfg.listen_addr,
+                store = %cfg.store_root.display(),
+                "kappa-registry starting"
+            );
+            topcoat::start(router).await.expect("server error");
+        }
+    }
 }

@@ -26,55 +26,9 @@ fn generate_self_signed_cert(dir: &std::path::Path) -> (std::path::PathBuf, std:
     let cert_path = dir.join("test.crt");
     let key_path = dir.join("test.key");
 
-    // rcgen generates self-signed certs without external dependencies.
-    // FAILS UNTIL: rcgen is added to dev-dependencies.
-    // For now, generate minimal PEM stubs that will cause TLS init to fail
-    // with a clear error rather than silently producing invalid certs.
-    //
-    // When rcgen is available:
-    //   let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    //   std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    //   std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-    //
-    // Fallback: use openssl CLI if available, otherwise write stubs.
-    let status = std::process::Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            key_path.to_str().unwrap(),
-            "-out",
-            cert_path.to_str().unwrap(),
-            "-days",
-            "1",
-            "-nodes",
-            "-subj",
-            "/CN=localhost",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {}
-        _ => {
-            // openssl not available. Write valid-looking but incorrect PEM.
-            // TLS tests will fail with connection errors, which is the
-            // correct failure mode for "TLS not implemented yet."
-            std::fs::write(
-                &cert_path,
-                "-----BEGIN CERTIFICATE-----\nINVALID\n-----END CERTIFICATE-----\n",
-            )
-            .unwrap();
-            std::fs::write(
-                &key_path,
-                "-----BEGIN PRIVATE KEY-----\nINVALID\n-----END PRIVATE KEY-----\n",
-            )
-            .unwrap();
-        }
-    }
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     (cert_path, key_path)
 }
@@ -91,7 +45,7 @@ fn tls_serves_https() {
     let port = pick_port();
     let store_tmp = tempfile::tempdir().unwrap();
 
-    let guard = start_server_at_with_env(
+    let guard = start_server_tls(
         store_tmp.path(),
         port,
         &[
@@ -130,7 +84,7 @@ fn tls_rejects_plain_http() {
     let port = pick_port();
     let store_tmp = tempfile::tempdir().unwrap();
 
-    let guard = start_server_at_with_env(
+    let guard = start_server_tls(
         store_tmp.path(),
         port,
         &[
@@ -259,7 +213,7 @@ fn tls_blob_put_get_over_https() {
     let port = pick_port();
     let store_tmp = tempfile::tempdir().unwrap();
 
-    let guard = start_server_at_with_env(
+    let guard = start_server_tls(
         store_tmp.path(),
         port,
         &[

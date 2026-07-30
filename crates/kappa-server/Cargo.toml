@@ -23,6 +23,14 @@ thiserror = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 
+kappa-store-redb = { path = "../kappa-store-redb" }
+uuid = { workspace = true }
+libc = "0.2"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+
+kappa-akd = { path = "../kappa-akd" }
 kappa-module-oci = { path = "../kappa-module-oci", optional = true }
 kappa-module-identity = { path = "../kappa-module-identity", optional = true }
 kappa-module-distribution = { path = "../kappa-module-distribution", optional = true }
@@ -35,7 +43,12 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 blake3 = { workspace = true }
+rcgen = "0.14"
 libc = "0.2"
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+getrandom = { workspace = true }
+kappa-core = { workspace = true }
 
 [[test]]
 name = "smoke"

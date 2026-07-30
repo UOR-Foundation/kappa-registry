@@ -4,13 +4,16 @@
 //! compute sha256 + blob_put + tag_set. Content-type and object-type
 //! via blob_put_meta. No _ct/ tags. No _meta/ tags.
 
-use topcoat::context::Cx;
+use std::sync::Arc;
+
+use topcoat::context::{try_app_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
 use kappa_core::kappa::{kappa_from_bytes, verify_kappa, KappaLabel};
 use kappa_core::types::{Edge, EdgeRelation};
 
+use crate::blob::DiskPressure;
 use crate::{path_param, query_param, query_params_multi, read_body, store};
 
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
@@ -94,6 +97,17 @@ async fn manifest_put(
     body: &[u8],
 ) -> topcoat::Result<Response> {
     let s = store(cx).clone();
+
+    // Disk pressure check -- manifest PUT stores a blob
+    if let Some(pressure) = try_app_context::<Arc<DiskPressure>>(cx) {
+        if pressure.0.load(std::sync::atomic::Ordering::Relaxed) {
+            return crate::oci_error(
+                StatusCode::from_u16(507).unwrap(),
+                "INSUFFICIENT_STORAGE",
+                "disk pressure: insufficient space for write",
+            );
+        }
+    }
 
     // Filter evaluation BEFORE storing
     if let Some(rejection) = crate::evaluate_filters(&s, ns, body).await? {

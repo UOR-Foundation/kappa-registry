@@ -13,6 +13,8 @@ path = "src/lib.rs"
 
 [dependencies]
 kappa-core = { workspace = true }
+kappa-akd = { path = "../kappa-akd" }
+akd = { workspace = true }
 topcoat = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

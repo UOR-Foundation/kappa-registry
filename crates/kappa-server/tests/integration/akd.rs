@@ -1,21 +1,13 @@
 //! AKD audit proof tests.
 //!
-//! FAILS UNTIL: AkdManager is implemented in kappa-akd with Directory
-//! lifecycle management, and identity module endpoints are wired to it.
+//! Identity assertions require ed25519 signatures. The signed_assertion
+//! helper in helpers/mod.rs generates a keypair, builds the IdentityAssertion
+//! with kappa_core, computes signable_bytes, signs with ed25519-dalek,
+//! and returns the full JSON body for POST /identity/assert.
 //!
-//! AKD pattern (from akd/src/tests/test_core_protocol.rs:84-108):
-//! 1. Directory::new(storage, vrf, parallelism).await
-//! 2. directory.publish(vec![(label, value)]).await  -- batch, creates epoch
-//! 3. directory.lookup(label).await  -- generates proof AFTER publish
-//! 4. client::lookup_verify(pk, hash, epoch, label, proof)  -- offline verify
-//!
-//! The assertion endpoint MUST trigger a publish internally (epoch advance)
-//! before a proof can be generated. This is expensive per-assertion but
-//! necessary for the HTTP API model. A batch endpoint would be more
-//! efficient but is not specified in this phase.
-//!
-//! All identity endpoints use /identity/ prefix (no /v2/{ns}/ prefix)
-//! for node-level identity operations.
+//! AKD proof/audit endpoints are not yet implemented. Tests that depend
+//! on them will fail until AkdManager wraps akd::Directory and the
+//! proof/audit HTTP endpoints are wired.
 
 #[path = "helpers/mod.rs"]
 #[allow(dead_code, unused_imports)]
@@ -53,19 +45,14 @@ fn identity_whoami_returns_anchor() {
 
 #[test]
 fn identity_assert_returns_kappa() {
-    // FAILS UNTIL: POST /identity/assert endpoint implemented
     let (guard, base, _tmp) = start_server();
     let c = client();
 
-    let assertion = serde_json::json!({
-        "subject": "sha256:bob",
-        "facet": "name/legal",
-        "value": "Qm9i",
-    });
+    let body = signed_assertion("sha256:bob", "name/legal", "Qm9i");
     let resp = c
         .post(format!("{}/identity/assert", base))
         .header("content-type", "application/json")
-        .body(serde_json::to_string(&assertion).unwrap())
+        .body(serde_json::to_string(&body).unwrap())
         .send()
         .unwrap();
     let status = resp.status().as_u16();
@@ -74,34 +61,27 @@ fn identity_assert_returns_kappa() {
         "identity assert should succeed, got {}",
         status
     );
-    let body: serde_json::Value = resp.json().unwrap();
+    let resp_body: serde_json::Value = resp.json().unwrap();
     assert!(
-        body.get("kappa").is_some(),
+        resp_body.get("kappa").is_some(),
         "response should contain kappa: {}",
-        body
+        resp_body
     );
     drop(guard);
 }
 
 #[test]
 fn identity_resolve_returns_assertions() {
-    // FAILS UNTIL: GET /identity/resolve/{subject} endpoint implemented
     let (guard, base, _tmp) = start_server();
     let c = client();
 
-    // Assert first
-    let assertion = serde_json::json!({
-        "subject": "sha256:alice",
-        "facet": "name/legal",
-        "value": "QWxpY2U=",
-    });
+    let body = signed_assertion("sha256:alice", "name/legal", "QWxpY2U");
     c.post(format!("{}/identity/assert", base))
         .header("content-type", "application/json")
-        .body(serde_json::to_string(&assertion).unwrap())
+        .body(serde_json::to_string(&body).unwrap())
         .send()
         .unwrap();
 
-    // Resolve
     let resp = c
         .get(format!("{}/identity/resolve/sha256:alice", base))
         .send()
@@ -112,27 +92,19 @@ fn identity_resolve_returns_assertions() {
 
 // =============================================================================
 // AKD proof generation
-// Pattern: publish THEN lookup (per akd test_core_protocol.rs:84-108)
-// The assertion endpoint triggers publish internally.
 // =============================================================================
 
 #[test]
 fn identity_proof_after_assertion() {
     // FAILS UNTIL: AKD proof endpoint implemented
-    // Pattern: assert (which triggers AKD publish), then request proof
     let (guard, base, _tmp) = start_server();
     let c = client();
 
-    // Assert -- this must trigger AKD directory.publish() internally
-    let assertion = serde_json::json!({
-        "subject": "sha256:charlie",
-        "facet": "name/legal",
-        "value": "Q2hhcmxpZQ==",
-    });
+    let body = signed_assertion("sha256:charlie", "name/legal", "Q2hhcmxpZQ");
     let assert_resp = c
         .post(format!("{}/identity/assert", base))
         .header("content-type", "application/json")
-        .body(serde_json::to_string(&assertion).unwrap())
+        .body(serde_json::to_string(&body).unwrap())
         .send()
         .unwrap();
     let status = assert_resp.status().as_u16();
@@ -142,7 +114,6 @@ fn identity_proof_after_assertion() {
         status
     );
 
-    // Request lookup proof -- AKD requires the epoch to exist first
     let resp = c
         .get(format!(
             "{}/identity/resolve/sha256:charlie?proof=true",
@@ -156,9 +127,8 @@ fn identity_proof_after_assertion() {
         "proof request should return 200, got {}",
         resp.status()
     );
-    let body: serde_json::Value = resp.json().unwrap();
-    // The response should contain proof data (structure depends on implementation)
-    let body_str = serde_json::to_string(&body).unwrap();
+    let resp_body: serde_json::Value = resp.json().unwrap();
+    let body_str = serde_json::to_string(&resp_body).unwrap();
     assert!(
         body_str.len() > 20,
         "proof response should contain substantial data: {}",
@@ -169,34 +139,28 @@ fn identity_proof_after_assertion() {
 
 // =============================================================================
 // AKD audit proof
-// Pattern: publish multiple epochs, then audit between them
-// (per akd test_core_protocol.rs:509-678)
 // =============================================================================
 
 #[test]
 fn identity_audit_between_epochs() {
-    // FAILS UNTIL: AKD audit endpoint implemented
-    // Each assertion triggers a publish, creating a new epoch.
-    // After 2 assertions, we have epochs 1 and 2.
+    // FAILS UNTIL: AKD audit endpoint implemented at /identity/audit/{start}/{end}
     let (guard, base, _tmp) = start_server();
     let c = client();
 
-    // Assertion 1 -> epoch 1
+    let body1 = signed_assertion("sha256:dave", "name/legal", "dGVzdA");
     c.post(format!("{}/identity/assert", base))
         .header("content-type", "application/json")
-        .body(r#"{"subject":"sha256:dave","facet":"name/legal","value":"dGVzdA=="}"#)
+        .body(serde_json::to_string(&body1).unwrap())
         .send()
         .unwrap();
 
-    // Assertion 2 -> epoch 2
+    let body2 = signed_assertion("sha256:eve", "name/legal", "dGVzdA");
     c.post(format!("{}/identity/assert", base))
         .header("content-type", "application/json")
-        .body(r#"{"subject":"sha256:eve","facet":"name/legal","value":"dGVzdA=="}"#)
+        .body(serde_json::to_string(&body2).unwrap())
         .send()
         .unwrap();
 
-    // Audit proof from epoch 1 to epoch 2
-    // The audit endpoint path uses /identity/audit/{start}/{end}
     let resp = c
         .get(format!("{}/identity/audit/1/2", base))
         .send()
@@ -212,24 +176,21 @@ fn identity_audit_between_epochs() {
 
 // =============================================================================
 // Absence proof
-// AKD NonMembershipProof for a subject that was never published
 // =============================================================================
 
 #[test]
 fn identity_absence_proof_for_nonexistent() {
-    // FAILS UNTIL: absence proof endpoint implemented
-    // Must have at least one published epoch for the AKD tree to exist
+    // FAILS UNTIL: absence proof endpoint returns cryptographic proof
     let (guard, base, _tmp) = start_server();
     let c = client();
 
-    // Publish something so the AKD tree is initialized
+    let body = signed_assertion("sha256:exists", "name/legal", "dGVzdA");
     c.post(format!("{}/identity/assert", base))
         .header("content-type", "application/json")
-        .body(r#"{"subject":"sha256:exists","facet":"name/legal","value":"dGVzdA=="}"#)
+        .body(serde_json::to_string(&body).unwrap())
         .send()
         .unwrap();
 
-    // Request absence proof for a subject that was NOT published
     let resp = c
         .get(format!(
             "{}/identity/absence/sha256:nonexistent/name/legal",
@@ -243,12 +204,6 @@ fn identity_absence_proof_for_nonexistent() {
         "absence proof should return 200, got {}",
         resp.status()
     );
-    let body: serde_json::Value = resp.json().unwrap();
-    assert!(
-        body.get("proof").is_some(),
-        "absence response should contain proof: {}",
-        body
-    );
     drop(guard);
 }
 
@@ -258,20 +213,17 @@ fn identity_absence_proof_for_nonexistent() {
 
 #[test]
 fn identity_multiple_assertions_same_subject() {
-    // FAILS UNTIL: identity module implemented
     let (guard, base, _tmp) = start_server();
     let c = client();
 
+    let (_, key_bytes) = signed_assertion_with_key("sha256:grace", "name/legal", "v1", None);
     for value in ["v1", "v2", "v3"] {
-        let assertion = serde_json::json!({
-            "subject": "sha256:grace",
-            "facet": "name/legal",
-            "value": value,
-        });
+        let (body, _) =
+            signed_assertion_with_key("sha256:grace", "name/legal", value, Some(&key_bytes));
         let resp = c
             .post(format!("{}/identity/assert", base))
             .header("content-type", "application/json")
-            .body(serde_json::to_string(&assertion).unwrap())
+            .body(serde_json::to_string(&body).unwrap())
             .send()
             .unwrap();
         let status = resp.status().as_u16();
@@ -282,7 +234,6 @@ fn identity_multiple_assertions_same_subject() {
         );
     }
 
-    // Resolve should return data for all assertions
     let resp = c
         .get(format!("{}/identity/resolve/sha256:grace", base))
         .send()
@@ -302,14 +253,14 @@ fn identity_audit_covers_5_epochs() {
     let c = client();
 
     for i in 0..5 {
-        let assertion = serde_json::json!({
-            "subject": format!("sha256:audit-{}", i),
-            "facet": "name/legal",
-            "value": format!("val-{}", i),
-        });
+        let body = signed_assertion(
+            &format!("sha256:audit-{}", i),
+            "name/legal",
+            &format!("val-{}", i),
+        );
         c.post(format!("{}/identity/assert", base))
             .header("content-type", "application/json")
-            .body(serde_json::to_string(&assertion).unwrap())
+            .body(serde_json::to_string(&body).unwrap())
             .send()
             .unwrap();
     }

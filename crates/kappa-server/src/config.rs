@@ -69,6 +69,32 @@ pub struct Config {
     pub max_staging_bytes: usize,
     /// Per-class rate limiting configuration.
     pub rate_limit: RateLimitConfig,
+    /// Whether fsync is called on blob writes. Default true.
+    pub fsync: bool,
+    /// Bearer token authentication tokens. Empty = no auth.
+    /// Parsed from KAPPA_AUTH_TOKENS: comma-separated, or @filepath
+    /// to read one token per line from a file.
+    pub auth_tokens: Vec<String>,
+    /// Whether bearer token auth is required. Default false.
+    pub auth_required: bool,
+    /// Disk pressure threshold in megabytes. Default 1024 (1 GiB).
+    /// When available space drops below this, blob writes are rejected
+    /// with 507 Insufficient Storage.
+    pub disk_pressure_threshold_mb: u64,
+    /// Disk pressure check interval in seconds. Default 30.
+    pub disk_pressure_check_interval_secs: u64,
+    /// TLS certificate path. If set with tls_key, enables HTTPS.
+    pub tls_cert: Option<String>,
+    /// TLS private key path. If set with tls_cert, enables HTTPS.
+    pub tls_key: Option<String>,
+    /// Per-request timeout in seconds. Default 300.
+    pub request_timeout_secs: u64,
+    /// Max non-blob request body in bytes. Default 4 MiB.
+    pub max_api_body_bytes: usize,
+    /// Trusted proxy header for client IP extraction. Default unset.
+    pub proxy_trusted_header: Option<String>,
+    /// CORS allowed origins. Default "*" (permissive).
+    pub cors_allowed_origins: String,
 }
 
 impl Config {
@@ -108,6 +134,25 @@ impl Config {
             },
         };
 
+        let fsync = env_or("KAPPA_FSYNC", "true") == "true";
+
+        let auth_tokens = parse_auth_tokens(&env_or("KAPPA_AUTH_TOKENS", ""));
+        let auth_required = env_or("KAPPA_AUTH_REQUIRED", "false") == "true";
+
+        let disk_pressure_threshold_mb: u64 =
+            env_parse("KAPPA_DISK_PRESSURE_THRESHOLD_MB", 1024);
+        let disk_pressure_check_interval_secs: u64 =
+            env_parse("KAPPA_DISK_PRESSURE_CHECK_INTERVAL_SECS", 30);
+
+        let tls_cert = std::env::var("KAPPA_TLS_CERT").ok();
+        let tls_key = std::env::var("KAPPA_TLS_KEY").ok();
+
+        let request_timeout_secs: u64 = env_parse("KAPPA_REQUEST_TIMEOUT_SECS", 300);
+        let max_api_body_bytes: usize =
+            env_parse("KAPPA_MAX_API_BODY_BYTES", 4 * 1024 * 1024);
+        let proxy_trusted_header = std::env::var("KAPPA_PROXY_TRUSTED_HEADERS").ok();
+        let cors_allowed_origins = env_or("KAPPA_CORS_ALLOWED_ORIGINS", "*");
+
         Config {
             listen_addr,
             store_root,
@@ -117,6 +162,17 @@ impl Config {
             max_transactions,
             max_staging_bytes,
             rate_limit,
+            fsync,
+            auth_tokens,
+            auth_required,
+            disk_pressure_threshold_mb,
+            disk_pressure_check_interval_secs,
+            tls_cert,
+            tls_key,
+            request_timeout_secs,
+            max_api_body_bytes,
+            proxy_trusted_header,
+            cors_allowed_origins,
         }
     }
 
@@ -147,6 +203,33 @@ where
             .parse()
             .unwrap_or_else(|e| config_exit(&format!("{key}: {e}"))),
         Err(_) => default,
+    }
+}
+
+/// Parse auth tokens from the KAPPA_AUTH_TOKENS value.
+/// If the value starts with @, read tokens from the file (one per line).
+/// Otherwise split on comma.
+fn parse_auth_tokens(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    if let Some(path) = raw.strip_prefix('@') {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            Err(e) => {
+                config_exit(&format!("KAPPA_AUTH_TOKENS file {}: {}", path, e));
+            }
+        }
+    } else {
+        raw.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
     }
 }
 
@@ -193,6 +276,17 @@ mod tests {
                     burst: 10,
                 },
             },
+            fsync: true,
+            auth_tokens: Vec::new(),
+            auth_required: false,
+            disk_pressure_threshold_mb: 1024,
+            disk_pressure_check_interval_secs: 30,
+            tls_cert: None,
+            tls_key: None,
+            request_timeout_secs: 300,
+            max_api_body_bytes: 4 * 1024 * 1024,
+            proxy_trusted_header: None,
+            cors_allowed_origins: "*".into(),
         };
         assert_eq!(cfg.listen_host(), "10.0.0.1");
         assert_eq!(cfg.listen_port(), "8080");
