@@ -6,6 +6,9 @@
 
 use std::sync::Arc;
 
+use futures_util::StreamExt;
+use http_body::Frame;
+use http_body_util::StreamBody;
 use topcoat::context::{try_app_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
@@ -13,7 +16,7 @@ use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, Status
 use kappa_core::kappa::{kappa_from_bytes, verify_kappa, KappaLabel};
 use kappa_core::types::{Edge, EdgeRelation};
 
-use crate::blob::DiskPressure;
+use crate::blob::{DiskPressure, STREAM_CHUNK_SIZE};
 use crate::{path_param, query_param, query_params_multi, read_body, store};
 
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
@@ -296,16 +299,6 @@ async fn manifest_get(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Res
         .map_err(crate::store_err)?
     };
 
-    // Get the manifest blob
-    let k = kappa.clone();
-    let content = tokio::task::spawn_blocking({
-        let s = s.clone();
-        move || s.blob_get(&k)
-    })
-    .await
-    .map_err(|e| bad_request(e.to_string()))?
-    .map_err(crate::store_err)?;
-
     // Content-type from blob metadata
     let k = kappa.clone();
     let ct = tokio::task::spawn_blocking({
@@ -318,17 +311,41 @@ async fn manifest_get(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Res
     .and_then(|b| String::from_utf8(b).ok())
     .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    (
-        StatusCode::OK,
-        [
-            ("content-type", ct),
-            ("content-length", content.len().to_string()),
-            ("x-kappa-label", kappa.clone()),
-            ("docker-content-digest", kappa),
-        ],
-        content,
-    )
-        .into_response(cx)
+    // Stream manifest from file -- same pattern as blob GET
+    let k = kappa.clone();
+    let size = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let k = k.clone();
+        move || s.blob_size(&k)
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
+
+    let file = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let k = kappa.clone();
+        move || s.blob_open(&k)
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
+
+    let async_file = tokio::fs::File::from_std(file);
+    let stream = tokio_util::io::ReaderStream::with_capacity(async_file, STREAM_CHUNK_SIZE);
+    let body_stream = StreamBody::new(stream.map(|r| r.map(|b| Frame::data(b)).map_err(|e| {
+        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+    })));
+    let body = Body::new(body_stream);
+
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    let h = response.headers_mut();
+    h.insert("content-type", ct.parse().unwrap());
+    h.insert("content-length", size.to_string().parse().unwrap());
+    h.insert("x-kappa-label", kappa.parse().unwrap());
+    h.insert("docker-content-digest", kappa.parse().unwrap());
+    Ok(response)
 }
 
 // -- HEAD ---------------------------------------------------------------------
@@ -350,12 +367,12 @@ async fn manifest_head(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Re
         .map_err(crate::store_err)?
     };
 
-    // Use blob_get to get both size and content-type in one pass
-    // (manifest blobs are small -- typically < 10 KiB)
+    // HEAD: use blob_size for Content-Length, no file open
     let k = kappa.clone();
-    let content = tokio::task::spawn_blocking({
+    let size = tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.blob_get(&k)
+        let k = k.clone();
+        move || s.blob_size(&k)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -376,7 +393,7 @@ async fn manifest_head(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Re
         StatusCode::OK,
         [
             ("content-type", ct),
-            ("content-length", content.len().to_string()),
+            ("content-length", size.to_string()),
             ("x-kappa-label", kappa.clone()),
             ("docker-content-digest", kappa),
         ],

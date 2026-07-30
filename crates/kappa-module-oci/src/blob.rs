@@ -7,6 +7,9 @@
 
 use std::sync::Arc;
 
+use futures_util::StreamExt;
+use http_body::Frame;
+use http_body_util::StreamBody;
 use topcoat::context::{try_app_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
@@ -14,6 +17,9 @@ use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, Status
 use kappa_core::kappa::verify_kappa;
 
 use crate::{path_param, query_param, read_body, store, MaxBlobSize};
+
+/// Chunk size for streaming blob downloads: 64 KiB per frame.
+pub(crate) const STREAM_CHUNK_SIZE: usize = 65536;
 
 /// Disk pressure flag set by periodic background check.
 /// When true, blob writes are rejected with 507.
@@ -276,29 +282,42 @@ async fn get(cx: &Cx, _ns: &str, kappa: &str) -> topcoat::Result<Response> {
         }
     }
 
-    // Full GET
-    let content = tokio::task::spawn_blocking({
+    // Full GET -- stream from file, never buffer entire blob in memory
+    let size = tokio::task::spawn_blocking({
         let s = s.clone();
         let k = k.clone();
-        move || s.blob_get(&k)
+        move || s.blob_size(&k)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
-    (
-        StatusCode::OK,
-        [
-            ("content-type", ct),
-            ("content-length", content.len().to_string()),
-            ("docker-content-digest", k.clone()),
-            ("x-kappa-label", k.clone()),
-            ("x-kappa-axis", axis),
-            ("accept-ranges", "bytes".to_string()),
-        ],
-        content,
-    )
-        .into_response(cx)
+    let file = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let k = k.clone();
+        move || s.blob_open(&k)
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
+
+    let async_file = tokio::fs::File::from_std(file);
+    let stream = tokio_util::io::ReaderStream::with_capacity(async_file, STREAM_CHUNK_SIZE);
+    let body_stream = StreamBody::new(stream.map(|r| r.map(|b| Frame::data(b)).map_err(|e| {
+        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+    })));
+    let body = Body::new(body_stream);
+
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    let h = response.headers_mut();
+    h.insert("content-type", ct.parse().unwrap());
+    h.insert("content-length", size.to_string().parse().unwrap());
+    h.insert("docker-content-digest", k.parse().unwrap());
+    h.insert("x-kappa-label", k.parse().unwrap());
+    h.insert("x-kappa-axis", axis.parse().unwrap());
+    h.insert("accept-ranges", "bytes".parse().unwrap());
+    Ok(response)
 }
 
 // -- HEAD ---------------------------------------------------------------------

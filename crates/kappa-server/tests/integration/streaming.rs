@@ -18,6 +18,8 @@ extern crate blake3;
 mod helpers;
 use helpers::*;
 
+use std::time::Duration;
+
 // =============================================================================
 // Memory-bounded upload
 // RSS measurement: takes baseline BEFORE upload, measures delta AFTER.
@@ -507,5 +509,277 @@ fn chunked_upload_zero_length_chunk_no_crash() {
     // Server should still be responsive
     let status = c.get(format!("{}/_status", base)).send().unwrap().status();
     assert_eq!(status, 200, "server unresponsive after zero-length chunk");
+    drop(guard);
+}
+
+// =============================================================================
+// Streaming download tests
+// Blob GET responses stream from file in 64 KiB chunks. Memory usage is
+// O(chunk_size), not O(blob_size).
+// =============================================================================
+
+#[test]
+fn streaming_download_large_blob_rss_bounded() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+    let size: usize = 100 * 1024 * 1024; // 100 MB
+    let chunk_size: usize = 1024 * 1024;
+
+    // Upload 100MB via chunked upload
+    let mut upload_url = start_upload(&c, &base, "dl-100m");
+    let mut upload_hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    let mut offset: usize = 0;
+    while offset < size {
+        let end = std::cmp::min(offset + chunk_size, size);
+        let chunk: Vec<u8> = (offset..end).map(|i| (i % 251) as u8).collect();
+        upload_hasher.update(&chunk);
+        upload_url = send_chunk(&c, &base, &upload_url, offset, &chunk);
+        offset = end;
+    }
+    let digest = format!("sha256:{}", hex::encode(upload_hasher.finalize()));
+    let complete_url = format!("{}?digest={}", upload_url, digest);
+    let resp = c.put(&complete_url).send().unwrap();
+    assert_eq!(resp.status(), 201, "upload failed: {}", resp.text().unwrap());
+
+    // Measure baseline RSS before download
+    #[cfg(target_os = "linux")]
+    let baseline_rss = server_rss_kb(guard.pid());
+
+    // Download and verify via streaming read
+    let dl_resp = c
+        .get(format!("{}/v2/dl-100m/blobs/{}", base, digest))
+        .send()
+        .unwrap();
+    assert_eq!(dl_resp.status(), 200);
+
+    let cl: usize = dl_resp
+        .headers()
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(cl, size, "Content-Length mismatch");
+
+    // Read body as bytes, hash it
+    let body = dl_resp.bytes().unwrap();
+    let mut dl_hasher = sha2::Sha256::new();
+    dl_hasher.update(&body);
+    assert_eq!(body.len(), size, "downloaded size mismatch");
+
+    let dl_digest = format!("sha256:{}", hex::encode(dl_hasher.finalize()));
+    assert_eq!(dl_digest, digest, "downloaded content digest mismatch");
+
+    // Verify RSS growth is bounded (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        if let (Some(before), Some(after)) = (baseline_rss, server_rss_kb(guard.pid())) {
+            let growth_mb = (after.saturating_sub(before)) / 1024;
+            assert!(
+                growth_mb < 80,
+                "server RSS grew by {} MB during 100MB download -- \
+                 should grow < 80 MB if streaming from file. \
+                 Baseline: {} KB, After: {} KB",
+                growth_mb,
+                before,
+                after
+            );
+        }
+    }
+    drop(guard);
+}
+
+#[test]
+fn streaming_download_content_length_set() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+    let size: usize = 10 * 1024 * 1024; // 10 MB
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let digest = sha256_digest(&content);
+    c.put(format!("{}/v2/dl-cl/blobs/{}", base, digest))
+        .body(content)
+        .send()
+        .unwrap();
+
+    let resp = c
+        .get(format!("{}/v2/dl-cl/blobs/{}", base, digest))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cl: usize = resp
+        .headers()
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(cl, size);
+    let body = resp.bytes().unwrap();
+    assert_eq!(body.len(), size);
+    drop(guard);
+}
+
+#[test]
+fn streaming_download_concurrent_pulls_bounded() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+    let size: usize = 50 * 1024 * 1024; // 50 MB
+
+    // Upload 50MB blob
+    let mut upload_url = start_upload(&c, &base, "dl-conc");
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    let chunk_size: usize = 1024 * 1024;
+    let mut offset: usize = 0;
+    while offset < size {
+        let end = std::cmp::min(offset + chunk_size, size);
+        let chunk: Vec<u8> = (offset..end).map(|i| (i % 251) as u8).collect();
+        hasher.update(&chunk);
+        upload_url = send_chunk(&c, &base, &upload_url, offset, &chunk);
+        offset = end;
+    }
+    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let complete_url = format!("{}?digest={}", upload_url, digest);
+    c.put(&complete_url).send().unwrap();
+
+    #[cfg(target_os = "linux")]
+    let baseline_rss = server_rss_kb(guard.pid());
+
+    // 5 concurrent GETs
+    let handles: Vec<_> = (0..5)
+        .map(|_| {
+            let url = format!("{}/v2/dl-conc/blobs/{}", base, digest);
+            let expected_size = size;
+            std::thread::spawn(move || {
+                let c = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(120))
+                    .build()
+                    .unwrap();
+                let resp = c.get(&url).send().unwrap();
+                assert_eq!(resp.status().as_u16(), 200);
+                let body = resp.bytes().unwrap();
+                assert_eq!(body.len(), expected_size);
+                true
+            })
+        })
+        .collect();
+
+    for h in handles {
+        assert!(h.join().unwrap(), "concurrent download failed");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let (Some(before), Some(after)) = (baseline_rss, server_rss_kb(guard.pid())) {
+            let growth_mb = (after.saturating_sub(before)) / 1024;
+            assert!(
+                growth_mb < 100,
+                "server RSS grew by {} MB during 5 concurrent 50MB downloads -- \
+                 should grow < 100 MB if streaming. \
+                 Baseline: {} KB, After: {} KB",
+                growth_mb,
+                before,
+                after
+            );
+        }
+    }
+    drop(guard);
+}
+
+#[test]
+fn streaming_download_small_blob_unchanged() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+    let content = b"small blob content for streaming test";
+    let digest = sha256_digest(content);
+    c.put(format!("{}/v2/dl-small/blobs/{}", base, digest))
+        .body(content.to_vec())
+        .send()
+        .unwrap();
+
+    let resp = c
+        .get(format!("{}/v2/dl-small/blobs/{}", base, digest))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("docker-content-digest").unwrap().to_str().unwrap(),
+        digest
+    );
+    assert_eq!(
+        resp.headers().get("accept-ranges").unwrap().to_str().unwrap(),
+        "bytes"
+    );
+    assert_eq!(resp.bytes().unwrap().as_ref(), content);
+    drop(guard);
+}
+
+#[test]
+fn streaming_download_manifest_streams() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+    // 3MB manifest (under default 4MB max_api_body_bytes limit)
+    let manifest_size = 3 * 1024 * 1024;
+    let manifest: Vec<u8> = {
+        let mut m = br#"{"schemaVersion":2,"config":{"digest":"sha256:aaaa","data":""#.to_vec();
+        // Pad with spaces to reach target size
+        let padding_needed = manifest_size - m.len() - 3; // 3 for closing '"}}'
+        m.extend(std::iter::repeat(b' ').take(padding_needed));
+        m.extend(br#""}}"#);
+        m
+    };
+    let tag = "big-manifest";
+    let status = push_manifest(&c, &base, "dl-manifest", tag, &manifest);
+    assert!(status == 201, "manifest push failed: {}", status);
+
+    let resp = c
+        .get(format!("{}/v2/dl-manifest/manifests/{}", base, tag))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cl: usize = resp
+        .headers()
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(cl, manifest.len());
+    let body = resp.bytes().unwrap();
+    assert_eq!(body.len(), manifest.len());
+    drop(guard);
+}
+
+#[test]
+fn streaming_download_head_no_body() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+    let content = b"head test blob for streaming";
+    let digest = sha256_digest(content);
+    c.put(format!("{}/v2/dl-head/blobs/{}", base, digest))
+        .body(content.to_vec())
+        .send()
+        .unwrap();
+
+    let resp = c
+        .head(format!("{}/v2/dl-head/blobs/{}", base, digest))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cl: usize = resp
+        .headers()
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(cl, content.len());
+    // HEAD body must be empty
+    assert_eq!(resp.bytes().unwrap().len(), 0);
     drop(guard);
 }

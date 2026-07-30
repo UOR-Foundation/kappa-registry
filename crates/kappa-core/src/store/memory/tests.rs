@@ -409,6 +409,42 @@ fn epoch_current_tracks_latest() {
     assert_eq!(store.epoch_current("ns").unwrap(), Some(k2));
 }
 
+// -- blob_open (default impl via tempfile) ------------------------------------
+
+#[test]
+fn blob_open_default_roundtrip() {
+    let (store, _dir) = test_store();
+    let kappa = kappa_from_bytes(b"open default");
+    store.blob_put(&kappa, b"open default").unwrap();
+    let mut file = store.blob_open(&kappa).unwrap();
+    let mut buf = Vec::new();
+    use std::io::Read;
+    file.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"open default");
+}
+
+#[test]
+fn blob_open_default_not_found() {
+    let (store, _dir) = test_store();
+    let k = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    assert!(store.blob_open(k).is_err());
+}
+
+#[test]
+fn blob_open_default_matches_blob_get() {
+    let (store, _dir) = test_store();
+    let content: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    let kappa = kappa_from_bytes(&content);
+    store.blob_put(&kappa, &content).unwrap();
+
+    let get_result = store.blob_get(&kappa).unwrap();
+    let mut file = store.blob_open(&kappa).unwrap();
+    let mut open_result = Vec::new();
+    use std::io::Read;
+    file.read_to_end(&mut open_result).unwrap();
+    assert_eq!(get_result, open_result);
+}
+
 // -- Namespace --------------------------------------------------------------
 
 #[test]

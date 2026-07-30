@@ -405,6 +405,18 @@ pub fn signed_assertion_with_key(
     (body, secret_bytes)
 }
 
+/// Read server RSS in KB via /proc/{pid}/status. Linux only.
+#[cfg(target_os = "linux")]
+pub fn server_rss_kb(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in status.lines() {
+        if line.starts_with("VmRSS:") {
+            return line.split_whitespace().nth(1)?.parse().ok();
+        }
+    }
+    None
+}
+
 /// Recursively list all files under a directory.
 #[cfg(unix)]
 pub fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
