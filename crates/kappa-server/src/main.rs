@@ -171,6 +171,7 @@ async fn main() {
 
     // -- Events --
     let event_log = Arc::new(InMemoryEventLog::new());
+    let event_log_for_ws: Arc<dyn kappa_core::events::EventLog> = event_log.clone();
     let broadcaster = Arc::new(EventBroadcaster::new(
         event_log,
         broadcast::EVENT_CHANNEL_CAPACITY,
@@ -347,6 +348,13 @@ async fn main() {
     }
     #[cfg(feature = "distribution")]
     {
+        // EventLog for WebSocket event streaming
+        builder = builder.app_context(event_log_for_ws);
+
+        // CrdtManager for WebSocket CRDT collaboration
+        let crdt_manager = Arc::new(kappa_module_distribution::CrdtManager::new(store.clone()));
+        builder = builder.app_context(crdt_manager);
+
         builder = kappa_module_distribution::register(builder);
     }
 
