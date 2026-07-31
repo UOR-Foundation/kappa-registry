@@ -163,6 +163,7 @@ mod tests {
     #[test]
     fn build_root_set_includes_tags_and_epochs() {
         use crate::clock::ntp_lamport::NtpLamportClock;
+        use crate::kappa::kappa_from_bytes;
         use crate::store::memory::{InMemoryStore, MemoryStoreConfig};
         use crate::store::KappaStore;
         let tmp = tempfile::tempdir().unwrap();
@@ -175,21 +176,22 @@ mod tests {
         )
         .unwrap();
 
-        // Put a blob and tag it
-        store.blob_put("sha256:aaa", b"content-a").unwrap();
-        store.tag_set("ns", "latest", "sha256:aaa").unwrap();
+        let content = b"content-a";
+        let k = kappa_from_bytes(content);
+        store.blob_put(&k, content).unwrap();
+        store.tag_set("ns", "latest", &k).unwrap();
 
-        // Advance epoch
         let epoch_k = store.epoch_advance("ns", vec![]).unwrap();
 
         let roots = build_root_set(&store).unwrap();
-        assert!(roots.contains(&"sha256:aaa".to_string()));
+        assert!(roots.contains(&k));
         assert!(roots.contains(&epoch_k));
     }
 
     #[test]
     fn sweep_deletes_unreachable() {
         use crate::clock::ntp_lamport::NtpLamportClock;
+        use crate::kappa::kappa_from_bytes;
         use crate::store::memory::{InMemoryStore, MemoryStoreConfig};
         use crate::store::KappaStore;
         let tmp = tempfile::tempdir().unwrap();
@@ -202,20 +204,25 @@ mod tests {
         )
         .unwrap();
 
-        // Put two blobs, only tag one
-        store.blob_put("sha256:tagged", b"tagged").unwrap();
-        store.blob_put("sha256:orphan", b"orphan").unwrap();
-        store.tag_set("ns", "keep", "sha256:tagged").unwrap();
+        let tagged_content = b"tagged-content";
+        let tagged_k = kappa_from_bytes(tagged_content);
+        let orphan_content = b"orphan-content";
+        let orphan_k = kappa_from_bytes(orphan_content);
+
+        store.blob_put(&tagged_k, tagged_content).unwrap();
+        store.blob_put(&orphan_k, orphan_content).unwrap();
+        store.tag_set("ns", "keep", &tagged_k).unwrap();
 
         let result = sweep(&store, &|_| vec![]).unwrap();
         assert!(result.objects_collected >= 1);
-        assert!(store.blob_exists("sha256:tagged").unwrap());
-        assert!(!store.blob_exists("sha256:orphan").unwrap());
+        assert!(store.blob_exists(&tagged_k).unwrap());
+        assert!(!store.blob_exists(&orphan_k).unwrap());
     }
 
     #[test]
     fn sweep_follows_edges() {
         use crate::clock::ntp_lamport::NtpLamportClock;
+        use crate::kappa::kappa_from_bytes;
         use crate::store::memory::{InMemoryStore, MemoryStoreConfig};
         use crate::store::KappaStore;
         let tmp = tempfile::tempdir().unwrap();
@@ -228,24 +235,32 @@ mod tests {
         )
         .unwrap();
 
-        store.blob_put("sha256:root", b"root").unwrap();
-        store.blob_put("sha256:child", b"child").unwrap();
-        store.blob_put("sha256:orphan", b"orphan").unwrap();
-        store.tag_set("ns", "entry", "sha256:root").unwrap();
+        let root_content = b"root-content";
+        let root_k = kappa_from_bytes(root_content);
+        let child_content = b"child-content";
+        let child_k = kappa_from_bytes(child_content);
+        let orphan_content = b"orphan-content-edge";
+        let orphan_k = kappa_from_bytes(orphan_content);
 
-        // Edge from root to child
+        store.blob_put(&root_k, root_content).unwrap();
+        store.blob_put(&child_k, child_content).unwrap();
+        store.blob_put(&orphan_k, orphan_content).unwrap();
+        store.tag_set("ns", "entry", &root_k).unwrap();
+
+        let root_k_clone = root_k.clone();
+        let child_k_clone = child_k.clone();
         let result = sweep(&store, &|k| {
-            if k == "sha256:root" {
-                vec!["sha256:child".into()]
+            if k == root_k_clone {
+                vec![child_k_clone.clone()]
             } else {
                 vec![]
             }
         })
         .unwrap();
 
-        assert!(store.blob_exists("sha256:root").unwrap());
-        assert!(store.blob_exists("sha256:child").unwrap());
-        assert!(!store.blob_exists("sha256:orphan").unwrap());
+        assert!(store.blob_exists(&root_k).unwrap());
+        assert!(store.blob_exists(&child_k).unwrap());
+        assert!(!store.blob_exists(&orphan_k).unwrap());
         assert_eq!(result.objects_collected, 1);
     }
 }
