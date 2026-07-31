@@ -154,3 +154,43 @@ fn trust_position_states() {
     assert_eq!(TrustPosition::Standalone.as_str(), "standalone");
     assert!(!TrustPosition::Standalone.is_faulted());
 }
+
+#[test]
+fn asserter_anchor_closed_constructor() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/asserter_anchor_closed.rs");
+}
+
+#[test]
+fn resolve_all_filtered_excludes_untrusted() {
+    let assertions = vec![
+        IdentityAssertion {
+            asserter: "trusted-anchor".into(),
+            subject: "s".into(),
+            facet: "f1".into(),
+            value: vec![],
+            basis: "self-asserted".into(),
+            valid_from_ms: 100,
+            valid_until_ms: None,
+            signature: vec![],
+        },
+        IdentityAssertion {
+            asserter: "untrusted-anchor".into(),
+            subject: "s".into(),
+            facet: "f2".into(),
+            value: vec![],
+            basis: "self-asserted".into(),
+            valid_from_ms: 200,
+            valid_until_ms: None,
+            signature: vec![],
+        },
+    ];
+    let result = resolution::resolve_all_filtered(
+        &assertions,
+        &[],
+        &[],
+        Some(&|asserter: &str| asserter == "trusted-anchor"),
+    );
+    assert_eq!(result.valid.len(), 1);
+    assert_eq!(result.valid[0].asserter, "trusted-anchor");
+}

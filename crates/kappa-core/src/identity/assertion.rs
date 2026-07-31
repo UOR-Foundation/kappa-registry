@@ -72,6 +72,82 @@ struct SignableAssertion {
     valid_until_ms: Option<u64>,
 }
 
+/// Store two assertions as a double-entry pair under a single epoch advance.
+///
+/// Used for bidirectional relationships: "A asserts X about B" and
+/// "B asserts Y about A" in the same epoch. Both assertions get stored,
+/// tagged, and edged, then ONE epoch_advance captures both mutations.
+///
+/// Returns (kappa_a, kappa_b).
+pub fn assert_double_entry(
+    store: &dyn crate::store::KappaStore,
+    assertion_a: &IdentityAssertion,
+    assertion_b: &IdentityAssertion,
+) -> Result<(String, String), crate::types::StoreError> {
+    let bytes_a = crate::canonical::canonical_bytes(assertion_a);
+    let kappa_a = crate::kappa::kappa_from_bytes(&bytes_a);
+    let bytes_b = crate::canonical::canonical_bytes(assertion_b);
+    let kappa_b = crate::kappa::kappa_from_bytes(&bytes_b);
+
+    let ns_a = &assertion_a.asserter;
+    let ns_b = &assertion_b.asserter;
+
+    // Store both blobs
+    store.blob_put(&kappa_a, &bytes_a)?;
+    store.blob_put(&kappa_b, &bytes_b)?;
+
+    // Tag both under their asserter namespaces
+    store.tag_set(ns_a, &format!("assertion/{}", kappa_a), &kappa_a)?;
+    store.tag_set(ns_b, &format!("assertion/{}", kappa_b), &kappa_b)?;
+
+    // Edge: Assertion relation for both
+    store.edge_put(
+        ns_a,
+        &crate::types::Edge {
+            source: ns_a.clone(),
+            target: assertion_a.subject.clone(),
+            relation: crate::types::EdgeRelation::Assertion,
+            asserter: ns_a.clone(),
+            value_kappa: Some(kappa_a.clone()),
+            metadata: None,
+        },
+    )?;
+    store.edge_put(
+        ns_b,
+        &crate::types::Edge {
+            source: ns_b.clone(),
+            target: assertion_b.subject.clone(),
+            relation: crate::types::EdgeRelation::Assertion,
+            asserter: ns_b.clone(),
+            value_kappa: Some(kappa_b.clone()),
+            metadata: None,
+        },
+    )?;
+
+    // ONE epoch advance with BOTH mutations
+    store.epoch_advance(
+        ns_a,
+        vec![
+            crate::types::EpochMutation {
+                op: crate::types::MutationOp::AssertionPublish,
+                namespace: ns_a.clone(),
+                tag_name: format!("assertion/{}", kappa_a),
+                old_kappa: None,
+                new_kappa: Some(kappa_a.clone()),
+            },
+            crate::types::EpochMutation {
+                op: crate::types::MutationOp::AssertionPublish,
+                namespace: ns_b.clone(),
+                tag_name: format!("assertion/{}", kappa_b),
+                old_kappa: None,
+                new_kappa: Some(kappa_b.clone()),
+            },
+        ],
+    )?;
+
+    Ok((kappa_a, kappa_b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +196,58 @@ mod tests {
             signature: vec![99, 99, 99],
         };
         assert_eq!(a1.signable_bytes(), a2.signable_bytes());
+    }
+
+    #[test]
+    fn double_entry_produces_one_epoch() {
+        use crate::clock::ntp_lamport::NtpLamportClock;
+        use crate::store::memory::{InMemoryStore, MemoryStoreConfig};
+        use crate::store::KappaStore;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = Arc::new(NtpLamportClock::new());
+        let store = InMemoryStore::new(
+            MemoryStoreConfig {
+                blob_root: tmp.path().join("blobs"),
+            },
+            clock,
+        )
+        .unwrap();
+
+        let a = IdentityAssertion {
+            asserter: "asserter-a".into(),
+            subject: "subject-shared".into(),
+            facet: "name/legal".into(),
+            value: b"Alice".to_vec(),
+            basis: "self-asserted".into(),
+            valid_from_ms: 100,
+            valid_until_ms: None,
+            signature: vec![],
+        };
+        let b = IdentityAssertion {
+            asserter: "asserter-b".into(),
+            subject: "subject-shared".into(),
+            facet: "name/legal".into(),
+            value: b"Bob".to_vec(),
+            basis: "self-asserted".into(),
+            valid_from_ms: 100,
+            valid_until_ms: None,
+            signature: vec![],
+        };
+
+        let (ka, kb) = assert_double_entry(&store, &a, &b).unwrap();
+        assert_ne!(ka, kb);
+
+        // Both blobs exist
+        assert!(store.blob_exists(&ka).unwrap());
+        assert!(store.blob_exists(&kb).unwrap());
+
+        // Asserter-a namespace has exactly one epoch (the double-entry)
+        let epoch_kappa = store.epoch_current("asserter-a").unwrap();
+        assert!(epoch_kappa.is_some());
+        let epoch = store.epoch_get(epoch_kappa.as_ref().unwrap()).unwrap();
+        assert_eq!(epoch.epoch_number, 1, "one epoch, not two");
     }
 
     #[test]

@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 
+dashmap = { workspace = true }
 kappa-store-redb = { path = "../kappa-store-redb" }
 uuid = { workspace = true }
 libc = "0.2"
@@ -34,6 +35,7 @@ kappa-akd = { path = "../kappa-akd" }
 kappa-module-oci = { path = "../kappa-module-oci", optional = true }
 kappa-module-identity = { path = "../kappa-module-identity", optional = true }
 kappa-module-distribution = { path = "../kappa-module-distribution", optional = true }
+kappa-transport-veilid = { path = "../kappa-transport-veilid", optional = true }
 
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
@@ -113,3 +115,4 @@ default = ["oci", "identity-http", "distribution"]
 oci = ["dep:kappa-module-oci"]
 identity-http = ["dep:kappa-module-identity"]
 distribution = ["dep:kappa-module-distribution"]
+veilid = ["dep:kappa-transport-veilid"]

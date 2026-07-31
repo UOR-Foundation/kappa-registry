@@ -29,9 +29,14 @@ impl PersistentStore {
             drop(ns_table);
 
             let edge_key = format!("{}\x00{}", ns, edge_kappa);
+            let stored_bytes: Vec<u8> = match &self.table_encryptor {
+                Some(enc) => enc.encrypt_value(&edge_key, &edge_bytes)
+                    .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+                None => edge_bytes.clone(),
+            };
             let mut edges = txn.open_table(EDGES).map_err(Self::redb_err)?;
             edges
-                .insert(edge_key.as_str(), edge_bytes.as_slice())
+                .insert(edge_key.as_str(), stored_bytes.as_slice())
                 .map_err(Self::redb_err)?;
             drop(edges);
 
@@ -94,7 +99,13 @@ impl PersistentStore {
         for ek in &edge_kappas {
             let edge_key = format!("{}\x00{}", ns, ek);
             if let Some(val) = edges_table.get(edge_key.as_str()).map_err(Self::redb_err)? {
-                let edge: Edge = from_canonical(val.value())
+                let raw_bytes = val.value();
+                let decrypted = match &self.table_encryptor {
+                    Some(enc) => enc.decrypt_value(&edge_key, raw_bytes)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+                    None => raw_bytes.to_vec(),
+                };
+                let edge: Edge = from_canonical(&decrypted)
                     .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                 if let Some(ref rel) = query.relation {
                     if edge.relation != *rel {
@@ -138,7 +149,13 @@ impl PersistentStore {
             for ek in &candidates {
                 let edge_key = format!("{}\x00{}", ns, ek);
                 if let Some(val) = edges_table.get(edge_key.as_str()).map_err(Self::redb_err)? {
-                    let edge: Edge = from_canonical(val.value())
+                    let raw_bytes = val.value();
+                    let decrypted = match &self.table_encryptor {
+                        Some(enc) => enc.decrypt_value(&edge_key, raw_bytes)
+                            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+                        None => raw_bytes.to_vec(),
+                    };
+                    let edge: Edge = from_canonical(&decrypted)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                     if edge.source == source && edge.target == target && edge.relation == relation {
                         found_kappa = Some(ek.clone());

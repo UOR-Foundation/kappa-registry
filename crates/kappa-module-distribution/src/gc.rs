@@ -298,11 +298,8 @@ fn run_sweep(
     ns: &str,
     sweep_id: &str,
 ) -> Result<SweepResult, kappa_core::StoreError> {
-    tracing::debug!(
-        ns = ns,
-        sweep_id = sweep_id,
-        "run_sweep: collecting root set"
-    );
+    let _span = tracing::info_span!("store_mutation", op = "gc_sweep", ns = %ns, sweep_id = %sweep_id).entered();
+    tracing::debug!("run_sweep: collecting root set");
 
     let mut roots = std::collections::HashSet::new();
 

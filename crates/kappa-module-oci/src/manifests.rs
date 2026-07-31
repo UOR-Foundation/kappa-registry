@@ -14,7 +14,7 @@ use topcoat::router::error::bad_request;
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
 use kappa_core::kappa::{kappa_from_bytes, verify_kappa, KappaLabel};
-use kappa_core::types::{Edge, EdgeRelation};
+use kappa_core::types::{Edge, EdgeRelation, EpochMutation, MutationOp};
 
 use crate::blob::{DiskPressure, STREAM_CHUNK_SIZE};
 use crate::{path_param, query_param, query_params_multi, read_body, store};
@@ -199,6 +199,10 @@ async fn manifest_put(
         .map_err(crate::store_err)?;
     }
 
+    // Collect all tag mutations for ONE epoch advance
+    let extra_tags = query_params_multi(cx, "tag");
+    let mut tag_mutations: Vec<EpochMutation> = Vec::new();
+
     // Bind tag if reference is a tag name
     if is_tag {
         let n = ns.to_string();
@@ -211,10 +215,16 @@ async fn manifest_put(
         .await
         .map_err(|e| bad_request(e.to_string()))?
         .map_err(crate::store_err)?;
+        tag_mutations.push(EpochMutation {
+            op: MutationOp::TagSet,
+            namespace: ns.to_string(),
+            tag_name: reference.to_string(),
+            old_kappa: None,
+            new_kappa: Some(kappa.clone()),
+        });
     }
 
     // Multi-tag bind via ?tag= query params (OCI tag parameter extension)
-    let extra_tags = query_params_multi(cx, "tag");
     for extra_tag in &extra_tags {
         let n = ns.to_string();
         let k = kappa.clone();
@@ -222,6 +232,29 @@ async fn manifest_put(
         tokio::task::spawn_blocking({
             let s = s.clone();
             move || s.tag_set(&n, &t, &k)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(crate::store_err)?;
+        tag_mutations.push(EpochMutation {
+            op: MutationOp::TagSet,
+            namespace: ns.to_string(),
+            tag_name: extra_tag.clone(),
+            old_kappa: None,
+            new_kappa: Some(kappa.clone()),
+        });
+    }
+
+    // ONE epoch for all tag mutations in this manifest PUT
+    if !tag_mutations.is_empty() {
+        let n = ns.to_string();
+        let mutation_count = tag_mutations.len();
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || {
+                let _span = tracing::info_span!("store_mutation", op = "manifest_put_tags", ns = %n, count = mutation_count).entered();
+                s.epoch_advance(&n, tag_mutations)
+            }
         })
         .await
         .map_err(|e| bad_request(e.to_string()))?
@@ -429,20 +462,33 @@ async fn manifest_delete(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<
         .map_err(|e| bad_request(e.to_string()))?
         .map_err(crate::store_err)?;
 
-        for tag in &tags {
-            let t = tag.clone();
-            let n = ns.to_string();
-            let _ = tokio::task::spawn_blocking({
-                let s = s.clone();
-                move || s.tag_delete(&n, &t)
+        let delete_mutations: Vec<EpochMutation> = tags
+            .iter()
+            .map(|t| EpochMutation {
+                op: MutationOp::TagDelete,
+                namespace: ns.to_string(),
+                tag_name: t.clone(),
+                old_kappa: Some(digest.clone()),
+                new_kappa: None,
             })
-            .await;
-        }
+            .collect();
 
-        let d = reference.to_string();
         tokio::task::spawn_blocking({
             let s = s.clone();
-            move || s.blob_delete(&d)
+            let n = ns.to_string();
+            let d = reference.to_string();
+            let tags_owned = tags;
+            move || {
+                let _span = tracing::info_span!("store_mutation", op = "manifest_delete_digest", ns = %n, count = tags_owned.len()).entered();
+                for tag_name in &tags_owned {
+                    s.tag_delete(&n, tag_name)?;
+                }
+                s.blob_delete(&d)?;
+                if !delete_mutations.is_empty() {
+                    s.epoch_advance(&n, delete_mutations)?;
+                }
+                Ok::<_, kappa_core::StoreError>(())
+            }
         })
         .await
         .map_err(|e| bad_request(e.to_string()))?
@@ -454,10 +500,27 @@ async fn manifest_delete(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<
     // Delete by tag name
     let n = ns.to_string();
     let tag = reference.to_string();
-    tokio::task::spawn_blocking(move || s.tag_delete(&n, &tag))
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(crate::store_err)?;
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || {
+            let _span = tracing::info_span!("store_mutation", op = "manifest_delete_tag", ns = %n, tag = %tag).entered();
+            s.tag_delete(&n, &tag)?;
+            s.epoch_advance(
+                &n,
+                vec![EpochMutation {
+                    op: MutationOp::TagDelete,
+                    namespace: n.clone(),
+                    tag_name: tag,
+                    old_kappa: None,
+                    new_kappa: None,
+                }],
+            )?;
+            Ok::<_, kappa_core::StoreError>(())
+        }
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
 
     StatusCode::ACCEPTED.into_response(cx)
 }

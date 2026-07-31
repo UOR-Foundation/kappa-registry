@@ -17,6 +17,7 @@
 
 mod blob;
 mod edge;
+pub mod encrypted;
 mod epoch;
 mod namespace;
 mod tables;
@@ -26,7 +27,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use redb::Database;
+use redb::{Database, ReadableDatabase};
 
 use kappa_core::clock::Clock;
 use kappa_core::epoch::EpochRoot;
@@ -39,6 +40,16 @@ pub struct PersistentStore {
     db: Database,
     fsync: bool,
     epoch_cache: RwLock<HashMap<String, EpochRoot>>,
+    /// Optional encryption key for blob-at-rest and redb value encryption.
+    /// When Some, blobs are AEAD-encrypted before writing to disk, and
+    /// blob paths use HMAC(key, kappa) instead of plaintext hex.
+    /// When None, blobs are stored in plaintext (default).
+    encryption_key: Option<[u8; 32]>,
+    /// Cached BlobEncryptor for the current encryption key.
+    /// Constructed once at store creation, reused for all operations.
+    blob_encryptor: Option<kappa_core::crypto::aead::BlobEncryptor>,
+    /// Cached TableEncryptor for redb value encryption.
+    table_encryptor: Option<encrypted::TableEncryptor>,
 }
 
 impl PersistentStore {
@@ -47,6 +58,26 @@ impl PersistentStore {
         db_path: PathBuf,
         clock: Arc<dyn Clock>,
         fsync: bool,
+    ) -> Result<Self, StoreError> {
+        Self::new_with_encryption(blob_root, db_path, clock, fsync, None)
+    }
+
+    /// Create a PersistentStore with optional encryption.
+    ///
+    /// When `encryption_key` is Some, all blob content is AEAD-encrypted
+    /// with per-blob nonces derived from the kappa-label. Blob filesystem
+    /// paths use HMAC(key, kappa) instead of plaintext hex to prevent
+    /// content-inference from filenames. Redb table values are encrypted
+    /// with the same key.
+    ///
+    /// When `encryption_key` is None, the store operates in plaintext
+    /// mode (backward compatible, default).
+    pub fn new_with_encryption(
+        blob_root: PathBuf,
+        db_path: PathBuf,
+        clock: Arc<dyn Clock>,
+        fsync: bool,
+        encryption_key: Option<[u8; 32]>,
     ) -> Result<Self, StoreError> {
         std::fs::create_dir_all(&blob_root).map_err(StoreError::Io)?;
         if let Some(parent) = db_path.parent() {
@@ -74,8 +105,31 @@ impl PersistentStore {
             txn.open_table(tables::NAMESPACES).map_err(Self::redb_err)?;
             txn.open_table(tables::EPOCH_CURRENT)
                 .map_err(Self::redb_err)?;
+            txn.open_multimap_table(tables::ASSERTION_INBOUND)
+                .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
+
+        let blob_encryptor = match &encryption_key {
+            Some(key) => {
+                // Create a FileKms with the encryption key as root secret
+                let erased_dir = blob_root.join("_erased");
+                let kms = kappa_core::crypto::kms::FileKms::new(*key, erased_dir)
+                    .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                Some(
+                    kappa_core::crypto::aead::BlobEncryptor::new(&kms, "_default")
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+                )
+            }
+            None => None,
+        };
+        let table_encryptor = match &encryption_key {
+            Some(key) => Some(
+                encrypted::TableEncryptor::new(key)
+                    .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+            ),
+            None => None,
+        };
 
         Ok(Self {
             blob_root,
@@ -83,11 +137,86 @@ impl PersistentStore {
             db,
             fsync,
             epoch_cache: RwLock::new(HashMap::new()),
+            encryption_key,
+            blob_encryptor,
+            table_encryptor,
         })
     }
 
     pub(crate) fn redb_err(e: impl std::fmt::Display) -> StoreError {
         StoreError::Io(std::io::Error::other(e.to_string()))
+    }
+
+    /// Index an assertion by subject+facet for cross-namespace resolution.
+    pub fn assertion_index_put(
+        &self,
+        subject: &str,
+        facet: &str,
+        assertion_kappa: &str,
+    ) -> Result<(), StoreError> {
+        let key = format!("{}\x00{}", subject, facet);
+        let txn = self.db.begin_write().map_err(Self::redb_err)?;
+        {
+            let mut table = txn
+                .open_multimap_table(tables::ASSERTION_INBOUND)
+                .map_err(Self::redb_err)?;
+            table
+                .insert(&*key, assertion_kappa)
+                .map_err(Self::redb_err)?;
+        }
+        txn.commit().map_err(Self::redb_err)?;
+        Ok(())
+    }
+
+    /// Query assertions by subject+facet from the cross-namespace index.
+    pub fn assertion_index_query(
+        &self,
+        subject: &str,
+        facet: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let key = format!("{}\x00{}", subject, facet);
+        let txn = self.db.begin_read().map_err(Self::redb_err)?;
+        let table = txn
+            .open_multimap_table(tables::ASSERTION_INBOUND)
+            .map_err(Self::redb_err)?;
+        let mut results = Vec::new();
+        if let Ok(values) = table.get(&*key) {
+            for v in values.flatten() {
+                results.push(v.value().to_string());
+            }
+        }
+        Ok(results)
+    }
+
+    /// Query all assertions for a subject (any facet) from the cross-namespace index.
+    pub fn assertion_index_query_subject(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let prefix = format!("{}\x00", subject);
+        let txn = self.db.begin_read().map_err(Self::redb_err)?;
+        let table = txn
+            .open_multimap_table(tables::ASSERTION_INBOUND)
+            .map_err(Self::redb_err)?;
+        let mut results = Vec::new();
+        let range = match Self::prefix_successor(prefix.as_bytes()) {
+            Some(end) => {
+                let end_str = String::from_utf8_lossy(&end).to_string();
+                table.range::<&str>(prefix.as_str()..end_str.as_str())
+            }
+            None => table.range::<&str>(prefix.as_str()..),
+        };
+        if let Ok(iter) = range {
+            for entry in iter.flatten() {
+                let (_key, values) = entry;
+                for v in values.flatten() {
+                    results.push(v.value().to_string());
+                }
+            }
+        }
+        results.sort();
+        results.dedup();
+        Ok(results)
     }
 
     /// Compute the successor key for prefix range scans.
@@ -228,6 +357,20 @@ impl KappaStore for PersistentStore {
     }
     fn namespace_exists(&self, ns: &str) -> Result<bool, StoreError> {
         self.namespace_exists_impl(ns)
+    }
+    fn assertion_index_put(
+        &self,
+        subject: &str,
+        facet: &str,
+        assertion_kappa: &str,
+    ) -> Result<(), StoreError> {
+        PersistentStore::assertion_index_put(self, subject, facet, assertion_kappa)
+    }
+    fn assertion_index_query_subject(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        PersistentStore::assertion_index_query_subject(self, subject)
     }
 }
 

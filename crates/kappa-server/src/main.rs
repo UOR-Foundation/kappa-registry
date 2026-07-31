@@ -26,6 +26,7 @@ use kappa_core::transaction::TransactionManager;
 use kappa_core::types::MaxBlobSize;
 use kappa_store_redb::PersistentStore;
 
+use auth::TrustPolicy;
 use broadcast::EventBroadcaster;
 use config::Config;
 use layers::*;
@@ -299,6 +300,15 @@ async fn main() {
         builder = builder.app_context(ni.clone());
     }
 
+    // TrustPolicy -> AsserterFilter for identity resolution
+    {
+        let trust_policy = auth::AllowList::allow_all();
+        let filter = Arc::new(kappa_module_identity::AsserterFilter(
+            Box::new(move |asserter: &str| trust_policy.believes(asserter, "")),
+        ));
+        builder = builder.app_context(filter);
+    }
+
     if let Some(ref rl) = rate_limiter {
         builder = builder.app_context(rl.clone());
     }
@@ -367,6 +377,48 @@ async fn main() {
         builder = builder.app_context(crdt_manager);
 
         builder = kappa_module_distribution::register(builder);
+    }
+
+    // -- Veilid transport (optional) --
+    #[cfg(feature = "veilid")]
+    {
+        if let Some(ref storage_dir) = cfg.veilid_storage_dir {
+            let namespace = cfg.veilid_namespace.clone().unwrap_or_else(|| "kappa-registry".to_string());
+            tracing::info!(
+                storage_dir = %storage_dir,
+                namespace = %namespace,
+                "starting Veilid transport"
+            );
+
+            let transport_config = kappa_transport_veilid::TransportConfig {
+                namespace,
+                storage_dir: storage_dir.clone(),
+                allow_insecure_protected_store: cfg.veilid_insecure,
+                ..Default::default()
+            };
+
+            match kappa_transport_veilid::TransportNode::start(transport_config).await {
+                Ok((node, _inbound_rx)) => {
+                    let node = Arc::new(node);
+                    let peer_transport = Arc::new(
+                        kappa_transport_veilid::VeilidPeerTransport::new(node.clone()),
+                    );
+                    let self_id = node_identity
+                        .as_ref()
+                        .map(|ni| ni.anchor().as_str().to_string())
+                        .unwrap_or_default();
+                    let membership = Arc::new(
+                        kappa_transport_veilid::VeilidMembershipView::new(node.clone(), self_id),
+                    );
+                    builder = builder.app_context(peer_transport);
+                    builder = builder.app_context(membership);
+                    tracing::info!("Veilid transport started");
+                }
+                Err(e) => {
+                    tracing::warn!("Veilid transport start failed: {e}");
+                }
+            }
+        }
     }
 
     let router = builder.build();

@@ -95,6 +95,12 @@ pub struct Config {
     pub proxy_trusted_header: Option<String>,
     /// CORS allowed origins. Default "*" (permissive).
     pub cors_allowed_origins: String,
+    /// Veilid transport: storage directory.
+    pub veilid_storage_dir: Option<String>,
+    /// Veilid transport: namespace.
+    pub veilid_namespace: Option<String>,
+    /// Veilid transport: allow insecure protected store (testing only).
+    pub veilid_insecure: bool,
 }
 
 impl Config {
@@ -153,6 +159,10 @@ impl Config {
         let proxy_trusted_header = std::env::var("KAPPA_PROXY_TRUSTED_HEADERS").ok();
         let cors_allowed_origins = env_or("KAPPA_CORS_ALLOWED_ORIGINS", "*");
 
+        let veilid_storage_dir = std::env::var("KAPPA_VEILID_STORAGE_DIR").ok();
+        let veilid_namespace = std::env::var("KAPPA_VEILID_NAMESPACE").ok();
+        let veilid_insecure = env_or("KAPPA_VEILID_INSECURE", "false") == "true";
+
         Config {
             listen_addr,
             store_root,
@@ -173,6 +183,9 @@ impl Config {
             max_api_body_bytes,
             proxy_trusted_header,
             cors_allowed_origins,
+            veilid_storage_dir,
+            veilid_namespace,
+            veilid_insecure,
         }
     }
 
@@ -287,6 +300,9 @@ mod tests {
             max_api_body_bytes: 4 * 1024 * 1024,
             proxy_trusted_header: None,
             cors_allowed_origins: "*".into(),
+            veilid_storage_dir: None,
+            veilid_namespace: None,
+            veilid_insecure: false,
         };
         assert_eq!(cfg.listen_host(), "10.0.0.1");
         assert_eq!(cfg.listen_port(), "8080");

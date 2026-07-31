@@ -86,6 +86,43 @@ pub fn resolve_all(
     resolve_at(assertions, revocations, watermarks, u64::MAX)
 }
 
+/// Resolve all assertions with an optional asserter filter.
+///
+/// After the standard revocation/watermark filtering, applies the
+/// asserter_filter closure to exclude assertions from untrusted asserters.
+/// Pass None to allow all asserters (equivalent to resolve_all).
+///
+/// The filter is a closure rather than a trait to avoid kappa-core
+/// depending on kappa-server's TrustPolicy type. The server layer
+/// wires AllowList::believes as the closure.
+pub fn resolve_all_filtered(
+    assertions: &[IdentityAssertion],
+    revocations: &[Revocation],
+    watermarks: &[Watermark],
+    asserter_filter: Option<&dyn Fn(&str) -> bool>,
+) -> ResolutionResult {
+    let mut result = resolve_all(assertions, revocations, watermarks);
+    if let Some(filter) = asserter_filter {
+        result.valid.retain(|a| filter(&a.asserter));
+    }
+    result
+}
+
+/// Resolve assertions at a specific time with an optional asserter filter.
+pub fn resolve_at_filtered(
+    assertions: &[IdentityAssertion],
+    revocations: &[Revocation],
+    watermarks: &[Watermark],
+    at_ms: u64,
+    asserter_filter: Option<&dyn Fn(&str) -> bool>,
+) -> ResolutionResult {
+    let mut result = resolve_at(assertions, revocations, watermarks, at_ms);
+    if let Some(filter) = asserter_filter {
+        result.valid.retain(|a| filter(&a.asserter));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +203,51 @@ mod tests {
         ];
         let result = resolve_all(&assertions, &[], &[]);
         assert_eq!(result.valid.len(), 2);
+    }
+
+    #[test]
+    fn resolve_all_filtered_excludes_untrusted() {
+        let assertions = vec![
+            make_assertion("trusted", "f1", 100, None),
+            make_assertion("untrusted", "f2", 200, None),
+        ];
+        let result = resolve_all_filtered(
+            &assertions,
+            &[],
+            &[],
+            Some(&|asserter: &str| asserter == "trusted"),
+        );
+        assert_eq!(result.valid.len(), 1);
+        assert_eq!(result.valid[0].asserter, "trusted");
+    }
+
+    #[test]
+    fn resolve_all_filtered_none_allows_all() {
+        let assertions = vec![
+            make_assertion("a", "f1", 100, None),
+            make_assertion("b", "f2", 200, None),
+        ];
+        let result = resolve_all_filtered(&assertions, &[], &[], None);
+        assert_eq!(result.valid.len(), 2);
+    }
+
+    #[test]
+    fn resolve_at_filtered_combines_time_and_trust() {
+        let assertions = vec![
+            make_assertion("trusted", "f1", 100, Some(300)),
+            make_assertion("untrusted", "f2", 100, None),
+            make_assertion("trusted", "f3", 500, None),
+        ];
+        // At time 200: f1 is valid (100-300), f2 is valid, f3 not yet valid
+        // Filter: only "trusted"
+        let result = resolve_at_filtered(
+            &assertions,
+            &[],
+            &[],
+            200,
+            Some(&|asserter: &str| asserter == "trusted"),
+        );
+        assert_eq!(result.valid.len(), 1);
+        assert_eq!(result.valid[0].facet, "f1");
     }
 }

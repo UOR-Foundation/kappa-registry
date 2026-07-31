@@ -8,7 +8,7 @@ use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use kappa_core::types::TagUpdate;
+use kappa_core::types::{EpochMutation, MutationOp, TagUpdate};
 
 use crate::{path_param, query_param, read_body, store};
 
@@ -51,10 +51,25 @@ async fn tag_batch(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> 
 
     let s = store(cx).clone();
     let n = ns.to_string();
-    tokio::task::spawn_blocking(move || s.tag_set_batch(&n, &updates))
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(crate::store_err)?;
+    let mutations: Vec<EpochMutation> = updates
+        .iter()
+        .map(|u| EpochMutation {
+            op: MutationOp::TagSet,
+            namespace: n.clone(),
+            tag_name: u.name.clone(),
+            old_kappa: None,
+            new_kappa: Some(u.kappa.clone()),
+        })
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let _span = tracing::info_span!("store_mutation", op = "tag_set_batch", ns = %n, count = updates.len()).entered();
+        s.tag_set_batch(&n, &updates)?;
+        s.epoch_advance(&n, mutations)?;
+        Ok::<_, kappa_core::StoreError>(())
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
 
     (StatusCode::OK, [("content-length", "0")]).into_response(cx)
 }
@@ -88,15 +103,36 @@ async fn tag_delete_prefix(cx: &Cx, ns: &str, prefix: &str) -> topcoat::Result<R
     .map_err(crate::store_err)?;
 
     let count = matching.len();
-    for tag in &matching {
-        let t = tag.name.clone();
-        let n = ns.to_string();
-        let _ = tokio::task::spawn_blocking({
-            let s = s.clone();
-            move || s.tag_delete(&n, &t)
+    let ns_owned = ns.to_string();
+    let mutations: Vec<EpochMutation> = matching
+        .iter()
+        .map(|tag| EpochMutation {
+            op: MutationOp::TagDelete,
+            namespace: ns_owned.clone(),
+            tag_name: tag.name.clone(),
+            old_kappa: Some(tag.kappa.clone()),
+            new_kappa: None,
         })
-        .await;
-    }
+        .collect();
+
+    tokio::task::spawn_blocking({
+        let s = s.clone();
+        let n = ns_owned.clone();
+        let tags_to_delete: Vec<String> = matching.iter().map(|t| t.name.clone()).collect();
+        move || {
+            let _span = tracing::info_span!("store_mutation", op = "tag_delete_prefix", ns = %n, count = tags_to_delete.len()).entered();
+            for tag_name in &tags_to_delete {
+                s.tag_delete(&n, tag_name)?;
+            }
+            if !mutations.is_empty() {
+                s.epoch_advance(&n, mutations)?;
+            }
+            Ok::<_, kappa_core::StoreError>(())
+        }
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
 
     let body = serde_json::json!({"deleted": count});
     (
@@ -171,10 +207,24 @@ async fn tag_create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response>
     }
 
     let nm = name.to_string();
-    tokio::task::spawn_blocking(move || s.tag_set(&n, &nm, &k))
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(crate::store_err)?;
+    tokio::task::spawn_blocking(move || {
+        let _span = tracing::info_span!("store_mutation", op = "tag_create", ns = %n, tag = %nm).entered();
+        s.tag_set(&n, &nm, &k)?;
+        s.epoch_advance(
+            &n,
+            vec![EpochMutation {
+                op: MutationOp::TagSet,
+                namespace: n.clone(),
+                tag_name: nm,
+                old_kappa: None,
+                new_kappa: Some(k),
+            }],
+        )?;
+        Ok::<_, kappa_core::StoreError>(())
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
 
     (StatusCode::CREATED, [("content-length", "0")]).into_response(cx)
 }
@@ -204,10 +254,24 @@ async fn tag_delete_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<R
     let s = store(cx).clone();
     let n = ns.to_string();
     let nm = name.to_string();
-    tokio::task::spawn_blocking(move || s.tag_delete(&n, &nm))
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(crate::store_err)?;
+    tokio::task::spawn_blocking(move || {
+        let _span = tracing::info_span!("store_mutation", op = "tag_delete", ns = %n, tag = %nm).entered();
+        s.tag_delete(&n, &nm)?;
+        s.epoch_advance(
+            &n,
+            vec![EpochMutation {
+                op: MutationOp::TagDelete,
+                namespace: n.clone(),
+                tag_name: nm,
+                old_kappa: None,
+                new_kappa: None,
+            }],
+        )?;
+        Ok::<_, kappa_core::StoreError>(())
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
 
     StatusCode::ACCEPTED.into_response(cx)
 }
@@ -312,7 +376,21 @@ async fn tag_put(
         tokio::task::spawn_blocking({
             let s = s.clone();
             let n = n.clone();
-            move || s.tag_set(&n, &nm, &resolved_kappa)
+            move || {
+                let _span = tracing::info_span!("store_mutation", op = "tag_set_symref", ns = %n, tag = %nm).entered();
+                s.tag_set(&n, &nm, &resolved_kappa)?;
+                s.epoch_advance(
+                    &n,
+                    vec![EpochMutation {
+                        op: MutationOp::TagSet,
+                        namespace: n.clone(),
+                        tag_name: nm,
+                        old_kappa: None,
+                        new_kappa: Some(resolved_kappa),
+                    }],
+                )?;
+                Ok::<_, kappa_core::StoreError>(())
+            }
         })
         .await
         .map_err(|e| bad_request(e.to_string()))?
@@ -361,16 +439,29 @@ async fn tag_put(
 
         let result = tokio::task::spawn_blocking({
             let s = s.clone();
-            move || match s.tag_get(&n, &nm) {
-                Ok(entry) => {
-                    if entry.kappa == ek {
-                        s.tag_set(&n, &nm, &k)?;
-                        Ok(true)
-                    } else {
-                        Ok(false)
+            move || {
+                let _span = tracing::info_span!("store_mutation", op = "tag_set_cas", ns = %n, tag = %nm).entered();
+                match s.tag_get(&n, &nm) {
+                    Ok(entry) => {
+                        if entry.kappa == ek {
+                            s.tag_set(&n, &nm, &k)?;
+                            s.epoch_advance(
+                                &n,
+                                vec![EpochMutation {
+                                    op: MutationOp::TagSet,
+                                    namespace: n.clone(),
+                                    tag_name: nm,
+                                    old_kappa: Some(ek),
+                                    new_kappa: Some(k),
+                                }],
+                            )?;
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
                     }
+                    Err(_) => Ok(false),
                 }
-                Err(_) => Ok(false),
             }
         })
         .await
@@ -402,10 +493,26 @@ async fn tag_put(
             kappa: k.clone(),
             expected_version: Some(0),
         }];
+        let kappa_for_epoch = k.clone();
+        let name_for_epoch = updates[0].name.clone();
         let result = tokio::task::spawn_blocking({
             let s = s.clone();
             let n = n.clone();
-            move || s.tag_set_batch(&n, &updates)
+            move || {
+                let _span = tracing::info_span!("store_mutation", op = "tag_set_if_none_match", ns = %n, tag = %name_for_epoch).entered();
+                s.tag_set_batch(&n, &updates)?;
+                s.epoch_advance(
+                    &n,
+                    vec![EpochMutation {
+                        op: MutationOp::TagSet,
+                        namespace: n.clone(),
+                        tag_name: name_for_epoch,
+                        old_kappa: None,
+                        new_kappa: Some(kappa_for_epoch),
+                    }],
+                )?;
+                Ok::<_, kappa_core::StoreError>(())
+            }
         })
         .await
         .map_err(|e| bad_request(e.to_string()))?;
@@ -443,7 +550,21 @@ async fn tag_put(
 
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.tag_set(&n, &nm, &k)
+        move || {
+            let _span = tracing::info_span!("store_mutation", op = "tag_set", ns = %n, tag = %nm).entered();
+            s.tag_set(&n, &nm, &k)?;
+            s.epoch_advance(
+                &n,
+                vec![EpochMutation {
+                    op: MutationOp::TagSet,
+                    namespace: n.clone(),
+                    tag_name: nm,
+                    old_kappa: None,
+                    new_kappa: Some(k),
+                }],
+            )?;
+            Ok::<_, kappa_core::StoreError>(())
+        }
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?

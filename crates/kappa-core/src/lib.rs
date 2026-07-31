@@ -34,8 +34,9 @@ pub use crypto::{
 };
 pub use epoch::{EpochRoot, EpochRootFields};
 pub use kappa::{
-    axis_of, blob_path_for, compute_kappa, kappa_from_bytes, kappa_from_value, sha256_raw,
-    split_kappa, verify_kappa, Axis, KappaLabel, LabelError, Sha1Policy,
+    axis_of, blob_path_for, compute_kappa, encrypted_blob_path_for, kappa_from_bytes,
+    kappa_from_value, sha256_raw, split_kappa, verify_kappa, Axis, KappaLabel, LabelError,
+    Sha1Policy,
 };
 pub use store::KappaStore;
 pub use types::*;

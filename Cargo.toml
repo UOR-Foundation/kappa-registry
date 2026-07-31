@@ -10,6 +10,7 @@ members = [
     "crates/kappa-module-distribution",
     "crates/kappa-akd",
     "crates/kappa-reconcile",
+    "crates/kappa-transport-veilid",
     "crates/kappa-conformance",
 ]
 
@@ -47,6 +48,9 @@ frost-core = { version = "3", features = ["serialization"] }
 frost-ed25519 = { version = "3", features = ["serialization"] }
 frost-p256 = { version = "3", features = ["serialization"] }
 frost-secp256k1 = { version = "3", features = ["serialization"] }
+
+# Symmetric encryption (AES-256-GCM + AEGIS-128L via rekindle-aead)
+rekindle-aead = { git = "https://github.com/ScopeCreep-zip/rekindle", branch = "feat/cli-tui-restructure-rewrite", default-features = false }
 
 # Key management
 zeroize = "1.9"
