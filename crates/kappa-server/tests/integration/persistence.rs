@@ -299,9 +299,7 @@ fn format_version_rejects_old() {
     let tmp = tempfile::tempdir().unwrap();
     let port = pick_port();
 
-    // Write format version 3 (current is 4 after concern 1 bumps it).
-    // If the actual current version is still 3, this test is wrong --
-    // but the test is written for the post-implementation state.
+    // Write an old format version that the server must reject.
     std::fs::write(tmp.path().join("format_version"), "3\n").unwrap();
 
     let mut guard = start_server_expect_failure(tmp.path(), port);
@@ -338,12 +336,12 @@ fn format_version_accepts_current() {
     let tmp = tempfile::tempdir().unwrap();
     let port = pick_port();
 
-    // Write the current format version.
-    // TODO: This should read STORE_FORMAT_VERSION from kappa_core::version
-    // rather than hardcoding. For now, version 4 is the post-implementation target.
-    // If the current version is 3 (pre-implementation), this test passes vacuously
-    // because check_or_write_version creates the file on first use.
-    std::fs::write(tmp.path().join("format_version"), "4\n").unwrap();
+    // Write the current format version from the constant, not hardcoded.
+    std::fs::write(
+        tmp.path().join("format_version"),
+        format!("{}\n", kappa_core::version::STORE_FORMAT_VERSION),
+    )
+    .unwrap();
 
     let guard = start_server_at(tmp.path(), port);
     let c = client();
