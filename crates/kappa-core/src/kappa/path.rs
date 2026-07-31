@@ -63,6 +63,39 @@ pub fn split_kappa(kappa: &str) -> Option<(&str, &str)> {
     Some((&kappa[..colon], &kappa[colon + 1..]))
 }
 
+/// Compute an encrypted filesystem path for a blob.
+///
+/// Uses HMAC(ns_key, kappa) as the filename instead of the raw hex digest.
+/// This prevents an attacker with filesystem access from correlating
+/// filenames with content hashes. The HMAC is keyed per-namespace so
+/// the same kappa in different namespaces produces different paths.
+///
+/// Layout: {root}/_enc/{hmac[0..2]}/{hmac[2..4]}/{hmac}
+///
+/// The `_enc` prefix distinguishes encrypted paths from plaintext paths.
+/// A store that mixes encrypted and plaintext namespaces can coexist
+/// in the same blob_root.
+pub fn encrypted_blob_path_for(
+    root: &Path,
+    ns_key: &[u8; 32],
+    kappa: &str,
+) -> Result<PathBuf, StoreError> {
+    // Validate the kappa format first
+    let _ = split_kappa(kappa)
+        .ok_or_else(|| StoreError::Rejected(format!("invalid kappa-label: {}", kappa)))?;
+
+    let mut hasher = blake3::Hasher::new_keyed(ns_key);
+    hasher.update(kappa.as_bytes());
+    let hash = hasher.finalize();
+    let hmac_hex = hex::encode(hash.as_bytes());
+
+    Ok(root
+        .join("_enc")
+        .join(&hmac_hex[..2])
+        .join(&hmac_hex[2..4])
+        .join(&hmac_hex))
+}
+
 /// Extract the axis prefix from a kappa string without full validation.
 ///
 /// Returns the algorithm name (e.g. "sha256") or None if no colon.

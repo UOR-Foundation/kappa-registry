@@ -54,6 +54,11 @@ pub enum AuthError {
 /// - Reserved namespaces require a capability edge from the namespace
 ///   authority granting the asserter the requested op class. This
 ///   includes reads -- reserved content is not public.
+///
+/// Namespace hierarchy: if `ns` contains '/', the authorization check
+/// walks up the hierarchy. A capability edge on "org" grants access to
+/// "org/team" and "org/team/repo". The first match wins. This enables
+/// organization-level capability grants that apply to all sub-namespaces.
 pub fn authorize(
     store: &dyn KappaStore,
     ns: &str,
@@ -67,23 +72,65 @@ pub fn authorize(
         return Ok(());
     }
 
-    // Query edges where the asserter is the source, looking for
-    // Capability relation edges in this namespace.
-    let query = EdgeQuery {
+    // Walk namespace hierarchy: "org/team/repo" -> "org/team" -> "org"
+    let mut check_ns = ns;
+    loop {
+        let query = EdgeQuery {
+            anchor: asserter.to_string(),
+            direction: Direction::Outbound,
+            relation: Some(EdgeRelation::Capability),
+            asserter: Some(asserter.to_string()),
+        };
+        if let Ok(edges) = store.edge_query(check_ns, &query) {
+            if edges.iter().any(|e| cap_permits(e, op)) {
+                return Ok(());
+            }
+        }
+
+        // Walk up to parent namespace
+        match check_ns.rfind('/') {
+            Some(pos) => check_ns = &check_ns[..pos],
+            None => break,
+        }
+    }
+
+    // Two-hop role check: asserter -> role (holds-role) -> namespace (capability)
+    // Query edges where the asserter holds a role
+    let role_query = EdgeQuery {
         anchor: asserter.to_string(),
         direction: Direction::Outbound,
         relation: Some(EdgeRelation::Capability),
-        asserter: Some(asserter.to_string()),
+        asserter: None,
     };
-    let edges = store.edge_query(ns, &query)?;
-
-    if edges.iter().any(|e| cap_permits(e, op)) {
-        Ok(())
-    } else {
-        Err(AuthError::Forbidden {
-            reason: "no capability edge for this operation on reserved namespace".to_owned(),
-        })
+    // Check all namespaces the asserter has edges in for role grants
+    if let Ok(role_edges) = store.edge_query(ns, &role_query) {
+        for role_edge in &role_edges {
+            // The target of a holds-role edge is the role anchor
+            // Check if that role has the capability on this namespace
+            if let Some(ref meta) = role_edge.metadata {
+                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(meta) {
+                    if parsed.get("type").and_then(|v| v.as_str()) == Some("holds-role") {
+                        let role_anchor = &role_edge.target;
+                        let role_cap_query = EdgeQuery {
+                            anchor: role_anchor.clone(),
+                            direction: Direction::Outbound,
+                            relation: Some(EdgeRelation::Capability),
+                            asserter: Some(role_anchor.clone()),
+                        };
+                        if let Ok(role_caps) = store.edge_query(ns, &role_cap_query) {
+                            if role_caps.iter().any(|e| cap_permits(e, op)) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    Err(AuthError::Forbidden {
+        reason: "no capability edge for this operation on reserved namespace".to_owned(),
+    })
 }
 
 /// Check if a capability edge permits the requested operation class.
@@ -172,6 +219,63 @@ impl BearerAuth {
                 Err(resp)
             }
         }
+    }
+}
+
+// -- Authz result cache -----------------------------------------------------
+
+/// Cache of authorization results keyed on (asserter, namespace, op_class).
+///
+/// Invalidated when any epoch advances. Uses DashMap for lock-free
+/// concurrent reads on the hot path (every request checks authz).
+/// Epoch-keyed invalidation: the cache stores results only for the
+/// current epoch. When epoch_advance fires, the cache is cleared.
+pub struct AuthzCache {
+    cache: dashmap::DashMap<(String, String, u8), bool>,
+    epoch: std::sync::atomic::AtomicU64,
+}
+
+impl AuthzCache {
+    pub fn new() -> Self {
+        Self {
+            cache: dashmap::DashMap::new(),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Check cache for a prior authorization result. Returns None on miss.
+    pub fn check(&self, asserter: &str, ns: &str, op: OpClass) -> Option<bool> {
+        let key = (asserter.to_string(), ns.to_string(), op as u8);
+        self.cache.get(&key).map(|v| *v)
+    }
+
+    /// Insert an authorization result.
+    pub fn insert(&self, asserter: &str, ns: &str, op: OpClass, allowed: bool) {
+        let key = (asserter.to_string(), ns.to_string(), op as u8);
+        self.cache.insert(key, allowed);
+    }
+
+    /// Invalidate all cached results. Called on epoch advance.
+    pub fn invalidate(&self) {
+        self.cache.clear();
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Number of cached entries (for diagnostics).
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+}
+
+impl Default for AuthzCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

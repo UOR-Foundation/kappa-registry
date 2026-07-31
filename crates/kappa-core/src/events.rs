@@ -95,6 +95,19 @@ pub trait EventLog: Send + Sync {
     /// client sends its last-seen sequence, server returns everything
     /// since then.
     fn since_sequence(&self, namespace: &str, after: u64) -> Vec<TagEvent>;
+
+    /// Remove all events with sequence <= retain_after across all namespaces.
+    /// Returns the number of events removed.
+    ///
+    /// Used to bound memory for long-running servers. The retention floor
+    /// is the oldest sequence number that clients can catch up from.
+    /// Events below the floor are gone -- clients that fall behind must
+    /// do a full re-sync.
+    fn compact(&self, retain_after: u64) -> usize;
+
+    /// The oldest available sequence number across all namespaces.
+    /// Returns 0 if no events exist.
+    fn oldest_sequence(&self) -> u64;
 }
 
 /// In-memory event log with bounded VecDeque per namespace.
@@ -155,6 +168,25 @@ impl EventLog for InMemoryEventLog {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn compact(&self, retain_after: u64) -> usize {
+        let mut log = self.log.write().expect("event log lock poisoned");
+        let mut total_removed = 0;
+        for events in log.values_mut() {
+            let before = events.len();
+            events.retain(|e| e.sequence > retain_after);
+            total_removed += before - events.len();
+        }
+        total_removed
+    }
+
+    fn oldest_sequence(&self) -> u64 {
+        let log = self.log.read().expect("event log lock poisoned");
+        log.values()
+            .filter_map(|events| events.front().map(|e| e.sequence))
+            .min()
+            .unwrap_or(0)
     }
 }
 
@@ -310,5 +342,52 @@ mod tests {
         log.emit(make_event("ns", "b"));
         let events = log.recent("ns", 100);
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn compact_removes_old_events() {
+        let log = InMemoryEventLog::new();
+        for i in 0..10 {
+            log.emit(make_event("ns", &format!("t{}", i)));
+        }
+        // Events have sequences 1..=10. Compact retaining > 5.
+        let removed = log.compact(5);
+        assert_eq!(removed, 5);
+        let remaining = log.since_sequence("ns", 0);
+        assert_eq!(remaining.len(), 5);
+        assert_eq!(remaining[0].sequence, 6);
+    }
+
+    #[test]
+    fn compact_all_removes_everything() {
+        let log = InMemoryEventLog::new();
+        log.emit(make_event("ns", "a"));
+        log.emit(make_event("ns", "b"));
+        let removed = log.compact(u64::MAX);
+        assert_eq!(removed, 2);
+        assert!(log.since_sequence("ns", 0).is_empty());
+    }
+
+    #[test]
+    fn oldest_sequence_tracks_minimum() {
+        let log = InMemoryEventLog::new();
+        assert_eq!(log.oldest_sequence(), 0);
+        log.emit(make_event("ns1", "a"));
+        log.emit(make_event("ns2", "b"));
+        assert_eq!(log.oldest_sequence(), 1);
+        log.compact(1);
+        assert_eq!(log.oldest_sequence(), 2);
+    }
+
+    #[test]
+    fn compact_across_namespaces() {
+        let log = InMemoryEventLog::new();
+        log.emit(make_event("ns1", "a")); // seq 1
+        log.emit(make_event("ns2", "b")); // seq 2
+        log.emit(make_event("ns1", "c")); // seq 3
+        let removed = log.compact(2);
+        assert_eq!(removed, 2); // seq 1 from ns1, seq 2 from ns2
+        assert_eq!(log.since_sequence("ns1", 0).len(), 1);
+        assert!(log.since_sequence("ns2", 0).is_empty());
     }
 }

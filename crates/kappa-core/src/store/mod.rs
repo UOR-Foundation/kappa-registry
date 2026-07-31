@@ -138,6 +138,28 @@ pub trait KappaStore: Send + Sync {
 
     fn namespace_list(&self) -> Result<Vec<String>, StoreError>;
     fn namespace_exists(&self, ns: &str) -> Result<bool, StoreError>;
+
+    // -- Cross-namespace assertion index (2, optional) -------------------------
+
+    /// Index an assertion by subject+facet for cross-namespace resolution.
+    /// Default: no-op. PersistentStore overrides with redb multimap.
+    fn assertion_index_put(
+        &self,
+        _subject: &str,
+        _facet: &str,
+        _assertion_kappa: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Query assertions by subject from the cross-namespace index.
+    /// Default: empty vec. PersistentStore overrides with redb scan.
+    fn assertion_index_query_subject(
+        &self,
+        _subject: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Convenience function for internal code that wants auto-sha256 storage.

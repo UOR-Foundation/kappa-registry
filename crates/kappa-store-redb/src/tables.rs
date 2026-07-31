@@ -37,8 +37,8 @@ pub const EDGE_ASR: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("edge_asr");
 
 // -- Sequences ----------------------------------------------------------------
-// Key: "{ns}\x00{name}"  Value: counter (u64)
-pub const SEQUENCES: TableDefinition<&str, u64> = TableDefinition::new("sequences");
+// Key: "{ns}\x00{name}"  Value: counter as 8-byte big-endian (encrypted when enabled)
+pub const SEQUENCES: TableDefinition<&str, &[u8]> = TableDefinition::new("sequences_v5");
 
 // -- Blob metadata ------------------------------------------------------------
 // Key: "{kappa}\x00{meta_key}"  Value: raw bytes
@@ -57,3 +57,11 @@ pub const NAMESPACES: TableDefinition<&str, ()> = TableDefinition::new("namespac
 // Key: "{ns}"  Value: "{kappa}" of the current epoch root
 pub const EPOCH_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("epoch_current");
+
+// -- Identity assertion inbound index -----------------------------------------
+// Key: "{subject}\x00{facet}"  Values: assertion kappa strings
+// Cross-namespace: assertions from any namespace are indexed here.
+// Used by resolve endpoints to find assertions about a subject without
+// scanning all namespace tag prefixes.
+pub const ASSERTION_INBOUND: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("assertion_inbound");

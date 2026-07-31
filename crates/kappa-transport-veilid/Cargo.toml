@@ -1,0 +1,30 @@
+[package]
+name = "kappa-transport-veilid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Veilid DHT transport adapter for kappa-registry federation."
+
+[lib]
+name = "kappa_transport_veilid"
+path = "src/lib.rs"
+
+[dependencies]
+# kappa-core provides PeerTransport + MembershipView traits
+kappa-core = { workspace = true }
+kappa-reconcile = { workspace = true }
+
+# rekindle-transport-veilid provides the Veilid node lifecycle, DHT ops,
+# route management, peer registry, and sender/caller primitives.
+# This crate adapts those to kappa-core's trait interfaces.
+rekindle-transport-veilid = { git = "https://github.com/ScopeCreep-zip/rekindle", branch = "feat/cli-tui-restructure-rewrite" }
+rekindle-types = { git = "https://github.com/ScopeCreep-zip/rekindle", branch = "feat/cli-tui-restructure-rewrite" }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }

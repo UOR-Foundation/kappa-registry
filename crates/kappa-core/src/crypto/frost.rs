@@ -146,6 +146,7 @@ impl FrostEd25519Coordinator {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ecdsa::{K256SchnorrVerifier, P256SchnorrVerifier};
     use super::super::ed25519::Ed25519Verifier;
     use super::super::Verifier;
     use super::*;
@@ -283,5 +284,185 @@ mod tests {
                 &group_sig
             )
             .unwrap());
+    }
+
+    // -- FROST P-256 end-to-end -----------------------------------------------
+
+    fn keygen_p256_2_of_3() -> (
+        frost_p256::keys::PublicKeyPackage,
+        Vec<frost_p256::keys::KeyPackage>,
+    ) {
+        let rng = rand_core_06::OsRng;
+        let (shares, pubkey_package) = frost_p256::keys::generate_with_dealer(
+            3,
+            2,
+            frost_p256::keys::IdentifierList::Default,
+            rng,
+        )
+        .unwrap();
+        let key_packages: Vec<frost_p256::keys::KeyPackage> = shares
+            .into_values()
+            .map(|s| frost_p256::keys::KeyPackage::try_from(s).unwrap())
+            .collect();
+        (pubkey_package, key_packages)
+    }
+
+    #[test]
+    fn frost_p256_sign_verify() {
+        let (pubkey_pkg, key_packages) = keygen_p256_2_of_3();
+        let message = b"frost p256 threshold test";
+        let mut rng = rand_core_06::OsRng;
+
+        let (nonces_0, commits_0) =
+            frost_p256::round1::commit(key_packages[0].signing_share(), &mut rng);
+        let (nonces_1, commits_1) =
+            frost_p256::round1::commit(key_packages[1].signing_share(), &mut rng);
+
+        let mut commitment_map = std::collections::BTreeMap::new();
+        commitment_map.insert(*key_packages[0].identifier(), commits_0);
+        commitment_map.insert(*key_packages[1].identifier(), commits_1);
+
+        let signing_package = frost_p256::SigningPackage::new(commitment_map, message);
+
+        let share_0 =
+            frost_p256::round2::sign(&signing_package, &nonces_0, &key_packages[0]).unwrap();
+        let share_1 =
+            frost_p256::round2::sign(&signing_package, &nonces_1, &key_packages[1]).unwrap();
+
+        let mut share_map = std::collections::BTreeMap::new();
+        share_map.insert(*key_packages[0].identifier(), share_0);
+        share_map.insert(*key_packages[1].identifier(), share_1);
+
+        let sig = frost_p256::aggregate(&signing_package, &share_map, &pubkey_pkg).unwrap();
+        let sig_bytes = sig.serialize().unwrap();
+        let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
+
+        let verifier = P256SchnorrVerifier;
+        assert!(verifier.verify(&vk_bytes, message, &sig_bytes).unwrap());
+    }
+
+    #[test]
+    fn frost_p256_wrong_message_fails() {
+        let (pubkey_pkg, key_packages) = keygen_p256_2_of_3();
+        let mut rng = rand_core_06::OsRng;
+
+        let (nonces_0, commits_0) =
+            frost_p256::round1::commit(key_packages[0].signing_share(), &mut rng);
+        let (nonces_1, commits_1) =
+            frost_p256::round1::commit(key_packages[1].signing_share(), &mut rng);
+
+        let mut commitment_map = std::collections::BTreeMap::new();
+        commitment_map.insert(*key_packages[0].identifier(), commits_0);
+        commitment_map.insert(*key_packages[1].identifier(), commits_1);
+
+        let signing_package =
+            frost_p256::SigningPackage::new(commitment_map, b"signed message");
+
+        let share_0 =
+            frost_p256::round2::sign(&signing_package, &nonces_0, &key_packages[0]).unwrap();
+        let share_1 =
+            frost_p256::round2::sign(&signing_package, &nonces_1, &key_packages[1]).unwrap();
+
+        let mut share_map = std::collections::BTreeMap::new();
+        share_map.insert(*key_packages[0].identifier(), share_0);
+        share_map.insert(*key_packages[1].identifier(), share_1);
+
+        let sig = frost_p256::aggregate(&signing_package, &share_map, &pubkey_pkg).unwrap();
+        let sig_bytes = sig.serialize().unwrap();
+        let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
+
+        let verifier = P256SchnorrVerifier;
+        assert!(!verifier.verify(&vk_bytes, b"wrong message", &sig_bytes).unwrap());
+    }
+
+    // -- FROST secp256k1 end-to-end -------------------------------------------
+
+    fn keygen_secp256k1_2_of_3() -> (
+        frost_secp256k1::keys::PublicKeyPackage,
+        Vec<frost_secp256k1::keys::KeyPackage>,
+    ) {
+        let rng = rand_core_06::OsRng;
+        let (shares, pubkey_package) = frost_secp256k1::keys::generate_with_dealer(
+            3,
+            2,
+            frost_secp256k1::keys::IdentifierList::Default,
+            rng,
+        )
+        .unwrap();
+        let key_packages: Vec<frost_secp256k1::keys::KeyPackage> = shares
+            .into_values()
+            .map(|s| frost_secp256k1::keys::KeyPackage::try_from(s).unwrap())
+            .collect();
+        (pubkey_package, key_packages)
+    }
+
+    #[test]
+    fn frost_secp256k1_sign_verify() {
+        let (pubkey_pkg, key_packages) = keygen_secp256k1_2_of_3();
+        let message = b"frost secp256k1 threshold test";
+        let mut rng = rand_core_06::OsRng;
+
+        let (nonces_0, commits_0) =
+            frost_secp256k1::round1::commit(key_packages[0].signing_share(), &mut rng);
+        let (nonces_1, commits_1) =
+            frost_secp256k1::round1::commit(key_packages[1].signing_share(), &mut rng);
+
+        let mut commitment_map = std::collections::BTreeMap::new();
+        commitment_map.insert(*key_packages[0].identifier(), commits_0);
+        commitment_map.insert(*key_packages[1].identifier(), commits_1);
+
+        let signing_package = frost_secp256k1::SigningPackage::new(commitment_map, message);
+
+        let share_0 =
+            frost_secp256k1::round2::sign(&signing_package, &nonces_0, &key_packages[0]).unwrap();
+        let share_1 =
+            frost_secp256k1::round2::sign(&signing_package, &nonces_1, &key_packages[1]).unwrap();
+
+        let mut share_map = std::collections::BTreeMap::new();
+        share_map.insert(*key_packages[0].identifier(), share_0);
+        share_map.insert(*key_packages[1].identifier(), share_1);
+
+        let sig =
+            frost_secp256k1::aggregate(&signing_package, &share_map, &pubkey_pkg).unwrap();
+        let sig_bytes = sig.serialize().unwrap();
+        let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
+
+        let verifier = K256SchnorrVerifier;
+        assert!(verifier.verify(&vk_bytes, message, &sig_bytes).unwrap());
+    }
+
+    #[test]
+    fn frost_secp256k1_wrong_message_fails() {
+        let (pubkey_pkg, key_packages) = keygen_secp256k1_2_of_3();
+        let mut rng = rand_core_06::OsRng;
+
+        let (nonces_0, commits_0) =
+            frost_secp256k1::round1::commit(key_packages[0].signing_share(), &mut rng);
+        let (nonces_1, commits_1) =
+            frost_secp256k1::round1::commit(key_packages[1].signing_share(), &mut rng);
+
+        let mut commitment_map = std::collections::BTreeMap::new();
+        commitment_map.insert(*key_packages[0].identifier(), commits_0);
+        commitment_map.insert(*key_packages[1].identifier(), commits_1);
+
+        let signing_package =
+            frost_secp256k1::SigningPackage::new(commitment_map, b"signed message");
+
+        let share_0 =
+            frost_secp256k1::round2::sign(&signing_package, &nonces_0, &key_packages[0]).unwrap();
+        let share_1 =
+            frost_secp256k1::round2::sign(&signing_package, &nonces_1, &key_packages[1]).unwrap();
+
+        let mut share_map = std::collections::BTreeMap::new();
+        share_map.insert(*key_packages[0].identifier(), share_0);
+        share_map.insert(*key_packages[1].identifier(), share_1);
+
+        let sig =
+            frost_secp256k1::aggregate(&signing_package, &share_map, &pubkey_pkg).unwrap();
+        let sig_bytes = sig.serialize().unwrap();
+        let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
+
+        let verifier = K256SchnorrVerifier;
+        assert!(!verifier.verify(&vk_bytes, b"wrong message", &sig_bytes).unwrap());
     }
 }

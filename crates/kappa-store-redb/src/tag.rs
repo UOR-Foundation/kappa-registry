@@ -57,7 +57,15 @@ impl PersistentStore {
                 .map(|v| parse_version(v.value()))
                 .unwrap_or(0);
             version = current_version + 1;
-            let db_value = format!("{}\x00{}", kappa, version);
+            let plaintext_value = format!("{}\x00{}", kappa, version);
+            let db_value = match &self.table_encryptor {
+                Some(enc) => {
+                    let encrypted = enc.encrypt_value(&db_key, plaintext_value.as_bytes())
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    hex::encode(&encrypted)
+                }
+                None => plaintext_value,
+            };
             table
                 .insert(db_key.as_str(), db_value.as_str())
                 .map_err(Self::redb_err)?;
@@ -74,7 +82,19 @@ impl PersistentStore {
             .get(db_key.as_str())
             .map_err(Self::redb_err)?
             .ok_or_else(|| StoreError::NotFound(format!("{}/{}", ns, name)))?;
-        parse_entry(name, val.value())
+        let raw_value = val.value();
+        let decrypted_value = match &self.table_encryptor {
+            Some(enc) => {
+                let encrypted_bytes = hex::decode(raw_value)
+                    .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                let plaintext = enc.decrypt_value(&db_key, &encrypted_bytes)
+                    .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                String::from_utf8(plaintext)
+                    .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?
+            }
+            None => raw_value.to_string(),
+        };
+        parse_entry(name, &decrypted_value)
     }
 
     pub(crate) fn tag_delete_impl(&self, ns: &str, name: &str) -> Result<(), StoreError> {
@@ -94,6 +114,20 @@ impl PersistentStore {
         let table = txn.open_table(TAGS).map_err(Self::redb_err)?;
         let mut entries = Vec::new();
 
+        let decrypt_value = |db_key: &str, raw: &str| -> Result<String, StoreError> {
+            match &self.table_encryptor {
+                Some(enc) => {
+                    let bytes = hex::decode(raw)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    let pt = enc.decrypt_value(db_key, &bytes)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    String::from_utf8(pt)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
+                }
+                None => Ok(raw.to_string()),
+            }
+        };
+
         match Self::prefix_successor(prefix.as_bytes()) {
             Some(end_bytes) => {
                 let end_str = String::from_utf8(end_bytes)
@@ -103,10 +137,12 @@ impl PersistentStore {
                     .map_err(Self::redb_err)?
                 {
                     let (k, v) = item.map_err(Self::redb_err)?;
-                    let name = k.value().strip_prefix(&prefix).ok_or_else(|| {
+                    let key_str = k.value();
+                    let name = key_str.strip_prefix(&prefix).ok_or_else(|| {
                         StoreError::Io(std::io::Error::other("prefix mismatch"))
                     })?;
-                    entries.push(parse_entry(name, v.value())?);
+                    let decrypted = decrypt_value(key_str, v.value())?;
+                    entries.push(parse_entry(name, &decrypted)?);
                 }
             }
             None => {
@@ -120,7 +156,8 @@ impl PersistentStore {
                         break;
                     }
                     let name = key_str.strip_prefix(&prefix).unwrap();
-                    entries.push(parse_entry(name, v.value())?);
+                    let decrypted = decrypt_value(key_str, v.value())?;
+                    entries.push(parse_entry(name, &decrypted)?);
                 }
             }
         }
@@ -139,6 +176,20 @@ impl PersistentStore {
         let table = txn.open_table(TAGS).map_err(Self::redb_err)?;
         let mut entries = Vec::new();
 
+        let decrypt_value = |db_key: &str, raw: &str| -> Result<String, StoreError> {
+            match &self.table_encryptor {
+                Some(enc) => {
+                    let bytes = hex::decode(raw)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    let pt = enc.decrypt_value(db_key, &bytes)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    String::from_utf8(pt)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
+                }
+                None => Ok(raw.to_string()),
+            }
+        };
+
         match Self::prefix_successor(db_prefix.as_bytes()) {
             Some(end_bytes) => {
                 let end_str = String::from_utf8(end_bytes)
@@ -148,10 +199,12 @@ impl PersistentStore {
                     .map_err(Self::redb_err)?
                 {
                     let (k, v) = item.map_err(Self::redb_err)?;
-                    let name = k.value().strip_prefix(&ns_prefix).ok_or_else(|| {
+                    let key_str = k.value();
+                    let name = key_str.strip_prefix(&ns_prefix).ok_or_else(|| {
                         StoreError::Io(std::io::Error::other("prefix mismatch"))
                     })?;
-                    entries.push(parse_entry(name, v.value())?);
+                    let decrypted = decrypt_value(key_str, v.value())?;
+                    entries.push(parse_entry(name, &decrypted)?);
                 }
             }
             None => {
@@ -165,7 +218,8 @@ impl PersistentStore {
                         break;
                     }
                     let name = key_str.strip_prefix(&ns_prefix).unwrap();
-                    entries.push(parse_entry(name, v.value())?);
+                    let decrypted = decrypt_value(key_str, v.value())?;
+                    entries.push(parse_entry(name, &decrypted)?);
                 }
             }
         }
@@ -212,7 +266,15 @@ impl PersistentStore {
                     .map(|v| parse_version(v.value()))
                     .unwrap_or(0);
                 let version = current + 1;
-                let db_value = format!("{}\x00{}", update.kappa, version);
+                let plaintext_value = format!("{}\x00{}", update.kappa, version);
+                let db_value = match &self.table_encryptor {
+                    Some(enc) => {
+                        let encrypted = enc.encrypt_value(&db_key, plaintext_value.as_bytes())
+                            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                        hex::encode(&encrypted)
+                    }
+                    None => plaintext_value,
+                };
                 table
                     .insert(db_key.as_str(), db_value.as_str())
                     .map_err(Self::redb_err)?;

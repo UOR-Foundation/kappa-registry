@@ -55,6 +55,8 @@
                 ];
               })
               pkg-config
+              protobuf
+              cmake
               b3sum
               taplo
               shellcheck

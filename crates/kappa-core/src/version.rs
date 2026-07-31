@@ -11,7 +11,12 @@ use crate::types::StoreError;
 ///
 /// v3: dCBOR canonical encoding, hashbrown store, Merkle epoch roots,
 ///     EdgeRelation enum, ThresholdSigner/ThresholdCoordinator split.
-pub const STORE_FORMAT_VERSION: u32 = 4;
+/// v4: redb persistent store, blob metadata tables, ns_meta index,
+///     epoch chain blob persistence, SHA3-256/Keccak256 axes.
+/// v5: GC sweep with build_root_set, probe.rs, resolve_all_filtered,
+///     event log compaction, federation config, membership state,
+///     watermark endpoint, FROST P-256/K-256 end-to-end verified.
+pub const STORE_FORMAT_VERSION: u32 = 5;
 
 const VERSION_FILE: &str = "format_version";
 

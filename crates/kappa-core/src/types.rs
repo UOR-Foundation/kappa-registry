@@ -262,6 +262,65 @@ pub enum MutationOp {
     BlobDelete,
 }
 
+// -- Federation config (per-namespace) ---------------------------------------
+
+/// Per-namespace federation configuration.
+///
+/// Stored as a tag under _config/federation in each namespace.
+/// CBOR key assignments (PERMANENT):
+///   0: mode, 1: peers, 2: sync_interval_secs, 3: conflict_resolution
+#[derive(Debug, Clone, PartialEq, Eq, CBORCodable)]
+pub struct FederationConfig {
+    #[cbor(n = 0)]
+    pub mode: FederationMode,
+    #[cbor(n = 1)]
+    pub peers: Vec<String>,
+    #[cbor(n = 2)]
+    pub sync_interval_secs: u64,
+    #[cbor(n = 3)]
+    pub conflict_resolution: ConflictResolution,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            mode: FederationMode::Disabled,
+            peers: Vec::new(),
+            sync_interval_secs: 300,
+            conflict_resolution: ConflictResolution::Reject,
+        }
+    }
+}
+
+/// Federation participation mode for a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CBORCodable)]
+pub enum FederationMode {
+    /// No federation. This namespace is local-only.
+    #[cbor(n = 0)]
+    Disabled,
+    /// Active federation: push and pull.
+    #[cbor(n = 1)]
+    Active,
+    /// Passive federation: pull only, never push.
+    #[cbor(n = 2)]
+    Passive,
+}
+
+/// How to resolve conflicts when federation pulls a tag that
+/// already exists locally with a different kappa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CBORCodable)]
+pub enum ConflictResolution {
+    /// Reject the remote value. Manual resolution required.
+    #[cbor(n = 0)]
+    Reject,
+    /// Accept all remote values unconditionally.
+    #[cbor(n = 1)]
+    AcceptAll,
+    /// Higher version number wins.
+    #[cbor(n = 2)]
+    VersionWins,
+}
+
 // -- Writer mode (anti-seam) ------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +486,35 @@ mod tests {
         let bytes = canonical_bytes(&d);
         let decoded: Direction = from_canonical(&bytes).unwrap();
         assert_eq!(decoded, d);
+    }
+
+    #[test]
+    fn federation_config_roundtrip() {
+        let config = FederationConfig {
+            mode: FederationMode::Active,
+            peers: vec!["http://peer1:8080".into(), "http://peer2:8080".into()],
+            sync_interval_secs: 60,
+            conflict_resolution: ConflictResolution::VersionWins,
+        };
+        let bytes = canonical_bytes(&config);
+        let decoded: FederationConfig = from_canonical(&bytes).unwrap();
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn federation_config_default() {
+        let config = FederationConfig::default();
+        assert!(matches!(config.mode, FederationMode::Disabled));
+        assert!(config.peers.is_empty());
+        assert_eq!(config.sync_interval_secs, 300);
+        assert!(matches!(config.conflict_resolution, ConflictResolution::Reject));
+    }
+
+    #[test]
+    fn federation_mode_deterministic() {
+        let a = canonical_bytes(&FederationMode::Active);
+        let b = canonical_bytes(&FederationMode::Passive);
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod absence;
 pub mod assertion;
 pub mod audience;
 pub mod node;
+pub mod probe;
 pub mod resolution;
 pub mod revocation;
 pub mod trust;

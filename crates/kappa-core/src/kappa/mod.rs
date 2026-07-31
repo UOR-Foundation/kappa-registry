@@ -30,5 +30,5 @@ mod tests;
 
 pub use compute::{compute_kappa, kappa_from_bytes, kappa_from_value, sha256_raw, verify_kappa};
 pub use label::{Axis, KappaLabel, LabelError};
-pub use path::{axis_of, blob_path_for, split_kappa};
+pub use path::{axis_of, blob_path_for, encrypted_blob_path_for, split_kappa};
 pub use sha1_policy::Sha1Policy;

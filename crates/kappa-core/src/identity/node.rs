@@ -99,6 +99,62 @@ impl NodeIdentity {
     pub fn set_position(&self, pos: TrustPosition) {
         *self.position.write().expect("position lock poisoned") = pos;
     }
+
+    /// Update trust position from a batch of probe results.
+    ///
+    /// Examines all probe results to determine the aggregate trust state:
+    /// - All verified -> Federated { verified_peers: count }
+    /// - Any equivocation -> Degraded { reason: Equivocation, ... }
+    /// - Any invalid signature -> Degraded { reason: SignatureInvalid, ... }
+    /// - All unreachable -> Standalone (absence is not failure, I-3)
+    /// - No probes -> Unprobed
+    pub fn update_from_probes(&self, results: &[super::probe::ProbeResult]) {
+        use super::probe::ProbeResult;
+        use super::trust::DegradeReason;
+
+        if results.is_empty() {
+            return;
+        }
+
+        let mut verified = 0u64;
+        let mut unreachable = 0u64;
+        let mut sig_invalid = 0u64;
+        let mut equivocations = 0u64;
+        let total = results.len() as u64;
+
+        for result in results {
+            match result {
+                ProbeResult::Verified(_) => verified += 1,
+                ProbeResult::Unreachable(_) => unreachable += 1,
+                ProbeResult::SignatureInvalid(_) => sig_invalid += 1,
+                ProbeResult::Equivocation { .. } => equivocations += 1,
+            }
+        }
+
+        let position = if equivocations > 0 {
+            TrustPosition::Degraded {
+                reason: DegradeReason::Equivocation,
+                reachable: verified + sig_invalid,
+                verified,
+            }
+        } else if sig_invalid > 0 {
+            TrustPosition::Degraded {
+                reason: DegradeReason::SignatureInvalid,
+                reachable: verified + sig_invalid,
+                verified,
+            }
+        } else if verified > 0 {
+            TrustPosition::Federated {
+                verified_peers: verified,
+            }
+        } else if unreachable == total {
+            TrustPosition::Standalone
+        } else {
+            TrustPosition::Unprobed
+        };
+
+        self.set_position(position);
+    }
 }
 
 #[cfg(test)]

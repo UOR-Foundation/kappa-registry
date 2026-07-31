@@ -17,7 +17,10 @@ use crate::PersistentStore;
 
 impl PersistentStore {
     pub(crate) fn blob_path_for(&self, kappa: &str) -> Result<PathBuf, StoreError> {
-        kappa_core::kappa::blob_path_for(&self.blob_root, kappa)
+        match &self.encryption_key {
+            Some(key) => kappa_core::kappa::encrypted_blob_path_for(&self.blob_root, key, kappa),
+            None => kappa_core::kappa::blob_path_for(&self.blob_root, kappa),
+        }
     }
 
     pub(crate) fn blob_put_impl(&self, kappa: &str, content: &[u8]) -> Result<bool, StoreError> {
@@ -29,12 +32,27 @@ impl PersistentStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
         }
+
+        // Encrypt content if encryption is enabled
+        let write_content: std::borrow::Cow<[u8]> = match &self.blob_encryptor {
+            Some(enc) => {
+                let (ct, tag) = enc.encrypt(kappa, content)
+                    .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                // Store format: [tag:16][ciphertext:N]
+                let mut buf = Vec::with_capacity(16 + ct.len());
+                buf.extend_from_slice(&tag);
+                buf.extend_from_slice(&ct);
+                std::borrow::Cow::Owned(buf)
+            }
+            None => std::borrow::Cow::Borrowed(content),
+        };
+
         let tmp = path.with_extension("tmp");
         {
             use std::io::Write;
             let file = std::fs::File::create(&tmp).map_err(StoreError::Io)?;
             let mut writer = std::io::BufWriter::new(file);
-            writer.write_all(content).map_err(StoreError::Io)?;
+            writer.write_all(&write_content).map_err(StoreError::Io)?;
             let file = writer
                 .into_inner()
                 .map_err(|e| StoreError::Io(e.into_error()))?;
@@ -55,13 +73,29 @@ impl PersistentStore {
 
     pub(crate) fn blob_get_impl(&self, kappa: &str) -> Result<Vec<u8>, StoreError> {
         let path = self.blob_path_for(kappa)?;
-        std::fs::read(&path).map_err(|e| {
+        let raw = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound(kappa.to_string())
             } else {
                 StoreError::Io(e)
             }
-        })
+        })?;
+
+        // Decrypt if encryption is enabled
+        match &self.blob_encryptor {
+            Some(enc) => {
+                if raw.len() < 16 {
+                    return Err(StoreError::Io(std::io::Error::other(
+                        "encrypted blob too short for tag",
+                    )));
+                }
+                let tag: [u8; 16] = raw[..16].try_into().unwrap();
+                let ciphertext = &raw[16..];
+                enc.decrypt(kappa, ciphertext, &tag)
+                    .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
+            }
+            None => Ok(raw),
+        }
     }
 
     pub(crate) fn blob_exists_impl(&self, kappa: &str) -> Result<bool, StoreError> {
@@ -168,11 +202,16 @@ impl PersistentStore {
         value: &[u8],
     ) -> Result<(), StoreError> {
         let db_key = format!("{}\x00{}", kappa, key);
+        let stored_value: Vec<u8> = match &self.table_encryptor {
+            Some(enc) => enc.encrypt_value(&db_key, value)
+                .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+            None => value.to_vec(),
+        };
         let txn = self.db.begin_write().map_err(Self::redb_err)?;
         {
             let mut table = txn.open_table(BLOB_META).map_err(Self::redb_err)?;
             table
-                .insert(db_key.as_str(), value)
+                .insert(db_key.as_str(), stored_value.as_slice())
                 .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
@@ -187,11 +226,16 @@ impl PersistentStore {
         let db_key = format!("{}\x00{}", kappa, key);
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
         let table = txn.open_table(BLOB_META).map_err(Self::redb_err)?;
-        table
+        let raw = table
             .get(db_key.as_str())
             .map_err(Self::redb_err)?
             .map(|v| v.value().to_vec())
-            .ok_or_else(|| StoreError::NotFound(format!("meta {}:{}", kappa, key)))
+            .ok_or_else(|| StoreError::NotFound(format!("meta {}:{}", kappa, key)))?;
+        match &self.table_encryptor {
+            Some(enc) => enc.decrypt_value(&db_key, &raw)
+                .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string()))),
+            None => Ok(raw),
+        }
     }
 
     pub(crate) fn blob_delete_meta_impl(
@@ -223,11 +267,19 @@ impl PersistentStore {
             let mut ns_table = txn.open_table(NAMESPACES).map_err(Self::redb_err)?;
             ns_table.insert(ns, ()).map_err(Self::redb_err)?;
             let db_key = format!("{}\x00{}\x00{}", ns, key, value);
+            let stored_kappa = match &self.table_encryptor {
+                Some(enc) => {
+                    let encrypted = enc.encrypt_value(&db_key, kappa.as_bytes())
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    hex::encode(&encrypted)
+                }
+                None => kappa.to_string(),
+            };
             let mut table = txn
                 .open_multimap_table(crate::tables::NS_META)
                 .map_err(Self::redb_err)?;
             table
-                .insert(db_key.as_str(), kappa)
+                .insert(db_key.as_str(), stored_kappa.as_str())
                 .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
@@ -246,6 +298,20 @@ impl PersistentStore {
             .map_err(Self::redb_err)?;
         let mut results = Vec::new();
 
+        let decrypt_multimap_value = |db_key: &str, raw: &str| -> Result<String, StoreError> {
+            match &self.table_encryptor {
+                Some(enc) => {
+                    let bytes = hex::decode(raw)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    let pt = enc.decrypt_value(db_key, &bytes)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    String::from_utf8(pt)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
+                }
+                None => Ok(raw.to_string()),
+            }
+        };
+
         if value.is_empty() {
             let prefix = format!("{}\x00{}\x00", ns, key);
             match Self::prefix_successor(prefix.as_bytes()) {
@@ -256,9 +322,11 @@ impl PersistentStore {
                         .range::<&str>(prefix.as_str()..end_str.as_str())
                         .map_err(Self::redb_err)?
                     {
-                        let (_, values) = entry.map_err(Self::redb_err)?;
+                        let (k, values) = entry.map_err(Self::redb_err)?;
+                        let db_key = k.value();
                         for v in values {
-                            results.push(v.map_err(Self::redb_err)?.value().to_string());
+                            let raw = v.map_err(Self::redb_err)?.value().to_string();
+                            results.push(decrypt_multimap_value(db_key, &raw)?);
                         }
                     }
                 }
@@ -271,8 +339,10 @@ impl PersistentStore {
                         if !k.value().starts_with(&prefix) {
                             break;
                         }
+                        let db_key = k.value();
                         for v in values {
-                            results.push(v.map_err(Self::redb_err)?.value().to_string());
+                            let raw = v.map_err(Self::redb_err)?.value().to_string();
+                            results.push(decrypt_multimap_value(db_key, &raw)?);
                         }
                     }
                 }
@@ -280,7 +350,8 @@ impl PersistentStore {
         } else {
             let db_key = format!("{}\x00{}\x00{}", ns, key, value);
             for v in table.get(db_key.as_str()).map_err(Self::redb_err)? {
-                results.push(v.map_err(Self::redb_err)?.value().to_string());
+                let raw = v.map_err(Self::redb_err)?.value().to_string();
+                results.push(decrypt_multimap_value(&db_key, &raw)?);
             }
         }
 

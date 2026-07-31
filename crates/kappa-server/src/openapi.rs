@@ -101,6 +101,11 @@ const ROUTES: &[&str] = &[
     "post|/identity/revoke|identity_revoke|Revoke an assertion|Identity||j|j",
     "get|/identity/absence/{subject}/{facet}|identity_absence|Absence proof|Identity|subject:path!,facet:path!|-|j",
     "get|/identity/audit/{start}/{end}|identity_audit|Audit proof|Identity|start:path!,end:path!|-|j",
+    "post|/identity/watermark|identity_watermark|Advance watermark|Identity||j|j",
+    "post|/identity/anchor|identity_anchor|Register anchor spec|Identity||j|j",
+    // Cluster
+    "get|/cluster/members|cluster_members|List cluster members|System||-|j",
+    "get|/cluster/status|cluster_status|Cluster status|System||-|j",
 ];
 
 // -- Spec builder -------------------------------------------------------------
