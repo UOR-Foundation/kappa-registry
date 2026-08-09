@@ -178,7 +178,7 @@ mod tests {
     fn tampered_ciphertext_fails() {
         let enc = TableEncryptor::new(&[0x42u8; 32]).unwrap();
         let mut encrypted = enc.encrypt_value("key", b"data").unwrap();
-        encrypted[20] ^= 0xFF; // tamper after the tag
+        encrypted[16] ^= 0xFF; // tamper the ciphertext (first byte after tag)
         assert!(enc.decrypt_value("key", &encrypted).is_err());
     }
 
