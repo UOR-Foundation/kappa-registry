@@ -95,7 +95,7 @@ async fn ingest(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         let mut kappas = Vec::with_capacity(entries.len());
         for entry in &entries {
             // Bundle entry already has the kappa -- store at that address
-            s.blob_put(&entry.kappa, &entry.content)?;
+            s.ingest_verified(&entry.kappa,&entry.content)?;
             kappas.push(entry.kappa.clone());
         }
         Ok::<Vec<String>, kappa_core::StoreError>(kappas)

@@ -10,7 +10,6 @@
 use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTable};
 
 use kappa_core::canonical::{canonical_bytes, from_canonical};
-use kappa_core::kappa::kappa_from_bytes;
 use kappa_core::types::*;
 
 use crate::tables::*;
@@ -19,8 +18,10 @@ use crate::PersistentStore;
 impl PersistentStore {
     pub(crate) fn edge_put_impl(&self, ns: &str, edge: &Edge) -> Result<(), StoreError> {
         let edge_bytes = canonical_bytes(edge);
-        let edge_kappa = kappa_from_bytes(&edge_bytes);
-        self.blob_put_impl(&edge_kappa, &edge_bytes)?;
+        let edge_kappa = {
+            use kappa_core::store::KappaStore;
+            self.ingest_compute(kappa_core::kappa::Axis::Sha256, &edge_bytes)?.kappa
+        };
 
         let txn = self.db.begin_write().map_err(Self::redb_err)?;
         {

@@ -11,6 +11,8 @@ members = [
     "crates/kappa-akd",
     "crates/kappa-reconcile",
     "crates/kappa-transport-veilid",
+    "crates/kappa-module-git",
+    "crates/kappa-module-s3",
     "crates/kappa-conformance",
 ]
 

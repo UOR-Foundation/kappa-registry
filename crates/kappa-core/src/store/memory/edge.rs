@@ -42,7 +42,7 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &str, edge: &Edge) -> Result<(
 
     let edge_bytes = canonical_bytes(edge);
     let edge_kappa = kappa_from_bytes(&edge_bytes);
-    store.blob_put(&edge_kappa, &edge_bytes)?;
+    store.ingest_compute(crate::kappa::Axis::Sha256, &edge_bytes)?;
 
     let ns_hash = namespace_hash(ns);
     let ek_hash = item_hash(&edge_kappa);

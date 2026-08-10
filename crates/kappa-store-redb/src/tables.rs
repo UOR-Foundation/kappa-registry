@@ -58,6 +58,27 @@ pub const NAMESPACES: TableDefinition<&str, ()> = TableDefinition::new("namespac
 pub const EPOCH_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("epoch_current");
 
+// -- Binding records (sigma-to-kappa mapping for encrypted stores) ------------
+// Key: "{sigma}"  Value: dCBOR-encoded BindingRecord
+// When encryption is enabled, sigma = hash(plaintext) and kappa = hash(ciphertext).
+// The binding record maps the protocol-facing sigma to the storage-facing kappa
+// plus the encryption nonce needed to decrypt. When encryption is disabled,
+// this table is empty and unused (sigma == kappa, identity transform).
+pub const BINDING_RECORDS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("binding_records");
+
+// -- Credentials --------------------------------------------------------------
+// Key: access_key_id  Value: TableEncryptor-encrypted credential record
+pub const CREDENTIALS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("credentials");
+
+// -- Versions -----------------------------------------------------------------
+// Key: "{ns}\x00{key}\x00{!timestamp_be}"  Value: dCBOR VersionEntry
+// Key ordering: namespace ascending, key ascending, timestamp descending
+// (bit-inverted timestamp so newest sorts first in ascending B-tree).
+pub const VERSIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("versions");
+
 // -- Identity assertion inbound index -----------------------------------------
 // Key: "{subject}\x00{facet}"  Values: assertion kappa strings
 // Cross-namespace: assertions from any namespace are indexed here.

@@ -26,6 +26,7 @@ hex = { workspace = true }
 uuid = { workspace = true }
 bytes = "1"
 tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
 http-body-util = "0.1"
 http-body = "1"
 futures-util = "0.3"

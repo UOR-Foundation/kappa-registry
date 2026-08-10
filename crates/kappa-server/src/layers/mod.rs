@@ -13,6 +13,12 @@ pub mod request_id;
 pub mod request_log;
 pub mod response_compliance;
 pub mod security_headers;
+#[cfg(feature = "git")]
+pub mod git_rewrite;
+#[cfg(feature = "s3")]
+pub mod s3_vhost;
+#[cfg(feature = "s3")]
+pub mod sigv4;
 pub mod timeout;
 
 pub use auth::auth_layer;

@@ -347,6 +347,106 @@ pub enum FaultModel {
     Byzantine,
 }
 
+// -- Protocol hint for response shaping ----------------------------------------
+
+/// Protocol hint registered per-route. Middleware reads this to apply
+/// protocol-specific response headers (Warning for OCI, Cache-Control
+/// differences for S3 vs Git, etc.). Registered at route registration
+/// time, not per-request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProtocolHint {
+    Oci,
+    S3,
+    Git,
+    KappaDistribution,
+    None,
+}
+
+// -- Attestation digests (cannot produce KappaLabel) --------------------------
+
+/// Digest algorithms that attest to content but do NOT produce content
+/// addresses (KappaLabel). MD5, CRC32, CRC32C, CRC64-NVME are attestation
+/// digests. They appear in S3 ETags, checksum headers, and part manifests.
+/// They CANNOT be used as addressing axes. There is no conversion from
+/// AttestationDigest to Axis or KappaLabel. Attempting to use one as
+/// a content address is a type error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttestationDigest {
+    Md5,
+    Crc32,
+    Crc32c,
+    Crc64Nvme,
+}
+
+impl AttestationDigest {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Md5 => "md5",
+            Self::Crc32 => "crc32",
+            Self::Crc32c => "crc32c",
+            Self::Crc64Nvme => "crc64nvme",
+        }
+    }
+
+    /// Compute the attestation digest of content. Returns raw digest
+    /// bytes, NOT a KappaLabel. There is no conversion path from this
+    /// return type to KappaLabel.
+    pub fn compute(&self, content: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Md5 => {
+                use md5::Digest;
+                md5::Md5::digest(content).to_vec()
+            }
+            Self::Crc32 => {
+                let checksum = crc_fast::checksum(
+                    crc_fast::CrcAlgorithm::Crc32IsoHdlc, content,
+                );
+                (checksum as u32).to_be_bytes().to_vec()
+            }
+            Self::Crc32c => {
+                let checksum = crc_fast::checksum(
+                    crc_fast::CrcAlgorithm::Crc32Iscsi, content,
+                );
+                (checksum as u32).to_be_bytes().to_vec()
+            }
+            Self::Crc64Nvme => {
+                let checksum = crc_fast::checksum(
+                    crc_fast::CrcAlgorithm::Crc64Nvme, content,
+                );
+                checksum.to_be_bytes().to_vec()
+            }
+        }
+    }
+}
+
+// -- Versioning ---------------------------------------------------------------
+
+/// Versioning state for a namespace/bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersioningState {
+    Unversioned,
+    Enabled,
+    Suspended,
+}
+
+/// A single version entry in the version chain.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VersionEntry {
+    pub version_id: String,
+    pub kappa: Option<String>,
+    pub is_delete_marker: bool,
+    pub timestamp_ms: u64,
+    pub size: u64,
+    pub etag: Option<String>,
+}
+
+/// Result of a version delete operation.
+#[derive(Debug, Clone)]
+pub struct DeleteResult {
+    pub version_id: String,
+    pub is_delete_marker: bool,
+}
+
 // -- Namespace hash utilities -----------------------------------------------
 
 /// Hash a namespace name to a u64 for use as a compound key prefix.

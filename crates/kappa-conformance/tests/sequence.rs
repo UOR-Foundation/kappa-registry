@@ -9,9 +9,7 @@ fn new_store() -> (InMemoryStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(NtpLamportClock::new());
     let store = InMemoryStore::new(
-        MemoryStoreConfig {
-            blob_root: dir.path().join("blobs"),
-        },
+        MemoryStoreConfig::new(dir.path().join("blobs")),
         clock,
     )
     .unwrap();

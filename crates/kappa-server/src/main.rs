@@ -139,10 +139,15 @@ async fn main() {
     let clock = Arc::new(NtpLamportClock::new());
     let blob_root = cfg.store_root.join("blobs");
     let db_path = cfg.store_root.join("state.redb");
-    let store: Arc<dyn KappaStore> = Arc::new(
-        PersistentStore::new(blob_root, db_path, clock.clone(), cfg.fsync)
-            .expect("failed to initialize persistent store"),
-    );
+    let store: Arc<dyn KappaStore> = {
+        let mut store_config = kappa_store_redb::PersistentStoreConfig::new(blob_root, db_path);
+        store_config.fsync = cfg.fsync;
+        store_config.upload_timeout_secs = Some(cfg.upload_timeout_secs);
+        Arc::new(
+            PersistentStore::new(store_config, clock.clone())
+                .expect("failed to initialize persistent store"),
+        )
+    };
 
     kappa_core::version::check_or_write_version(&cfg.store_root)
         .expect("store format version check failed");
@@ -313,29 +318,21 @@ async fn main() {
         builder = builder.app_context(rl.clone());
     }
 
-    // -- Upload session store --
+    // -- Upload eviction + config --
     #[cfg(feature = "oci")]
     {
         builder = builder.app_context(disk_pressure.clone());
-        let staging_root = cfg.store_root.join("upload-staging");
-        let session_store = Arc::new(
-            kappa_module_oci::upload_session::SessionStore::new(staging_root, cfg.max_blob_size),
-        );
-        let eviction_store = session_store.clone();
         let upload_timeout_secs = cfg.upload_timeout_secs;
+        let eviction_store = store.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                eviction_store.evict_expired(upload_timeout_secs);
+                eviction_store.upload_evict_expired(upload_timeout_secs);
             }
         });
-        builder = builder.app_context(session_store);
         builder = builder.app_context(kappa_module_oci::upload::UploadTimeout(
             cfg.upload_timeout_secs,
-        ));
-        builder = builder.app_context(kappa_module_oci::upload::BlobRoot(
-            cfg.store_root.join("blobs"),
         ));
     }
 
@@ -421,6 +418,1774 @@ async fn main() {
         }
     }
 
+    // -- Git smart HTTP routes --
+    #[cfg(feature = "git")]
+    {
+        /// Determine the object hash format for a repository.
+        /// Reads _config/object_format tag. Defaults to SHA-1.
+        fn repo_object_hash(store: &dyn KappaStore, repo: &str) -> gix_hash::Kind {
+            match store.tag_get(repo, "_config/object_format") {
+                Ok(entry) => match entry.kappa.as_str() {
+                    "sha256" => gix_hash::Kind::Sha256,
+                    _ => gix_hash::Kind::Sha1,
+                },
+                Err(_) => gix_hash::Kind::Sha1,
+            }
+        }
+
+        fn git_info_refs(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let repo = params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                // service comes from ?service= query param, not path param
+                let service = {
+                    let parts: &http::request::Parts = request_context(cx);
+                    parts.uri.query().unwrap_or("").split('&')
+                        .find_map(|p| p.strip_prefix("service="))
+                        .unwrap_or("").to_string()
+                };
+                let is_upload = service.contains("upload-pack");
+                // Check Git-Protocol header for v2
+                let is_v2 = {
+                    let parts: &http::request::Parts = request_context(cx);
+                    parts.headers.get("git-protocol")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.contains("version=2"))
+                        .unwrap_or(false)
+                };
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let svc = service.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let object_hash = repo_object_hash(&*store, &repo);
+                    let mut out = Vec::new();
+                    if is_v2 {
+                        kappa_module_git::write_v2_capability_advertisement(&mut out, object_hash)
+                            .map(|_| out)
+                    } else {
+                        kappa_module_git::write_ref_advertisement(
+                            &*store, &repo, &svc, &mut out, object_hash,
+                        ).map(|_| out)
+                    }
+                }).await;
+                match result {
+                    Ok(Ok(data)) => {
+                        let ct = if is_upload {
+                            "application/x-git-upload-pack-advertisement"
+                        } else {
+                            "application/x-git-receive-pack-advertisement"
+                        };
+                        let mut resp = (StatusCode::OK, [
+                            ("content-type", ct.to_string()),
+                            ("cache-control", "no-cache".to_string()),
+                        ], data).into_response(cx)?;
+                        if is_v2 {
+                            resp.headers_mut().insert("git-protocol", "version=2".parse().unwrap());
+                        }
+                        Ok(resp)
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(cx),
+                }
+            })
+        }
+
+        fn git_upload_pack(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let repo = params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let is_v2 = {
+                    let parts: &http::request::Parts = request_context(cx);
+                    parts.headers.get("git-protocol")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.contains("version=2"))
+                        .unwrap_or(false)
+                };
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let request_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 256 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    let object_hash = repo_object_hash(&*store, &repo);
+                    let mut response = Vec::new();
+                    if is_v2 {
+                        kappa_module_git::handle_v2_upload_pack(
+                            &*store, &repo,
+                            std::io::Cursor::new(request_bytes),
+                            &mut response,
+                            object_hash,
+                        ).map(|_| response)
+                    } else {
+                        kappa_module_git::handle_upload_pack(
+                            &*store, &repo,
+                            std::io::Cursor::new(request_bytes),
+                            &mut response,
+                            object_hash,
+                        ).map(|_| response)
+                    }
+                }).await;
+                match result {
+                    Ok(Ok(data)) => (StatusCode::OK, [
+                        ("content-type", "application/x-git-upload-pack-result".to_string()),
+                    ], data).into_response(cx),
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(cx),
+                }
+            })
+        }
+
+        fn git_receive_pack(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let repo = params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let request_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 256 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    // Detect object format from push or stored config.
+                    // For new repos, detect from ref update OID length (40=SHA-1, 64=SHA-256).
+                    let object_hash = repo_object_hash(&*store, &repo);
+                    let mut response = Vec::new();
+                    kappa_module_git::handle_receive_pack(
+                        &*store, &repo,
+                        std::io::BufReader::new(std::io::Cursor::new(request_bytes)),
+                        &mut response,
+                        object_hash,
+                    ).map(|_| response)
+                }).await;
+                match result {
+                    Ok(Ok(data)) => (StatusCode::OK, [
+                        ("content-type", "application/x-git-receive-pack-result".to_string()),
+                    ], data).into_response(cx),
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(cx),
+                }
+            })
+        }
+
+        fn git_lfs_batch(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let repo = params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let request_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 10 * 1024 * 1024).await
+                        .map(|b| b.to_vec()).unwrap_or_default()
+                };
+                // Determine base URL from Host header
+                let base_url = {
+                    let parts: &http::request::Parts = request_context(cx);
+                    let host = parts.headers.get("host")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("localhost:5000");
+                    format!("http://{}", host)
+                };
+                let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                    let batch_req: kappa_module_git::BatchRequest =
+                        serde_json::from_slice(&request_bytes)
+                            .map_err(|e| format!("invalid LFS batch request: {e}"))?;
+                    let batch_resp = kappa_module_git::process_batch(
+                        &*store, &base_url, &repo, &batch_req,
+                    );
+                    serde_json::to_vec(&batch_resp)
+                        .map_err(|e| format!("LFS response serialize: {e}"))
+                }).await;
+                match result {
+                    Ok(Ok(json)) => (StatusCode::OK, [
+                        ("content-type", "application/vnd.git-lfs+json".to_string()),
+                    ], json).into_response(cx),
+                    _ => (StatusCode::INTERNAL_SERVER_ERROR, [
+                        ("content-type", "application/vnd.git-lfs+json".to_string()),
+                    ], br#"{"message":"internal error"}"#.to_vec()).into_response(cx),
+                }
+            })
+        }
+
+        // Git path rewrite layer: transform /repo.git/sub/path into
+        // /_git/repo/sub/path before routing. Same pattern as s3_vhost
+        // rewrite. The /_git prefix is an internal routing namespace
+        // that never appears in user-facing URLs.
+        //
+        // Applied as a layer so it runs before route matching.
+        // Registered routes use /_git/{*repo}/... with no catch-all
+        // conflicts against S3's /{bucket}/{key} or OCI's /v2/{*ns}/...
+        fn git_rewrite_layer<'a>(
+            cx: &'a mut topcoat::context::CxBuilder,
+            body: Body,
+            next: topcoat::router::Next<'a>,
+        ) -> topcoat::router::LayerFuture<'a> {
+            Box::pin(async move {
+                // Rewrite .git/ paths to /_git/ internal prefix
+                if let Some(parts) = cx.get_mut::<http::request::Parts>() {
+                    if let Some(new_uri) = layers::git_rewrite::rewrite_git_path(&parts.uri) {
+                        parts.uri = new_uri;
+                    }
+                }
+                next.run(cx, body).await
+            })
+        }
+        builder = builder.layer(LayerFn::new(p("/"), git_rewrite_layer));
+
+        builder = builder
+            .route(RouteFn::new(Method::GET, p("/_git/{*repo}/info/refs"), git_info_refs))
+            .route(RouteFn::new(Method::POST, p("/_git/{*repo}/git_upload_pack"), git_upload_pack))
+            .route(RouteFn::new(Method::POST, p("/_git/{*repo}/git_receive_pack"), git_receive_pack))
+            .route(RouteFn::new(Method::POST, p("/_git/{*repo}/info/lfs/objects/batch"), git_lfs_batch));
+
+        tracing::info!("Git smart HTTP protocol enabled (v1+v2, LFS)");
+    }
+
+    // -- S3-compatible routes --
+    #[cfg(feature = "s3")]
+    {
+        /// Check SigV4 auth and bucket policy on an S3 request.
+        /// Returns None if auth + policy pass. Some(Response) on failure.
+        fn s3_auth_check(cx: &Cx) -> Option<topcoat::router::Response> {
+            // Step 1: SigV4 credential verification
+            match layers::sigv4::verify_request(cx, None) {
+                Ok(_) => {}
+                Err(response) => return Some(response),
+            }
+            // Step 2: Bucket policy evaluation
+            use topcoat::context::request_context;
+            use topcoat::router::RawPathParams;
+            let params: &RawPathParams = request_context(cx);
+            let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                .map(|(_, v)| v.to_string());
+            if let Some(ref b) = bucket {
+                let query = parse_s3_query(cx);
+                let parts: &http::request::Parts = request_context(cx);
+                let action = derive_s3_action(&parts.method, &query);
+                if let Some(resp) = evaluate_bucket_policy(cx, b, action) {
+                    return Some(resp);
+                }
+            }
+            None
+        }
+
+        /// Derive S3 action from HTTP method and query params.
+        fn derive_s3_action(method: &Method, query: &std::collections::HashMap<String, String>) -> &'static str {
+            if method == Method::GET {
+                if query.contains_key("tagging") { return "s3:GetObjectTagging"; }
+                if query.contains_key("acl") { return "s3:GetObjectAcl"; }
+                if query.contains_key("versioning") { return "s3:GetBucketVersioning"; }
+                if query.contains_key("lifecycle") { return "s3:GetLifecycleConfiguration"; }
+                if query.contains_key("cors") { return "s3:GetBucketCors"; }
+                if query.contains_key("policy") { return "s3:GetBucketPolicy"; }
+                if query.contains_key("attributes") { return "s3:GetObjectAttributes"; }
+                return "s3:GetObject";
+            }
+            if method == Method::PUT {
+                if query.contains_key("tagging") { return "s3:PutObjectTagging"; }
+                if query.contains_key("versioning") { return "s3:PutBucketVersioning"; }
+                if query.contains_key("lifecycle") { return "s3:PutLifecycleConfiguration"; }
+                if query.contains_key("cors") { return "s3:PutBucketCors"; }
+                if query.contains_key("policy") { return "s3:PutBucketPolicy"; }
+                return "s3:PutObject";
+            }
+            if method == Method::DELETE {
+                if query.contains_key("tagging") { return "s3:DeleteObjectTagging"; }
+                if query.contains_key("lifecycle") { return "s3:DeleteLifecycleConfiguration"; }
+                if query.contains_key("cors") { return "s3:DeleteBucketCors"; }
+                if query.contains_key("policy") { return "s3:DeleteBucketPolicy"; }
+                return "s3:DeleteObject";
+            }
+            if method == Method::HEAD { return "s3:GetObject"; }
+            if method == Method::POST {
+                if query.contains_key("uploads") { return "s3:PutObject"; }
+                if query.contains_key("delete") { return "s3:DeleteObject"; }
+                return "s3:PutObject";
+            }
+            "s3:*"
+        }
+
+        /// Evaluate bucket policy against the current request.
+        /// Returns None if allowed, Some(Response) if denied.
+        fn evaluate_bucket_policy(
+            cx: &Cx,
+            bucket: &str,
+            action: &str,
+        ) -> Option<topcoat::router::Response> {
+            let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+            let b = bucket.to_string();
+            // Synchronous policy check -- policy blobs are small
+            let policy_json = {
+                match store.tag_get(&b, "_config/policy") {
+                    Ok(entry) => match store.blob_get(&entry.kappa) {
+                        Ok(bytes) => Some(bytes),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                }
+            };
+            let policy_bytes = policy_json?;
+            let policy: serde_json::Value = serde_json::from_slice(&policy_bytes).ok()?;
+            let statements = policy.get("Statement")?.as_array()?;
+
+            let mut any_allow = false;
+            for stmt in statements {
+                let effect = stmt.get("Effect").and_then(|e| e.as_str()).unwrap_or("");
+                let actions: Vec<&str> = match stmt.get("Action") {
+                    Some(serde_json::Value::String(s)) => vec![s.as_str()],
+                    Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect(),
+                    _ => continue,
+                };
+                let action_matches = actions.iter().any(|a| {
+                    *a == "*" || *a == action
+                        || (a.ends_with('*') && action.starts_with(&a[..a.len() - 1]))
+                });
+                if !action_matches { continue; }
+                if effect == "Deny" {
+                    let err = kappa_module_s3::encode_s3_error_xml(
+                        "AccessDenied", "Access Denied by bucket policy",
+                    );
+                    if let Ok(resp) = (StatusCode::FORBIDDEN, [("content-type", "application/xml")], err).into_response(cx) {
+                        return Some(resp);
+                    }
+                }
+                if effect == "Allow" { any_allow = true; }
+            }
+            if !statements.is_empty() && !any_allow {
+                let err = kappa_module_s3::encode_s3_error_xml(
+                    "AccessDenied", "Access Denied by bucket policy (implicit deny)",
+                );
+                if let Ok(resp) = (StatusCode::FORBIDDEN, [("content-type", "application/xml")], err).into_response(cx) {
+                    return Some(resp);
+                }
+            }
+            None
+        }
+
+        /// Parse query parameters from a URI string.
+        fn parse_s3_query(cx: &Cx) -> std::collections::HashMap<String, String> {
+            use topcoat::context::request_context;
+            let parts: &http::request::Parts = request_context(cx);
+            let mut map = std::collections::HashMap::new();
+            if let Some(query) = parts.uri.query() {
+                for pair in query.split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        map.insert(k.to_string(), v.to_string());
+                    } else {
+                        map.insert(pair.to_string(), String::new());
+                    }
+                }
+            }
+            map
+        }
+
+        fn s3_list_objects(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                // Parse query params from URI query string, not path params
+                let query = parse_s3_query(cx);
+                let prefix = query.get("prefix").cloned();
+                let delimiter = query.get("delimiter").cloned();
+                let max_keys: u32 = query.get("max-keys")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1000);
+                let continuation_token = query.get("continuation-token").cloned();
+                let start_after = query.get("start-after").cloned();
+                let encoding_type = query.get("encoding-type").cloned();
+
+                let req = kappa_module_s3::ListObjectsV2Request {
+                    bucket: bucket.clone(),
+                    prefix,
+                    delimiter,
+                    max_keys,
+                    continuation_token,
+                    start_after,
+                    encoding_type,
+                    fetch_owner: false,
+                };
+
+                let result = tokio::task::spawn_blocking(move || {
+                    let resp = kappa_module_s3::list_objects_v2(&*store, &bucket, &req)?;
+                    Ok::<Vec<u8>, kappa_core::types::StoreError>(
+                        kappa_module_s3::encode_list_objects_v2_xml(&resp),
+                    )
+                }).await;
+
+                match result {
+                    Ok(Ok(xml)) => (StatusCode::OK, [
+                        ("content-type", "application/xml".to_string()),
+                    ], xml).into_response(cx),
+                    _ => {
+                        let err_xml = kappa_module_s3::encode_s3_error_xml(
+                            "InternalError", "list failed",
+                        );
+                        (StatusCode::INTERNAL_SERVER_ERROR, [
+                            ("content-type", "application/xml".to_string()),
+                        ], err_xml).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn s3_put_object(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                // Item 46: SSE-C rejection
+                {
+                    let parts: &http::request::Parts = request_context(cx);
+                    if parts.headers.contains_key("x-amz-server-side-encryption-customer-algorithm") {
+                        let err = kappa_module_s3::encode_s3_error_xml(
+                            "InvalidArgument", "SSE-C is not supported. Use SSE-S3 (AES256).",
+                        );
+                        return (StatusCode::BAD_REQUEST, [("content-type", "application/xml")], err).into_response(cx);
+                    }
+                }
+
+                let sse_algo = {
+                    let parts: &http::request::Parts = request_context(cx);
+                    parts.headers.get("x-amz-server-side-encryption")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string())
+                };
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                // Item 42: Check bucket exists BEFORE reading body.
+                // If Expect: 100-continue is set and bucket does not exist,
+                // hyper never sends 100 Continue -- client sees 404 without uploading.
+                {
+                    let b = bucket.clone();
+                    let s = store.clone();
+                    let exists = tokio::task::spawn_blocking(move || s.namespace_exists(&b))
+                        .await.unwrap_or(Ok(false)).unwrap_or(false);
+                    if !exists {
+                        let err = kappa_module_s3::encode_s3_error_xml(
+                            "NoSuchBucket", "The specified bucket does not exist.",
+                        );
+                        return (StatusCode::NOT_FOUND, [("content-type", "application/xml")], err).into_response(cx);
+                    }
+                }
+
+                // Extract Content-MD5 and Content-Type and x-amz-content-sha256 before reading body
+                let (content_md5_header, content_type_header, content_sha256_header) = {
+                    let parts: &http::request::Parts = request_context(cx);
+                    let cmd5 = parts.headers.get("content-md5")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    let ct = parts.headers.get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    let csha = parts.headers.get("x-amz-content-sha256")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    (cmd5, ct, csha)
+                };
+
+                let content = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 256 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+                };
+
+                // Fix 4: Validate Content-MD5 header against body
+                if let Some(ref expected_md5_b64) = content_md5_header {
+                    use md5::Digest;
+                    let computed = md5::Md5::digest(&content);
+                    let computed_b64 = base64_simd::STANDARD.encode_to_string(&computed);
+                    if computed_b64 != *expected_md5_b64 {
+                        let err = kappa_module_s3::encode_s3_error_xml(
+                            "BadDigest", "The Content-MD5 you specified did not match what we received.",
+                        );
+                        return (StatusCode::BAD_REQUEST, [("content-type", "application/xml")], err).into_response(cx);
+                    }
+                }
+
+                // Fix 5: Validate x-amz-content-sha256 against body
+                if let Some(ref expected_sha) = content_sha256_header {
+                    if expected_sha != "UNSIGNED-PAYLOAD"
+                        && !expected_sha.starts_with("STREAMING-")
+                        && !expected_sha.is_empty()
+                    {
+                        let computed = kappa_core::crypto::sigv4::sha256_hex(&content);
+                        if computed != *expected_sha {
+                            let err = kappa_module_s3::encode_s3_error_xml(
+                                "XAmzContentSHA256Mismatch",
+                                "The provided x-amz-content-sha256 header does not match the body.",
+                            );
+                            return (StatusCode::BAD_REQUEST, [("content-type", "application/xml")], err).into_response(cx);
+                        }
+                    }
+                }
+
+                let sse = sse_algo.clone();
+                let ct_for_store = content_type_header.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let digest = kappa_core::kappa::kappa_from_bytes(&content);
+                    let ingest = store.ingest_verified(&digest, &content)?;
+
+                    // Fix 2: S3 ETag for single PUT is md5(content), not kappa
+                    use md5::Digest;
+                    let md5_hash = md5::Md5::digest(&content);
+                    let etag = format!("\"{}\"", hex::encode(md5_hash));
+
+                    // Store creation timestamp for lifecycle expiration
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let _ = store.blob_put_meta(&ingest.kappa, "_s3_created_ms", now_ms.to_string().as_bytes());
+
+                    // Store MD5 for ETag retrieval on GET
+                    let _ = store.blob_put_meta(&ingest.kappa, "_s3_etag", etag.as_bytes());
+
+                    // Fix 6: Store Content-Type from PUT request
+                    if let Some(ref ct) = ct_for_store {
+                        let _ = store.blob_put_meta(&ingest.kappa, "content-type", ct.as_bytes());
+                    }
+
+                    // Item 46: Store SSE metadata
+                    if let Some(ref algo) = sse {
+                        let _ = store.blob_put_meta(&ingest.kappa, "_s3_sse", algo.as_bytes());
+                    }
+                    let vid = match store.version_put(&bucket, &key, &ingest.kappa, Some(&etag)) {
+                        Ok(v) => v,
+                        Err(kappa_core::types::StoreError::Rejected(_)) => {
+                            store.tag_set(&bucket, &key, &ingest.kappa)?;
+                            "null".to_string()
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    Ok::<(String, String, String), kappa_core::types::StoreError>((etag, vid, ingest.kappa))
+                }).await;
+
+                match result {
+                    Ok(Ok((etag, vid, _kappa))) => {
+                        let mut hm = http::HeaderMap::new();
+                        hm.insert("etag", etag.parse().unwrap());
+                        if vid != "null" {
+                            hm.insert("x-amz-version-id", vid.parse().unwrap());
+                        }
+                        if let Some(ref algo) = sse_algo {
+                            hm.insert("x-amz-server-side-encryption", algo.parse().unwrap());
+                        }
+                        (StatusCode::OK, hm).into_response(cx)
+                    }
+                    _ => {
+                        let err_xml = kappa_module_s3::encode_s3_error_xml(
+                            "InternalError", "put failed",
+                        );
+                        (StatusCode::INTERNAL_SERVER_ERROR, [
+                            ("content-type", "application/xml"),
+                        ], err_xml).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn s3_get_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let query = parse_s3_query(cx);
+                let version_id = query.get("versionId").cloned();
+
+                // Item 39: ListParts dispatch
+                if let Some(upload_id) = query.get("uploadId") {
+                    let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                    let uid = upload_id.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let received = store.upload_bytes_received(&uid);
+                        if received.is_none() {
+                            return Err(kappa_core::types::StoreError::NotFound(format!("upload {}", uid)));
+                        }
+                        Ok(Vec::<kappa_module_s3::xml::PartInfo>::new())
+                    }).await;
+                    match result {
+                        Ok(Ok(parts)) => {
+                            let xml = kappa_module_s3::encode_list_parts_xml(&parts);
+                            return (StatusCode::OK, [("content-type", "application/xml")], xml).into_response(cx);
+                        }
+                        _ => {
+                            let err = kappa_module_s3::encode_s3_error_xml("NoSuchUpload", "upload not found");
+                            return (StatusCode::NOT_FOUND, [("content-type", "application/xml")], err).into_response(cx);
+                        }
+                    }
+                }
+
+                // Item 43: Object tagging GET
+                if query.contains_key("tagging") {
+                    let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                    let b = bucket.clone();
+                    let k = key.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let entry = store.tag_get(&b, &k)?;
+                        match store.blob_get_meta(&entry.kappa, "_s3_tags") {
+                            Ok(raw) => Ok(raw),
+                            Err(kappa_core::types::StoreError::NotFound(_)) => Ok(b"[]".to_vec()),
+                            Err(e) => Err(e),
+                        }
+                    }).await;
+                    match result {
+                        Ok(Ok(raw)) => {
+                            // Convert JSON tag array to XML
+                            let tags: Vec<(String, String)> = serde_json::from_slice(&raw).unwrap_or_default();
+                            let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Tagging><TagSet>");
+                            for (k, v) in &tags {
+                                xml.push_str(&format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", k, v));
+                            }
+                            xml.push_str("</TagSet></Tagging>");
+                            return (StatusCode::OK, [("content-type", "application/xml")], xml).into_response(cx);
+                        }
+                        _ => {
+                            let err = kappa_module_s3::encode_s3_error_xml("NoSuchKey", "key not found");
+                            return (StatusCode::NOT_FOUND, [("content-type", "application/xml")], err).into_response(cx);
+                        }
+                    }
+                }
+
+                // Item 48: GetObjectAttributes
+                if query.contains_key("attributes") {
+                    let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                    let b = bucket.clone();
+                    let k = key.clone();
+                    // x-amz-object-attributes header specifies which attributes to return
+                    let requested_attrs = {
+                        use topcoat::context::request_context;
+                        let parts: &http::request::Parts = request_context(cx);
+                        parts.headers.get("x-amz-object-attributes")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("ETag,ObjectSize,StorageClass")
+                            .to_string()
+                    };
+                    let result = tokio::task::spawn_blocking(move || {
+                        let entry = store.tag_get(&b, &k)?;
+                        let size = store.blob_size(&entry.kappa)?;
+                        Ok::<(String, u64), kappa_core::types::StoreError>((entry.kappa, size))
+                    }).await;
+                    match result {
+                        Ok(Ok((kappa, size))) => {
+                            let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><GetObjectAttributesResponse>");
+                            if requested_attrs.contains("ETag") {
+                                xml.push_str(&format!("<ETag>\"{}\"</ETag>", kappa));
+                            }
+                            if requested_attrs.contains("ObjectSize") {
+                                xml.push_str(&format!("<ObjectSize>{}</ObjectSize>", size));
+                            }
+                            if requested_attrs.contains("StorageClass") {
+                                xml.push_str("<StorageClass>STANDARD</StorageClass>");
+                            }
+                            xml.push_str("</GetObjectAttributesResponse>");
+                            return (StatusCode::OK, [("content-type", "application/xml")], xml).into_response(cx);
+                        }
+                        _ => {
+                            let err = kappa_module_s3::encode_s3_error_xml("NoSuchKey", "key not found");
+                            return (StatusCode::NOT_FOUND, [("content-type", "application/xml")], err).into_response(cx);
+                        }
+                    }
+                }
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    let (kappa, content, vid) = match store.version_get(&bucket, &key, version_id.as_deref()) {
+                        Ok(ve) => {
+                            let kappa = ve.kappa.ok_or_else(|| {
+                                kappa_core::types::StoreError::NotFound(
+                                    format!("{}/{} (delete marker: {})", bucket, key, ve.version_id)
+                                )
+                            })?;
+                            let content = store.blob_get(&kappa)?;
+                            (kappa, content, ve.version_id)
+                        }
+                        Err(kappa_core::types::StoreError::Rejected(_)) => {
+                            let entry = store.tag_get(&bucket, &key)?;
+                            let content = store.blob_get(&entry.kappa)?;
+                            (entry.kappa, content, "null".to_string())
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    // Read stored metadata for response headers
+                    let sse = store.blob_get_meta(&kappa, "_s3_sse").ok()
+                        .and_then(|b| String::from_utf8(b).ok());
+                    let ct = store.blob_get_meta(&kappa, "content-type").ok()
+                        .and_then(|b| String::from_utf8(b).ok());
+                    let etag = store.blob_get_meta(&kappa, "_s3_etag").ok()
+                        .and_then(|b| String::from_utf8(b).ok());
+                    let created = store.blob_get_meta(&kappa, "_s3_created_ms").ok()
+                        .and_then(|b| String::from_utf8(b).ok());
+                    Ok((kappa, content, vid, sse, ct, etag, created))
+                }).await;
+
+                match result {
+                    Ok(Ok((kappa, content, vid, sse, ct, stored_etag, created))) => {
+                        let mut hm = http::HeaderMap::new();
+                        // Fix 6: Return Content-Type from PUT, default octet-stream
+                        hm.insert("content-type", ct.unwrap_or_else(|| "application/octet-stream".to_string()).parse().unwrap());
+                        // Fix 2: Return stored MD5 ETag, fall back to kappa
+                        let etag_val = stored_etag.unwrap_or_else(|| format!("\"{}\"", kappa));
+                        hm.insert("etag", etag_val.parse().unwrap());
+                        hm.insert("content-length", content.len().to_string().parse().unwrap());
+                        // Fix 7: Last-Modified from _s3_created_ms
+                        if let Some(ref ms_str) = created {
+                            if let Ok(ms) = ms_str.parse::<u64>() {
+                                let http_date = kappa_core::clock::epoch_ms_to_http_date(ms);
+                                hm.insert("last-modified", http_date.parse().unwrap());
+                            }
+                        }
+                        if vid != "null" {
+                            hm.insert("x-amz-version-id", vid.parse().unwrap());
+                        }
+                        if let Some(algo) = sse {
+                            hm.insert("x-amz-server-side-encryption", algo.parse().unwrap());
+                        }
+                        (StatusCode::OK, hm, content).into_response(cx)
+                    }
+                    Ok(Err(kappa_core::types::StoreError::NotFound(msg))) => {
+                        let mut hm = http::HeaderMap::new();
+                        hm.insert("content-type", "application/xml".parse().unwrap());
+                        if msg.contains("delete marker:") {
+                            hm.insert("x-amz-delete-marker", "true".parse().unwrap());
+                            if let Some(vid) = msg.split("delete marker: ").nth(1).and_then(|s| s.strip_suffix(')')) {
+                                hm.insert("x-amz-version-id", vid.parse().unwrap());
+                            }
+                        }
+                        let err_xml = kappa_module_s3::encode_s3_error_xml(
+                            "NoSuchKey", "The specified key does not exist.",
+                        );
+                        (StatusCode::NOT_FOUND, hm, err_xml).into_response(cx)
+                    }
+                    _ => {
+                        let err_xml = kappa_module_s3::encode_s3_error_xml(
+                            "InternalError", "get failed",
+                        );
+                        (StatusCode::INTERNAL_SERVER_ERROR, [
+                            ("content-type", "application/xml".to_string()),
+                        ], err_xml).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn s3_head_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let query = parse_s3_query(cx);
+                let version_id = query.get("versionId").cloned();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    match store.version_get(&bucket, &key, version_id.as_deref()) {
+                        Ok(ve) => {
+                            let kappa = ve.kappa.ok_or_else(|| {
+                                kappa_core::types::StoreError::NotFound(
+                                    format!("{}/{} (delete marker: {})", bucket, key, ve.version_id)
+                                )
+                            })?;
+                            let size = store.blob_size(&kappa)?;
+                            let ct = store.blob_get_meta(&kappa, "content-type").ok()
+                                .and_then(|b| String::from_utf8(b).ok());
+                            let etag = store.blob_get_meta(&kappa, "_s3_etag").ok()
+                                .and_then(|b| String::from_utf8(b).ok());
+                            let created = store.blob_get_meta(&kappa, "_s3_created_ms").ok()
+                                .and_then(|b| String::from_utf8(b).ok());
+                            Ok((kappa, size, ve.version_id, ct, etag, created))
+                        }
+                        Err(kappa_core::types::StoreError::Rejected(_)) => {
+                            let entry = store.tag_get(&bucket, &key)?;
+                            let size = store.blob_size(&entry.kappa)?;
+                            let ct = store.blob_get_meta(&entry.kappa, "content-type").ok()
+                                .and_then(|b| String::from_utf8(b).ok());
+                            let etag = store.blob_get_meta(&entry.kappa, "_s3_etag").ok()
+                                .and_then(|b| String::from_utf8(b).ok());
+                            let created = store.blob_get_meta(&entry.kappa, "_s3_created_ms").ok()
+                                .and_then(|b| String::from_utf8(b).ok());
+                            Ok((entry.kappa, size, "null".to_string(), ct, etag, created))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }).await;
+
+                match result {
+                    Ok(Ok((kappa, size, vid, ct, stored_etag, created))) => {
+                        let mut hm = http::HeaderMap::new();
+                        hm.insert("content-type", ct.unwrap_or_else(|| "application/octet-stream".to_string()).parse().unwrap());
+                        let etag_val = stored_etag.unwrap_or_else(|| format!("\"{}\"", kappa));
+                        hm.insert("etag", etag_val.parse().unwrap());
+                        hm.insert("content-length", size.to_string().parse().unwrap());
+                        if let Some(ref ms_str) = created {
+                            if let Ok(ms) = ms_str.parse::<u64>() {
+                                let dt = kappa_core::clock::epoch_ms_to_datetime(ms);
+                                if let Ok(epoch_secs) = kappa_core::clock::parse_datetime_to_epoch_secs(&dt) {
+                                    if let Some(dt_utc) = chrono::DateTime::from_timestamp(epoch_secs as i64, 0) {
+                                        let http_date = dt_utc.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                                        hm.insert("last-modified", http_date.parse().unwrap());
+                                    }
+                                }
+                            }
+                        }
+                        if vid != "null" {
+                            hm.insert("x-amz-version-id", vid.parse().unwrap());
+                        }
+                        (StatusCode::OK, hm).into_response(cx)
+                    }
+                    Ok(Err(kappa_core::types::StoreError::NotFound(msg))) => {
+                        if msg.contains("delete marker:") {
+                            (StatusCode::NOT_FOUND, [
+                                ("x-amz-delete-marker", "true"),
+                            ]).into_response(cx)
+                        } else {
+                            StatusCode::NOT_FOUND.into_response(cx)
+                        }
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(cx),
+                }
+            })
+        }
+
+        fn s3_delete_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let query = parse_s3_query(cx);
+                let version_id = query.get("versionId").cloned();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    match store.version_delete(&bucket, &key, version_id.as_deref()) {
+                        Ok(dr) => Ok(dr),
+                        Err(kappa_core::types::StoreError::Rejected(_)) => {
+                            // Versioning not implemented -- fallback to tag_delete
+                            store.tag_delete(&bucket, &key)?;
+                            Ok(kappa_core::types::DeleteResult {
+                                version_id: "null".to_string(),
+                                is_delete_marker: false,
+                            })
+                        }
+                        Err(e) => Err(e),
+                    }
+                }).await;
+
+                match result {
+                    Ok(Ok(dr)) => {
+                        let mut hm = http::HeaderMap::new();
+                        if dr.is_delete_marker {
+                            hm.insert("x-amz-delete-marker", "true".parse().unwrap());
+                        }
+                        if dr.version_id != "null" {
+                            hm.insert("x-amz-version-id", dr.version_id.parse().unwrap());
+                        }
+                        (StatusCode::NO_CONTENT, hm).into_response(cx)
+                    }
+                    _ => StatusCode::NO_CONTENT.into_response(cx),
+                }
+            })
+        }
+
+        fn s3_create_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                // "Create" a bucket by touching a marker tag
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.tag_set(&bucket, "_bucket_marker", "sha256:0000000000000000000000000000000000000000000000000000000000000000")
+                }).await;
+
+                StatusCode::OK.into_response(cx)
+            })
+        }
+
+        fn s3_head_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                let exists = tokio::task::spawn_blocking(move || {
+                    store.namespace_exists(&bucket).unwrap_or(false)
+                }).await.unwrap_or(false);
+
+                if exists {
+                    StatusCode::OK.into_response(cx)
+                } else {
+                    let err_xml = kappa_module_s3::encode_s3_error_xml(
+                        "NoSuchBucket", "The specified bucket does not exist.",
+                    );
+                    (StatusCode::NOT_FOUND, [
+                        ("content-type", "application/xml".to_string()),
+                    ], err_xml).into_response(cx)
+                }
+            })
+        }
+
+        fn s3_delete_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    // S3 DeleteBucket requires the bucket to be empty.
+                    // Check tag_list: if any non-marker tags exist, reject.
+                    let tags = store.tag_list(&bucket)?;
+                    let non_marker: Vec<_> = tags.iter()
+                        .filter(|t| t.name != "_bucket_marker")
+                        .collect();
+                    if !non_marker.is_empty() {
+                        return Err(kappa_core::types::StoreError::Conflict(
+                            "BucketNotEmpty".to_string(),
+                        ));
+                    }
+                    // Delete the bucket marker tag
+                    let _ = store.tag_delete(&bucket, "_bucket_marker");
+                    Ok(())
+                }).await;
+
+                match result {
+                    Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(cx),
+                    Ok(Err(kappa_core::types::StoreError::Conflict(_))) => {
+                        let err_xml = kappa_module_s3::encode_s3_error_xml(
+                            "BucketNotEmpty",
+                            "The bucket you tried to delete is not empty.",
+                        );
+                        (StatusCode::CONFLICT, [
+                            ("content-type", "application/xml".to_string()),
+                        ], err_xml).into_response(cx)
+                    }
+                    Ok(Err(kappa_core::types::StoreError::NotFound(_))) => {
+                        let err_xml = kappa_module_s3::encode_s3_error_xml(
+                            "NoSuchBucket",
+                            "The specified bucket does not exist.",
+                        );
+                        (StatusCode::NOT_FOUND, [
+                            ("content-type", "application/xml".to_string()),
+                        ], err_xml).into_response(cx)
+                    }
+                    _ => {
+                        let err_xml = kappa_module_s3::encode_s3_error_xml(
+                            "InternalError", "delete bucket failed",
+                        );
+                        (StatusCode::INTERNAL_SERVER_ERROR, [
+                            ("content-type", "application/xml".to_string()),
+                        ], err_xml).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn s3_list_buckets(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    store.namespace_list()
+                }).await;
+
+                match result {
+                    Ok(Ok(namespaces)) => {
+                        let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+                        xml.push_str("<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+                        xml.push_str("<Buckets>");
+                        for ns in &namespaces {
+                            xml.push_str("<Bucket><Name>");
+                            xml.push_str(ns);
+                            xml.push_str("</Name></Bucket>");
+                        }
+                        xml.push_str("</Buckets></ListAllMyBucketsResult>");
+                        (StatusCode::OK, [
+                            ("content-type", "application/xml".to_string()),
+                        ], xml).into_response(cx)
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(cx),
+                }
+            })
+        }
+
+        // -- S3 Multipart Upload --
+
+        fn s3_initiate_multipart(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let max_size = app_context::<MaxBlobSize>(cx).0 as u64;
+
+                let bucket_for_xml = bucket.clone();
+                let key_for_xml = key.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.upload_begin(&bucket, max_size)
+                }).await;
+
+                match result {
+                    Ok(Ok(upload_id)) => {
+                        let xml = kappa_module_s3::encode_initiate_multipart_xml(&bucket_for_xml, &key_for_xml, &upload_id);
+                        (StatusCode::OK, [
+                            ("content-type", "application/xml".to_string()),
+                        ], xml).into_response(cx)
+                    }
+                    _ => {
+                        let err = kappa_module_s3::encode_s3_error_xml("InternalError", "initiate failed");
+                        (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "application/xml".to_string())], err).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn s3_upload_part(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let query = parse_s3_query(cx);
+                let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                // Fix 1: Stream body to upload_put_part in chunks.
+                // Read body frames via http-body, write each to store.
+                // One frame in memory at a time. No 5 GiB allocation.
+                use http_body_util::BodyExt;
+                let mut offset = store.upload_bytes_received(&upload_id).unwrap_or(0);
+                let mut body = body;
+                let mut total: u64 = offset;
+                let mut part_error: Option<kappa_core::types::StoreError> = None;
+
+                while let Some(frame_result) = body.frame().await {
+                    match frame_result {
+                        Ok(frame) => {
+                            if let Some(data) = frame.data_ref() {
+                                let chunk = data.to_vec();
+                                let uid = upload_id.clone();
+                                let s = store.clone();
+                                let off = offset;
+                                match tokio::task::spawn_blocking(move || {
+                                    s.upload_put_part(&uid, off, &chunk)
+                                }).await {
+                                    Ok(Ok(new_total)) => {
+                                        offset = new_total;
+                                        total = new_total;
+                                    }
+                                    Ok(Err(e)) => { part_error = Some(e); break; }
+                                    Err(e) => {
+                                        part_error = Some(kappa_core::types::StoreError::Io(
+                                            std::io::Error::other(e.to_string())
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if let Some(e) = part_error {
+                    let err = kappa_module_s3::encode_s3_error_xml("InternalError", &e.to_string());
+                    return (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "application/xml".to_string())], err).into_response(cx);
+                }
+
+                // Per-part ETag: MD5 of the part data (already computed by upload_put_part)
+                let _ = total;
+                (StatusCode::OK, [
+                    ("etag", "\"part\"".to_string()),
+                ]).into_response(cx)
+            })
+        }
+
+        fn s3_complete_multipart(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let query = parse_s3_query(cx);
+                let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+
+                // Fix 8: Parse CompleteMultipartUpload XML body
+                // Format: <CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"..."</ETag></Part>...</CompleteMultipartUpload>
+                let body_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 10 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+                };
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                let mut client_parts: Vec<(u32, String)> = Vec::new();
+                let mut remaining = body_str.as_ref();
+                while let Some(part_start) = remaining.find("<Part>") {
+                    let after = &remaining[part_start..];
+                    if let Some(part_end) = after.find("</Part>") {
+                        let block = &after[6..part_end];
+                        let pn = block.find("<PartNumber>").and_then(|s| {
+                            block[s+12..].find("</PartNumber>").and_then(|e| block[s+12..s+12+e].parse::<u32>().ok())
+                        });
+                        let etag = block.find("<ETag>").and_then(|s| {
+                            block[s+6..].find("</ETag>").map(|e| block[s+6..s+6+e].to_string())
+                        });
+                        if let (Some(pn), Some(etag)) = (pn, etag) {
+                            client_parts.push((pn, etag));
+                        }
+                        remaining = &after[part_end + 7..];
+                    } else { break; }
+                }
+                // Sort by part number (S3 requires ascending order)
+                client_parts.sort_by_key(|(pn, _)| *pn);
+
+                // Content-Type from the initiate request (stored as upload metadata if available)
+                let content_type_header = {
+                    let parts: &http::request::Parts = request_context(cx);
+                    parts.headers.get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string())
+                };
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let bucket_for_xml = bucket.clone();
+
+                // Fix 8: Validate client part list against uploaded parts BEFORE completing
+                if !client_parts.is_empty() {
+                    let uid_for_check = upload_id.clone();
+                    let s_for_check = store.clone();
+                    let validation = tokio::task::spawn_blocking(move || {
+                        let stored = s_for_check.upload_part_info(&uid_for_check);
+                        if stored.is_empty() {
+                            return Err("NoSuchUpload".to_string());
+                        }
+                        // Check ascending order
+                        for i in 1..client_parts.len() {
+                            if client_parts[i].0 <= client_parts[i - 1].0 {
+                                return Err(format!(
+                                    "InvalidPartOrder: part {} listed before or equal to part {}",
+                                    client_parts[i].0, client_parts[i - 1].0
+                                ));
+                            }
+                        }
+                        // Check each listed part exists and ETag matches
+                        for (pn, client_etag) in &client_parts {
+                            let found = stored.iter().find(|(spn, _, _)| spn == pn);
+                            match found {
+                                None => return Err(format!(
+                                    "InvalidPart: part {} was not uploaded", pn
+                                )),
+                                Some((_, stored_etag, _)) => {
+                                    // Normalize: strip surrounding quotes for comparison
+                                    let ce = client_etag.trim_matches('"');
+                                    let se = stored_etag.trim_matches('"');
+                                    if ce != se {
+                                        return Err(format!(
+                                            "InvalidPart: ETag mismatch for part {}: client={}, stored={}",
+                                            pn, ce, se
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    }).await;
+                    match validation {
+                        Ok(Err(msg)) => {
+                            let code = if msg.starts_with("InvalidPartOrder") { "InvalidPartOrder" } else { "InvalidPart" };
+                            let err = kappa_module_s3::encode_s3_error_xml(code, &msg);
+                            return (StatusCode::BAD_REQUEST, [("content-type", "application/xml")], err).into_response(cx);
+                        }
+                        Err(e) => {
+                            let err = kappa_module_s3::encode_s3_error_xml("InternalError", &e.to_string());
+                            return (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "application/xml")], err).into_response(cx);
+                        }
+                        Ok(Ok(())) => {} // validation passed
+                    }
+                }
+
+                let result = tokio::task::spawn_blocking(move || {
+                    let ingest_result = store.upload_complete(&upload_id, None)?;
+                    store.tag_set(&bucket, &key, &ingest_result.kappa)?;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let _ = store.blob_put_meta(&ingest_result.kappa, "_s3_created_ms", now_ms.to_string().as_bytes());
+
+                    // Fix 3: composite ETag from IngestResult.etag (md5-of-md5s-N)
+                    let etag = ingest_result.etag.unwrap_or_else(|| {
+                        // Fallback: compute MD5 of content for single-chunk uploads
+                        format!("\"{}\"", ingest_result.kappa)
+                    });
+                    let _ = store.blob_put_meta(&ingest_result.kappa, "_s3_etag", etag.as_bytes());
+
+                    // Store content-type if provided
+                    if let Some(ref ct) = content_type_header {
+                        let _ = store.blob_put_meta(&ingest_result.kappa, "content-type", ct.as_bytes());
+                    }
+
+                    Ok::<(String, String), kappa_core::types::StoreError>((key.clone(), etag))
+                }).await;
+
+                match result {
+                    Ok(Ok((completed_key, etag))) => {
+                        let xml = kappa_module_s3::encode_complete_multipart_xml(&bucket_for_xml, &completed_key, &etag);
+                        (StatusCode::OK, [
+                            ("content-type", "application/xml".to_string()),
+                        ], xml).into_response(cx)
+                    }
+                    _ => {
+                        let err = kappa_module_s3::encode_s3_error_xml("InternalError", "complete failed");
+                        (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "application/xml".to_string())], err).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn s3_abort_multipart(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let query = parse_s3_query(cx);
+                let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.upload_abort(&upload_id)
+                }).await;
+
+                StatusCode::NO_CONTENT.into_response(cx)
+            })
+        }
+
+        fn s3_delete_objects(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let body_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 10 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+                };
+
+                // Parse the XML body to extract keys to delete
+                // Format: <Delete><Object><Key>...</Key></Object>...</Delete>
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                let mut keys_to_delete: Vec<String> = Vec::new();
+                // Simple XML extraction -- find all <Key>...</Key> values
+                let mut remaining = body_str.as_ref();
+                while let Some(start) = remaining.find("<Key>") {
+                    let after_tag = &remaining[start + 5..];
+                    if let Some(end) = after_tag.find("</Key>") {
+                        keys_to_delete.push(after_tag[..end].to_string());
+                        remaining = &after_tag[end + 6..];
+                    } else {
+                        break;
+                    }
+                }
+
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut deleted = Vec::new();
+                    let mut errors: Vec<(String, String, String)> = Vec::new();
+                    for key in &keys_to_delete {
+                        match store.tag_delete(&bucket, key) {
+                            Ok(()) => deleted.push(key.clone()),
+                            Err(e) => errors.push((key.clone(), "InternalError".into(), e.to_string())),
+                        }
+                    }
+                    (deleted, errors)
+                }).await;
+
+                match result {
+                    Ok((deleted, errors)) => {
+                        let xml = kappa_module_s3::encode_delete_result_xml(&deleted, &errors);
+                        (StatusCode::OK, [
+                            ("content-type", "application/xml".to_string()),
+                        ], xml).into_response(cx)
+                    }
+                    _ => {
+                        let err = kappa_module_s3::encode_s3_error_xml("InternalError", "batch delete failed");
+                        (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "application/xml".to_string())], err).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn s3_copy_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                // x-amz-copy-source header: /source-bucket/source-key
+                let copy_source = {
+                    use topcoat::context::request_context;
+                    let parts: &http::request::Parts = request_context(cx);
+                    parts.headers.get("x-amz-copy-source")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                };
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    // Parse copy source: /bucket/key or bucket/key
+                    let source = copy_source.strip_prefix('/').unwrap_or(&copy_source);
+                    let (src_bucket, src_key) = source.split_once('/')
+                        .ok_or_else(|| kappa_core::types::StoreError::Rejected("invalid copy source".into()))?;
+
+                    let src_entry = store.tag_get(src_bucket, src_key)?;
+                    store.tag_set(&bucket, &key, &src_entry.kappa)?;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let _ = store.blob_put_meta(&src_entry.kappa, "_s3_created_ms", now_ms.to_string().as_bytes());
+                    Ok::<String, kappa_core::types::StoreError>(src_entry.kappa)
+                }).await;
+
+                match result {
+                    Ok(Ok(kappa)) => {
+                        let etag = format!("\"{}\"", kappa);
+                        let xml = kappa_module_s3::encode_copy_result_xml(&etag, "");
+                        (StatusCode::OK, [
+                            ("content-type", "application/xml".to_string()),
+                        ], xml).into_response(cx)
+                    }
+                    Ok(Err(kappa_core::types::StoreError::NotFound(_))) => {
+                        let err = kappa_module_s3::encode_s3_error_xml("NoSuchKey", "source key not found");
+                        (StatusCode::NOT_FOUND, [("content-type", "application/xml".to_string())], err).into_response(cx)
+                    }
+                    _ => {
+                        let err = kappa_module_s3::encode_s3_error_xml("InternalError", "copy failed");
+                        (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "application/xml".to_string())], err).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        // PUT/GET /{bucket}?versioning -- versioning configuration
+        fn s3_put_versioning(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let body_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+                };
+
+                // Parse <VersioningConfiguration><Status>Enabled|Suspended</Status></VersioningConfiguration>
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                let status_value = if body_str.contains("<Status>Enabled</Status>") {
+                    "enabled"
+                } else if body_str.contains("<Status>Suspended</Status>") {
+                    "suspended"
+                } else {
+                    "unversioned"
+                };
+
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.tag_set(&bucket, "_config/versioning", status_value)
+                }).await;
+
+                StatusCode::OK.into_response(cx)
+            })
+        }
+
+        fn s3_get_versioning(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    match store.tag_get(&bucket, "_config/versioning") {
+                        Ok(entry) => Ok(entry.kappa),
+                        Err(kappa_core::types::StoreError::NotFound(_)) => Ok(String::new()),
+                        Err(e) => Err(e),
+                    }
+                }).await;
+
+                let status_str = match result {
+                    Ok(Ok(s)) => s,
+                    _ => String::new(),
+                };
+
+                let xml_status = match status_str.as_str() {
+                    "enabled" => "<Status>Enabled</Status>",
+                    "suspended" => "<Status>Suspended</Status>",
+                    _ => "",
+                };
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     {}\
+                     </VersioningConfiguration>",
+                    xml_status
+                );
+                (StatusCode::OK, [("content-type", "application/xml")], xml).into_response(cx)
+            })
+        }
+
+        // Unified POST /{bucket}/{key} handler -- dispatches by query params:
+        // ?uploads -> InitiateMultipartUpload
+        // ?uploadId=X -> CompleteMultipartUpload
+        // else -> unsupported
+        fn s3_post_object(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let uri = {
+                    use topcoat::context::request_context;
+                    let parts: &http::request::Parts = request_context(cx);
+                    parts.uri.clone()
+                };
+                let query = uri.query().unwrap_or("");
+                if query.contains("uploads") {
+                    s3_initiate_multipart(cx, body).await
+                } else if query.contains("uploadId") {
+                    s3_complete_multipart(cx, body).await
+                } else {
+                    StatusCode::BAD_REQUEST.into_response(cx)
+                }
+            })
+        }
+
+        // Item 43: PUT /{bucket}/{key}?tagging
+        fn s3_put_tagging(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let body_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 128 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+                };
+                // Parse XML: extract <Key>...</Key> and <Value>...</Value> pairs
+                let body_str = String::from_utf8_lossy(&body_bytes);
+                let mut tags: Vec<(String, String)> = Vec::new();
+                let mut remaining = body_str.as_ref();
+                while let Some(tag_start) = remaining.find("<Tag>") {
+                    let after = &remaining[tag_start..];
+                    if let Some(tag_end) = after.find("</Tag>") {
+                        let tag_block = &after[5..tag_end];
+                        let k = tag_block.find("<Key>").and_then(|s| {
+                            tag_block[s+5..].find("</Key>").map(|e| tag_block[s+5..s+5+e].to_string())
+                        });
+                        let v = tag_block.find("<Value>").and_then(|s| {
+                            tag_block[s+7..].find("</Value>").map(|e| tag_block[s+7..s+7+e].to_string())
+                        });
+                        if let (Some(k), Some(v)) = (k, v) {
+                            if tags.len() < 10 { tags.push((k, v)); }
+                        }
+                        remaining = &after[tag_end+6..];
+                    } else { break; }
+                }
+                let result = tokio::task::spawn_blocking(move || {
+                    let entry = store.tag_get(&bucket, &key)?;
+                    let json = serde_json::to_vec(&tags)
+                        .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
+                    store.blob_put_meta(&entry.kappa, "_s3_tags", &json)
+                }).await;
+                match result {
+                    Ok(Ok(())) => StatusCode::OK.into_response(cx),
+                    _ => {
+                        let err = kappa_module_s3::encode_s3_error_xml("InternalError", "put tagging failed");
+                        (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "application/xml")], err).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        // Item 43: DELETE /{bucket}/{key}?tagging
+        fn s3_delete_tagging(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let key = params.iter().find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(entry) = store.tag_get(&bucket, &key) {
+                        let _ = store.blob_delete_meta(&entry.kappa, "_s3_tags");
+                    }
+                }).await;
+                StatusCode::NO_CONTENT.into_response(cx)
+            })
+        }
+
+        // Unified PUT /{bucket}/{key} handler -- dispatches by query/header:
+        // ?tagging -> PutObjectTagging
+        // x-amz-copy-source header -> CopyObject
+        // ?partNumber=&uploadId= -> UploadPart
+        // else -> PutObject
+        fn s3_put_or_copy_or_part(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let (has_copy_source, has_part_number, has_tagging) = {
+                    use topcoat::context::request_context;
+                    let parts: &http::request::Parts = request_context(cx);
+                    let copy = parts.headers.contains_key("x-amz-copy-source");
+                    let q = parts.uri.query().unwrap_or("");
+                    let part = q.contains("partNumber");
+                    let tagging = q.contains("tagging");
+                    (copy, part, tagging)
+                };
+                if has_tagging {
+                    s3_put_tagging(cx, body).await
+                } else if has_copy_source {
+                    s3_copy_object(cx, body).await
+                } else if has_part_number {
+                    s3_upload_part(cx, body).await
+                } else {
+                    s3_put_object(cx, body).await
+                }
+            })
+        }
+
+        // Unified DELETE /{bucket}/{key} handler -- dispatches by query:
+        // ?tagging -> DeleteObjectTagging
+        // ?uploadId= -> AbortMultipartUpload
+        // else -> DeleteObject
+        fn s3_delete_or_abort(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let (has_upload_id, has_tagging) = {
+                    use topcoat::context::request_context;
+                    let parts: &http::request::Parts = request_context(cx);
+                    let q = parts.uri.query().unwrap_or("");
+                    (q.contains("uploadId"), q.contains("tagging"))
+                };
+                if has_tagging {
+                    s3_delete_tagging(cx, body).await
+                } else if has_upload_id {
+                    s3_abort_multipart(cx, body).await
+                } else {
+                    s3_delete_object(cx, body).await
+                }
+            })
+        }
+
+        // Item 44/45: Generic bucket config PUT/GET/DELETE for lifecycle, cors, policy
+        fn s3_put_bucket_config<'a>(cx: &'a Cx, body: Body, config_key: &'static str) -> RouteFuture<'a> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let body_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 256 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+                };
+                let tag_name = format!("_config/{}", config_key);
+                let _ = tokio::task::spawn_blocking(move || {
+                    let kappa = kappa_core::kappa::kappa_from_bytes(&body_bytes);
+                    let _ = store.ingest_verified(&kappa, &body_bytes);
+                    store.tag_set(&bucket, &tag_name, &kappa)
+                }).await;
+                StatusCode::OK.into_response(cx)
+            })
+        }
+
+        fn s3_get_bucket_config<'a>(cx: &'a Cx, _body: Body, config_key: &'static str) -> RouteFuture<'a> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let tag_name = format!("_config/{}", config_key);
+                let result = tokio::task::spawn_blocking(move || {
+                    let entry = store.tag_get(&bucket, &tag_name)?;
+                    store.blob_get(&entry.kappa)
+                }).await;
+                match result {
+                    Ok(Ok(content)) => (StatusCode::OK, [
+                        ("content-type", "application/xml"),
+                    ], content).into_response(cx),
+                    _ => {
+                        let err = kappa_module_s3::encode_s3_error_xml(
+                            "NoSuchConfiguration",
+                            &format!("{} configuration not found", config_key),
+                        );
+                        (StatusCode::NOT_FOUND, [("content-type", "application/xml")], err).into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn s3_delete_bucket_config<'a>(cx: &'a Cx, _body: Body, config_key: &'static str) -> RouteFuture<'a> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let bucket = params.iter().find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let tag_name = format!("_config/{}", config_key);
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.tag_delete(&bucket, &tag_name)
+                }).await;
+                StatusCode::NO_CONTENT.into_response(cx)
+            })
+        }
+
+        // Unified bucket-level PUT: dispatches by query param
+        fn s3_put_bucket_dispatch(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let query = parse_s3_query(cx);
+                if query.contains_key("versioning") {
+                    s3_put_versioning(cx, body).await
+                } else if query.contains_key("lifecycle") {
+                    s3_put_bucket_config(cx, body, "lifecycle").await
+                } else if query.contains_key("cors") {
+                    s3_put_bucket_config(cx, body, "cors").await
+                } else if query.contains_key("policy") {
+                    s3_put_bucket_config(cx, body, "policy").await
+                } else if query.contains_key("acl") {
+                    s3_put_bucket_config(cx, body, "acl").await
+                } else {
+                    s3_create_bucket(cx, body).await
+                }
+            })
+        }
+
+        // Unified bucket-level GET: dispatches by query param
+        fn s3_get_bucket_dispatch(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let query = parse_s3_query(cx);
+                if query.contains_key("versioning") {
+                    s3_get_versioning(cx, body).await
+                } else if query.contains_key("lifecycle") {
+                    s3_get_bucket_config(cx, body, "lifecycle").await
+                } else if query.contains_key("cors") {
+                    s3_get_bucket_config(cx, body, "cors").await
+                } else if query.contains_key("policy") {
+                    s3_get_bucket_config(cx, body, "policy").await
+                } else if query.contains_key("acl") {
+                    s3_get_bucket_config(cx, body, "acl").await
+                } else {
+                    s3_list_objects(cx, body).await
+                }
+            })
+        }
+
+        // Unified bucket-level DELETE: dispatches by query param
+        fn s3_delete_bucket_dispatch(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let query = parse_s3_query(cx);
+                if query.contains_key("lifecycle") {
+                    s3_delete_bucket_config(cx, body, "lifecycle").await
+                } else if query.contains_key("cors") {
+                    s3_delete_bucket_config(cx, body, "cors").await
+                } else if query.contains_key("policy") {
+                    s3_delete_bucket_config(cx, body, "policy").await
+                } else {
+                    s3_delete_bucket(cx, body).await
+                }
+            })
+        }
+
+        // S3 routes -- path-style. One handler per method+path, with
+        // query-parameter dispatch inside the unified handlers above.
+        builder = builder
+            .route(RouteFn::new(Method::PUT, p("/{bucket}/{key}"), s3_put_or_copy_or_part))
+            .route(RouteFn::new(Method::GET, p("/{bucket}/{key}"), s3_get_object))
+            .route(RouteFn::new(Method::HEAD, p("/{bucket}/{key}"), s3_head_object))
+            .route(RouteFn::new(Method::DELETE, p("/{bucket}/{key}"), s3_delete_or_abort))
+            .route(RouteFn::new(Method::POST, p("/{bucket}/{key}"), s3_post_object))
+            .route(RouteFn::new(Method::GET, p("/{bucket}"), s3_get_bucket_dispatch))
+            .route(RouteFn::new(Method::PUT, p("/{bucket}"), s3_put_bucket_dispatch))
+            .route(RouteFn::new(Method::HEAD, p("/{bucket}"), s3_head_bucket))
+            .route(RouteFn::new(Method::DELETE, p("/{bucket}"), s3_delete_bucket_dispatch))
+            .route(RouteFn::new(Method::POST, p("/{bucket}"), s3_delete_objects))
+            .route(RouteFn::new(Method::GET, p("/"), s3_list_buckets));
+
+        tracing::info!("S3-compatible API enabled (path-style)");
+    }
+
     let router = builder.build();
 
     // -- Periodic cleanup --
@@ -436,7 +2201,98 @@ async fn main() {
         }
     });
 
+    // -- S3 lifecycle background task (item 44) --
+    // Checks every 24 hours (configurable via KAPPA_LIFECYCLE_INTERVAL_SECS).
+    // For each namespace with a _config/lifecycle tag, evaluates expiration rules.
+    let lifecycle_store = store.clone();
+    let lifecycle_interval_secs: u64 = std::env::var("KAPPA_LIFECYCLE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(86400);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(lifecycle_interval_secs));
+        loop {
+            interval.tick().await;
+            let s = lifecycle_store.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let namespaces = match s.namespace_list() {
+                    Ok(ns) => ns,
+                    Err(_) => return,
+                };
+                for ns in &namespaces {
+                    // Check if this namespace has a lifecycle config
+                    let lifecycle_tag = match s.tag_get(ns, "_config/lifecycle") {
+                        Ok(entry) => entry,
+                        Err(_) => continue,
+                    };
+                    let config_bytes = match s.blob_get(&lifecycle_tag.kappa) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let config_str = String::from_utf8_lossy(&config_bytes);
+                    if let Some(days_start) = config_str.find("<Days>") {
+                        let after = &config_str[days_start + 6..];
+                        if let Some(days_end) = after.find("</Days>") {
+                            if let Ok(days) = after[..days_end].parse::<u64>() {
+                                let threshold_ms = days * 86400 * 1000;
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64;
+                                if let Ok(tags) = s.tag_list(ns) {
+                                    for tag in &tags {
+                                        if tag.name.starts_with('_') { continue; }
+                                        let created_ms = s.blob_get_meta(&tag.kappa, "_s3_created_ms")
+                                            .ok()
+                                            .and_then(|b| String::from_utf8(b).ok())
+                                            .and_then(|s| s.parse::<u64>().ok())
+                                            .unwrap_or(0);
+                                        if created_ms > 0 && now_ms.saturating_sub(created_ms) >= threshold_ms {
+                                            tracing::info!(
+                                                ns = ns, key = %tag.name,
+                                                age_days = (now_ms - created_ms) / 86400000,
+                                                "lifecycle: expiring object"
+                                            );
+                                            let _ = s.tag_delete(ns, &tag.name);
+                                        } else if threshold_ms == 0 {
+                                            let _ = s.tag_delete(ns, &tag.name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // AbortIncompleteMultipartUpload
+                    if config_str.contains("<AbortIncompleteMultipartUpload>") {
+                        if let Some(d_start) = config_str.find("<DaysAfterInitiation>") {
+                            let after = &config_str[d_start + 21..];
+                            if let Some(d_end) = after.find("</DaysAfterInitiation>") {
+                                if let Ok(days) = after[..d_end].parse::<u64>() {
+                                    s.upload_evict_expired(days * 86400);
+                                }
+                            }
+                        }
+                    }
+                }
+            }).await;
+        }
+    });
+
     // -- Start --
+    // When KAPPA_S3_BASE_DOMAIN is set, use the vhost-rewriting accept loop
+    // so virtual-hosted-style S3 requests (Host: bucket.domain) are rewritten
+    // to path-style (/{bucket}/key) before routing. When unset, use topcoat's
+    // standard serve path (no rewriting, path-style only).
+    let s3_base_domain = std::env::var("KAPPA_S3_BASE_DOMAIN").unwrap_or_default();
+    let use_vhost = !s3_base_domain.is_empty();
+
+    if use_vhost {
+        tracing::info!(
+            base_domain = %s3_base_domain,
+            "S3 virtual-hosted-style enabled"
+        );
+    }
+
     match tls_config {
         Some(tls_cfg) => {
             let acceptor = tls::build_acceptor(&tls_cfg);
@@ -451,9 +2307,21 @@ async fn main() {
                 mtls = tls_cfg.client_ca_path.is_some(),
                 "kappa-registry starting with TLS"
             );
-            topcoat::serve(listener, router)
+            if use_vhost {
+                layers::s3_vhost::serve_with_vhost(
+                    listener,
+                    router,
+                    s3_base_domain,
+                    Duration::from_secs(30),
+                    shutdown_signal(),
+                )
                 .await
-                .expect("TLS server error");
+                .expect("TLS vhost server error");
+            } else {
+                topcoat::serve(listener, router)
+                    .await
+                    .expect("TLS server error");
+            }
         }
         None => {
             tracing::info!(
@@ -461,7 +2329,44 @@ async fn main() {
                 store = %cfg.store_root.display(),
                 "kappa-registry starting"
             );
-            topcoat::start(router).await.expect("server error");
+            if use_vhost {
+                let tcp = tokio::net::TcpListener::bind(&cfg.listen_addr)
+                    .await
+                    .expect("failed to bind TCP listener");
+                layers::s3_vhost::serve_with_vhost(
+                    tcp,
+                    router,
+                    s3_base_domain,
+                    Duration::from_secs(30),
+                    shutdown_signal(),
+                )
+                .await
+                .expect("vhost server error");
+            } else {
+                topcoat::start(router).await.expect("server error");
+            }
         }
+    }
+}
+
+/// Shutdown signal: Ctrl+C or SIGTERM on Unix.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
     }
 }

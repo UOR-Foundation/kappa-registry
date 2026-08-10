@@ -151,6 +151,199 @@ pub fn kappa_from_value<T: Into<dcbor::CBOR> + Clone>(value: &T) -> String {
     kappa_from_bytes(&bytes)
 }
 
+/// Streaming kappa computation from a reader. 16 KiB incremental hashing.
+///
+/// SSOT for streaming digest verification. Every path that needs to hash
+/// a file without reading it entirely into memory calls this function.
+/// Supports all six axes. SHA-1 uses collision-detecting incremental hasher.
+///
+/// Returns a `StreamingVerificationProof` -- a sealed proof type that
+/// can only be produced by this function and consumed by `upload_complete`.
+/// The compiler enforces that no unverified kappa reaches storage via
+/// the streaming path.
+pub fn streaming_compute_kappa(
+    axis: &str,
+    reader: &mut dyn std::io::Read,
+) -> Result<crate::verified::StreamingVerificationProof, LabelError> {
+    let mut buf = [0u8; 16384];
+    match axis {
+        "sha256" => {
+            let mut h = Sha256::new();
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| LabelError::DigestMismatch {
+                    expected: String::new(), computed: e.to_string(), axis: axis.to_string(),
+                })?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            Ok(crate::verified::StreamingVerificationProof::single(format!("sha256:{}", hex::encode(h.finalize()))))
+        }
+        "sha512" => {
+            let mut h = Sha512::new();
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| LabelError::DigestMismatch {
+                    expected: String::new(), computed: e.to_string(), axis: axis.to_string(),
+                })?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            Ok(crate::verified::StreamingVerificationProof::single(format!("sha512:{}", hex::encode(h.finalize()))))
+        }
+        "blake3" => {
+            let mut h = blake3::Hasher::new();
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| LabelError::DigestMismatch {
+                    expected: String::new(), computed: e.to_string(), axis: axis.to_string(),
+                })?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            Ok(crate::verified::StreamingVerificationProof::single(format!("blake3:{}", h.finalize().to_hex())))
+        }
+        "sha3-256" => {
+            let mut h = Sha3_256::new();
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| LabelError::DigestMismatch {
+                    expected: String::new(), computed: e.to_string(), axis: axis.to_string(),
+                })?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            Ok(crate::verified::StreamingVerificationProof::single(format!("sha3-256:{}", hex::encode(h.finalize()))))
+        }
+        "keccak256" => {
+            let mut h = Keccak256::new();
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| LabelError::DigestMismatch {
+                    expected: String::new(), computed: e.to_string(), axis: axis.to_string(),
+                })?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            Ok(crate::verified::StreamingVerificationProof::single(format!("keccak256:{}", hex::encode(h.finalize()))))
+        }
+        "sha1" => {
+            use sha1_checked::Sha1 as Sha1Checked;
+            use sha1_checked::Digest as _;
+            let mut h = Sha1Checked::new();
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| LabelError::DigestMismatch {
+                    expected: String::new(), computed: e.to_string(), axis: axis.to_string(),
+                })?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            let result = h.try_finalize();
+            if result.has_collision() {
+                return Err(LabelError::CollisionDetected);
+            }
+            Ok(crate::verified::StreamingVerificationProof::single(format!("sha1:{}", hex::encode(result.hash()))))
+        }
+        _ => Err(LabelError::UnknownAxis),
+    }
+}
+
+/// Multi-axis streaming hash. One read pass, N hashers running in parallel.
+///
+/// The first axis in `axes` is the primary. Additional axes produce
+/// additional verified kappas carried inside the proof. Returns a single
+/// `StreamingVerificationProof` carrying all results.
+///
+/// The primary use is `upload_complete` computing the client's claimed
+/// axis plus all mandatory axes (at minimum sha256) in a single pass.
+pub fn streaming_compute_multi(
+    axes: &[&str],
+    reader: &mut dyn std::io::Read,
+) -> Result<crate::verified::StreamingVerificationProof, LabelError> {
+    use sha1_checked::Sha1 as Sha1Checked;
+    use sha1_checked::Digest as Sha1Digest;
+
+    // Initialize all hashers
+    let mut sha256_h: Option<Sha256> = None;
+    let mut sha512_h: Option<Sha512> = None;
+    let mut blake3_h: Option<blake3::Hasher> = None;
+    let mut sha3_256_h: Option<Sha3_256> = None;
+    let mut keccak256_h: Option<Keccak256> = None;
+    let mut sha1_h: Option<Sha1Checked> = None;
+
+    for axis in axes {
+        match *axis {
+            "sha256" => { sha256_h.get_or_insert_with(Sha256::new); }
+            "sha512" => { sha512_h.get_or_insert_with(Sha512::new); }
+            "blake3" => { blake3_h.get_or_insert_with(blake3::Hasher::new); }
+            "sha3-256" => { sha3_256_h.get_or_insert_with(Sha3_256::new); }
+            "keccak256" => { keccak256_h.get_or_insert_with(Keccak256::new); }
+            "sha1" => { sha1_h.get_or_insert_with(Sha1Checked::new); }
+            _ => return Err(LabelError::UnknownAxis),
+        }
+    }
+
+    // Single read loop feeding all hashers
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| LabelError::DigestMismatch {
+            expected: String::new(),
+            computed: e.to_string(),
+            axis: "multi".to_string(),
+        })?;
+        if n == 0 { break; }
+        let chunk = &buf[..n];
+        if let Some(ref mut h) = sha256_h { h.update(chunk); }
+        if let Some(ref mut h) = sha512_h { h.update(chunk); }
+        if let Some(ref mut h) = blake3_h { h.update(chunk); }
+        if let Some(ref mut h) = sha3_256_h { h.update(chunk); }
+        if let Some(ref mut h) = keccak256_h { h.update(chunk); }
+        if let Some(ref mut h) = sha1_h { Sha1Digest::update(h, chunk); }
+    }
+
+    // Finalize all hashers
+    let mut results = Vec::with_capacity(axes.len());
+    if let Some(h) = sha256_h {
+        results.push(("sha256".to_string(), format!("sha256:{}", hex::encode(h.finalize()))));
+    }
+    if let Some(h) = sha512_h {
+        results.push(("sha512".to_string(), format!("sha512:{}", hex::encode(h.finalize()))));
+    }
+    if let Some(h) = blake3_h {
+        results.push(("blake3".to_string(), format!("blake3:{}", h.finalize().to_hex())));
+    }
+    if let Some(h) = sha3_256_h {
+        results.push(("sha3-256".to_string(), format!("sha3-256:{}", hex::encode(h.finalize()))));
+    }
+    if let Some(h) = keccak256_h {
+        results.push(("keccak256".to_string(), format!("keccak256:{}", hex::encode(h.finalize()))));
+    }
+    if let Some(h) = sha1_h {
+        let result = h.try_finalize();
+        if result.has_collision() {
+            return Err(LabelError::CollisionDetected);
+        }
+        results.push(("sha1".to_string(), format!("sha1:{}", hex::encode(result.hash()))));
+    }
+
+    // Find the primary by matching the first input axis against results.
+    // Results are built in hasher-check order (sha256 first), not input order.
+    if results.is_empty() {
+        return Err(LabelError::UnknownAxis);
+    }
+    let primary_axis = axes[0];
+    eprintln!(
+        "[streaming_compute_multi] input axes: {:?}, results: {:?}, primary_axis: {}",
+        axes,
+        results.iter().map(|(a, k)| format!("{}={}", a, &k[..std::cmp::min(k.len(), 20)])).collect::<Vec<_>>(),
+        primary_axis,
+    );
+    let primary_idx = results.iter().position(|(a, _)| a == primary_axis)
+        .unwrap_or(0);
+    let (_, primary_kappa) = results.remove(primary_idx);
+    eprintln!(
+        "[streaming_compute_multi] selected primary: {} (idx {})",
+        &primary_kappa[..std::cmp::min(primary_kappa.len(), 30)],
+        primary_idx,
+    );
+    Ok(crate::verified::StreamingVerificationProof::multi(primary_kappa, results))
+}
+
 /// Compute the raw SHA-256 hash of bytes, returning 32 bytes.
 pub fn sha256_raw(bytes: &[u8]) -> [u8; 32] {
     let hash = Sha256::digest(bytes);

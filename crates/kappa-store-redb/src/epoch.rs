@@ -86,37 +86,15 @@ impl PersistentStore {
                 signer_anchor: String::new(),
             });
 
-            kappa = epoch_root.kappa();
-
-            // Persist epoch blob on filesystem (must happen before commit
-            // so the blob exists when recovery reads the pointer)
-            let path = self.blob_path_for(&kappa)?;
-            if !path.exists() {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
-                }
-                let tmp = path.with_extension("tmp");
-                let leaf_bytes = epoch_root.to_leaf_bytes();
-                {
-                    use std::io::Write;
-                    let file = std::fs::File::create(&tmp).map_err(StoreError::Io)?;
-                    let mut writer = std::io::BufWriter::new(file);
-                    writer.write_all(&leaf_bytes).map_err(StoreError::Io)?;
-                    let file = writer
-                        .into_inner()
-                        .map_err(|e| StoreError::Io(e.into_error()))?;
-                    if self.fsync {
-                        file.sync_all().map_err(StoreError::Io)?;
-                    }
-                }
-                std::fs::rename(&tmp, &path).map_err(StoreError::Io)?;
-                if self.fsync {
-                    if let Some(parent) = path.parent() {
-                        if let Ok(dir) = std::fs::File::open(parent) {
-                            let _ = dir.sync_all();
-                        }
-                    }
-                }
+            // Persist epoch blob through the ingest path.
+            // ingest_compute hashes the leaf bytes, stores them at the
+            // computed kappa, and returns the kappa. The Merkle root is
+            // a field inside the epoch, not the storage address.
+            let leaf_bytes = epoch_root.to_leaf_bytes();
+            {
+                use kappa_core::store::KappaStore;
+                let result = self.ingest_compute(kappa_core::kappa::Axis::Sha256, &leaf_bytes)?;
+                kappa = result.kappa;
             }
 
             // Update current pointer in redb (encrypt if enabled)

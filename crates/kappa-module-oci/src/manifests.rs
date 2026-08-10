@@ -164,7 +164,7 @@ async fn manifest_put(
     let content = body.to_vec();
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.blob_put(&k, &content)
+        move || s.ingest_verified(&k,&content)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -355,7 +355,7 @@ async fn manifest_get(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Res
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
-    let file = tokio::task::spawn_blocking({
+    let reader = tokio::task::spawn_blocking({
         let s = s.clone();
         let k = kappa.clone();
         move || s.blob_open(&k)
@@ -364,8 +364,27 @@ async fn manifest_get(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Res
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
-    let async_file = tokio::fs::File::from_std(file);
-    let stream = tokio_util::io::ReaderStream::with_capacity(async_file, STREAM_CHUNK_SIZE);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut reader = reader;
+        let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body_stream = StreamBody::new(stream.map(|r| r.map(|b| Frame::data(b)).map_err(|e| {
         Box::new(e) as Box<dyn std::error::Error + Send + Sync>
     })));

@@ -1,36 +1,24 @@
 //! OCI chunked upload handlers: start, chunk, recovery, complete, cancel.
 //!
-//! Chunks are written to disk-backed staging files. At complete time,
-//! the staging file is verified via streaming digest computation and
-//! renamed to the blob path. No in-memory buffering of upload content.
-
-use std::path::PathBuf;
-use std::sync::Arc;
+//! Upload state is managed via KappaStore trait methods:
+//! upload_begin, upload_put_part, upload_complete, upload_abort,
+//! upload_bytes_received. The store owns staging files, eviction,
+//! and encryption.
 
 use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use kappa_core::kappa::{KappaLabel, Sha1Policy};
+use kappa_core::kappa::KappaLabel;
 use kappa_core::store::blob_put_computed;
+use kappa_core::types::MaxBlobSize;
 
-use crate::upload_session::{
-    place_blob, verify_staged_digest, AppendError, SessionStore, VerifyError,
-};
 use crate::{path_param, query_param, read_body, store};
-
-/// Blob root path, registered as app_context by kappa-server.
-/// Used by the complete handler to compute blob paths for rename.
-pub struct BlobRoot(pub PathBuf);
 
 pub struct UploadTimeout(pub u64);
 
-fn sessions(cx: &Cx) -> &Arc<SessionStore> {
-    app_context::<Arc<SessionStore>>(cx)
-}
-
-fn upload_timeout(cx: &Cx) -> u64 {
-    app_context::<UploadTimeout>(cx).0
+fn max_blob_size(cx: &Cx) -> u64 {
+    app_context::<MaxBlobSize>(cx).0 as u64
 }
 
 // -- Route handlers -----------------------------------------------------------
@@ -104,7 +92,9 @@ pub fn cancel_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let _ = body;
         let id = path_param(cx, "id");
         release_upload_pin(cx, id).await;
-        sessions(cx).remove(id);
+        let s = store(cx).clone();
+        let upload_id = id.to_string();
+        let _ = tokio::task::spawn_blocking(move || s.upload_abort(&upload_id)).await;
         StatusCode::NO_CONTENT.into_response(cx)
     })
 }
@@ -136,8 +126,17 @@ async fn start(cx: &Cx, ns: &str, mount_kappa: Option<&str>) -> topcoat::Result<
         }
     }
 
-    let id = sessions(cx).create(ns);
+    let max_size = max_blob_size(cx);
+    let ns_owned = ns.to_string();
+    let id = tokio::task::spawn_blocking({
+        let s = s.clone();
+        move || s.upload_begin(&ns_owned, max_size)
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(crate::store_err)?;
 
+    // Pin the upload in the namespace so GC does not sweep in-flight content
     let pin_ns = ns.to_string();
     let pin_id = id.clone();
     tokio::task::spawn_blocking({
@@ -170,20 +169,29 @@ async fn chunk(
     range_start: Option<usize>,
     body: &[u8],
 ) -> topcoat::Result<Response> {
-    let timeout = upload_timeout(cx);
-    if sessions(cx).is_expired(id, timeout) {
-        release_upload_pin(cx, id).await;
-        sessions(cx).remove(id);
+    let s = store(cx).clone();
+    let upload_id = id.to_string();
+
+    // Determine offset: from Content-Range header or from bytes received
+    let received = s.upload_bytes_received(&upload_id);
+    if received.is_none() {
         return Err(not_found().into());
     }
-
-    let offset = match (range_start, sessions(cx).bytes_received(id)) {
-        (Some(start), Some(_)) => start as u64,
-        (None, Some(received)) => received,
-        (_, None) => return Err(not_found().into()),
+    let offset = match range_start {
+        Some(start) => start as u64,
+        None => received.unwrap(),
     };
 
-    match sessions(cx).append(id, offset, body) {
+    let data = body.to_vec();
+    let result = tokio::task::spawn_blocking({
+        let s = s.clone();
+        let uid = upload_id.clone();
+        move || s.upload_put_part(&uid, offset, &data)
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?;
+
+    match result {
         Ok(total) => {
             let range = format!("0-{}", total.saturating_sub(1));
             (
@@ -196,30 +204,24 @@ async fn chunk(
             )
                 .into_response(cx)
         }
-        Err(AppendError::NotFound) => Err(not_found().into()),
-        Err(AppendError::OutOfOrder { .. }) => {
+        Err(kappa_core::types::StoreError::NotFound(_)) => Err(not_found().into()),
+        Err(kappa_core::types::StoreError::Conflict(_)) => {
             (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk").into_response(cx)
         }
-        Err(AppendError::SizeExceeded(max)) => {
+        Err(kappa_core::types::StoreError::Rejected(msg)) => {
             crate::oci_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "SIZE_EXCEEDED",
-                &format!("upload exceeds max size {max}"),
+                &msg,
             )
         }
-        Err(AppendError::Io(e)) => Err(bad_request(e.to_string()).into()),
+        Err(e) => Err(bad_request(e.to_string()).into()),
     }
 }
 
 async fn recovery(cx: &Cx, id: &str) -> topcoat::Result<Response> {
-    let timeout = upload_timeout(cx);
-    if sessions(cx).is_expired(id, timeout) {
-        release_upload_pin(cx, id).await;
-        sessions(cx).remove(id);
-        return Err(not_found().into());
-    }
-
-    let received = sessions(cx).bytes_received(id).ok_or_else(not_found)?;
+    let s = store(cx).clone();
+    let received = s.upload_bytes_received(id).ok_or_else(not_found)?;
     let range = format!("0-{}", received.saturating_sub(1));
     (
         StatusCode::NO_CONTENT,
@@ -240,94 +242,80 @@ async fn complete(
     range_start: Option<usize>,
     final_body: &[u8],
 ) -> topcoat::Result<Response> {
-    let timeout = upload_timeout(cx);
-    if sessions(cx).is_expired(id, timeout) {
-        release_upload_pin(cx, id).await;
-        sessions(cx).remove(id);
+    let s = store(cx).clone();
+    let upload_id = id.to_string();
+
+    // Check upload exists
+    if s.upload_bytes_received(&upload_id).is_none() {
         return Err(not_found().into());
     }
 
+    // Validate digest format
+    let _label = KappaLabel::parse(client_digest).map_err(|e| bad_request(e.to_string()))?;
+
     // Append final chunk if present
     if !final_body.is_empty() {
-        let offset = match (range_start, sessions(cx).bytes_received(id)) {
-            (Some(start), Some(_)) => start as u64,
-            (None, Some(received)) => received,
-            (_, None) => return Err(not_found().into()),
+        let offset = match range_start {
+            Some(start) => start as u64,
+            None => s.upload_bytes_received(&upload_id).unwrap_or(0),
         };
-        match sessions(cx).append(id, offset, final_body) {
+        let data = final_body.to_vec();
+        let uid = upload_id.clone();
+        let result = tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.upload_put_part(&uid, offset, &data)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?;
+
+        match result {
             Ok(_) => {}
-            Err(AppendError::OutOfOrder { .. }) => {
+            Err(kappa_core::types::StoreError::Conflict(_)) => {
                 return (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk")
                     .into_response(cx);
             }
-            Err(AppendError::SizeExceeded(max)) => {
+            Err(kappa_core::types::StoreError::Rejected(msg)) => {
                 return crate::oci_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "SIZE_EXCEEDED",
-                    &format!("upload exceeds max size {max}"),
+                    &msg,
                 );
             }
-            Err(AppendError::NotFound) => return Err(not_found().into()),
-            Err(AppendError::Io(e)) => return Err(bad_request(e.to_string()).into()),
+            Err(kappa_core::types::StoreError::NotFound(_)) => {
+                return Err(not_found().into());
+            }
+            Err(e) => return Err(bad_request(e.to_string()).into()),
         }
     }
 
-    // Validate digest format before taking the staging path
-    let _label = KappaLabel::parse(client_digest).map_err(|e| bad_request(e.to_string()))?;
-
-    // Take staging path. Session removed. File NOT deleted.
-    let (session_ns, staging_path) = sessions(cx).take(id).ok_or_else(not_found)?;
-
-    let s = store(cx).clone();
-    let blob_root = app_context::<BlobRoot>(cx).0.clone();
+    // Streaming hash verification + store
     let digest = client_digest.to_string();
-    let ct = content_type.map(|s| s.to_string());
-    let ns = session_ns.clone();
-
-    // Streaming verify + rename in spawn_blocking (filesystem IO)
+    let uid = upload_id.clone();
     let result = tokio::task::spawn_blocking({
         let s = s.clone();
-        let digest = digest.clone();
-        let staging = staging_path.clone();
-        move || -> Result<String, topcoat::Error> {
-            // Streaming digest verification. No memory spike.
-            let sha1_policy = Sha1Policy::for_namespace(&*s, &ns);
-            let verified = verify_staged_digest(&staging, &digest, sha1_policy)
-                .map_err(|e| match &e {
-                    VerifyError::Mismatch { .. } | VerifyError::Sha1Collision(_) => {
-                        let _ = std::fs::remove_file(&staging);
-                        bad_request(e.to_string())
-                    }
-                    VerifyError::AlgorithmDenied(_) => {
-                        let _ = std::fs::remove_file(&staging);
-                        bad_request(e.to_string())
-                    }
-                    _ => {
-                        let _ = std::fs::remove_file(&staging);
-                        bad_request(e.to_string())
-                    }
-                })?;
-
-            // Rename staging file to blob path. Zero-copy.
-            place_blob(&blob_root, &staging, &verified)
-                .map_err(|e| bad_request(e.to_string()))?;
-
-            // Store metadata for upgrade digest if present
-            if let Some(ref upgrade) = verified.upgrade {
-                let _ = s.blob_put_meta(upgrade, "content-type", b"application/octet-stream");
-                let _ = s.blob_put_meta(upgrade, "upgrade-from", verified.primary.as_bytes());
-            }
-
-            Ok(verified.primary)
-        }
+        move || s.upload_complete(&uid, Some(digest.as_str()))
     })
     .await
-    .map_err(|e| bad_request(e.to_string()))??;
+    .map_err(|e| bad_request(e.to_string()))?;
+
+    let ingest_result = match result {
+        Ok(r) => r,
+        Err(kappa_core::types::StoreError::Rejected(msg)) => {
+            return crate::oci_error(
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                &msg,
+            );
+        }
+        Err(e) => return Err(bad_request(e.to_string()).into()),
+    };
+
+    let result_kappa = ingest_result.kappa.clone();
 
     // Store content-type metadata
-    if let Some(ct) = ct {
+    if let Some(ct) = content_type {
         let ct_bytes = ct.as_bytes().to_vec();
-        let d = result.clone();
+        let d = result_kappa.clone();
         tokio::task::spawn_blocking({
             let s = s.clone();
             move || s.blob_put_meta(&d, "content-type", &ct_bytes)
@@ -339,12 +327,14 @@ async fn complete(
 
     release_upload_pin(cx, id).await;
 
+    let ns = path_param(cx, "ns");
+
     (
         StatusCode::CREATED,
         [
-            ("x-kappa-label", result.clone()),
-            ("docker-content-digest", result.clone()),
-            ("location", format!("/v2/{}/blobs/{}", session_ns, result)),
+            ("x-kappa-label", result_kappa.clone()),
+            ("docker-content-digest", result_kappa.clone()),
+            ("location", format!("/v2/{}/blobs/{}", ns, result_kappa)),
             ("content-length", "0".to_string()),
         ],
     )
@@ -354,11 +344,15 @@ async fn complete(
 // -- Helpers ------------------------------------------------------------------
 
 async fn release_upload_pin(cx: &Cx, id: &str) {
-    if let Some(ns) = sessions(cx).namespace_for(id) {
-        let s = store(cx).clone();
-        let tag_name = format!("_upload/{}", id);
-        let _ = tokio::task::spawn_blocking(move || s.tag_delete(&ns, &tag_name)).await;
-    }
+    let s = store(cx).clone();
+    let upload_id = id.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(ns) = s.upload_namespace(&upload_id) {
+            let tag_name = format!("_upload/{}", upload_id);
+            let _ = s.tag_delete(&ns, &tag_name);
+        }
+    })
+    .await;
 }
 
 pub fn parse_range_start(v: &str) -> Option<usize> {

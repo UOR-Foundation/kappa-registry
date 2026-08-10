@@ -169,16 +169,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
         let store = InMemoryStore::new(
-            MemoryStoreConfig {
-                blob_root: tmp.path().join("blobs"),
-            },
+            MemoryStoreConfig::new(tmp.path().join("blobs")),
             clock,
         )
         .unwrap();
 
         let content = b"content-a";
         let k = kappa_from_bytes(content);
-        store.blob_put(&k, content).unwrap();
+        store.ingest_verified(&k, content).unwrap();
         store.tag_set("ns", "latest", &k).unwrap();
 
         let epoch_k = store.epoch_advance("ns", vec![]).unwrap();
@@ -197,9 +195,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
         let store = InMemoryStore::new(
-            MemoryStoreConfig {
-                blob_root: tmp.path().join("blobs"),
-            },
+            MemoryStoreConfig::new(tmp.path().join("blobs")),
             clock,
         )
         .unwrap();
@@ -209,8 +205,8 @@ mod tests {
         let orphan_content = b"orphan-content";
         let orphan_k = kappa_from_bytes(orphan_content);
 
-        store.blob_put(&tagged_k, tagged_content).unwrap();
-        store.blob_put(&orphan_k, orphan_content).unwrap();
+        store.ingest_verified(&tagged_k, tagged_content).unwrap();
+        store.ingest_verified(&orphan_k, orphan_content).unwrap();
         store.tag_set("ns", "keep", &tagged_k).unwrap();
 
         let result = sweep(&store, &|_| vec![]).unwrap();
@@ -228,9 +224,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
         let store = InMemoryStore::new(
-            MemoryStoreConfig {
-                blob_root: tmp.path().join("blobs"),
-            },
+            MemoryStoreConfig::new(tmp.path().join("blobs")),
             clock,
         )
         .unwrap();
@@ -242,9 +236,9 @@ mod tests {
         let orphan_content = b"orphan-content-edge";
         let orphan_k = kappa_from_bytes(orphan_content);
 
-        store.blob_put(&root_k, root_content).unwrap();
-        store.blob_put(&child_k, child_content).unwrap();
-        store.blob_put(&orphan_k, orphan_content).unwrap();
+        store.ingest_verified(&root_k, root_content).unwrap();
+        store.ingest_verified(&child_k, child_content).unwrap();
+        store.ingest_verified(&orphan_k, orphan_content).unwrap();
         store.tag_set("ns", "entry", &root_k).unwrap();
 
         let root_k_clone = root_k.clone();

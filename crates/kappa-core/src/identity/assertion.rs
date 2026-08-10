@@ -93,8 +93,8 @@ pub fn assert_double_entry(
     let ns_b = &assertion_b.asserter;
 
     // Store both blobs
-    store.blob_put(&kappa_a, &bytes_a)?;
-    store.blob_put(&kappa_b, &bytes_b)?;
+    store.ingest_verified(&kappa_a, &bytes_a)?;
+    store.ingest_verified(&kappa_b, &bytes_b)?;
 
     // Tag both under their asserter namespaces
     store.tag_set(ns_a, &format!("assertion/{}", kappa_a), &kappa_a)?;
@@ -208,9 +208,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
         let store = InMemoryStore::new(
-            MemoryStoreConfig {
-                blob_root: tmp.path().join("blobs"),
-            },
+            MemoryStoreConfig::new(tmp.path().join("blobs")),
             clock,
         )
         .unwrap();

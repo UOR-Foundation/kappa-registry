@@ -68,8 +68,36 @@ pub fn authorize(
     if matches!(op, OpClass::Exempt) {
         return Ok(());
     }
+
+    // Superadmin: capability edge on _admin grants access to any namespace
+    let admin_query = EdgeQuery {
+        anchor: asserter.to_string(),
+        direction: Direction::Outbound,
+        relation: Some(EdgeRelation::Capability),
+        asserter: Some(asserter.to_string()),
+    };
+    if let Ok(edges) = store.edge_query("_admin", &admin_query) {
+        if edges.iter().any(|e| cap_permits(e, op)) {
+            return Ok(());
+        }
+    }
+
+    // Non-reserved namespace: first-writer-claims model.
+    // If no capability edges exist for this namespace, it is unclaimed
+    // and anyone can write. Once claimed, only holders of capability
+    // edges can access it.
     if !is_reserved(ns) {
-        return Ok(());
+        let any_caps_query = EdgeQuery {
+            anchor: String::new(),
+            direction: Direction::Outbound,
+            relation: Some(EdgeRelation::Capability),
+            asserter: None,
+        };
+        match store.edge_query(ns, &any_caps_query) {
+            Ok(caps) if caps.is_empty() => return Ok(()), // unclaimed
+            Ok(_) => {} // claimed -- fall through to capability check
+            Err(_) => return Ok(()), // error reading = treat as unclaimed
+        }
     }
 
     // Walk namespace hierarchy: "org/team/repo" -> "org/team" -> "org"

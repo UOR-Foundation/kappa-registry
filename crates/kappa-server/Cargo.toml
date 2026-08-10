@@ -24,6 +24,15 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 
 dashmap = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+md-5 = "0.10"
+base64-simd = "0.8"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"
 kappa-store-redb = { path = "../kappa-store-redb" }
 uuid = { workspace = true }
 libc = "0.2"
@@ -36,6 +45,9 @@ kappa-module-oci = { path = "../kappa-module-oci", optional = true }
 kappa-module-identity = { path = "../kappa-module-identity", optional = true }
 kappa-module-distribution = { path = "../kappa-module-distribution", optional = true }
 kappa-transport-veilid = { path = "../kappa-transport-veilid", optional = true }
+kappa-module-git = { path = "../kappa-module-git", optional = true }
+kappa-module-s3 = { path = "../kappa-module-s3", optional = true }
+gix-hash = { version = "0.23", features = ["sha1"], optional = true }
 
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
@@ -111,8 +123,10 @@ name = "websocket"
 path = "tests/integration/websocket.rs"
 
 [features]
-default = ["oci", "identity-http", "distribution"]
+default = ["oci", "identity-http", "distribution", "git", "s3"]
 oci = ["dep:kappa-module-oci"]
 identity-http = ["dep:kappa-module-identity"]
 distribution = ["dep:kappa-module-distribution"]
 veilid = ["dep:kappa-transport-veilid"]
+git = ["dep:kappa-module-git", "dep:gix-hash"]
+s3 = ["dep:kappa-module-s3"]

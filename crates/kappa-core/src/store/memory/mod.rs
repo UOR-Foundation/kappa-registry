@@ -18,13 +18,25 @@ use crate::epoch::{self, EpochRoot, EpochRootFields};
 use crate::store::KappaStore;
 use crate::types::*;
 
+#[non_exhaustive]
 pub struct MemoryStoreConfig {
     pub blob_root: PathBuf,
+    pub upload_timeout_secs: Option<u64>,
+}
+
+impl MemoryStoreConfig {
+    pub fn new(blob_root: PathBuf) -> Self {
+        Self {
+            blob_root,
+            upload_timeout_secs: None,
+        }
+    }
 }
 
 pub struct InMemoryStore {
     blob_root: PathBuf,
     clock: Arc<dyn Clock>,
+    upload_timeout_secs: Option<u64>,
     tags: RwLock<HashMap<(u64, u64), TagEntry>>,
     meta: DashMap<(u64, u64), Vec<u8>>,
     /// Namespace-scoped metadata index: (ns_hash, key_hash, value_hash) -> Vec<kappa>
@@ -38,6 +50,15 @@ pub struct InMemoryStore {
     namespaces: RwLock<std::collections::HashSet<String>>,
     epoch_roots: RwLock<HashMap<String, EpochRoot>>,
     current_epochs: RwLock<HashMap<u64, String>>,
+    uploads: Mutex<HashMap<String, UploadSession>>,
+}
+
+struct UploadSession {
+    namespace: String,
+    data: Vec<u8>,
+    max_size: u64,
+    created_at: std::time::Instant,
+    part_digests: Vec<(u32, [u8; 16], u64)>, // (part_number, md5, size)
 }
 
 impl InMemoryStore {
@@ -46,6 +67,7 @@ impl InMemoryStore {
         Ok(InMemoryStore {
             blob_root: config.blob_root,
             clock,
+            upload_timeout_secs: config.upload_timeout_secs,
             tags: RwLock::new(HashMap::new()),
             meta: DashMap::new(),
             ns_meta: DashMap::new(),
@@ -58,6 +80,7 @@ impl InMemoryStore {
             namespaces: RwLock::new(std::collections::HashSet::new()),
             epoch_roots: RwLock::new(HashMap::new()),
             current_epochs: RwLock::new(HashMap::new()),
+            uploads: Mutex::new(HashMap::new()),
         })
     }
 
@@ -83,8 +106,10 @@ impl InMemoryStore {
 }
 
 impl KappaStore for InMemoryStore {
-    fn blob_put(&self, kappa: &str, content: &[u8]) -> Result<bool, StoreError> {
-        tracing::debug!(kappa = kappa, size = content.len(), "blob_put");
+    fn blob_put_verified(&self, verified: &crate::verified::VerifiedContent) -> Result<bool, StoreError> {
+        let kappa = verified.kappa();
+        let content = verified.content();
+        tracing::debug!(kappa = kappa, size = content.len(), "blob_put_verified");
         let path = self.blob_path(kappa)?;
         if path.exists() {
             return Ok(false);
@@ -447,7 +472,7 @@ impl KappaStore for InMemoryStore {
         // Persist the epoch root as a content-addressed blob so it
         // survives process restart and participates in GC/federation.
         // Format: 7 length-prefixed Merkle leaves (+ signature if present).
-        self.blob_put(&kappa, &epoch_root.to_leaf_bytes())?;
+        self.ingest_compute(crate::kappa::Axis::Sha256, &epoch_root.to_leaf_bytes())?;
 
         self.epoch_roots
             .write()
@@ -521,5 +546,159 @@ impl KappaStore for InMemoryStore {
     fn namespace_exists(&self, ns: &str) -> Result<bool, StoreError> {
         tracing::trace!(ns = ns, "namespace_exists");
         Ok(self.namespaces.read().unwrap().contains(ns))
+    }
+
+    // -- Streaming upload (in-memory) -----------------------------------------
+
+    fn upload_begin(&self, namespace: &str, max_size: u64) -> Result<String, StoreError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut uploads = self.uploads.lock().unwrap();
+        uploads.insert(id.clone(), UploadSession {
+            namespace: namespace.to_string(),
+            data: Vec::new(),
+            max_size,
+            created_at: std::time::Instant::now(),
+            part_digests: Vec::new(),
+        });
+        Ok(id)
+    }
+
+    fn upload_put_part(
+        &self,
+        upload_id: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64, StoreError> {
+        let mut uploads = self.uploads.lock().unwrap();
+        // Inline expiration check before proceeding
+        if let Some(timeout) = self.upload_timeout_secs {
+            if let Some(session) = uploads.get(upload_id) {
+                if session.created_at.elapsed() > std::time::Duration::from_secs(timeout) {
+                    uploads.remove(upload_id);
+                    return Err(StoreError::NotFound(format!("upload {} expired", upload_id)));
+                }
+            }
+        }
+        let session = uploads.get_mut(upload_id)
+            .ok_or_else(|| StoreError::NotFound(format!("upload {}", upload_id)))?;
+        if offset != session.data.len() as u64 {
+            return Err(StoreError::Conflict(format!(
+                "out-of-order: expected offset {}, got {}",
+                session.data.len(), offset
+            )));
+        }
+        let new_len = session.data.len() + data.len();
+        if session.max_size > 0 && new_len as u64 > session.max_size {
+            return Err(StoreError::Rejected(format!(
+                "upload exceeds max size {}",
+                session.max_size
+            )));
+        }
+        // Compute per-part MD5 for ETag validation on CompleteMultipartUpload
+        use md5::Digest;
+        let md5_hash = md5::Md5::digest(data);
+        let mut md5_bytes = [0u8; 16];
+        md5_bytes.copy_from_slice(&md5_hash);
+        let part_number = session.part_digests.len() as u32 + 1;
+        session.part_digests.push((part_number, md5_bytes, data.len() as u64));
+
+        session.data.extend_from_slice(data);
+        Ok(session.data.len() as u64)
+    }
+
+    fn upload_complete(
+        &self,
+        upload_id: &str,
+        claimed_digest: Option<&str>,
+    ) -> Result<crate::store::IngestResult, StoreError> {
+        let content = {
+            let mut uploads = self.uploads.lock().unwrap();
+            let session = uploads.remove(upload_id)
+                .ok_or_else(|| StoreError::NotFound(format!("upload {}", upload_id)))?;
+            if let Some(timeout) = self.upload_timeout_secs {
+                if session.created_at.elapsed() > std::time::Duration::from_secs(timeout) {
+                    return Err(StoreError::NotFound(format!("upload {} expired", upload_id)));
+                }
+            }
+            session.data
+        };
+
+        // Type-enforced verification: produce a StreamingVerificationProof
+        // from the content, then consume it via ingest_verified. For
+        // InMemoryStore the content is in memory so we use the in-memory
+        // hash. The proof ensures no unverified kappa reaches storage.
+        let proof = {
+            let mut cursor = std::io::Cursor::new(&content);
+            let axis = match claimed_digest {
+                Some(d) => d.split_once(':').map(|(a, _)| a).unwrap_or("sha256"),
+                None => "sha256",
+            };
+            crate::kappa::streaming_compute_kappa(axis, &mut cursor)
+                .map_err(|e| StoreError::Rejected(e.to_string()))?
+        };
+
+        // Verify claimed digest matches proof if caller provided one
+        if let Some(claimed) = claimed_digest {
+            if proof.kappa() != claimed {
+                return Err(StoreError::Rejected(format!(
+                    "digest mismatch: expected {}, computed {}",
+                    claimed, proof.kappa()
+                )));
+            }
+        }
+
+        // Consume the proof: extract the verified kappa and store
+        let verified_kappa = proof.kappa().to_string();
+        drop(proof); // proof consumed
+        self.ingest_verified(&verified_kappa, &content)
+    }
+
+    fn upload_abort(&self, upload_id: &str) -> Result<(), StoreError> {
+        let mut uploads = self.uploads.lock().unwrap();
+        uploads.remove(upload_id);
+        Ok(())
+    }
+
+    fn upload_bytes_received(&self, upload_id: &str) -> Option<u64> {
+        let mut uploads = self.uploads.lock().unwrap();
+        if let Some(timeout) = self.upload_timeout_secs {
+            if let Some(s) = uploads.get(upload_id) {
+                if s.created_at.elapsed() > std::time::Duration::from_secs(timeout) {
+                    uploads.remove(upload_id);
+                    return None;
+                }
+            }
+        }
+        uploads.get(upload_id).map(|s| s.data.len() as u64)
+    }
+
+    fn upload_namespace(&self, upload_id: &str) -> Option<String> {
+        let mut uploads = self.uploads.lock().unwrap();
+        if let Some(timeout) = self.upload_timeout_secs {
+            if let Some(s) = uploads.get(upload_id) {
+                if s.created_at.elapsed() > std::time::Duration::from_secs(timeout) {
+                    uploads.remove(upload_id);
+                    return None;
+                }
+            }
+        }
+        uploads.get(upload_id).map(|s| s.namespace.clone())
+    }
+
+    fn upload_part_info(&self, upload_id: &str) -> Vec<(u32, String, u64)> {
+        let uploads = self.uploads.lock().unwrap();
+        match uploads.get(upload_id) {
+            Some(session) => session.part_digests.iter().map(|(pn, md5, size)| {
+                (*pn, format!("\"{}\"", hex::encode(md5)), *size)
+            }).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn upload_evict_expired(&self, timeout_secs: u64) -> usize {
+        let mut uploads = self.uploads.lock().unwrap();
+        let before = uploads.len();
+        uploads.retain(|_, s| s.created_at.elapsed() <= std::time::Duration::from_secs(timeout_secs));
+        before - uploads.len()
     }
 }

@@ -453,33 +453,4 @@ mod tests {
         assert!(blob_path_for(root, "sha256:....").is_err());
     }
 
-    // -- Sha1Policy -----------------------------------------------------------
-
-    #[test]
-    fn sha1_policy_default_is_allow() {
-        assert_eq!(Sha1Policy::default(), Sha1Policy::Allow);
-    }
-
-    #[test]
-    fn sha1_policy_from_str() {
-        assert_eq!(Sha1Policy::parse_str("allow"), Sha1Policy::Allow);
-        assert_eq!(Sha1Policy::parse_str("deny"), Sha1Policy::Deny);
-        assert_eq!(
-            Sha1Policy::parse_str("upgrade"),
-            Sha1Policy::AllowWithSha256Upgrade
-        );
-        assert_eq!(Sha1Policy::parse_str("unknown"), Sha1Policy::Allow);
-        assert_eq!(Sha1Policy::parse_str(""), Sha1Policy::Allow);
-    }
-
-    #[test]
-    fn sha1_policy_roundtrip() {
-        for policy in [
-            Sha1Policy::Allow,
-            Sha1Policy::Deny,
-            Sha1Policy::AllowWithSha256Upgrade,
-        ] {
-            assert_eq!(Sha1Policy::parse_str(policy.as_str()), policy);
-        }
-    }
 }

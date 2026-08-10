@@ -2,9 +2,6 @@
 //! memory buffering, incremental digest computation is correct across axes,
 //! staging files are cleaned up properly, and adversarial inputs are rejected.
 //!
-//! FAILS UNTIL: Disk-backed SessionStore is implemented in upload.rs replacing
-//! the current Vec<u8> in-memory buffering.
-//!
 //! Adversarial tests informed by:
 //! - OCI conformance run.go:940-1010 (out-of-order chunks)
 //! - OCI conformance run.go:1279-1311 (bad digest on chunked upload)

@@ -188,7 +188,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_assert", ns = %ns, subject = %subj).entered();
                 // 1. Store assertion blob
-                s.blob_put(&k, &ab)?;
+                s.ingest_verified(&k,&ab)?;
                 s.blob_put_meta(&k, "object-type", b"assertion")?;
 
                 // 2. Tag under asserter namespace
@@ -419,7 +419,7 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let rak = revoked_assertion_kappa;
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_revoke", ns = %ns).entered();
-                s.blob_put(&k, &rb)?;
+                s.ingest_verified(&k,&rb)?;
                 s.blob_put_meta(&k, "object-type", b"revocation")?;
                 s.tag_set(&ns, &format!("revocation/{}", k), &k)?;
 
@@ -567,7 +567,7 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let ns = asserter;
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_watermark", ns = %ns).entered();
-                s.blob_put(&k, &wb)?;
+                s.ingest_verified(&k,&wb)?;
                 s.blob_put_meta(&k, "object-type", b"watermark")?;
                 s.tag_set(&ns, &format!("watermark/{}", k), &k)?;
 
@@ -687,7 +687,7 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 let spec_bytes = serde_json::to_vec(&spec)
                     .map_err(|e| kappa_core::StoreError::Io(std::io::Error::other(e.to_string())))?;
                 let kappa = kappa_from_bytes(&spec_bytes);
-                s.blob_put(&kappa, &spec_bytes)?;
+                s.ingest_verified(&kappa,&spec_bytes)?;
                 s.blob_put_meta(&kappa, "object-type", b"anchor-spec")?;
                 s.tag_set(&a, "anchor/spec", &kappa)?;
                 if !ep.is_empty() {

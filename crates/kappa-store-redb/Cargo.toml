@@ -18,6 +18,14 @@ redb = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+md-5 = "0.10"
+serde = { workspace = true }
+serde_json = { workspace = true }
+getrandom = { workspace = true }
+base64-simd = "0.8"
+crc-fast = "1"
 
 [dev-dependencies]
-tempfile = { workspace = true }

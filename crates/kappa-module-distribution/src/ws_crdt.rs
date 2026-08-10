@@ -90,7 +90,7 @@ impl CrdtManager {
             return;
         }
         let kappa = kappa_core::kappa::kappa_from_bytes(state);
-        let _ = self.store.blob_put(&kappa, state);
+        let _ = self.store.ingest_verified(&kappa,state);
         let _ = self.store.tag_set(ns, &format!("_crdt/{}", doc), &kappa);
     }
 

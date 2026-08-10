@@ -106,6 +106,28 @@ const ROUTES: &[&str] = &[
     // Cluster
     "get|/cluster/members|cluster_members|List cluster members|System||-|j",
     "get|/cluster/status|cluster_status|Cluster status|System||-|j",
+    // Git smart HTTP
+    "get|/{repo}.git/info/refs|git_info_refs|Git ref advertisement|Git|repo:path!,service:query!|-|t",
+    "post|/{repo}.git/git-upload-pack|git_upload_pack|Git fetch/clone (upload-pack)|Git|repo:path!|b|b",
+    "post|/{repo}.git/git-receive-pack|git_receive_pack|Git push (receive-pack)|Git|repo:path!|b|b",
+    // S3-compatible API
+    "get|/|s3_list_buckets|List S3 buckets|S3||-|t",
+    "put|/{bucket}|s3_create_bucket|Create S3 bucket|S3|bucket:path!|-|t",
+    "delete|/{bucket}|s3_delete_bucket|Delete S3 bucket|S3|bucket:path!|-|t",
+    "get|/{bucket}|s3_list_objects|List objects (ListObjectsV2)|S3|bucket:path!,prefix:query,delimiter:query,max-keys:query,continuation-token:query,start-after:query,encoding-type:query|-|t",
+    "head|/{bucket}|s3_head_bucket|Check bucket existence|S3|bucket:path!|-|t",
+    "put|/{bucket}/{key}|s3_put_object|Upload object|S3|bucket:path!,key:path!|b|t",
+    "get|/{bucket}/{key}|s3_get_object|Download object|S3|bucket:path!,key:path!|-|b",
+    "head|/{bucket}/{key}|s3_head_object|Object metadata|S3|bucket:path!,key:path!|-|t",
+    "delete|/{bucket}/{key}|s3_delete_object|Delete object|S3|bucket:path!,key:path!|-|t",
+    "post|/{bucket}?delete|s3_delete_objects|Batch delete objects|S3|bucket:path!|t|t",
+    "post|/{bucket}/{key}?uploads|s3_create_multipart|Initiate multipart upload|S3|bucket:path!,key:path!|-|t",
+    "put|/{bucket}/{key}?partNumber&uploadId|s3_upload_part|Upload part|S3|bucket:path!,key:path!,partNumber:query!,uploadId:query!|b|t",
+    "post|/{bucket}/{key}?uploadId|s3_complete_multipart|Complete multipart upload|S3|bucket:path!,key:path!,uploadId:query!|t|t",
+    "delete|/{bucket}/{key}?uploadId|s3_abort_multipart|Abort multipart upload|S3|bucket:path!,key:path!,uploadId:query!|-|t",
+    "get|/{bucket}/{key}?uploadId|s3_list_parts|List parts|S3|bucket:path!,key:path!,uploadId:query!|-|t",
+    "put|/{bucket}/{key}?copy|s3_copy_object|Copy object|S3|bucket:path!,key:path!|-|t",
+    "get|/{bucket}/{key}?attributes|s3_get_object_attributes|Object attributes|S3|bucket:path!,key:path!|-|t",
 ];
 
 // -- Spec builder -------------------------------------------------------------

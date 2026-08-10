@@ -119,7 +119,7 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
     let c = canon.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.blob_put(&ck, &c)
+        move || s.ingest_verified(&ck,&c)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -148,7 +148,7 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
     let w = witness_data;
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.blob_put(&wk, &w)
+        move || s.ingest_verified(&wk,&w)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?

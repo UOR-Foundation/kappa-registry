@@ -214,7 +214,7 @@ impl TransactionManager {
         for (kappa, path) in &staged {
             let content = std::fs::read(path)?;
             main_store
-                .blob_put(kappa, &content)
+                .ingest_verified(kappa, &content)
                 .map_err(|e| TransactionError::Io(std::io::Error::other(e.to_string())))?;
             promoted.push(kappa.clone());
         }
@@ -362,9 +362,7 @@ mod tests {
         let clock = Arc::new(NtpLamportClock::new());
         Arc::new(
             InMemoryStore::new(
-                MemoryStoreConfig {
-                    blob_root: dir.join("blobs"),
-                },
+                MemoryStoreConfig::new(dir.join("blobs")),
                 clock,
             )
             .unwrap(),

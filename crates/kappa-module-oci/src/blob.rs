@@ -160,7 +160,7 @@ pub(crate) async fn put(
         let s = s.clone();
         let d = d.clone();
         let c = c.clone();
-        move || s.blob_put(&d, &c)
+        move || s.ingest_verified(&d,&c)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -188,14 +188,14 @@ pub(crate) async fn put(
         let c = c.clone();
         tokio::task::spawn_blocking({
             let s = s.clone();
-            move || s.blob_put(&also_k, &c)
+            move || s.ingest_verified(&also_k,&c)
         })
         .await
         .map_err(|e| bad_request(e.to_string()))?
         .map_err(crate::store_err)?;
     }
 
-    let status = if created {
+    let status = if created.newly_stored {
         StatusCode::CREATED
     } else {
         StatusCode::OK
@@ -292,7 +292,7 @@ async fn get(cx: &Cx, _ns: &str, kappa: &str) -> topcoat::Result<Response> {
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
-    let file = tokio::task::spawn_blocking({
+    let reader = tokio::task::spawn_blocking({
         let s = s.clone();
         let k = k.clone();
         move || s.blob_open(&k)
@@ -301,8 +301,31 @@ async fn get(cx: &Cx, _ns: &str, kappa: &str) -> topcoat::Result<Response> {
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
-    let async_file = tokio::fs::File::from_std(file);
-    let stream = tokio_util::io::ReaderStream::with_capacity(async_file, STREAM_CHUNK_SIZE);
+    // Bridge sync BlobReader to async stream via a bounded channel.
+    // The blocking thread reads STREAM_CHUNK_SIZE bytes at a time from the
+    // BlobReader (which may be a raw File or a FrameDecryptingReader) and
+    // sends Bytes through the channel. Memory bounded: one chunk in flight.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut reader = reader;
+        let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body_stream = StreamBody::new(stream.map(|r| r.map(|b| Frame::data(b)).map_err(|e| {
         Box::new(e) as Box<dyn std::error::Error + Send + Sync>
     })));
