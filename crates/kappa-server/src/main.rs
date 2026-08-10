@@ -95,13 +95,9 @@ fn p(s: &'static str) -> Cow<'static, Path> {
     Cow::Borrowed(Path::new(s))
 }
 
-/// kappa-distribution spec section 6.1: Warning header on every response.
-fn kappa_warning_header(mut response: topcoat::router::Response) -> topcoat::router::Response {
-    response
-        .headers_mut()
-        .insert("warning", "299 - \"kappa-registry\"".parse().unwrap());
-    response
-}
+// Warning header is applied by warning_layer, not a response hook.
+// The layer checks the request path and only adds Warning: 299 to
+// OCI/kappa-distribution responses (/v2/, /identity/, /_status, /docs).
 
 #[cfg(unix)]
 fn available_bytes(path: &std::path::Path) -> Option<u64> {
@@ -244,10 +240,10 @@ async fn main() {
 
     // -- Router --
     let mut builder = Router::builder()
-        .compression(Compression::off())
-        .response_hook(kappa_warning_header);
+        .compression(Compression::off());
 
     // Layer chain: outermost to innermost
+    builder = builder.layer(LayerFn::new(p("/"), warning_layer));
     builder = builder.layer(LayerFn::new(p("/"), cache_layer));
     builder = builder.layer(LayerFn::new(p("/"), response_compliance_layer));
     builder = builder.layer(LayerFn::new(p("/"), request_id_layer));
@@ -637,6 +633,298 @@ async fn main() {
             .route(RouteFn::new(Method::POST, p("/_git/{*repo}/info/lfs/objects/batch"), git_lfs_batch));
 
         tracing::info!("Git smart HTTP protocol enabled (v1+v2, LFS)");
+    }
+
+    // -- Nix binary cache routes --
+    #[cfg(feature = "nix")]
+    {
+        fn nix_cache_info(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let priority = std::env::var("KAPPA_NIX_PRIORITY")
+                    .unwrap_or_else(|_| "30".to_string());
+                let body = format!(
+                    "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: {}\n",
+                    priority
+                );
+                (StatusCode::OK, [
+                    ("content-type", "text/x-nix-cache-info"),
+                ], body).into_response(cx)
+            })
+        }
+
+        fn nix_narinfo_get(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let hash = params.iter().find(|(k, _)| *k == "hash")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let tag_name = format!("narinfo:{}", hash);
+                let result = tokio::task::spawn_blocking(move || {
+                    let entry = store.tag_get("_nix", &tag_name)?;
+                    store.blob_get(&entry.kappa)
+                }).await;
+                match result {
+                    Ok(Ok(content)) => (StatusCode::OK, [
+                        ("content-type", "text/x-nix-narinfo"),
+                        ("cache-control", "max-age=600"),
+                    ], content).into_response(cx),
+                    _ => StatusCode::NOT_FOUND.into_response(cx),
+                }
+            })
+        }
+
+        fn nix_narinfo_head(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let hash = params.iter().find(|(k, _)| *k == "hash")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let tag_name = format!("narinfo:{}", hash);
+                let result = tokio::task::spawn_blocking(move || {
+                    let entry = store.tag_get("_nix", &tag_name)?;
+                    store.blob_size(&entry.kappa)
+                }).await;
+                match result {
+                    Ok(Ok(size)) => (StatusCode::OK, [
+                        ("content-type", "text/x-nix-narinfo"),
+                        ("content-length", &size.to_string()),
+                    ]).into_response(cx),
+                    _ => StatusCode::NOT_FOUND.into_response(cx),
+                }
+            })
+        }
+
+        fn nix_narinfo_put(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let url_hash = params.iter().find(|(k, _)| *k == "hash")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let narinfo_bytes = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 64 * 1024).await
+                        .map(|b| b.to_vec()).unwrap_or_default()
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    let narinfo_text = String::from_utf8(narinfo_bytes.clone())
+                        .map_err(|e| kappa_core::types::StoreError::Rejected(
+                            format!("narinfo is not valid UTF-8: {e}")
+                        ))?;
+                    let narinfo = kappa_module_nix::narinfo::NarInfo::parse(&narinfo_text)
+                        .map_err(|e| kappa_core::types::StoreError::Rejected(
+                            format!("narinfo parse error: {e}")
+                        ))?;
+
+                    // Verify URL hash matches store path hash
+                    let store_hash = narinfo.store_path_hash();
+                    if url_hash != store_hash {
+                        return Err(kappa_core::types::StoreError::Rejected(format!(
+                            "URL hash {} does not match store path hash {}",
+                            url_hash, store_hash
+                        )));
+                    }
+
+                    // Verify NarHash and references if the referenced NAR is already stored.
+                    // The Nix client uploads narinfo BEFORE the NAR, so the NAR may not
+                    // exist yet. When it does exist, verify immediately. When it doesn't,
+                    // store the narinfo and defer verification to NAR PUT time.
+                    let nar_path = narinfo.url.strip_prefix("nar/").unwrap_or(&narinfo.url);
+                    let nar_tag_name = format!("nar:{}", nar_path);
+                    if let Ok(nar_entry) = store.tag_get("_nix", &nar_tag_name) {
+                        let nar_bytes = store.blob_get(&nar_entry.kappa)?;
+                        kappa_module_nix::refs::decompress_and_verify(
+                            &nar_bytes,
+                            &narinfo.compression,
+                            &narinfo.nar_hash,
+                            &narinfo.references,
+                        ).map_err(|e| kappa_core::types::StoreError::Rejected(
+                            format!("NAR verification failed: {e}")
+                        ))?;
+                    }
+
+                    // Store narinfo text as blob
+                    let narinfo_result = store.ingest_compute(
+                        kappa_core::kappa::Axis::Sha256, &narinfo_bytes
+                    )?;
+
+                    // Set tag: narinfo:{hash} -> narinfo blob kappa
+                    let tag_name = format!("narinfo:{}", store_hash);
+                    store.tag_set("_nix", &tag_name, &narinfo_result.kappa)?;
+
+                    // Create RefersTo edges via edge_put_batch
+                    let edges: Vec<kappa_core::types::Edge> = narinfo.references.iter()
+                        .filter_map(|basename| {
+                            if basename.len() > 32 && basename.as_bytes().get(32) == Some(&b'-') {
+                                Some(kappa_core::types::Edge {
+                                    source: narinfo_result.kappa.clone(),
+                                    target: format!("storepath:{}", &basename[..32]),
+                                    relation: kappa_core::types::EdgeRelation::RefersTo,
+                                    asserter: "_nix".to_string(),
+                                    value_kappa: None,
+                                    metadata: None,
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !edges.is_empty() {
+                        store.edge_put_batch("_nix", &edges)?;
+                    }
+
+                    // Create DerivedFrom edge if deriver is present
+                    if let Some(ref deriver) = narinfo.deriver {
+                        let deriver_edge = kappa_core::types::Edge {
+                            source: narinfo_result.kappa.clone(),
+                            target: format!("deriver:{}", deriver),
+                            relation: kappa_core::types::EdgeRelation::DerivedFrom,
+                            asserter: "_nix".to_string(),
+                            value_kappa: None,
+                            metadata: None,
+                        };
+                        store.edge_put("_nix", &deriver_edge)?;
+                    }
+
+                    // Store signatures as blob metadata
+                    for (i, sig) in narinfo.signatures.iter().enumerate() {
+                        let meta_key = format!("_nix_sig_{}", i);
+                        store.blob_put_meta(
+                            &narinfo_result.kappa, &meta_key, sig.as_bytes()
+                        )?;
+                    }
+
+                    Ok(())
+                }).await;
+                match result {
+                    Ok(Ok(())) => StatusCode::CREATED.into_response(cx),
+                    Ok(Err(kappa_core::types::StoreError::Rejected(msg))) => {
+                        (StatusCode::BAD_REQUEST, msg).into_response(cx)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "nix narinfo put failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(cx)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "nix narinfo put spawn failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(cx)
+                    }
+                }
+            })
+        }
+
+        fn nix_nar_get(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let path = params.iter().find(|(k, _)| *k == "path")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let tag_name = format!("nar:{}", path);
+                let result = tokio::task::spawn_blocking(move || {
+                    let entry = store.tag_get("_nix", &tag_name)?;
+                    // Stream via blob_open for large NARs
+                    let mut reader = store.blob_open(&entry.kappa)?;
+                    let mut content = Vec::new();
+                    std::io::Read::read_to_end(&mut *reader, &mut content)?;
+                    Ok::<Vec<u8>, kappa_core::types::StoreError>(content)
+                }).await;
+                match result {
+                    Ok(Ok(content)) => (StatusCode::OK, [
+                        ("content-type", "application/x-nix-nar"),
+                    ], content).into_response(cx),
+                    _ => StatusCode::NOT_FOUND.into_response(cx),
+                }
+            })
+        }
+
+        fn nix_nar_put(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                use topcoat::context::request_context;
+                use topcoat::router::RawPathParams;
+                let params: &RawPathParams = request_context(cx);
+                let path = params.iter().find(|(k, _)| *k == "path")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let content = {
+                    use topcoat::router::to_bytes;
+                    to_bytes(body, 10 * 1024 * 1024 * 1024).await
+                        .map(|b| b.to_vec()).unwrap_or_default()
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    let nar_kappa = kappa_core::kappa::kappa_from_bytes(&content);
+                    store.ingest_verified(&nar_kappa, &content)?;
+                    let tag_name = format!("nar:{}", path);
+                    store.tag_set("_nix", &tag_name, &nar_kappa)?;
+
+                    // Deferred verification: check if any narinfo already references
+                    // this NAR and verify NarHash + references now that the NAR is stored.
+                    // Scan narinfo tags for entries whose URL field matches this NAR path.
+                    // The narinfo stores the URL as "nar/{path}", the NAR tag is "nar:{path}".
+                    if let Ok(tags) = store.tag_list("_nix") {
+                        for tag in &tags {
+                            if !tag.name.starts_with("narinfo:") {
+                                continue;
+                            }
+                            if let Ok(narinfo_bytes) = store.blob_get(&tag.kappa) {
+                                if let Ok(narinfo_text) = String::from_utf8(narinfo_bytes) {
+                                    if let Ok(narinfo) = kappa_module_nix::narinfo::NarInfo::parse(&narinfo_text) {
+                                        let narinfo_nar_path = narinfo.url.strip_prefix("nar/").unwrap_or(&narinfo.url);
+                                        if narinfo_nar_path == path {
+                                            if let Err(e) = kappa_module_nix::refs::decompress_and_verify(
+                                                &content,
+                                                &narinfo.compression,
+                                                &narinfo.nar_hash,
+                                                &narinfo.references,
+                                            ) {
+                                                tracing::warn!(
+                                                    narinfo = %tag.name,
+                                                    error = %e,
+                                                    "deferred NAR verification failed, removing narinfo"
+                                                );
+                                                let _ = store.tag_delete("_nix", &tag.name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Ok::<(), kappa_core::types::StoreError>(())
+                }).await;
+                match result {
+                    Ok(Ok(())) => StatusCode::CREATED.into_response(cx),
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "nix nar put failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(cx)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "nix nar put spawn failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(cx)
+                    }
+                }
+            })
+        }
+
+        // Routes use INTERNAL paths from nix_rewrite.rs mapping table.
+        // External /{hash}.narinfo is rewritten to /narinfo/{hash} by the
+        // rewrite layer before routing. See nix_rewrite.rs doc comment.
+        builder = builder
+            .route(RouteFn::new(Method::GET, p("/_nix/nix-cache-info"), nix_cache_info))
+            .route(RouteFn::new(Method::GET, p("/_nix/narinfo/{hash}"), nix_narinfo_get))
+            .route(RouteFn::new(Method::HEAD, p("/_nix/narinfo/{hash}"), nix_narinfo_head))
+            .route(RouteFn::new(Method::PUT, p("/_nix/narinfo/{hash}"), nix_narinfo_put))
+            .route(RouteFn::new(Method::GET, p("/_nix/nar/{*path}"), nix_nar_get))
+            .route(RouteFn::new(Method::PUT, p("/_nix/nar/{*path}"), nix_nar_put));
+
+        tracing::info!("Nix binary cache protocol enabled");
     }
 
     // -- S3-compatible routes --

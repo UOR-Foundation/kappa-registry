@@ -17,7 +17,7 @@ use kappa_core::types::MaxBlobSize;
 pub struct MaxApiBodyBytes(pub usize);
 
 fn is_blob_path(path: &str) -> bool {
-    path.contains("/blobs/") || path.contains("/_uploads/")
+    path.contains("/blobs/") || path.contains("/_uploads/") || path.starts_with("/_nix/nar/")
 }
 
 pub fn body_limit_layer<'a>(

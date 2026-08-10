@@ -359,6 +359,7 @@ pub enum ProtocolHint {
     S3,
     Git,
     KappaDistribution,
+    Nix,
     None,
 }
 
@@ -544,6 +545,7 @@ mod tests {
             EdgeRelation::CertifiedBy,
             EdgeRelation::EvidenceProvenance,
             EdgeRelation::SectionOf,
+            EdgeRelation::RefersTo,
         ];
         for rel in all {
             // Just calling gc_reachable proves the match is exhaustive

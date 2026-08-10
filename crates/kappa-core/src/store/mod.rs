@@ -179,7 +179,7 @@ pub trait KappaStore: Send + Sync {
     fn tag_prefix(&self, ns: &str, prefix: &str) -> Result<Vec<TagEntry>, StoreError>;
     fn tag_set_batch(&self, ns: &str, updates: &[TagUpdate]) -> Result<(), StoreError>;
 
-    // -- Edge: typed relationships between kappas (3) -------------------------
+    // -- Edge: typed relationships between kappas (4) -------------------------
 
     fn edge_put(&self, ns: &str, edge: &Edge) -> Result<(), StoreError>;
     fn edge_query(&self, ns: &str, query: &EdgeQuery) -> Result<Vec<Edge>, StoreError>;
@@ -190,6 +190,16 @@ pub trait KappaStore: Send + Sync {
         target: &str,
         relation: EdgeRelation,
     ) -> Result<(), StoreError>;
+
+    /// Store multiple edges in a single transaction. Default loops
+    /// edge_put. PersistentStore overrides with a single redb write
+    /// transaction for all edges, amortizing commit overhead.
+    fn edge_put_batch(&self, ns: &str, edges: &[Edge]) -> Result<(), StoreError> {
+        for edge in edges {
+            self.edge_put(ns, edge)?;
+        }
+        Ok(())
+    }
 
     // -- Sequence: monotonic counters (2) -------------------------------------
 

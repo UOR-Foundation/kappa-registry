@@ -526,6 +526,9 @@ impl KappaStore for PersistentStore {
     ) -> Result<(), StoreError> {
         self.edge_delete_impl(ns, source, target, relation)
     }
+    fn edge_put_batch(&self, ns: &str, edges: &[Edge]) -> Result<(), StoreError> {
+        self.edge_put_batch_impl(ns, edges)
+    }
     fn sequence_next(&self, ns: &str, name: &str) -> Result<u64, StoreError> {
         self.sequence_next_impl(ns, name)
     }

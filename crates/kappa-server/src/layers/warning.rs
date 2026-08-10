@@ -2,12 +2,16 @@
 //! Warning: 299 - "kappa-registry"
 //! Per kappa-distribution spec section 6.1.
 //!
-//! S3 and Git responses do NOT receive this header. Detection is by
-//! path prefix: /v2/ is OCI/kappa-distribution, /{repo}.git/ is Git,
-//! everything else (/{bucket}/...) is S3.
+//! Non-OCI responses (S3, Git, Nix) do NOT receive this header.
+//! Detection is by request path prefix: /v2/, /identity/, /_status,
+//! /openapi.json, /docs are OCI/kappa-distribution.
+//!
+//! The header is added to BOTH success and error responses on OCI
+//! paths. Error responses are converted to HTTP responses with the
+//! error's status code and body so the Warning header can be attached.
 
 use topcoat::context::CxBuilder;
-use topcoat::router::{Body, Next, Response, StatusCode};
+use topcoat::router::{Body, Next, Response};
 
 pub fn warning_layer<'a>(
     cx: &'a mut CxBuilder,
@@ -15,7 +19,6 @@ pub fn warning_layer<'a>(
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
-        // Determine protocol hint from request path
         let is_oci = {
             use topcoat::context::request_context;
             let parts: &http::request::Parts = request_context(cx);
@@ -25,6 +28,10 @@ pub fn warning_layer<'a>(
                 || path == "/_status" || path.starts_with("/_status/")
                 || path == "/openapi.json" || path == "/docs"
         };
+
+        if !is_oci {
+            return next.run(cx, body).await;
+        }
 
         let mut response = match next.run(cx, body).await {
             Ok(r) => r,
@@ -37,12 +44,9 @@ pub fn warning_layer<'a>(
             }
         };
 
-        // Only add Warning header to OCI/kappa-distribution responses
-        if is_oci {
-            response
-                .headers_mut()
-                .insert("warning", "299 - \"kappa-registry\"".parse().unwrap());
-        }
+        response
+            .headers_mut()
+            .insert("warning", "299 - \"kappa-registry\"".parse().unwrap());
         Ok(response)
     })
 }

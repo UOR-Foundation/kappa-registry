@@ -47,6 +47,7 @@ kappa-module-distribution = { path = "../kappa-module-distribution", optional = 
 kappa-transport-veilid = { path = "../kappa-transport-veilid", optional = true }
 kappa-module-git = { path = "../kappa-module-git", optional = true }
 kappa-module-s3 = { path = "../kappa-module-s3", optional = true }
+kappa-module-nix = { path = "../kappa-module-nix", optional = true }
 gix-hash = { version = "0.23", features = ["sha1"], optional = true }
 
 [dev-dependencies]
@@ -65,6 +66,12 @@ ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 getrandom = { workspace = true }
 kappa-core = { workspace = true }
+zstd = "0.13"
+nix-derivation = { git = "https://github.com/cachix/nix-derivation" }
+
+[[test]]
+name = "nix_e2e"
+path = "tests/integration/nix_e2e.rs"
 
 [[test]]
 name = "smoke"
@@ -127,10 +134,11 @@ name = "git_e2e"
 path = "tests/integration/git_e2e.rs"
 
 [features]
-default = ["oci", "identity-http", "distribution", "git", "s3"]
+default = ["oci", "identity-http", "distribution", "git", "s3", "nix"]
 oci = ["dep:kappa-module-oci"]
 identity-http = ["dep:kappa-module-identity"]
 distribution = ["dep:kappa-module-distribution"]
 veilid = ["dep:kappa-transport-veilid"]
 git = ["dep:kappa-module-git", "dep:gix-hash"]
 s3 = ["dep:kappa-module-s3"]
+nix = ["dep:kappa-module-nix"]

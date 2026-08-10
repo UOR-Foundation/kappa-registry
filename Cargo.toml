@@ -13,6 +13,7 @@ members = [
     "crates/kappa-transport-veilid",
     "crates/kappa-module-git",
     "crates/kappa-module-s3",
+    "crates/kappa-module-nix",
     "crates/kappa-conformance",
 ]
 

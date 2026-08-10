@@ -124,6 +124,68 @@ impl PersistentStore {
         Ok(results)
     }
 
+    pub(crate) fn edge_put_batch_impl(&self, ns: &str, edges: &[Edge]) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 1: store all edge blobs on the filesystem (outside redb transaction).
+        // Each edge is content-addressed dCBOR. Collect (edge, edge_bytes, edge_kappa).
+        let mut prepared: Vec<(&Edge, Vec<u8>, String)> = Vec::with_capacity(edges.len());
+        for edge in edges {
+            let edge_bytes = canonical_bytes(edge);
+            let edge_kappa = {
+                use kappa_core::store::KappaStore;
+                self.ingest_compute(kappa_core::kappa::Axis::Sha256, &edge_bytes)?.kappa
+            };
+            prepared.push((edge, edge_bytes, edge_kappa));
+        }
+
+        // Phase 2: single redb write transaction for all index inserts.
+        let txn = self.db.begin_write().map_err(Self::redb_err)?;
+        {
+            let mut ns_table = txn.open_table(NAMESPACES).map_err(Self::redb_err)?;
+            ns_table.insert(ns, ()).map_err(Self::redb_err)?;
+            drop(ns_table);
+
+            let mut edge_table = txn.open_table(EDGES).map_err(Self::redb_err)?;
+            let mut fwd = txn.open_multimap_table(EDGE_FWD).map_err(Self::redb_err)?;
+            let mut rev = txn.open_multimap_table(EDGE_REV).map_err(Self::redb_err)?;
+            let mut rel = txn.open_multimap_table(EDGE_REL).map_err(Self::redb_err)?;
+            let mut asr = txn.open_multimap_table(EDGE_ASR).map_err(Self::redb_err)?;
+
+            for (edge, edge_bytes, edge_kappa) in &prepared {
+                let edge_key = format!("{}\x00{}", ns, edge_kappa);
+                let stored_bytes: Vec<u8> = match &self.table_encryptor {
+                    Some(enc) => enc.encrypt_value(&edge_key, edge_bytes)
+                        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+                    None => edge_bytes.clone(),
+                };
+                edge_table
+                    .insert(edge_key.as_str(), stored_bytes.as_slice())
+                    .map_err(Self::redb_err)?;
+
+                let fwd_key = format!("{}\x00{}", ns, edge.source);
+                fwd.insert(fwd_key.as_str(), edge_kappa.as_str())
+                    .map_err(Self::redb_err)?;
+
+                let rev_key = format!("{}\x00{}", ns, edge.target);
+                rev.insert(rev_key.as_str(), edge_kappa.as_str())
+                    .map_err(Self::redb_err)?;
+
+                let rel_key = format!("{}\x00{}", ns, edge.relation.as_str());
+                rel.insert(rel_key.as_str(), edge_kappa.as_str())
+                    .map_err(Self::redb_err)?;
+
+                let asr_key = format!("{}\x00{}", ns, edge.asserter);
+                asr.insert(asr_key.as_str(), edge_kappa.as_str())
+                    .map_err(Self::redb_err)?;
+            }
+        }
+        txn.commit().map_err(Self::redb_err)?;
+        Ok(())
+    }
+
     pub(crate) fn edge_delete_impl(
         &self,
         ns: &str,

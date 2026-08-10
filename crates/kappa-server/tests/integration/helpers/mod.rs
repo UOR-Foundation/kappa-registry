@@ -1,15 +1,15 @@
 //! Shared test infrastructure for kappa-server integration tests.
 //!
 //! Each integration test file includes `mod helpers; use helpers::*;`
-//! Not every file uses every helper, so all items are `#[allow(dead_code)]`.
-//!
-//! One ServerGuard. One start_server(). One client(). One sha256_digest().
-//! Every integration test file uses: mod helpers; use helpers::*;
+//! Each `[[test]]` binary compiles this module independently. Functions
+//! used only by other test binaries appear unused in any single binary.
 //!
 //! Design informed by:
 //! - redb/tests/integration_tests.rs:31-37 (create_tempfile defined once)
 //! - distribution-spec/conformance/run.go:45-81 (runner with all shared state)
 //! - topcoat-router/src/router.rs:558-610 (shared test helpers)
+
+#![allow(dead_code)]
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -92,8 +92,14 @@ pub fn start_server_at_with_env(
         .env("KAPPA_RATELIMIT_WRITE_PERIOD_MS", "0")
         .env("KAPPA_RATELIMIT_ADMIN_PERIOD_MS", "0")
         .env("RUST_LOG", "error")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    // Write stderr to a temp file for diagnostics on startup failure.
+    // Cannot use store_root because some tests (store_root_created_if_nonexistent)
+    // pass a path that does not yet exist.
+    let stderr_path = std::env::temp_dir().join(format!("kappa-server-{}.stderr", port));
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .expect("failed to create stderr log");
+    cmd.stderr(stderr_file);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -116,7 +122,11 @@ pub fn start_server_at_with_env(
             return guard;
         }
     }
-    panic!("kappa-server did not become ready within 5 seconds");
+    let stderr_content = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    panic!(
+        "kappa-server did not become ready within 5 seconds\nserver stderr:\n{}",
+        stderr_content
+    );
 }
 
 /// Start a server with a fresh TempDir and optional extra env vars.

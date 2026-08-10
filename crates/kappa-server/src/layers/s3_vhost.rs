@@ -127,6 +127,12 @@ pub async fn serve_with_vhost(
                         parts.uri = new_uri;
                     }
 
+                    // Nix rewrite: /nix/ paths -> /_nix/ internal prefix.
+                    #[cfg(feature = "nix")]
+                    if let Some(new_uri) = super::nix_rewrite::rewrite_nix_path(&parts.uri) {
+                        parts.uri = new_uri;
+                    }
+
                     let request = http::Request::from_parts(parts, body);
                     let response: Response = router.handle(request.map(Body::new)).await;
                     Ok::<_, Infallible>(response)
