@@ -327,20 +327,9 @@ pub fn streaming_compute_multi(
         return Err(LabelError::UnknownAxis);
     }
     let primary_axis = axes[0];
-    eprintln!(
-        "[streaming_compute_multi] input axes: {:?}, results: {:?}, primary_axis: {}",
-        axes,
-        results.iter().map(|(a, k)| format!("{}={}", a, &k[..std::cmp::min(k.len(), 20)])).collect::<Vec<_>>(),
-        primary_axis,
-    );
     let primary_idx = results.iter().position(|(a, _)| a == primary_axis)
         .unwrap_or(0);
     let (_, primary_kappa) = results.remove(primary_idx);
-    eprintln!(
-        "[streaming_compute_multi] selected primary: {} (idx {})",
-        &primary_kappa[..std::cmp::min(primary_kappa.len(), 30)],
-        primary_idx,
-    );
     Ok(crate::verified::StreamingVerificationProof::multi(primary_kappa, results))
 }
 

@@ -1,0 +1,10 @@
+error[E0624]: associated function `single` is private
+ --> tests/compile_fail/streaming_proof_closed.rs:8:68
+  |
+8 |     let _proof = kappa_core::verified::StreamingVerificationProof::single(
+  |                                                                    ^^^^^^ private associated function
+  |
+ ::: $WORKSPACE/crates/kappa-core/src/verified.rs
+  |
+  |     pub(crate) fn single(kappa: String) -> Self {
+  |     ------------------------------------------- private associated function defined here

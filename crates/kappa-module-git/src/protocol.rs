@@ -85,7 +85,8 @@ pub fn write_ref_advertisement<W: Write>(
     mut out: W,
     object_hash: gix_hash::Kind,
 ) -> Result<(), ProtocolError> {
-    let service_line = format!("# service={}\n", service);
+    // text_to_write appends \n, so do not include one in the string
+    let service_line = format!("# service={}", service);
     encode::text_to_write(service_line.as_bytes(), &mut out)?;
     encode::flush_to_write(&mut out)?;
 
@@ -296,10 +297,12 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
         }
         reader.reset_with(&[PacketLineRef::Flush]);
 
-        // Read want/have/done lines
+        // Read want/have/done lines.
+        // "done" terminates the section -- stop reading after it.
+        // On HTTP stateless transport, "done" is always present and
+        // "ready" is always sent in the acknowledgments (no multi-round).
         let mut wants: Vec<String> = Vec::new();
         let mut haves: HashSet<String> = HashSet::new();
-        let mut done = false;
 
         while let Some(line_result) = reader.read_line() {
             let line = line_result
@@ -314,7 +317,6 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
                 } else if let Some(rest) = text.strip_prefix("have ") {
                     haves.insert(rest.trim().to_string());
                 } else if text == "done" {
-                    done = true;
                     break;
                 } else if let Some(rest) = text.strip_prefix("shallow ") {
                     fetch_opts.client_shallows.insert(rest.trim().to_string());
@@ -329,25 +331,37 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
             return Ok(());
         }
 
-        // Acknowledgments section
-        encode::data_to_write(b"acknowledgments\n", &mut response)?;
+        // Build the common set from have lines
         let mut common: HashSet<String> = HashSet::new();
         for have_oid in &haves {
             let kappa = oid_to_kappa_string(object_hash, have_oid);
             if store.blob_exists(&kappa).unwrap_or(false) {
                 common.insert(have_oid.clone());
-                let ack = format!("ACK {}\n", have_oid);
-                encode::data_to_write(ack.as_bytes(), &mut response)?;
             }
         }
-        if common.is_empty() {
-            encode::data_to_write(b"NAK\n", &mut response)?;
-        }
-        if done {
+
+        // Acknowledgments section: only sent when the client sent have lines.
+        // For a fresh clone (no haves, client sends done), skip straight to
+        // packfile. Git v2 spec: "If the client has not sent done, the server
+        // MUST send an acknowledgments section."
+        if !haves.is_empty() {
+            encode::data_to_write(b"acknowledgments\n", &mut response)?;
+            for have_oid in &haves {
+                if common.contains(have_oid) {
+                    let ack = format!("ACK {}\n", have_oid);
+                    encode::data_to_write(ack.as_bytes(), &mut response)?;
+                }
+            }
+            if common.is_empty() {
+                encode::data_to_write(b"NAK\n", &mut response)?;
+            }
+            // HTTP is stateless: each POST is a complete round. The server
+            // MUST send "ready" to indicate it will send a packfile in this
+            // response. Without "ready", the client expects the response to
+            // end (more rounds needed) and rejects the packfile section.
             encode::data_to_write(b"ready\n", &mut response)?;
+            encode::delim_to_write(&mut response)?;
         }
-        // Delimiter between acknowledgments and packfile sections
-        encode::delim_to_write(&mut response)?;
 
         // Packfile section
         encode::data_to_write(b"packfile\n", &mut response)?;
@@ -708,46 +722,95 @@ pub fn handle_receive_pack<R: Read, W: Write>(
         }
     }
 
-    // Item 55: report-status-v2 with option lines
+    // report-status via side-band-64k.
+    //
+    // Git report-status format (inside side-band channel 1):
+    //   pkt-line: "unpack ok\n"        (or "unpack <error>\n")
+    //   pkt-line: "ok <ref>\n"         (per ref)
+    //   pkt-line: "ng <ref> <reason>\n" (per failed ref)
+    //   flush-pkt
+    //
+    // The side-band wrapping: each pkt-line is sent inside a side-band
+    // channel 1 packet. The outer layer is pkt-line(\x01 + inner_pkt_line).
+    // The inner pkt-line framing is preserved -- the client's side-band
+    // demuxer extracts channel 1 data and feeds it to the report-status
+    // parser which expects pkt-line encoded lines.
+
+    // "unpack ok" pkt-line via side-band channel 1
+    {
+        let mut inner = Vec::new();
+        encode::data_to_write(b"unpack ok\n", &mut inner)?;
+        let mut sb = Vec::with_capacity(1 + inner.len());
+        sb.push(1);
+        sb.extend_from_slice(&inner);
+        encode::data_to_write(&sb, &mut response)?;
+    }
+
+    // Per-ref status lines + report-status-v2 option lines via side-band channel 1
     for (i, ref_name) in ref_names_in_order.iter().enumerate() {
-        let (status_line, ok) = if deletes.contains(ref_name) {
+        let is_ok = if deletes.contains(ref_name) {
+            delete_errors.iter().find(|(n, _)| n == ref_name).is_none()
+        } else {
+            batch_result.is_ok()
+        };
+        let status_line = if deletes.contains(ref_name) {
             if let Some((_, err)) = delete_errors.iter().find(|(n, _)| n == ref_name) {
-                (format!("ng {} {}\n", ref_name, err), false)
+                format!("ng {} {}\n", ref_name, err)
             } else {
-                (format!("ok {}\n", ref_name), true)
+                format!("ok {}\n", ref_name)
             }
         } else {
             match &batch_result {
-                Ok(()) => (format!("ok {}\n", ref_name), true),
-                Err(e) => (format!("ng {} {}\n", ref_name, e), false),
+                Ok(()) => format!("ok {}\n", ref_name),
+                Err(e) => format!("ng {} {}\n", ref_name, e),
             }
         };
-        encode::data_to_write(status_line.as_bytes(), &mut response)?;
 
-        // report-status-v2 option lines
-        if ok {
+        // Status line as pkt-line inside side-band channel 1
+        let mut inner = Vec::new();
+        encode::data_to_write(status_line.as_bytes(), &mut inner)?;
+
+        // report-status-v2 option lines (after each ok line)
+        if is_ok {
             let update = &updates[i];
-            let refname_opt = format!("option refname {}\n", ref_name);
-            encode::data_to_write(refname_opt.as_bytes(), &mut response)?;
-            let old_opt = format!("option old-oid {}\n", update.old_oid);
-            encode::data_to_write(old_opt.as_bytes(), &mut response)?;
-            let new_opt = format!("option new-oid {}\n", update.new_oid);
-            encode::data_to_write(new_opt.as_bytes(), &mut response)?;
+            encode::data_to_write(
+                format!("option refname {}\n", ref_name).as_bytes(), &mut inner,
+            )?;
+            encode::data_to_write(
+                format!("option old-oid {}\n", update.old_oid).as_bytes(), &mut inner,
+            )?;
+            encode::data_to_write(
+                format!("option new-oid {}\n", update.new_oid).as_bytes(), &mut inner,
+            )?;
             if update.old_oid != zero_oid && update.new_oid != zero_oid {
-                // Non-fast-forward check: if the old OID is not an ancestor
-                // of the new OID, this was a forced update
                 let old_kappa = format!("{}:{}", prefix, update.old_oid);
-                let new_kappa = format!("{}:{}", prefix, update.new_oid);
                 let new_reachable = walk_reachable(
                     store, vec![update.new_oid.clone()], object_hash,
                 );
                 if !new_reachable.contains(&old_kappa) {
-                    encode::data_to_write(b"option forced-update\n", &mut response)?;
+                    encode::data_to_write(b"option forced-update\n", &mut inner)?;
                 }
-                let _ = new_kappa; // used indirectly via new_reachable
             }
         }
+
+        // Send all inner pkt-lines as one side-band channel 1 packet
+        let mut sb = Vec::with_capacity(1 + inner.len());
+        sb.push(1);
+        sb.extend_from_slice(&inner);
+        encode::data_to_write(&sb, &mut response)?;
     }
+
+    // Flush inside side-band channel 1
+    {
+        let mut inner = Vec::new();
+        encode::flush_to_write(&mut inner)?;
+        let mut sb = Vec::with_capacity(1 + inner.len());
+        sb.push(1);
+        sb.extend_from_slice(&inner);
+        encode::data_to_write(&sb, &mut response)?;
+    }
+
+    // Outer flush
     encode::flush_to_write(&mut response)?;
 
     // Item 56: Spawn post-receive hook asynchronously

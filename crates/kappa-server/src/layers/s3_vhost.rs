@@ -120,6 +120,13 @@ pub async fn serve_with_vhost(
                         }
                     }
 
+                    // Git rewrite: .git/ paths -> /_git/ internal prefix.
+                    // Must happen before routing because topcoat resolves
+                    // the route from the URI before any layer runs.
+                    if let Some(new_uri) = super::git_rewrite::rewrite_git_path(&parts.uri) {
+                        parts.uri = new_uri;
+                    }
+
                     let request = http::Request::from_parts(parts, body);
                     let response: Response = router.handle(request.map(Body::new)).await;
                     Ok::<_, Infallible>(response)
@@ -146,12 +153,19 @@ pub async fn serve_with_vhost(
         });
     }
 
-    // Graceful shutdown: signal drain, wait timeout, signal cutoff
+    // Graceful shutdown: signal drain, wait for connections or timeout, signal cutoff.
+    // Drop drain_tx to tell all connections to start graceful shutdown.
+    // Then wait up to shutdown_timeout for them to finish. If all connections
+    // are already done (no active senders on done_rx), skip the wait.
     drop(drain_tx);
-    tokio::time::sleep(shutdown_timeout).await;
-    drop(cutoff_tx);
-    // Wait for all connections to finish
     drop(done_tx);
+    // If done_rx.has_changed() returns Err, all senders are gone (no connections).
+    // Otherwise wait up to shutdown_timeout for connections to drain.
+    if done_rx.has_changed().is_ok() {
+        tokio::time::sleep(shutdown_timeout).await;
+    }
+    drop(cutoff_tx);
+    // Yield until all connection tasks have exited
     while done_rx.has_changed().is_ok() {
         tokio::task::yield_now().await;
     }

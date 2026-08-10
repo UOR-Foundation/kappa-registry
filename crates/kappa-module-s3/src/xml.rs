@@ -46,9 +46,7 @@ pub fn encode_list_objects_v2_xml(response: &ListObjectsV2Response) -> Vec<u8> {
         writer.write_event(Event::Start(BytesStart::new("Contents"))).unwrap();
         let key = if url_encode { percent_encode_key(&entry.key) } else { entry.key.clone() };
         write_text_element(&mut writer, "Key", &key);
-        if !entry.last_modified.is_empty() {
-            write_text_element(&mut writer, "LastModified", &entry.last_modified);
-        }
+        write_text_element(&mut writer, "LastModified", &entry.last_modified);
         write_text_element(&mut writer, "ETag", &entry.etag);
         write_text_element(&mut writer, "Size", &entry.size.to_string());
         write_text_element(&mut writer, "StorageClass", &entry.storage_class);

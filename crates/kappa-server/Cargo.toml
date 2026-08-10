@@ -122,6 +122,10 @@ path = "tests/integration/correctness.rs"
 name = "websocket"
 path = "tests/integration/websocket.rs"
 
+[[test]]
+name = "git_e2e"
+path = "tests/integration/git_e2e.rs"
+
 [features]
 default = ["oci", "identity-http", "distribution", "git", "s3"]
 oci = ["dep:kappa-module-oci"]

@@ -136,10 +136,20 @@ pub fn list_objects_v2(
 
         // Regular content entry
         let size = store.blob_size(&tag.kappa).unwrap_or(0);
+        let last_modified = store.blob_get_meta(&tag.kappa, "_s3_created_ms")
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|ms_str| ms_str.parse::<u64>().ok())
+            .map(|ms| kappa_core::clock::epoch_ms_to_iso8601(ms))
+            .unwrap_or_else(|| "2026-01-01T00:00:00.000Z".to_string());
+        let etag = store.blob_get_meta(&tag.kappa, "_s3_etag")
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| format!("\"{}\"", &tag.kappa));
         contents.push(ObjectEntry {
             key: key.clone(),
-            last_modified: String::new(),
-            etag: format!("\"{}\"", &tag.kappa),
+            last_modified,
+            etag,
             size,
             storage_class: "STANDARD".to_string(),
         });

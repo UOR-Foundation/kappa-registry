@@ -68,6 +68,20 @@ pub fn epoch_secs_to_datetime(epoch_secs: u64) -> String {
 /// Convert epoch milliseconds to RFC 7231 HTTP date.
 /// "Sat, 09 Aug 2026 12:34:56 GMT"
 /// SSOT for Last-Modified and Date response headers.
+/// Convert epoch milliseconds to ISO 8601 format.
+/// "2026-01-01T00:00:00.000Z"
+/// SSOT for S3 LastModified in ListObjectsV2 and GetObject responses.
+pub fn epoch_ms_to_iso8601(epoch_ms: u64) -> String {
+    let secs = (epoch_ms / 1000) as i64;
+    let millis = (epoch_ms % 1000) as u32;
+    let dt = chrono::DateTime::from_timestamp(secs, millis * 1_000_000)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// Convert epoch milliseconds to RFC 7231 HTTP date.
+/// "Sat, 09 Aug 2026 12:34:56 GMT"
+/// SSOT for Last-Modified and Date response headers.
 pub fn epoch_ms_to_http_date(epoch_ms: u64) -> String {
     let secs = (epoch_ms / 1000) as i64;
     let dt = chrono::DateTime::from_timestamp(secs, 0)

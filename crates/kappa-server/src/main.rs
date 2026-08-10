@@ -486,7 +486,14 @@ async fn main() {
                         }
                         Ok(resp)
                     }
-                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(cx),
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "git info/refs failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(cx)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "git info/refs spawn failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(cx)
+                    }
                 }
             })
         }
@@ -566,7 +573,14 @@ async fn main() {
                     Ok(Ok(data)) => (StatusCode::OK, [
                         ("content-type", "application/x-git-receive-pack-result".to_string()),
                     ], data).into_response(cx),
-                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(cx),
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "git receive-pack failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(cx)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "git receive-pack spawn failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(cx)
+                    }
                 }
             })
         }
@@ -613,31 +627,9 @@ async fn main() {
             })
         }
 
-        // Git path rewrite layer: transform /repo.git/sub/path into
-        // /_git/repo/sub/path before routing. Same pattern as s3_vhost
-        // rewrite. The /_git prefix is an internal routing namespace
-        // that never appears in user-facing URLs.
-        //
-        // Applied as a layer so it runs before route matching.
-        // Registered routes use /_git/{*repo}/... with no catch-all
-        // conflicts against S3's /{bucket}/{key} or OCI's /v2/{*ns}/...
-        fn git_rewrite_layer<'a>(
-            cx: &'a mut topcoat::context::CxBuilder,
-            body: Body,
-            next: topcoat::router::Next<'a>,
-        ) -> topcoat::router::LayerFuture<'a> {
-            Box::pin(async move {
-                // Rewrite .git/ paths to /_git/ internal prefix
-                if let Some(parts) = cx.get_mut::<http::request::Parts>() {
-                    if let Some(new_uri) = layers::git_rewrite::rewrite_git_path(&parts.uri) {
-                        parts.uri = new_uri;
-                    }
-                }
-                next.run(cx, body).await
-            })
-        }
-        builder = builder.layer(LayerFn::new(p("/"), git_rewrite_layer));
-
+        // Git routes: /_git/ internal prefix. The .git/ -> /_git/ rewrite
+        // happens in serve_with_vhost BEFORE routing, not in a layer,
+        // because topcoat resolves routes before layers run.
         builder = builder
             .route(RouteFn::new(Method::GET, p("/_git/{*repo}/info/refs"), git_info_refs))
             .route(RouteFn::new(Method::POST, p("/_git/{*repo}/git_upload_pack"), git_upload_pack))
@@ -776,13 +768,52 @@ async fn main() {
             if let Some(query) = parts.uri.query() {
                 for pair in query.split('&') {
                     if let Some((k, v)) = pair.split_once('=') {
-                        map.insert(k.to_string(), v.to_string());
+                        map.insert(
+                            percent_decode(k),
+                            percent_decode(v),
+                        );
                     } else {
-                        map.insert(pair.to_string(), String::new());
+                        map.insert(percent_decode(pair), String::new());
                     }
                 }
             }
             map
+        }
+
+        /// Percent-decode a URL-encoded string (e.g. dir%2F -> dir/).
+        fn percent_decode(s: &str) -> String {
+            let mut result = Vec::with_capacity(s.len());
+            let bytes = s.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() {
+                    if let (Some(hi), Some(lo)) = (
+                        hex_val(bytes[i + 1]),
+                        hex_val(bytes[i + 2]),
+                    ) {
+                        result.push(hi << 4 | lo);
+                        i += 3;
+                        continue;
+                    }
+                }
+                // '+' decodes to space in query strings
+                if bytes[i] == b'+' {
+                    result.push(b' ');
+                } else {
+                    result.push(bytes[i]);
+                }
+                i += 1;
+            }
+            String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+        }
+
+        fn hex_val(b: u8) -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
         }
 
         fn s3_list_objects(cx: &Cx, _body: Body) -> RouteFuture<'_> {
@@ -1445,7 +1476,7 @@ async fn main() {
                         for ns in &namespaces {
                             xml.push_str("<Bucket><Name>");
                             xml.push_str(ns);
-                            xml.push_str("</Name></Bucket>");
+                            xml.push_str("</Name><CreationDate>2026-01-01T00:00:00.000Z</CreationDate></Bucket>");
                         }
                         xml.push_str("</Buckets></ListAllMyBucketsResult>");
                         (StatusCode::OK, [
@@ -2171,11 +2202,11 @@ async fn main() {
         // S3 routes -- path-style. One handler per method+path, with
         // query-parameter dispatch inside the unified handlers above.
         builder = builder
-            .route(RouteFn::new(Method::PUT, p("/{bucket}/{key}"), s3_put_or_copy_or_part))
-            .route(RouteFn::new(Method::GET, p("/{bucket}/{key}"), s3_get_object))
-            .route(RouteFn::new(Method::HEAD, p("/{bucket}/{key}"), s3_head_object))
-            .route(RouteFn::new(Method::DELETE, p("/{bucket}/{key}"), s3_delete_or_abort))
-            .route(RouteFn::new(Method::POST, p("/{bucket}/{key}"), s3_post_object))
+            .route(RouteFn::new(Method::PUT, p("/{bucket}/{*key}"), s3_put_or_copy_or_part))
+            .route(RouteFn::new(Method::GET, p("/{bucket}/{*key}"), s3_get_object))
+            .route(RouteFn::new(Method::HEAD, p("/{bucket}/{*key}"), s3_head_object))
+            .route(RouteFn::new(Method::DELETE, p("/{bucket}/{*key}"), s3_delete_or_abort))
+            .route(RouteFn::new(Method::POST, p("/{bucket}/{*key}"), s3_post_object))
             .route(RouteFn::new(Method::GET, p("/{bucket}"), s3_get_bucket_dispatch))
             .route(RouteFn::new(Method::PUT, p("/{bucket}"), s3_put_bucket_dispatch))
             .route(RouteFn::new(Method::HEAD, p("/{bucket}"), s3_head_bucket))
@@ -2282,11 +2313,14 @@ async fn main() {
     // When KAPPA_S3_BASE_DOMAIN is set, use the vhost-rewriting accept loop
     // so virtual-hosted-style S3 requests (Host: bucket.domain) are rewritten
     // to path-style (/{bucket}/key) before routing. When unset, use topcoat's
-    // standard serve path (no rewriting, path-style only).
+    // Always use serve_with_vhost: it handles both S3 vhost URI rewriting
+    // (when KAPPA_S3_BASE_DOMAIN is set) AND Git .git/ -> /_git/ rewriting.
+    // When base_domain is empty, the vhost rewrite is a no-op. The git
+    // rewrite always runs. topcoat layers cannot rewrite URIs because
+    // routing resolves before layers run.
     let s3_base_domain = std::env::var("KAPPA_S3_BASE_DOMAIN").unwrap_or_default();
-    let use_vhost = !s3_base_domain.is_empty();
 
-    if use_vhost {
+    if !s3_base_domain.is_empty() {
         tracing::info!(
             base_domain = %s3_base_domain,
             "S3 virtual-hosted-style enabled"
@@ -2307,21 +2341,15 @@ async fn main() {
                 mtls = tls_cfg.client_ca_path.is_some(),
                 "kappa-registry starting with TLS"
             );
-            if use_vhost {
-                layers::s3_vhost::serve_with_vhost(
-                    listener,
-                    router,
-                    s3_base_domain,
-                    Duration::from_secs(30),
-                    shutdown_signal(),
-                )
-                .await
-                .expect("TLS vhost server error");
-            } else {
-                topcoat::serve(listener, router)
-                    .await
-                    .expect("TLS server error");
-            }
+            layers::s3_vhost::serve_with_vhost(
+                listener,
+                router,
+                s3_base_domain,
+                Duration::from_secs(30),
+                shutdown_signal(),
+            )
+            .await
+            .expect("TLS server error");
         }
         None => {
             tracing::info!(
@@ -2329,22 +2357,18 @@ async fn main() {
                 store = %cfg.store_root.display(),
                 "kappa-registry starting"
             );
-            if use_vhost {
-                let tcp = tokio::net::TcpListener::bind(&cfg.listen_addr)
-                    .await
-                    .expect("failed to bind TCP listener");
-                layers::s3_vhost::serve_with_vhost(
-                    tcp,
-                    router,
-                    s3_base_domain,
-                    Duration::from_secs(30),
-                    shutdown_signal(),
-                )
+            let tcp = tokio::net::TcpListener::bind(&cfg.listen_addr)
                 .await
-                .expect("vhost server error");
-            } else {
-                topcoat::start(router).await.expect("server error");
-            }
+                .expect("failed to bind TCP listener");
+            layers::s3_vhost::serve_with_vhost(
+                tcp,
+                router,
+                s3_base_domain,
+                Duration::from_secs(30),
+                shutdown_signal(),
+            )
+            .await
+            .expect("server error");
         }
     }
 }

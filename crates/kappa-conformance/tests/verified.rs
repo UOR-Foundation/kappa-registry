@@ -80,6 +80,12 @@ fn compute_sha1_with_collision_detection() {
 }
 
 #[test]
+fn streaming_proof_closed_constructor() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/streaming_proof_closed.rs");
+}
+
+#[test]
 fn compute_all_six_axes() {
     let content = b"all axes";
     for axis in [Axis::Sha1, Axis::Sha256, Axis::Blake3, Axis::Sha512, Axis::Sha3_256, Axis::Keccak256] {
