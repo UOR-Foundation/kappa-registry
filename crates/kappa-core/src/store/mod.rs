@@ -6,8 +6,8 @@ use crate::epoch::EpochRoot;
 use crate::kappa::Axis;
 use crate::verified::VerifiedContent;
 pub use crate::types::{
-    DeleteResult, Edge, EdgeQuery, EdgeRelation, EpochMutation, StoreError, TagEntry, TagUpdate,
-    VersionEntry,
+    DeleteResult, Edge, EdgeQuery, EdgeRelation, EpochMutation, NamespaceRef, StoreError,
+    TagEntry, TagUpdate, VersionEntry,
 };
 
 /// Trait object for streaming blob reads. Implemented by std::fs::File
@@ -167,25 +167,25 @@ pub trait KappaStore: Send + Sync {
 
     // -- Namespace-scoped metadata (2) ----------------------------------------
 
-    fn meta_set(&self, ns: &str, kappa: &str, key: &str, value: &str) -> Result<(), StoreError>;
-    fn meta_query(&self, ns: &str, key: &str, value: &str) -> Result<Vec<String>, StoreError>;
+    fn meta_set(&self, ns: &NamespaceRef, kappa: &str, key: &str, value: &str) -> Result<(), StoreError>;
+    fn meta_query(&self, ns: &NamespaceRef, key: &str, value: &str) -> Result<Vec<String>, StoreError>;
 
     // -- Tag: namespace-scoped name-to-kappa bindings (6) ---------------------
 
-    fn tag_set(&self, ns: &str, name: &str, kappa: &str) -> Result<u64, StoreError>;
-    fn tag_get(&self, ns: &str, name: &str) -> Result<TagEntry, StoreError>;
-    fn tag_delete(&self, ns: &str, name: &str) -> Result<(), StoreError>;
-    fn tag_list(&self, ns: &str) -> Result<Vec<TagEntry>, StoreError>;
-    fn tag_prefix(&self, ns: &str, prefix: &str) -> Result<Vec<TagEntry>, StoreError>;
-    fn tag_set_batch(&self, ns: &str, updates: &[TagUpdate]) -> Result<(), StoreError>;
+    fn tag_set(&self, ns: &NamespaceRef, name: &str, kappa: &str) -> Result<u64, StoreError>;
+    fn tag_get(&self, ns: &NamespaceRef, name: &str) -> Result<TagEntry, StoreError>;
+    fn tag_delete(&self, ns: &NamespaceRef, name: &str) -> Result<(), StoreError>;
+    fn tag_list(&self, ns: &NamespaceRef) -> Result<Vec<TagEntry>, StoreError>;
+    fn tag_prefix(&self, ns: &NamespaceRef, prefix: &str) -> Result<Vec<TagEntry>, StoreError>;
+    fn tag_set_batch(&self, ns: &NamespaceRef, updates: &[TagUpdate]) -> Result<(), StoreError>;
 
     // -- Edge: typed relationships between kappas (4) -------------------------
 
-    fn edge_put(&self, ns: &str, edge: &Edge) -> Result<(), StoreError>;
-    fn edge_query(&self, ns: &str, query: &EdgeQuery) -> Result<Vec<Edge>, StoreError>;
+    fn edge_put(&self, ns: &NamespaceRef, edge: &Edge) -> Result<(), StoreError>;
+    fn edge_query(&self, ns: &NamespaceRef, query: &EdgeQuery) -> Result<Vec<Edge>, StoreError>;
     fn edge_delete(
         &self,
-        ns: &str,
+        ns: &NamespaceRef,
         source: &str,
         target: &str,
         relation: EdgeRelation,
@@ -194,7 +194,7 @@ pub trait KappaStore: Send + Sync {
     /// Store multiple edges in a single transaction. Default loops
     /// edge_put. PersistentStore overrides with a single redb write
     /// transaction for all edges, amortizing commit overhead.
-    fn edge_put_batch(&self, ns: &str, edges: &[Edge]) -> Result<(), StoreError> {
+    fn edge_put_batch(&self, ns: &NamespaceRef, edges: &[Edge]) -> Result<(), StoreError> {
         for edge in edges {
             self.edge_put(ns, edge)?;
         }
@@ -203,13 +203,13 @@ pub trait KappaStore: Send + Sync {
 
     // -- Sequence: monotonic counters (2) -------------------------------------
 
-    fn sequence_next(&self, ns: &str, name: &str) -> Result<u64, StoreError>;
-    fn sequence_current(&self, ns: &str, name: &str) -> Result<u64, StoreError>;
+    fn sequence_next(&self, ns: &NamespaceRef, name: &str) -> Result<u64, StoreError>;
+    fn sequence_current(&self, ns: &NamespaceRef, name: &str) -> Result<u64, StoreError>;
 
     // -- Epoch: signed state chain (3) ----------------------------------------
 
-    fn epoch_advance(&self, ns: &str, mutations: Vec<EpochMutation>) -> Result<String, StoreError>;
-    fn epoch_current(&self, ns: &str) -> Result<Option<String>, StoreError>;
+    fn epoch_advance(&self, ns: &NamespaceRef, mutations: Vec<EpochMutation>) -> Result<String, StoreError>;
+    fn epoch_current(&self, ns: &NamespaceRef) -> Result<Option<String>, StoreError>;
     fn epoch_get(&self, kappa: &str) -> Result<EpochRoot, StoreError>;
 
     // -- Streaming upload (4) --------------------------------------------------
@@ -219,7 +219,7 @@ pub trait KappaStore: Send + Sync {
     /// `namespace` is stored with the session for policy enforcement
     /// at completion (e.g. SHA-1 policy per namespace).
     /// `max_size` is the maximum total content size (0 = unlimited).
-    fn upload_begin(&self, namespace: &str, max_size: u64) -> Result<String, StoreError>;
+    fn upload_begin(&self, namespace: &NamespaceRef, max_size: u64) -> Result<String, StoreError>;
 
     /// Append a part to a streaming upload.
     /// `offset` must equal the number of bytes previously appended
@@ -299,7 +299,7 @@ pub trait KappaStore: Send + Sync {
     // -- Namespace (2) --------------------------------------------------------
 
     fn namespace_list(&self) -> Result<Vec<String>, StoreError>;
-    fn namespace_exists(&self, ns: &str) -> Result<bool, StoreError>;
+    fn namespace_exists(&self, ns: &NamespaceRef) -> Result<bool, StoreError>;
 
     // -- Versioning (5, optional) -------------------------------------------------
 
@@ -310,7 +310,7 @@ pub trait KappaStore: Send + Sync {
     /// - Suspended: version_id = "null", replaces previous null entry.
     fn version_put(
         &self,
-        _ns: &str,
+        _ns: &NamespaceRef,
         _key: &str,
         _kappa: &str,
         _etag: Option<&str>,
@@ -321,7 +321,7 @@ pub trait KappaStore: Send + Sync {
     /// Get a version. None = latest non-delete-marker. Some = specific version.
     fn version_get(
         &self,
-        _ns: &str,
+        _ns: &NamespaceRef,
         _key: &str,
         _version_id: Option<&str>,
     ) -> Result<VersionEntry, StoreError> {
@@ -331,7 +331,7 @@ pub trait KappaStore: Send + Sync {
     /// Delete a version. None = insert delete marker. Some = permanent remove.
     fn version_delete(
         &self,
-        _ns: &str,
+        _ns: &NamespaceRef,
         _key: &str,
         _version_id: Option<&str>,
     ) -> Result<DeleteResult, StoreError> {
@@ -341,7 +341,7 @@ pub trait KappaStore: Send + Sync {
     /// List versions of a key, newest first.
     fn version_list(
         &self,
-        _ns: &str,
+        _ns: &NamespaceRef,
         _key: &str,
         _max: usize,
     ) -> Result<Vec<VersionEntry>, StoreError> {

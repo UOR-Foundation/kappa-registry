@@ -88,12 +88,12 @@ impl InMemoryStore {
         crate::kappa::blob_path_for(&self.blob_root, kappa)
     }
 
-    fn ensure_namespace(&self, ns: &str) {
-        self.namespaces.write().unwrap().insert(ns.to_string());
+    fn ensure_namespace(&self, ns: &NamespaceRef) {
+        self.namespaces.write().unwrap().insert(ns.as_str().to_string());
     }
 
-    fn collect_sorted_tags(&self, ns: &str) -> Vec<TagEntry> {
-        let ns_hash = namespace_hash(ns);
+    fn collect_sorted_tags(&self, ns: &NamespaceRef) -> Vec<TagEntry> {
+        let ns_hash = namespace_hash(ns.as_str());
         let tags = self.tags.read().unwrap();
         let mut entries: Vec<TagEntry> = tags
             .iter()
@@ -250,10 +250,10 @@ impl KappaStore for InMemoryStore {
 
     // -- Namespace-scoped metadata --------------------------------------------
 
-    fn meta_set(&self, ns: &str, kappa: &str, key: &str, value: &str) -> Result<(), StoreError> {
-        tracing::debug!(ns = ns, kappa = kappa, key = key, value = value, "meta_set");
+    fn meta_set(&self, ns: &NamespaceRef, kappa: &str, key: &str, value: &str) -> Result<(), StoreError> {
+        tracing::debug!(ns = ns.as_str(), kappa = kappa, key = key, value = value, "meta_set");
         self.ensure_namespace(ns);
-        let idx_key = (namespace_hash(ns), item_hash(key), item_hash(value));
+        let idx_key = (namespace_hash(ns.as_str()), item_hash(key), item_hash(value));
         self.ns_meta
             .entry(idx_key)
             .or_default()
@@ -261,12 +261,10 @@ impl KappaStore for InMemoryStore {
         Ok(())
     }
 
-    fn meta_query(&self, ns: &str, key: &str, value: &str) -> Result<Vec<String>, StoreError> {
-        tracing::trace!(ns = ns, key = key, value = value, "meta_query");
+    fn meta_query(&self, ns: &NamespaceRef, key: &str, value: &str) -> Result<Vec<String>, StoreError> {
+        tracing::trace!(ns = ns.as_str(), key = key, value = value, "meta_query");
         if value.is_empty() {
-            // Query all values for this key in this namespace.
-            // Scan all ns_meta entries matching (ns_hash, key_hash, *).
-            let ns_hash = namespace_hash(ns);
+            let ns_hash = namespace_hash(ns.as_str());
             let key_hash = item_hash(key);
             let mut results = Vec::new();
             for entry in self.ns_meta.iter() {
@@ -279,7 +277,7 @@ impl KappaStore for InMemoryStore {
             results.dedup();
             Ok(results)
         } else {
-            let idx_key = (namespace_hash(ns), item_hash(key), item_hash(value));
+            let idx_key = (namespace_hash(ns.as_str()), item_hash(key), item_hash(value));
             match self.ns_meta.get(&idx_key) {
                 Some(kappas) => {
                     let mut results = kappas.value().clone();
@@ -294,10 +292,10 @@ impl KappaStore for InMemoryStore {
 
     // -- Tag ------------------------------------------------------------------
 
-    fn tag_set(&self, ns: &str, name: &str, kappa: &str) -> Result<u64, StoreError> {
-        tracing::debug!(ns = ns, tag = name, kappa = kappa, "tag_set");
+    fn tag_set(&self, ns: &NamespaceRef, name: &str, kappa: &str) -> Result<u64, StoreError> {
+        tracing::debug!(ns = ns.as_str(), tag = name, kappa = kappa, "tag_set");
         self.ensure_namespace(ns);
-        let key = (namespace_hash(ns), item_hash(name));
+        let key = (namespace_hash(ns.as_str()), item_hash(name));
         let mut tags = self.tags.write().unwrap();
         let version = tags.get(&key).map(|e| e.version + 1).unwrap_or(1);
         tags.insert(
@@ -311,31 +309,31 @@ impl KappaStore for InMemoryStore {
         Ok(version)
     }
 
-    fn tag_get(&self, ns: &str, name: &str) -> Result<TagEntry, StoreError> {
-        tracing::trace!(ns = ns, tag = name, "tag_get");
+    fn tag_get(&self, ns: &NamespaceRef, name: &str) -> Result<TagEntry, StoreError> {
+        tracing::trace!(ns = ns.as_str(), tag = name, "tag_get");
         let tags = self.tags.read().unwrap();
-        tags.get(&(namespace_hash(ns), item_hash(name)))
+        tags.get(&(namespace_hash(ns.as_str()), item_hash(name)))
             .cloned()
-            .ok_or_else(|| StoreError::NotFound(format!("{}/{}", ns, name)))
+            .ok_or_else(|| StoreError::NotFound(format!("{}/{}", ns.as_str(), name)))
     }
 
-    fn tag_delete(&self, ns: &str, name: &str) -> Result<(), StoreError> {
-        tracing::debug!(ns = ns, tag = name, "tag_delete");
+    fn tag_delete(&self, ns: &NamespaceRef, name: &str) -> Result<(), StoreError> {
+        tracing::debug!(ns = ns.as_str(), tag = name, "tag_delete");
         self.tags
             .write()
             .unwrap()
-            .remove(&(namespace_hash(ns), item_hash(name)));
+            .remove(&(namespace_hash(ns.as_str()), item_hash(name)));
         Ok(())
     }
 
-    fn tag_list(&self, ns: &str) -> Result<Vec<TagEntry>, StoreError> {
-        tracing::trace!(ns = ns, "tag_list");
+    fn tag_list(&self, ns: &NamespaceRef) -> Result<Vec<TagEntry>, StoreError> {
+        tracing::trace!(ns = ns.as_str(), "tag_list");
         Ok(self.collect_sorted_tags(ns))
     }
 
-    fn tag_prefix(&self, ns: &str, prefix: &str) -> Result<Vec<TagEntry>, StoreError> {
-        tracing::trace!(ns = ns, prefix = prefix, "tag_prefix");
-        let ns_hash = namespace_hash(ns);
+    fn tag_prefix(&self, ns: &NamespaceRef, prefix: &str) -> Result<Vec<TagEntry>, StoreError> {
+        tracing::trace!(ns = ns.as_str(), prefix = prefix, "tag_prefix");
+        let ns_hash = namespace_hash(ns.as_str());
         let tags = self.tags.read().unwrap();
         let mut result: Vec<TagEntry> = tags
             .iter()
@@ -346,10 +344,10 @@ impl KappaStore for InMemoryStore {
         Ok(result)
     }
 
-    fn tag_set_batch(&self, ns: &str, updates: &[TagUpdate]) -> Result<(), StoreError> {
-        tracing::debug!(ns = ns, count = updates.len(), "tag_set_batch");
+    fn tag_set_batch(&self, ns: &NamespaceRef, updates: &[TagUpdate]) -> Result<(), StoreError> {
+        tracing::debug!(ns = ns.as_str(), count = updates.len(), "tag_set_batch");
         self.ensure_namespace(ns);
-        let ns_hash = namespace_hash(ns);
+        let ns_hash = namespace_hash(ns.as_str());
         let mut tags = self.tags.write().unwrap();
 
         for update in updates {
@@ -384,9 +382,9 @@ impl KappaStore for InMemoryStore {
 
     // -- Edge -----------------------------------------------------------------
 
-    fn edge_put(&self, ns: &str, edge_record: &Edge) -> Result<(), StoreError> {
+    fn edge_put(&self, ns: &NamespaceRef, edge_record: &Edge) -> Result<(), StoreError> {
         tracing::debug!(
-            ns = ns,
+            ns = ns.as_str(),
             source = %edge_record.source,
             target = %edge_record.target,
             "edge_put"
@@ -394,20 +392,20 @@ impl KappaStore for InMemoryStore {
         edge::edge_put(self, ns, edge_record)
     }
 
-    fn edge_query(&self, ns: &str, query: &EdgeQuery) -> Result<Vec<Edge>, StoreError> {
-        tracing::trace!(ns = ns, anchor = %query.anchor, "edge_query");
+    fn edge_query(&self, ns: &NamespaceRef, query: &EdgeQuery) -> Result<Vec<Edge>, StoreError> {
+        tracing::trace!(ns = ns.as_str(), anchor = %query.anchor, "edge_query");
         edge::edge_query(self, ns, query)
     }
 
     fn edge_delete(
         &self,
-        ns: &str,
+        ns: &NamespaceRef,
         source: &str,
         target: &str,
         relation: EdgeRelation,
     ) -> Result<(), StoreError> {
         tracing::debug!(
-            ns = ns,
+            ns = ns.as_str(),
             source = source,
             target = target,
             relation = relation.as_str(),
@@ -418,31 +416,31 @@ impl KappaStore for InMemoryStore {
 
     // -- Sequence -------------------------------------------------------------
 
-    fn sequence_next(&self, ns: &str, name: &str) -> Result<u64, StoreError> {
-        tracing::debug!(ns = ns, seq = name, "sequence_next");
+    fn sequence_next(&self, ns: &NamespaceRef, name: &str) -> Result<u64, StoreError> {
+        tracing::debug!(ns = ns.as_str(), seq = name, "sequence_next");
         self.ensure_namespace(ns);
-        let key = (namespace_hash(ns), item_hash(name));
+        let key = (namespace_hash(ns.as_str()), item_hash(name));
         let mut seqs = self.sequences.lock().unwrap();
         let counter = seqs.entry(key).or_insert(0);
         *counter += 1;
         Ok(*counter)
     }
 
-    fn sequence_current(&self, ns: &str, name: &str) -> Result<u64, StoreError> {
-        tracing::trace!(ns = ns, seq = name, "sequence_current");
+    fn sequence_current(&self, ns: &NamespaceRef, name: &str) -> Result<u64, StoreError> {
+        tracing::trace!(ns = ns.as_str(), seq = name, "sequence_current");
         let seqs = self.sequences.lock().unwrap();
         Ok(seqs
-            .get(&(namespace_hash(ns), item_hash(name)))
+            .get(&(namespace_hash(ns.as_str()), item_hash(name)))
             .copied()
             .unwrap_or(0))
     }
 
     // -- Epoch ----------------------------------------------------------------
 
-    fn epoch_advance(&self, ns: &str, mutations: Vec<EpochMutation>) -> Result<String, StoreError> {
-        tracing::debug!(ns = ns, mutation_count = mutations.len(), "epoch_advance");
+    fn epoch_advance(&self, ns: &NamespaceRef, mutations: Vec<EpochMutation>) -> Result<String, StoreError> {
+        tracing::debug!(ns = ns.as_str(), mutation_count = mutations.len(), "epoch_advance");
         self.ensure_namespace(ns);
-        let ns_hash = namespace_hash(ns);
+        let ns_hash = namespace_hash(ns.as_str());
         let epoch_number = {
             let mut seqs = self.sequences.lock().unwrap();
             let key = (ns_hash, item_hash("_epoch"));
@@ -458,7 +456,7 @@ impl KappaStore for InMemoryStore {
         let timestamp_ms = self.clock.now_ms();
 
         let epoch_root = EpochRoot::build(EpochRootFields {
-            namespace: ns.to_string(),
+            namespace: ns.as_str().to_string(),
             epoch_number,
             prev_root_kappa,
             state_root,
@@ -490,14 +488,14 @@ impl KappaStore for InMemoryStore {
         Ok(kappa)
     }
 
-    fn epoch_current(&self, ns: &str) -> Result<Option<String>, StoreError> {
-        tracing::trace!(ns = ns, "epoch_current");
+    fn epoch_current(&self, ns: &NamespaceRef) -> Result<Option<String>, StoreError> {
+        tracing::trace!(ns = ns.as_str(), "epoch_current");
         // Check in-memory cache first
         if let Some(k) = self
             .current_epochs
             .read()
             .unwrap()
-            .get(&namespace_hash(ns))
+            .get(&namespace_hash(ns.as_str()))
             .cloned()
         {
             return Ok(Some(k));
@@ -508,7 +506,7 @@ impl KappaStore for InMemoryStore {
                 self.current_epochs
                     .write()
                     .unwrap()
-                    .insert(namespace_hash(ns), entry.kappa.clone());
+                    .insert(namespace_hash(ns.as_str()), entry.kappa.clone());
                 Ok(Some(entry.kappa))
             }
             Err(StoreError::NotFound(_)) => Ok(None),
@@ -543,18 +541,18 @@ impl KappaStore for InMemoryStore {
         Ok(result)
     }
 
-    fn namespace_exists(&self, ns: &str) -> Result<bool, StoreError> {
-        tracing::trace!(ns = ns, "namespace_exists");
-        Ok(self.namespaces.read().unwrap().contains(ns))
+    fn namespace_exists(&self, ns: &NamespaceRef) -> Result<bool, StoreError> {
+        tracing::trace!(ns = ns.as_str(), "namespace_exists");
+        Ok(self.namespaces.read().unwrap().contains(ns.as_str()))
     }
 
     // -- Streaming upload (in-memory) -----------------------------------------
 
-    fn upload_begin(&self, namespace: &str, max_size: u64) -> Result<String, StoreError> {
+    fn upload_begin(&self, namespace: &NamespaceRef, max_size: u64) -> Result<String, StoreError> {
         let id = uuid::Uuid::new_v4().to_string();
         let mut uploads = self.uploads.lock().unwrap();
         uploads.insert(id.clone(), UploadSession {
-            namespace: namespace.to_string(),
+            namespace: namespace.as_str().to_string(),
             data: Vec::new(),
             max_size,
             created_at: std::time::Instant::now(),

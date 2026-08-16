@@ -15,7 +15,7 @@ use std::sync::RwLock;
 
 use kappa_core::identity::assertion::IdentityAssertion;
 use kappa_core::store::KappaStore;
-use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, StoreError};
+use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef, StoreError};
 
 use crate::ratelimit::OpClass;
 
@@ -61,7 +61,7 @@ pub enum AuthError {
 /// organization-level capability grants that apply to all sub-namespaces.
 pub fn authorize(
     store: &dyn KappaStore,
-    ns: &str,
+    ns: &NamespaceRef,
     op: OpClass,
     asserter: &str,
 ) -> Result<(), AuthError> {
@@ -70,13 +70,14 @@ pub fn authorize(
     }
 
     // Superadmin: capability edge on _admin grants access to any namespace
+    let admin_ns = NamespaceRef::from("_admin");
     let admin_query = EdgeQuery {
         anchor: asserter.to_string(),
         direction: Direction::Outbound,
         relation: Some(EdgeRelation::Capability),
         asserter: Some(asserter.to_string()),
     };
-    if let Ok(edges) = store.edge_query("_admin", &admin_query) {
+    if let Ok(edges) = store.edge_query(&admin_ns, &admin_query) {
         if edges.iter().any(|e| cap_permits(e, op)) {
             return Ok(());
         }
@@ -86,7 +87,7 @@ pub fn authorize(
     // If no capability edges exist for this namespace, it is unclaimed
     // and anyone can write. Once claimed, only holders of capability
     // edges can access it.
-    if !is_reserved(ns) {
+    if !is_reserved(ns.as_str()) {
         let any_caps_query = EdgeQuery {
             anchor: String::new(),
             direction: Direction::Outbound,
@@ -101,23 +102,24 @@ pub fn authorize(
     }
 
     // Walk namespace hierarchy: "org/team/repo" -> "org/team" -> "org"
-    let mut check_ns = ns;
+    let mut check_ns_str = ns.as_str();
     loop {
+        let check_ns = NamespaceRef::from(check_ns_str);
         let query = EdgeQuery {
             anchor: asserter.to_string(),
             direction: Direction::Outbound,
             relation: Some(EdgeRelation::Capability),
             asserter: Some(asserter.to_string()),
         };
-        if let Ok(edges) = store.edge_query(check_ns, &query) {
+        if let Ok(edges) = store.edge_query(&check_ns, &query) {
             if edges.iter().any(|e| cap_permits(e, op)) {
                 return Ok(());
             }
         }
 
         // Walk up to parent namespace
-        match check_ns.rfind('/') {
-            Some(pos) => check_ns = &check_ns[..pos],
+        match check_ns_str.rfind('/') {
+            Some(pos) => check_ns_str = &check_ns_str[..pos],
             None => break,
         }
     }

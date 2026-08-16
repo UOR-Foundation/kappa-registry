@@ -18,6 +18,7 @@ use std::io::{self, BufRead, Read};
 use gix_pack::data::input::{self, BytesToEntriesIter};
 
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 use crate::envelope;
 
@@ -51,7 +52,7 @@ pub enum IngestError {
 /// Ingest a packfile stream into the store.
 pub fn ingest_pack<R: BufRead>(
     store: &(dyn KappaStore + '_),
-    namespace: &str,
+    namespace: &NamespaceRef,
     pack_stream: R,
     object_hash: gix_hash::Kind,
 ) -> Result<PackIngestResult, IngestError> {
@@ -157,7 +158,7 @@ pub fn ingest_pack<R: BufRead>(
 /// Memory: one 64 KiB buffer regardless of object size.
 fn ingest_streaming(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     kind: gix_object::Kind,
     compressed: &[u8],
     decompressed_size: usize,

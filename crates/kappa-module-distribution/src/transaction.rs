@@ -15,6 +15,7 @@ use topcoat::router::{
 };
 
 use kappa_core::transaction::TransactionManager;
+use kappa_core::types::NamespaceRef;
 
 use crate::{path_param, read_body, store};
 
@@ -49,42 +50,42 @@ fn transactions(cx: &Cx) -> &Arc<TransactionManager> {
 fn begin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
-        begin(cx, ns).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        begin(cx, &ns).await
     })
 }
 
 fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let id = path_param(cx, "id");
         let kappa = path_param(cx, "kappa");
-        put(cx, ns, id, kappa, &bytes).await
+        put(cx, &ns, id, kappa, &bytes).await
     })
 }
 
 fn commit_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let id = path_param(cx, "id");
-        commit(cx, ns, id).await
+        commit(cx, &ns, id).await
     })
 }
 
 fn abort_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let id = path_param(cx, "id");
-        abort(cx, ns, id).await
+        abort(cx, &ns, id).await
     })
 }
 
-async fn begin(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+async fn begin(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let txns = transactions(cx).clone();
-    let n = ns.to_string();
+    let n = ns.as_str().to_string();
     let txn_id = tokio::task::spawn_blocking(move || txns.begin(&n))
         .await
         .map_err(|e| bad_request(e.to_string()))?
@@ -101,7 +102,7 @@ async fn begin(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
 
 async fn put(
     cx: &Cx,
-    _ns: &str,
+    _ns: &NamespaceRef,
     txn_id: &str,
     kappa: &str,
     body: &[u8],
@@ -130,7 +131,7 @@ async fn put(
         .into_response(cx)
 }
 
-async fn commit(cx: &Cx, _ns: &str, txn_id: &str) -> topcoat::Result<Response> {
+async fn commit(cx: &Cx, _ns: &NamespaceRef, txn_id: &str) -> topcoat::Result<Response> {
     let txns = transactions(cx).clone();
     let s = store(cx).clone();
     let tid = txn_id.to_string();
@@ -148,7 +149,7 @@ async fn commit(cx: &Cx, _ns: &str, txn_id: &str) -> topcoat::Result<Response> {
         .into_response(cx)
 }
 
-async fn abort(cx: &Cx, _ns: &str, txn_id: &str) -> topcoat::Result<Response> {
+async fn abort(cx: &Cx, _ns: &NamespaceRef, txn_id: &str) -> topcoat::Result<Response> {
     let txns = transactions(cx).clone();
     let tid = txn_id.to_string();
     tokio::task::spawn_blocking(move || txns.abort(&tid))

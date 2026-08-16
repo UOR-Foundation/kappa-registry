@@ -15,6 +15,7 @@ use topcoat::router::error::bad_request;
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
 use kappa_core::kappa::verify_kappa;
+use kappa_core::types::NamespaceRef;
 
 use crate::{path_param, query_param, read_body, store, MaxBlobSize};
 
@@ -28,27 +29,27 @@ pub struct DiskPressure(pub std::sync::atomic::AtomicBool);
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let client_digest = path_param(cx, "kappa");
-        put(cx, ns, client_digest, &bytes).await
+        put(cx, &ns, client_digest, &bytes).await
     })
 }
 
 pub fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let kappa = path_param(cx, "kappa");
-        get(cx, ns, kappa).await
+        get(cx, &ns, kappa).await
     })
 }
 
 pub fn head_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let kappa = path_param(cx, "kappa");
-        head(cx, ns, kappa).await
+        head(cx, &ns, kappa).await
     })
 }
 
@@ -63,8 +64,8 @@ pub fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn meta_list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
-        meta_list(cx, ns).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        meta_list(cx, &ns).await
     })
 }
 
@@ -79,7 +80,7 @@ pub fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
 pub(crate) async fn put(
     cx: &Cx,
-    ns: &str,
+    ns: &NamespaceRef,
     client_digest: &str,
     content: &[u8],
 ) -> topcoat::Result<Response> {
@@ -205,7 +206,7 @@ pub(crate) async fn put(
     (
         status,
         [
-            ("location", format!("/v2/{}/blobs/{}", ns, client_digest)),
+            ("location", format!("/v2/{}/blobs/{}", ns.as_str(), client_digest)),
             ("docker-content-digest", client_digest.to_string()),
             ("x-kappa-label", client_digest.to_string()),
             ("x-kappa-axis", axis.to_string()),
@@ -217,7 +218,7 @@ pub(crate) async fn put(
 
 // -- GET ----------------------------------------------------------------------
 
-async fn get(cx: &Cx, _ns: &str, kappa: &str) -> topcoat::Result<Response> {
+async fn get(cx: &Cx, _ns: &NamespaceRef, kappa: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
     let k = kappa.to_string();
     let axis = kappa.split(':').next().unwrap_or("sha256").to_string();
@@ -345,7 +346,7 @@ async fn get(cx: &Cx, _ns: &str, kappa: &str) -> topcoat::Result<Response> {
 
 // -- HEAD ---------------------------------------------------------------------
 
-async fn head(cx: &Cx, _ns: &str, kappa: &str) -> topcoat::Result<Response> {
+async fn head(cx: &Cx, _ns: &NamespaceRef, kappa: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
     let k = kappa.to_string();
     let axis = kappa.split(':').next().unwrap_or("sha256").to_string();
@@ -399,13 +400,13 @@ async fn delete(cx: &Cx, kappa: &str) -> topcoat::Result<Response> {
 // -- META LIST ----------------------------------------------------------------
 
 /// GET /v2/{ns}/blobs/_meta?key={key}&value={value}
-async fn meta_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+async fn meta_list(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let s = store(cx).clone();
     let key = query_param(cx, "key").unwrap_or_default();
     let value = query_param(cx, "value").unwrap_or_default();
 
     let kappas = tokio::task::spawn_blocking({
-        let n = ns.to_string();
+        let n = ns.clone();
         move || s.meta_query(&n, &key, &value)
     })
     .await

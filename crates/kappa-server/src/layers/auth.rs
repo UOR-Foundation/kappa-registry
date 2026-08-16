@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use kappa_core::types::NamespaceRef;
 use topcoat::context::{app_context, try_app_context, CxBuilder};
 use topcoat::router::{Body, Next, Response, StatusCode};
 
@@ -45,7 +46,7 @@ pub fn auth_layer<'a>(
                     let asserter = "anonymous";
                     let store = app_context::<Arc<dyn KappaStore>>(cx);
                     let s = store.clone();
-                    let ns_owned = ns.clone();
+                    let ns_owned = NamespaceRef::from(ns.clone());
                     let result = tokio::task::spawn_blocking(move || {
                         authorize(&*s, &ns_owned, op, asserter)
                     })

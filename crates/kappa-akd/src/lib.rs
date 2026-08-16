@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 type Epoch = u64;
 type UserValueMap = HashMap<Epoch, ValueState>;
@@ -126,7 +127,7 @@ impl AkdStoreAdapter {
         })?;
         let kappa = kappa_core::store::blob_put_computed(&*self.store, &bytes)?;
         self.store
-            .tag_set(&self.namespace, "_akd/checkpoint", &kappa)?;
+            .tag_set(&NamespaceRef::from(self.namespace.as_str()), "_akd/checkpoint", &kappa)?;
         Ok(())
     }
 
@@ -135,7 +136,7 @@ impl AkdStoreAdapter {
         store: Arc<dyn KappaStore>,
         namespace: String,
     ) -> Result<Self, kappa_core::StoreError> {
-        let entry = store.tag_get(&namespace, "_akd/checkpoint")?;
+        let entry = store.tag_get(&NamespaceRef::from(namespace.as_str()), "_akd/checkpoint")?;
         let bytes = store.blob_get(&entry.kappa)?;
         let checkpoint: AkdCheckpoint = postcard::from_bytes(&bytes).map_err(|e| {
             kappa_core::StoreError::Rejected(format!("checkpoint deserialize: {}", e))

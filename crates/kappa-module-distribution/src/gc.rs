@@ -14,7 +14,7 @@ use topcoat::router::{
 };
 
 use kappa_core::store::{blob_put_computed, KappaStore};
-use kappa_core::types::{Direction, EdgeQuery};
+use kappa_core::types::{Direction, EdgeQuery, NamespaceRef};
 
 use crate::{path_param, read_body, store};
 
@@ -45,36 +45,36 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn pin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        pin(cx, ns, &bytes).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        pin(cx, &ns, &bytes).await
     })
 }
 
 fn unpin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        unpin(cx, ns, &bytes).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        unpin(cx, &ns, &bytes).await
     })
 }
 
 fn sweep_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
-        sweep(cx, ns).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        sweep(cx, &ns).await
     })
 }
 
 fn status_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
-        status(cx, ns).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        status(cx, &ns).await
     })
 }
 
-async fn pin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn pin(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let kappa = v["kappa"]
@@ -84,7 +84,7 @@ async fn pin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     let controller = v["controller"].as_str().unwrap_or("");
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let k = kappa.to_string();
     let ctrl = controller.to_string();
 
@@ -112,7 +112,7 @@ async fn pin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 
     // Store object-type metadata (global + namespace-indexed)
     let pk = pin_kappa.clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || {
@@ -134,7 +134,7 @@ async fn pin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         .into_response(cx)
 }
 
-async fn unpin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn unpin(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let pin_kappa = v["pin_kappa"]
@@ -143,7 +143,7 @@ async fn unpin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     let release = v["release"].as_str() == Some("true");
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let pk = pin_kappa.to_string();
 
     let result = tokio::task::spawn_blocking({
@@ -199,14 +199,14 @@ async fn unpin(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     }
 }
 
-async fn sweep(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+async fn sweep(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let ns_owned = ns.to_string();
+    let ns_owned = ns.clone();
 
     let sweep_id = uuid::Uuid::new_v4().to_string();
     let sid = sweep_id.clone();
 
-    tracing::info!(ns = ns, sweep_id = %sid, "gc sweep starting");
+    tracing::info!(ns = ns.as_str(), sweep_id = %sid, "gc sweep starting");
 
     let result = tokio::task::spawn_blocking(move || run_sweep(&*s, &ns_owned, &sid))
         .await
@@ -235,9 +235,9 @@ async fn sweep(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
         .into_response(cx)
 }
 
-async fn status(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+async fn status(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     let status = tokio::task::spawn_blocking(move || {
         let pins = s.tag_prefix(&n, "_pin/").unwrap_or_default();
@@ -295,7 +295,7 @@ struct SweepResult {
 
 fn run_sweep(
     store: &dyn KappaStore,
-    ns: &str,
+    ns: &NamespaceRef,
     sweep_id: &str,
 ) -> Result<SweepResult, kappa_core::StoreError> {
     let _span = tracing::info_span!("store_mutation", op = "gc_sweep", ns = %ns, sweep_id = %sweep_id).entered();

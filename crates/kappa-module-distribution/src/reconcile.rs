@@ -15,6 +15,8 @@ use topcoat::router::{
     Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
+use kappa_core::types::NamespaceRef;
+
 use crate::{path_param, read_body, store};
 
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
@@ -28,12 +30,12 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn handle_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        handle(cx, ns, &bytes).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        handle(cx, &ns, &bytes).await
     })
 }
 
-async fn handle(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn handle(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let msg_type = v["type"]
@@ -48,7 +50,7 @@ async fn handle(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     }
 }
 
-async fn handle_fingerprint(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat::Result<Response> {
+async fn handle_fingerprint(cx: &Cx, ns: &NamespaceRef, v: &serde_json::Value) -> topcoat::Result<Response> {
     let lower = v["lower"]
         .as_str()
         .ok_or_else(|| bad_request("missing lower"))?;
@@ -60,7 +62,7 @@ async fn handle_fingerprint(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat
         .ok_or_else(|| bad_request("missing fingerprint"))?;
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let lo = lower.to_string();
     let up = upper.to_string();
 
@@ -161,7 +163,7 @@ async fn handle_fingerprint(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat
 
 async fn handle_items_request(
     cx: &Cx,
-    ns: &str,
+    ns: &NamespaceRef,
     v: &serde_json::Value,
 ) -> topcoat::Result<Response> {
     let lower = v["lower"]
@@ -172,7 +174,7 @@ async fn handle_items_request(
         .ok_or_else(|| bad_request("missing upper"))?;
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let lo = lower.to_string();
     let up = upper.to_string();
 
@@ -207,7 +209,7 @@ async fn handle_items_request(
         .into_response(cx)
 }
 
-async fn handle_items(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat::Result<Response> {
+async fn handle_items(cx: &Cx, ns: &NamespaceRef, v: &serde_json::Value) -> topcoat::Result<Response> {
     let lower = v["lower"]
         .as_str()
         .ok_or_else(|| bad_request("missing lower"))?;
@@ -225,7 +227,7 @@ async fn handle_items(cx: &Cx, ns: &str, v: &serde_json::Value) -> topcoat::Resu
 
     // Compute our items in the range and return the diff
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let lo = lower.to_string();
     let up = upper.to_string();
 

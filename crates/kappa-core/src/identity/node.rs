@@ -13,7 +13,7 @@ use crate::crypto::keystore::KeyStore;
 use crate::crypto::{CryptoError, Signer};
 use crate::identity::trust::TrustPosition;
 use crate::store::{blob_put_computed, KappaStore};
-use crate::types::StoreError;
+use crate::types::{NamespaceRef, StoreError};
 
 /// A registry node's identity, established at bootstrap.
 ///
@@ -47,7 +47,7 @@ impl NodeIdentity {
             crate::crypto::Signer::public_key(&signer),
         );
 
-        let ns = anchor.as_namespace();
+        let ns = NamespaceRef::from(anchor.as_namespace());
         let anchor_kappa = blob_put_computed(store, anchor.as_str().as_bytes())?;
         store.tag_set(&ns, "node/anchor", &anchor_kappa)?;
         let algo_kappa = blob_put_computed(store, signer.algorithm().as_bytes())?;

@@ -37,14 +37,14 @@ fn relation_index(relation: &EdgeRelation) -> u64 {
     }
 }
 
-pub(super) fn edge_put(store: &InMemoryStore, ns: &str, edge: &Edge) -> Result<(), StoreError> {
+pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) -> Result<(), StoreError> {
     store.ensure_namespace(ns);
 
     let edge_bytes = canonical_bytes(edge);
     let edge_kappa = kappa_from_bytes(&edge_bytes);
     store.ingest_compute(crate::kappa::Axis::Sha256, &edge_bytes)?;
 
-    let ns_hash = namespace_hash(ns);
+    let ns_hash = namespace_hash(ns.as_str());
     let ek_hash = item_hash(&edge_kappa);
 
     {
@@ -99,10 +99,10 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &str, edge: &Edge) -> Result<(
 
 pub(super) fn edge_query(
     store: &InMemoryStore,
-    ns: &str,
+    ns: &NamespaceRef,
     query: &EdgeQuery,
 ) -> Result<Vec<Edge>, StoreError> {
-    let ns_hash = namespace_hash(ns);
+    let ns_hash = namespace_hash(ns.as_str());
     let anchor_hash = item_hash(&query.anchor);
 
     let kappas = match query.direction {
@@ -145,12 +145,12 @@ pub(super) fn edge_query(
 
 pub(super) fn edge_delete(
     store: &InMemoryStore,
-    ns: &str,
+    ns: &NamespaceRef,
     source: &str,
     target: &str,
     relation: EdgeRelation,
 ) -> Result<(), StoreError> {
-    let ns_hash = namespace_hash(ns);
+    let ns_hash = namespace_hash(ns.as_str());
 
     // Find the edge kappa by scanning the source's forward index
     let edges = store.edges.read().unwrap();

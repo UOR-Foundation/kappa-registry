@@ -17,6 +17,7 @@ use gix_packetline::blocking_io::encode;
 use gix_packetline::PacketLineRef;
 
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 use crate::envelope;
 use crate::ingest;
@@ -80,7 +81,7 @@ fn oid_to_kappa_string(object_hash: gix_hash::Kind, hex_oid: &str) -> String {
 /// Terminated by flush packet.
 pub fn write_ref_advertisement<W: Write>(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     service: &str,
     mut out: W,
     object_hash: gix_hash::Kind,
@@ -171,7 +172,7 @@ pub fn write_v2_capability_advertisement<W: Write>(
 /// - `fetch`: full fetch with want/have negotiation
 pub fn handle_v2_upload_pack<R: Read, W: Write>(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     request: R,
     mut response: W,
     object_hash: gix_hash::Kind,
@@ -421,7 +422,7 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
 /// Handle a git-upload-pack v1 request (clone/fetch).
 pub fn handle_upload_pack<R: Read, W: Write>(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     request: R,
     mut response: W,
     object_hash: gix_hash::Kind,
@@ -601,7 +602,7 @@ pub fn handle_upload_pack<R: Read, W: Write>(
 /// Handle a git-receive-pack request (push).
 pub fn handle_receive_pack<R: Read, W: Write>(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     request: R,
     mut response: W,
     object_hash: gix_hash::Kind,
@@ -830,7 +831,7 @@ pub fn handle_receive_pack<R: Read, W: Write>(
 /// `filter` is BlobNone, blobs are excluded from the need set.
 fn compute_need_set(
     store: &dyn KappaStore,
-    _namespace: &str,
+    _namespace: &NamespaceRef,
     wants: &[String],
     common: &HashSet<String>,
     object_hash: gix_hash::Kind,
@@ -1134,8 +1135,9 @@ mod tests {
     #[test]
     fn ref_advertisement_empty_repo() {
         let (store, _tmp) = test_store();
+        let ns = NamespaceRef::from("test-repo");
         let mut output = Vec::new();
-        write_ref_advertisement(&*store, "test-repo", "git-upload-pack", &mut output, gix_hash::Kind::Sha1).unwrap();
+        write_ref_advertisement(&*store, &ns, "git-upload-pack", &mut output, gix_hash::Kind::Sha1).unwrap();
 
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("git-upload-pack"));
@@ -1145,11 +1147,12 @@ mod tests {
     #[test]
     fn ref_advertisement_with_refs() {
         let (store, _tmp) = test_store();
-        refs::update_ref(&*store, "repo", "refs/heads/main", "sha1:aabbccddee", None).unwrap();
-        refs::set_symbolic_ref(&*store, "repo", "HEAD", "refs/heads/main").unwrap();
+        let ns = NamespaceRef::from("repo");
+        refs::update_ref(&*store, &ns, "refs/heads/main", "sha1:aabbccddee", None).unwrap();
+        refs::set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/main").unwrap();
 
         let mut output = Vec::new();
-        write_ref_advertisement(&*store, "repo", "git-upload-pack", &mut output, gix_hash::Kind::Sha1).unwrap();
+        write_ref_advertisement(&*store, &ns, "git-upload-pack", &mut output, gix_hash::Kind::Sha1).unwrap();
 
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("aabbccddee"));
@@ -1187,7 +1190,7 @@ mod tests {
         let commit = store_git_commit(&*store, &tree, &[], "initial commit");
 
         let (need, _shallows) = compute_need_set(
-            &*store, "repo", &[hex_oid(&commit)], &HashSet::new(), gix_hash::Kind::Sha1,
+            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit)], &HashSet::new(), gix_hash::Kind::Sha1,
             &FetchOptions::default(),
         );
 
@@ -1217,7 +1220,7 @@ mod tests {
         let mut common = HashSet::new();
         common.insert(hex_oid(&commit1));
         let (need, _shallows) = compute_need_set(
-            &*store, "repo", &[hex_oid(&commit2)], &common, gix_hash::Kind::Sha1,
+            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit2)], &common, gix_hash::Kind::Sha1,
             &FetchOptions::default(),
         );
 
@@ -1245,7 +1248,7 @@ mod tests {
             ..Default::default()
         };
         let (need, shallows) = compute_need_set(
-            &*store, "repo", &[hex_oid(&commit3)], &HashSet::new(),
+            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit3)], &HashSet::new(),
             gix_hash::Kind::Sha1, &opts,
         );
 
@@ -1273,7 +1276,7 @@ mod tests {
             ..Default::default()
         };
         let (need, shallows) = compute_need_set(
-            &*store, "repo", &[hex_oid(&commit3)], &HashSet::new(),
+            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit3)], &HashSet::new(),
             gix_hash::Kind::Sha1, &opts,
         );
 
@@ -1299,7 +1302,7 @@ mod tests {
             ..Default::default()
         };
         let (need, _) = compute_need_set(
-            &*store, "repo", &[hex_oid(&commit)], &HashSet::new(),
+            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit)], &HashSet::new(),
             gix_hash::Kind::Sha1, &opts,
         );
 
@@ -1455,11 +1458,12 @@ mod tests {
         let commit = store_git_commit_sha256(&*store, &tree, &[], "init");
         let commit_hex = kappa_to_hex_oid(&commit);
 
-        refs::update_ref(&*store, "repo256", "refs/heads/main", &commit, None).unwrap();
-        refs::set_symbolic_ref(&*store, "repo256", "HEAD", "refs/heads/main").unwrap();
+        let ns = NamespaceRef::from("repo256");
+        refs::update_ref(&*store, &ns, "refs/heads/main", &commit, None).unwrap();
+        refs::set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/main").unwrap();
 
         let mut output = Vec::new();
-        write_ref_advertisement(&*store, "repo256", "git-upload-pack", &mut output, gix_hash::Kind::Sha256).unwrap();
+        write_ref_advertisement(&*store, &ns, "git-upload-pack", &mut output, gix_hash::Kind::Sha256).unwrap();
 
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains(commit_hex), "advertisement must contain 64-char OID");
@@ -1475,7 +1479,7 @@ mod tests {
         let commit = store_git_commit_sha256(&*store, &tree, &[], "sha256 commit");
 
         let (need, _shallows) = compute_need_set(
-            &*store, "repo256", &[hex_oid(&commit)], &HashSet::new(),
+            &*store, &NamespaceRef::from("repo256"), &[hex_oid(&commit)], &HashSet::new(),
             gix_hash::Kind::Sha256, &FetchOptions::default(),
         );
 
@@ -1506,7 +1510,8 @@ mod tests {
     fn repo_object_format_default_sha1() {
         let (store, _tmp) = test_store();
         // No _config/object_format tag -- defaults to SHA-1
-        let kind = match store.tag_get("newrepo", "_config/object_format") {
+        let ns = NamespaceRef::from("newrepo");
+        let kind = match store.tag_get(&ns, "_config/object_format") {
             Ok(entry) => match entry.kappa.as_str() {
                 "sha256" => gix_hash::Kind::Sha256,
                 _ => gix_hash::Kind::Sha1,
@@ -1519,8 +1524,9 @@ mod tests {
     #[test]
     fn repo_object_format_stored_sha256() {
         let (store, _tmp) = test_store();
-        store.tag_set("repo256", "_config/object_format", "sha256").unwrap();
-        let kind = match store.tag_get("repo256", "_config/object_format") {
+        let ns = NamespaceRef::from("repo256");
+        store.tag_set(&ns, "_config/object_format", "sha256").unwrap();
+        let kind = match store.tag_get(&ns, "_config/object_format") {
             Ok(entry) => match entry.kappa.as_str() {
                 "sha256" => gix_hash::Kind::Sha256,
                 _ => gix_hash::Kind::Sha1,

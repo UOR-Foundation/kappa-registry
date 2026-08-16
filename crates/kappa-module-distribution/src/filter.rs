@@ -13,6 +13,7 @@ use topcoat::router::{
 };
 
 use kappa_core::store::blob_put_computed;
+use kappa_core::types::NamespaceRef;
 
 use crate::{path_param, read_body, store};
 
@@ -38,32 +39,32 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn register_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let scope = path_param(cx, "filter_key");
-        register_filter(cx, ns, scope, &bytes).await
+        register_filter(cx, &ns, scope, &bytes).await
     })
 }
 
 fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
-        list(cx, ns).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        list(cx, &ns).await
     })
 }
 
 fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let kappa = path_param(cx, "filter_key");
-        delete(cx, ns, kappa).await
+        delete(cx, &ns, kappa).await
     })
 }
 
-async fn register_filter(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn register_filter(cx: &Cx, ns: &NamespaceRef, scope: &str, body: &[u8]) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let sc = scope.to_string();
     let content = body.to_vec();
 
@@ -81,7 +82,7 @@ async fn register_filter(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat
 
     // Store object-type metadata (global + namespace-indexed)
     let k = kappa.clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || {
@@ -103,9 +104,9 @@ async fn register_filter(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat
         .into_response(cx)
 }
 
-async fn list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+async fn list(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     let filters = tokio::task::spawn_blocking(move || s.tag_prefix(&n, "_filter/"))
         .await
@@ -129,9 +130,9 @@ async fn list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
         .into_response(cx)
 }
 
-async fn delete(cx: &Cx, ns: &str, filter_key: &str) -> topcoat::Result<Response> {
+async fn delete(cx: &Cx, ns: &NamespaceRef, filter_key: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let fk = filter_key.to_string();
 
     tokio::task::spawn_blocking({

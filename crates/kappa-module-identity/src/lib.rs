@@ -24,6 +24,7 @@ use kappa_core::identity::resolution;
 use kappa_core::identity::revocation::{Revocation, RevocationReason};
 use kappa_core::kappa::kappa_from_bytes;
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 /// Asserter filter registered in app_context by the server layer.
 /// The resolve handler reads this and passes it to resolve_all_filtered.
@@ -182,7 +183,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let ab = assertion_bytes;
-            let ns = asserter_ns.clone();
+            let ns = NamespaceRef::from(asserter_ns.as_str());
             let subj = subject.clone();
             let facet = facet_for_edge;
             move || {
@@ -201,10 +202,10 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 s.edge_put(
                     &ns,
                     &kappa_core::types::Edge {
-                        source: ns.clone(),
+                        source: ns.as_str().to_string(),
                         target: subj.clone(),
                         relation: kappa_core::types::EdgeRelation::Assertion,
-                        asserter: ns.clone(),
+                        asserter: ns.as_str().to_string(),
                         value_kappa: Some(k.clone()),
                         metadata: None,
                     },
@@ -215,7 +216,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     &ns,
                     vec![kappa_core::types::EpochMutation {
                         op: kappa_core::types::MutationOp::AssertionPublish,
-                        namespace: ns.clone(),
+                        namespace: ns.as_str().to_string(),
                         tag_name: format!("assertion/{}", k),
                         old_kappa: None,
                         new_kappa: Some(k.clone()),
@@ -302,8 +303,9 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let mut revocations = Vec::new();
             let mut watermarks = Vec::new();
 
-            for ns in &namespaces {
-                let rev_tags = s.tag_prefix(ns, "revocation/")?;
+            for ns_str in &namespaces {
+                let ns = NamespaceRef::from(ns_str.as_str());
+                let rev_tags = s.tag_prefix(&ns, "revocation/")?;
                 for tag in &rev_tags {
                     if let Ok(blob) = s.blob_get(&tag.kappa) {
                         if let Ok(r) = canonical::from_canonical::<Revocation>(&blob) {
@@ -312,7 +314,7 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     }
                 }
 
-                let wm_tags = s.tag_prefix(ns, "watermark/")?;
+                let wm_tags = s.tag_prefix(&ns, "watermark/")?;
                 for tag in &wm_tags {
                     if let Ok(blob) = s.blob_get(&tag.kappa) {
                         if let Ok(w) = canonical::from_canonical::<kappa_core::identity::watermark::Watermark>(&blob) {
@@ -415,7 +417,7 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let rb = rev_bytes;
-            let ns = asserter;
+            let ns = NamespaceRef::from(asserter.as_str());
             let rak = revoked_assertion_kappa;
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_revoke", ns = %ns).entered();
@@ -427,10 +429,10 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 s.edge_put(
                     &ns,
                     &kappa_core::types::Edge {
-                        source: ns.clone(),
+                        source: ns.as_str().to_string(),
                         target: rak.clone(),
                         relation: kappa_core::types::EdgeRelation::Revocation,
-                        asserter: ns.clone(),
+                        asserter: ns.as_str().to_string(),
                         value_kappa: Some(k.clone()),
                         metadata: None,
                     },
@@ -441,7 +443,7 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     &ns,
                     vec![kappa_core::types::EpochMutation {
                         op: kappa_core::types::MutationOp::RevocationPublish,
-                        namespace: ns.clone(),
+                        namespace: ns.as_str().to_string(),
                         tag_name: format!("revocation/{}", k),
                         old_kappa: None,
                         new_kappa: Some(k.clone()),
@@ -564,7 +566,7 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let wb = wm_bytes;
-            let ns = asserter;
+            let ns = NamespaceRef::from(asserter.as_str());
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_watermark", ns = %ns).entered();
                 s.ingest_verified(&k,&wb)?;
@@ -578,7 +580,7 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     &ns,
                     vec![kappa_core::types::EpochMutation {
                         op: kappa_core::types::MutationOp::RevocationPublish,
-                        namespace: ns.clone(),
+                        namespace: ns.as_str().to_string(),
                         tag_name: format!("watermark/{}", k),
                         old_kappa: None,
                         new_kappa: Some(k.clone()),
@@ -689,9 +691,10 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 let kappa = kappa_from_bytes(&spec_bytes);
                 s.ingest_verified(&kappa,&spec_bytes)?;
                 s.blob_put_meta(&kappa, "object-type", b"anchor-spec")?;
-                s.tag_set(&a, "anchor/spec", &kappa)?;
+                let ns = NamespaceRef::from(a.as_str());
+                s.tag_set(&ns, "anchor/spec", &kappa)?;
                 if !ep.is_empty() {
-                    s.tag_set(&a, "anchor/endpoint", &kappa)?;
+                    s.tag_set(&ns, "anchor/endpoint", &kappa)?;
                 }
                 Ok::<String, kappa_core::StoreError>(kappa)
             }

@@ -15,7 +15,7 @@ use topcoat::router::{
 
 use kappa_core::canonical::canonical_bytes;
 use kappa_core::kappa::kappa_from_bytes;
-use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation};
+use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef};
 
 use crate::{path_param, query_param, read_body, store};
 
@@ -46,15 +46,15 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        put(cx, ns, &bytes).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        put(cx, &ns, &bytes).await
     })
 }
 
 fn query_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let anchor = path_param(cx, "edge_key");
         let direction_str = query_param(cx, "direction").unwrap_or_else(|| "outbound".to_string());
         let relation_str = query_param(cx, "relation");
@@ -62,7 +62,7 @@ fn query_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let last = query_param(cx, "last");
         query(
             cx,
-            ns,
+            &ns,
             anchor,
             &direction_str,
             relation_str.as_deref(),
@@ -76,21 +76,21 @@ fn query_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let edge_kappa = path_param(cx, "edge_key");
-        delete(cx, ns, edge_kappa).await
+        delete(cx, &ns, edge_kappa).await
     })
 }
 
 fn diff_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        diff(cx, ns, &bytes).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        diff(cx, &ns, &bytes).await
     })
 }
 
-async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let source = v["source"]
@@ -141,7 +141,7 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     // Compute the edge kappa for the response (same as store does internally)
     let edge_kappa = kappa_from_bytes(&canonical_bytes(&edge));
 
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || s.edge_put(&n, &edge)
@@ -152,7 +152,7 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 
     // Store object-type metadata (global + namespace-indexed)
     let ek = edge_kappa.clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || {
@@ -176,7 +176,7 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 
 async fn query(
     cx: &Cx,
-    ns: &str,
+    ns: &NamespaceRef,
     anchor: &str,
     direction_str: &str,
     relation_str: Option<&str>,
@@ -187,7 +187,7 @@ async fn query(
     let relation = relation_str.and_then(EdgeRelation::parse);
 
     let s = store(cx).clone();
-    let ns_owned = ns.to_string();
+    let ns_owned = ns.clone();
 
     let mut edges = if is_both {
         let anchor_str = anchor.to_string();
@@ -273,10 +273,10 @@ async fn query(
         .into_response(cx)
 }
 
-async fn delete(cx: &Cx, ns: &str, edge_kappa: &str) -> topcoat::Result<Response> {
+async fn delete(cx: &Cx, ns: &NamespaceRef, edge_kappa: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
     let ek = edge_kappa.to_string();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     // Read the edge blob to get (source, target, relation) for the new
     // edge_delete signature. The edge blob is the dCBOR canonical form
@@ -311,7 +311,7 @@ async fn delete(cx: &Cx, ns: &str, edge_kappa: &str) -> topcoat::Result<Response
     StatusCode::ACCEPTED.into_response(cx)
 }
 
-async fn diff(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn diff(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let have: Vec<String> = v["have"]
@@ -332,7 +332,7 @@ async fn diff(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         .unwrap_or_default();
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let mut have_set = std::collections::HashSet::new();

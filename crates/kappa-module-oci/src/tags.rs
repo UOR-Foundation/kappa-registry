@@ -8,7 +8,7 @@ use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
 use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
 
-use kappa_core::types::{EpochMutation, MutationOp, TagUpdate};
+use kappa_core::types::{EpochMutation, MutationOp, NamespaceRef, TagUpdate};
 
 use crate::{path_param, query_param, read_body, store};
 
@@ -17,12 +17,12 @@ use crate::{path_param, query_param, read_body, store};
 pub fn tag_batch_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        tag_batch(cx, ns, &bytes).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        tag_batch(cx, &ns, &bytes).await
     })
 }
 
-async fn tag_batch(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn tag_batch(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let raw_updates = v["updates"]
@@ -50,12 +50,12 @@ async fn tag_batch(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> 
     }
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let mutations: Vec<EpochMutation> = updates
         .iter()
         .map(|u| EpochMutation {
             op: MutationOp::TagSet,
-            namespace: n.clone(),
+            namespace: n.as_str().to_string(),
             tag_name: u.name.clone(),
             old_kappa: None,
             new_kappa: Some(u.kappa.clone()),
@@ -79,18 +79,18 @@ async fn tag_batch(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> 
 pub fn tag_delete_prefix_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let prefix = query_param(cx, "prefix").unwrap_or_default();
         if prefix.is_empty() {
             return Err(bad_request("missing prefix parameter").into());
         }
-        tag_delete_prefix(cx, ns, &prefix).await
+        tag_delete_prefix(cx, &ns, &prefix).await
     })
 }
 
-async fn tag_delete_prefix(cx: &Cx, ns: &str, prefix: &str) -> topcoat::Result<Response> {
+async fn tag_delete_prefix(cx: &Cx, ns: &NamespaceRef, prefix: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let pfx = prefix.to_string();
 
     let matching = tokio::task::spawn_blocking({
@@ -103,12 +103,12 @@ async fn tag_delete_prefix(cx: &Cx, ns: &str, prefix: &str) -> topcoat::Result<R
     .map_err(crate::store_err)?;
 
     let count = matching.len();
-    let ns_owned = ns.to_string();
+    let n2 = ns.clone();
     let mutations: Vec<EpochMutation> = matching
         .iter()
         .map(|tag| EpochMutation {
             op: MutationOp::TagDelete,
-            namespace: ns_owned.clone(),
+            namespace: ns.as_str().to_string(),
             tag_name: tag.name.clone(),
             old_kappa: Some(tag.kappa.clone()),
             new_kappa: None,
@@ -117,7 +117,7 @@ async fn tag_delete_prefix(cx: &Cx, ns: &str, prefix: &str) -> topcoat::Result<R
 
     tokio::task::spawn_blocking({
         let s = s.clone();
-        let n = ns_owned.clone();
+        let n = n2;
         let tags_to_delete: Vec<String> = matching.iter().map(|t| t.name.clone()).collect();
         move || {
             let _span = tracing::info_span!("store_mutation", op = "tag_delete_prefix", ns = %n, count = tags_to_delete.len()).entered();
@@ -148,11 +148,11 @@ async fn tag_delete_prefix(cx: &Cx, ns: &str, prefix: &str) -> topcoat::Result<R
 pub fn tag_crud_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let method = topcoat::router::method(cx);
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         match method.as_str() {
             "POST" => {
                 let bytes = read_body(body).await?;
-                tag_create(cx, ns, &bytes).await
+                tag_create(cx, &ns, &bytes).await
             }
             "GET" => {
                 let _ = body;
@@ -160,7 +160,7 @@ pub fn tag_crud_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 if name.is_empty() {
                     return Err(bad_request("missing name parameter").into());
                 }
-                tag_get_by_query(cx, ns, &name).await
+                tag_get_by_query(cx, &ns, &name).await
             }
             "DELETE" => {
                 let _ = body;
@@ -168,14 +168,14 @@ pub fn tag_crud_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 if name.is_empty() {
                     return Err(bad_request("missing name parameter").into());
                 }
-                tag_delete_by_query(cx, ns, &name).await
+                tag_delete_by_query(cx, &ns, &name).await
             }
             _ => Err(bad_request("method not allowed").into()),
         }
     })
 }
 
-async fn tag_create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn tag_create(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let name = v["name"].as_str().unwrap_or("");
@@ -185,7 +185,7 @@ async fn tag_create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response>
     }
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let k = kappa.to_string();
 
     // Content-before-tag: verify the blob exists
@@ -214,7 +214,7 @@ async fn tag_create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response>
             &n,
             vec![EpochMutation {
                 op: MutationOp::TagSet,
-                namespace: n.clone(),
+                namespace: n.as_str().to_string(),
                 tag_name: nm,
                 old_kappa: None,
                 new_kappa: Some(k),
@@ -229,9 +229,9 @@ async fn tag_create(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response>
     (StatusCode::CREATED, [("content-length", "0")]).into_response(cx)
 }
 
-async fn tag_get_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Response> {
+async fn tag_get_by_query(cx: &Cx, ns: &NamespaceRef, name: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let nm = name.to_string();
     let entry = tokio::task::spawn_blocking(move || s.tag_get(&n, &nm))
         .await
@@ -250,9 +250,9 @@ async fn tag_get_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Resp
         .into_response(cx)
 }
 
-async fn tag_delete_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Response> {
+async fn tag_delete_by_query(cx: &Cx, ns: &NamespaceRef, name: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let nm = name.to_string();
     tokio::task::spawn_blocking(move || {
         let _span = tracing::info_span!("store_mutation", op = "tag_delete", ns = %n, tag = %nm).entered();
@@ -261,7 +261,7 @@ async fn tag_delete_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<R
             &n,
             vec![EpochMutation {
                 op: MutationOp::TagDelete,
-                namespace: n.clone(),
+                namespace: n.as_str().to_string(),
                 tag_name: nm,
                 old_kappa: None,
                 new_kappa: None,
@@ -281,16 +281,16 @@ async fn tag_delete_by_query(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<R
 pub fn tag_get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let name = path_param(cx, "name");
         let raw = query_param(cx, "raw").as_deref() == Some("true");
-        tag_get(cx, ns, name, raw).await
+        tag_get(cx, &ns, name, raw).await
     })
 }
 
-async fn tag_get(cx: &Cx, ns: &str, name: &str, raw: bool) -> topcoat::Result<Response> {
+async fn tag_get(cx: &Cx, ns: &NamespaceRef, name: &str, raw: bool) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let nm = name.to_string();
 
     let entry = tokio::task::spawn_blocking({
@@ -323,7 +323,7 @@ async fn tag_get(cx: &Cx, ns: &str, name: &str, raw: bool) -> topcoat::Result<Re
 pub fn tag_put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let name = path_param(cx, "name");
         let kappa = query_param(cx, "kappa").unwrap_or_default();
         let symref = query_param(cx, "symref");
@@ -337,7 +337,7 @@ pub fn tag_put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
             .map(String::from);
         tag_put(
             cx,
-            ns,
+            &ns,
             name,
             &kappa,
             symref.as_deref(),
@@ -350,7 +350,7 @@ pub fn tag_put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
 async fn tag_put(
     cx: &Cx,
-    ns: &str,
+    ns: &NamespaceRef,
     name: &str,
     kappa: &str,
     symref: Option<&str>,
@@ -361,7 +361,7 @@ async fn tag_put(
 
     // Symref: resolve target tag's kappa and bind transparently
     if let Some(target) = symref {
-        let n = ns.to_string();
+        let n = ns.clone();
         let nm = name.to_string();
         let t = target.to_string();
         let resolved_kappa = tokio::task::spawn_blocking({
@@ -383,7 +383,7 @@ async fn tag_put(
                     &n,
                     vec![EpochMutation {
                         op: MutationOp::TagSet,
-                        namespace: n.clone(),
+                        namespace: n.as_str().to_string(),
                         tag_name: nm,
                         old_kappa: None,
                         new_kappa: Some(resolved_kappa),
@@ -430,9 +430,8 @@ async fn tag_put(
     }
 
     // If-Match: CAS by kappa-label comparison
-    // (conformance test sends the current tag kappa as the If-Match value)
     if let Some(expected_kappa) = if_match {
-        let n = ns.to_string();
+        let n = ns.clone();
         let nm = name.to_string();
         let k = kappa.to_string();
         let ek = expected_kappa.to_string();
@@ -449,7 +448,7 @@ async fn tag_put(
                                 &n,
                                 vec![EpochMutation {
                                     op: MutationOp::TagSet,
-                                    namespace: n.clone(),
+                                    namespace: n.as_str().to_string(),
                                     tag_name: nm,
                                     old_kappa: Some(ek),
                                     new_kappa: Some(k),
@@ -484,7 +483,7 @@ async fn tag_put(
 
     // If-None-Match: * -- create-only (fail if tag exists)
     if if_none_match == Some("*") {
-        let n = ns.to_string();
+        let n = ns.clone();
         let nm = name.to_string();
         let k = kappa.to_string();
 
@@ -505,7 +504,7 @@ async fn tag_put(
                     &n,
                     vec![EpochMutation {
                         op: MutationOp::TagSet,
-                        namespace: n.clone(),
+                        namespace: n.as_str().to_string(),
                         tag_name: name_for_epoch,
                         old_kappa: None,
                         new_kappa: Some(kappa_for_epoch),
@@ -535,7 +534,7 @@ async fn tag_put(
     }
 
     // Unconditional set
-    let n = ns.to_string();
+    let n = ns.clone();
     let nm = name.to_string();
     let k = kappa.to_string();
 
@@ -557,7 +556,7 @@ async fn tag_put(
                 &n,
                 vec![EpochMutation {
                     op: MutationOp::TagSet,
-                    namespace: n.clone(),
+                    namespace: n.as_str().to_string(),
                     tag_name: nm,
                     old_kappa: None,
                     new_kappa: Some(k),

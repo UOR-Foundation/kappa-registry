@@ -5,7 +5,7 @@
 //! Symbolic refs ("ref: refs/heads/main") stored as tag values.
 
 use kappa_core::store::KappaStore;
-use kappa_core::types::StoreError;
+use kappa_core::types::{NamespaceRef, StoreError};
 
 const SYMREF_PREFIX: &str = "ref: ";
 const MAX_SYMREF_DEPTH: usize = 10;
@@ -29,7 +29,7 @@ pub enum RefError {
 /// Returns Ok(()) on success, Err(UpdateRejected) if CAS fails.
 pub fn update_ref(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     ref_name: &str,
     new_oid: &str,
     old_oid: Option<&str>,
@@ -102,7 +102,7 @@ pub fn update_ref(
 /// Follows "ref: {target}" chains up to MAX_SYMREF_DEPTH.
 pub fn resolve_ref(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     ref_name: &str,
 ) -> Result<Option<String>, RefError> {
     let mut current = ref_name.to_string();
@@ -127,7 +127,7 @@ pub fn resolve_ref(
 /// Create a symbolic ref: name points to target ref, not to an OID.
 pub fn set_symbolic_ref(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     name: &str,
     target: &str,
 ) -> Result<(), RefError> {
@@ -140,7 +140,7 @@ pub fn set_symbolic_ref(
 /// Returns (ref_name, target_oid_or_symref) pairs.
 pub fn list_refs(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     prefix: &str,
 ) -> Result<Vec<(String, String)>, RefError> {
     let tags = store.tag_prefix(namespace, prefix)?;
@@ -153,7 +153,7 @@ pub fn list_refs(
 /// Delete a ref.
 pub fn delete_ref(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     ref_name: &str,
 ) -> Result<(), RefError> {
     store.tag_delete(namespace, ref_name)?;
@@ -181,72 +181,80 @@ mod tests {
     #[test]
     fn create_and_resolve_ref() {
         let (store, _tmp) = test_store();
-        update_ref(&*store, "repo", "refs/heads/main", "sha1:aaa", None).unwrap();
-        let resolved = resolve_ref(&*store, "repo", "refs/heads/main").unwrap();
+        let ns = NamespaceRef::from("repo");
+        update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
+        let resolved = resolve_ref(&*store, &ns, "refs/heads/main").unwrap();
         assert_eq!(resolved, Some("sha1:aaa".into()));
     }
 
     #[test]
     fn cas_update_ref() {
         let (store, _tmp) = test_store();
-        update_ref(&*store, "repo", "refs/heads/main", "sha1:aaa", None).unwrap();
-        update_ref(&*store, "repo", "refs/heads/main", "sha1:bbb", Some("sha1:aaa")).unwrap();
-        let resolved = resolve_ref(&*store, "repo", "refs/heads/main").unwrap();
+        let ns = NamespaceRef::from("repo");
+        update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
+        update_ref(&*store, &ns, "refs/heads/main", "sha1:bbb", Some("sha1:aaa")).unwrap();
+        let resolved = resolve_ref(&*store, &ns, "refs/heads/main").unwrap();
         assert_eq!(resolved, Some("sha1:bbb".into()));
     }
 
     #[test]
     fn cas_rejects_wrong_old() {
         let (store, _tmp) = test_store();
-        update_ref(&*store, "repo", "refs/heads/main", "sha1:aaa", None).unwrap();
-        let result = update_ref(&*store, "repo", "refs/heads/main", "sha1:bbb", Some("sha1:wrong"));
+        let ns = NamespaceRef::from("repo");
+        update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
+        let result = update_ref(&*store, &ns, "refs/heads/main", "sha1:bbb", Some("sha1:wrong"));
         assert!(matches!(result, Err(RefError::UpdateRejected { .. })));
     }
 
     #[test]
     fn symbolic_ref_resolution() {
         let (store, _tmp) = test_store();
-        update_ref(&*store, "repo", "refs/heads/main", "sha1:aaa", None).unwrap();
-        set_symbolic_ref(&*store, "repo", "HEAD", "refs/heads/main").unwrap();
-        let resolved = resolve_ref(&*store, "repo", "HEAD").unwrap();
+        let ns = NamespaceRef::from("repo");
+        update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
+        set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/main").unwrap();
+        let resolved = resolve_ref(&*store, &ns, "HEAD").unwrap();
         assert_eq!(resolved, Some("sha1:aaa".into()));
     }
 
     #[test]
     fn symbolic_ref_chain() {
         let (store, _tmp) = test_store();
-        update_ref(&*store, "repo", "refs/heads/main", "sha1:aaa", None).unwrap();
-        set_symbolic_ref(&*store, "repo", "refs/heads/dev", "refs/heads/main").unwrap();
-        set_symbolic_ref(&*store, "repo", "HEAD", "refs/heads/dev").unwrap();
-        let resolved = resolve_ref(&*store, "repo", "HEAD").unwrap();
+        let ns = NamespaceRef::from("repo");
+        update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
+        set_symbolic_ref(&*store, &ns, "refs/heads/dev", "refs/heads/main").unwrap();
+        set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/dev").unwrap();
+        let resolved = resolve_ref(&*store, &ns, "HEAD").unwrap();
         assert_eq!(resolved, Some("sha1:aaa".into()));
     }
 
     #[test]
     fn resolve_missing_returns_none() {
         let (store, _tmp) = test_store();
-        let resolved = resolve_ref(&*store, "repo", "refs/heads/nonexistent").unwrap();
+        let ns = NamespaceRef::from("repo");
+        let resolved = resolve_ref(&*store, &ns, "refs/heads/nonexistent").unwrap();
         assert!(resolved.is_none());
     }
 
     #[test]
     fn list_refs_by_prefix() {
         let (store, _tmp) = test_store();
-        update_ref(&*store, "repo", "refs/heads/main", "sha1:aaa", None).unwrap();
-        update_ref(&*store, "repo", "refs/heads/dev", "sha1:bbb", None).unwrap();
-        update_ref(&*store, "repo", "refs/tags/v1.0", "sha1:ccc", None).unwrap();
-        let heads = list_refs(&*store, "repo", "refs/heads/").unwrap();
+        let ns = NamespaceRef::from("repo");
+        update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
+        update_ref(&*store, &ns, "refs/heads/dev", "sha1:bbb", None).unwrap();
+        update_ref(&*store, &ns, "refs/tags/v1.0", "sha1:ccc", None).unwrap();
+        let heads = list_refs(&*store, &ns, "refs/heads/").unwrap();
         assert_eq!(heads.len(), 2);
-        let tags = list_refs(&*store, "repo", "refs/tags/").unwrap();
+        let tags = list_refs(&*store, &ns, "refs/tags/").unwrap();
         assert_eq!(tags.len(), 1);
     }
 
     #[test]
     fn delete_ref_removes_it() {
         let (store, _tmp) = test_store();
-        update_ref(&*store, "repo", "refs/heads/main", "sha1:aaa", None).unwrap();
-        delete_ref(&*store, "repo", "refs/heads/main").unwrap();
-        let resolved = resolve_ref(&*store, "repo", "refs/heads/main").unwrap();
+        let ns = NamespaceRef::from("repo");
+        update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
+        delete_ref(&*store, &ns, "refs/heads/main").unwrap();
+        let resolved = resolve_ref(&*store, &ns, "refs/heads/main").unwrap();
         assert!(resolved.is_none());
     }
 }

@@ -11,7 +11,7 @@ use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, Status
 
 use kappa_core::kappa::KappaLabel;
 use kappa_core::store::blob_put_computed;
-use kappa_core::types::MaxBlobSize;
+use kappa_core::types::{MaxBlobSize, NamespaceRef};
 
 use crate::{path_param, query_param, read_body, store};
 
@@ -26,17 +26,17 @@ fn max_blob_size(cx: &Cx) -> u64 {
 pub fn start_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let digest = query_param(cx, "digest");
         let mount = query_param(cx, "mount");
 
         if let Some(ref digest) = digest {
             if !bytes.is_empty() {
-                return crate::blob::put(cx, ns, digest, &bytes).await;
+                return crate::blob::put(cx, &ns, digest, &bytes).await;
             }
         }
 
-        start(cx, ns, mount.as_deref()).await
+        start(cx, &ns, mount.as_deref()).await
     })
 }
 
@@ -101,7 +101,7 @@ pub fn cancel_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
 // -- Handlers -----------------------------------------------------------------
 
-async fn start(cx: &Cx, ns: &str, mount_kappa: Option<&str>) -> topcoat::Result<Response> {
+async fn start(cx: &Cx, ns: &NamespaceRef, mount_kappa: Option<&str>) -> topcoat::Result<Response> {
     let s = store(cx).clone();
 
     if let Some(kappa) = mount_kappa {
@@ -117,7 +117,7 @@ async fn start(cx: &Cx, ns: &str, mount_kappa: Option<&str>) -> topcoat::Result<
             return (
                 StatusCode::CREATED,
                 [
-                    ("location", format!("/v2/{}/blobs/{}", ns, kappa)),
+                    ("location", format!("/v2/{}/blobs/{}", ns.as_str(), kappa)),
                     ("content-length", "0".to_string()),
                     ("docker-content-digest", kappa.to_string()),
                 ],
@@ -127,17 +127,17 @@ async fn start(cx: &Cx, ns: &str, mount_kappa: Option<&str>) -> topcoat::Result<
     }
 
     let max_size = max_blob_size(cx);
-    let ns_owned = ns.to_string();
+    let n = ns.clone();
     let id = tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.upload_begin(&ns_owned, max_size)
+        move || s.upload_begin(&n, max_size)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
     // Pin the upload in the namespace so GC does not sweep in-flight content
-    let pin_ns = ns.to_string();
+    let pin_ns = ns.clone();
     let pin_id = id.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
@@ -173,13 +173,11 @@ async fn chunk(
     let upload_id = id.to_string();
 
     // Determine offset: from Content-Range header or from bytes received
-    let received = s.upload_bytes_received(&upload_id);
-    if received.is_none() {
-        return Err(not_found().into());
-    }
+    let received = s.upload_bytes_received(&upload_id)
+        .ok_or_else(not_found)?;
     let offset = match range_start {
         Some(start) => start as u64,
-        None => received.unwrap(),
+        None => received,
     };
 
     let data = body.to_vec();
@@ -347,7 +345,8 @@ async fn release_upload_pin(cx: &Cx, id: &str) {
     let s = store(cx).clone();
     let upload_id = id.to_string();
     let _ = tokio::task::spawn_blocking(move || {
-        if let Some(ns) = s.upload_namespace(&upload_id) {
+        if let Some(ns_str) = s.upload_namespace(&upload_id) {
+            let ns = NamespaceRef::from(ns_str);
             let tag_name = format!("_upload/{}", upload_id);
             let _ = s.tag_delete(&ns, &tag_name);
         }

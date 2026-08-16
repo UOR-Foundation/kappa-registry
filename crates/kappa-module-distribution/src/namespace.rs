@@ -14,6 +14,7 @@ use topcoat::router::{
 use std::sync::Arc;
 
 use kappa_core::identity::node::NodeIdentity;
+use kappa_core::types::NamespaceRef;
 use topcoat::context::try_app_context;
 
 use crate::{path_param, query_param, store};
@@ -35,26 +36,26 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn root_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
-        root(cx, ns).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        root(cx, &ns).await
     })
 }
 
 fn proof_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
         let name = path_param(cx, "name");
-        proof(cx, ns, name).await
+        proof(cx, &ns, name).await
     })
 }
 
 /// GET /v2/{*ns}/_root
 /// Returns current epoch root kappa and tag count.
 /// ?signed=true includes signer anchor, algorithm, and signature.
-async fn root(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+async fn root(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let want_signed = query_param(cx, "signed").as_deref() == Some("true");
 
     let (root_kappa, tag_count) = tokio::task::spawn_blocking({
@@ -75,10 +76,10 @@ async fn root(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
         if let Some(ref rk) = root_kappa {
             if let Some(ni) = try_app_context::<Arc<NodeIdentity>>(cx) {
                 let timestamp = chrono::Utc::now().to_rfc3339();
-                let message = format!("{ns}\n{rk}\n{timestamp}");
+                let message = format!("{}\n{rk}\n{timestamp}", ns.as_str());
                 let signature = ni.sign(message.as_bytes()).unwrap_or_default();
                 let body = serde_json::json!({
-                    "namespace": ns,
+                    "namespace": ns.as_str(),
                     "root": rk,
                     "count": tag_count,
                     "timestamp": timestamp,
@@ -111,9 +112,9 @@ async fn root(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
 
 /// GET /v2/{*ns}/_root/proof/{name}
 /// Returns the epoch root and a Merkle inclusion proof for the named tag.
-async fn proof(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Response> {
+async fn proof(cx: &Cx, ns: &NamespaceRef, name: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let nm = name.to_string();
 
     let result = tokio::task::spawn_blocking(move || {

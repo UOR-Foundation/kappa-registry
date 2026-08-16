@@ -13,6 +13,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 /// Errors from hook execution.
 #[derive(Debug, thiserror::Error)]
@@ -44,7 +45,7 @@ pub struct RefUpdate {
 /// Returns Err(HookError::Timeout) if the hook exceeds timeout_secs.
 pub fn run_pre_receive(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     updates: &[RefUpdate],
     timeout_secs: u64,
 ) -> Result<(), HookError> {
@@ -80,7 +81,7 @@ pub fn run_pre_receive(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env("GIT_NAMESPACE", namespace)
+        .env("GIT_NAMESPACE", namespace.as_str())
         .spawn()
         .map_err(|e| HookError::ExecutionFailed(e.to_string()))?;
 
@@ -126,7 +127,7 @@ pub fn run_pre_receive(
 /// Errors are logged, not returned.
 pub fn spawn_post_receive(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     updates: &[RefUpdate],
     timeout_secs: u64,
 ) {
@@ -135,7 +136,7 @@ pub fn spawn_post_receive(
         Err(_) => return, // no hook = nothing to do
     };
 
-    let ns = namespace.to_string();
+    let ns = namespace.clone();
     let updates = updates.to_vec();
     std::thread::spawn(move || {
         let tmp_dir = std::env::temp_dir().join("kappa-hooks");
@@ -158,7 +159,7 @@ pub fn spawn_post_receive(
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
-            .env("GIT_NAMESPACE", &ns)
+            .env("GIT_NAMESPACE", ns.as_str())
             .spawn()
         {
             Ok(c) => c,
@@ -191,7 +192,7 @@ pub fn spawn_post_receive(
 /// Load a hook script from the store.
 fn load_hook(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     hook_name: &str,
 ) -> Result<Vec<u8>, HookError> {
     let tag_name = format!("_hooks/{}", hook_name);
@@ -204,7 +205,7 @@ fn load_hook(
 /// Store a hook script in the namespace.
 pub fn set_hook(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     hook_name: &str,
     script: &[u8],
 ) -> Result<(), HookError> {
@@ -220,7 +221,7 @@ pub fn set_hook(
 /// Delete a hook from the namespace.
 pub fn delete_hook(
     store: &dyn KappaStore,
-    namespace: &str,
+    namespace: &NamespaceRef,
     hook_name: &str,
 ) -> Result<(), HookError> {
     let tag_name = format!("_hooks/{}", hook_name);

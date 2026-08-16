@@ -23,7 +23,7 @@ use kappa_core::crypto::keystore::KeyStore;
 use kappa_core::events::InMemoryEventLog;
 use kappa_core::store::KappaStore;
 use kappa_core::transaction::TransactionManager;
-use kappa_core::types::MaxBlobSize;
+use kappa_core::types::{MaxBlobSize, NamespaceRef};
 use kappa_store_redb::PersistentStore;
 
 use auth::TrustPolicy;
@@ -419,7 +419,7 @@ async fn main() {
     {
         /// Determine the object hash format for a repository.
         /// Reads _config/object_format tag. Defaults to SHA-1.
-        fn repo_object_hash(store: &dyn KappaStore, repo: &str) -> gix_hash::Kind {
+        fn repo_object_hash(store: &dyn KappaStore, repo: &NamespaceRef) -> gix_hash::Kind {
             match store.tag_get(repo, "_config/object_format") {
                 Ok(entry) => match entry.kappa.as_str() {
                     "sha256" => gix_hash::Kind::Sha256,
@@ -434,8 +434,8 @@ async fn main() {
                 use topcoat::context::request_context;
                 use topcoat::router::RawPathParams;
                 let params: &RawPathParams = request_context(cx);
-                let repo = params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let repo = NamespaceRef::from(params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v).unwrap_or(""));
                 // service comes from ?service= query param, not path param
                 let service = {
                     let parts: &http::request::Parts = request_context(cx);
@@ -499,8 +499,8 @@ async fn main() {
                 use topcoat::context::request_context;
                 use topcoat::router::RawPathParams;
                 let params: &RawPathParams = request_context(cx);
-                let repo = params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let repo = NamespaceRef::from(params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v).unwrap_or(""));
                 let is_v2 = {
                     let parts: &http::request::Parts = request_context(cx);
                     parts.headers.get("git-protocol")
@@ -546,8 +546,8 @@ async fn main() {
                 use topcoat::context::request_context;
                 use topcoat::router::RawPathParams;
                 let params: &RawPathParams = request_context(cx);
-                let repo = params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let repo = NamespaceRef::from(params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v).unwrap_or(""));
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
@@ -586,8 +586,8 @@ async fn main() {
                 use topcoat::context::request_context;
                 use topcoat::router::RawPathParams;
                 let params: &RawPathParams = request_context(cx);
-                let repo = params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let repo = NamespaceRef::from(params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v).unwrap_or(""));
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
@@ -607,7 +607,7 @@ async fn main() {
                         serde_json::from_slice(&request_bytes)
                             .map_err(|e| format!("invalid LFS batch request: {e}"))?;
                     let batch_resp = kappa_module_git::process_batch(
-                        &*store, &base_url, &repo, &batch_req,
+                        &*store, &base_url, repo.as_str(), &batch_req,
                     );
                     serde_json::to_vec(&batch_resp)
                         .map_err(|e| format!("LFS response serialize: {e}"))
@@ -662,7 +662,8 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("narinfo:{}", hash);
                 let result = tokio::task::spawn_blocking(move || {
-                    let entry = store.tag_get("_nix", &tag_name)?;
+                    let nix_ns = NamespaceRef::from("_nix");
+                    let entry = store.tag_get(&nix_ns, &tag_name)?;
                     store.blob_get(&entry.kappa)
                 }).await;
                 match result {
@@ -685,7 +686,8 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("narinfo:{}", hash);
                 let result = tokio::task::spawn_blocking(move || {
-                    let entry = store.tag_get("_nix", &tag_name)?;
+                    let nix_ns = NamespaceRef::from("_nix");
+                    let entry = store.tag_get(&nix_ns, &tag_name)?;
                     store.blob_size(&entry.kappa)
                 }).await;
                 match result {
@@ -712,6 +714,7 @@ async fn main() {
                         .map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
+                    let nix_ns = NamespaceRef::from("_nix");
                     let narinfo_text = String::from_utf8(narinfo_bytes.clone())
                         .map_err(|e| kappa_core::types::StoreError::Rejected(
                             format!("narinfo is not valid UTF-8: {e}")
@@ -736,7 +739,7 @@ async fn main() {
                     // store the narinfo and defer verification to NAR PUT time.
                     let nar_path = narinfo.url.strip_prefix("nar/").unwrap_or(&narinfo.url);
                     let nar_tag_name = format!("nar:{}", nar_path);
-                    if let Ok(nar_entry) = store.tag_get("_nix", &nar_tag_name) {
+                    if let Ok(nar_entry) = store.tag_get(&nix_ns, &nar_tag_name) {
                         let nar_bytes = store.blob_get(&nar_entry.kappa)?;
                         kappa_module_nix::refs::decompress_and_verify(
                             &nar_bytes,
@@ -755,7 +758,7 @@ async fn main() {
 
                     // Set tag: narinfo:{hash} -> narinfo blob kappa
                     let tag_name = format!("narinfo:{}", store_hash);
-                    store.tag_set("_nix", &tag_name, &narinfo_result.kappa)?;
+                    store.tag_set(&nix_ns, &tag_name, &narinfo_result.kappa)?;
 
                     // Create RefersTo edges via edge_put_batch
                     let edges: Vec<kappa_core::types::Edge> = narinfo.references.iter()
@@ -775,7 +778,7 @@ async fn main() {
                         })
                         .collect();
                     if !edges.is_empty() {
-                        store.edge_put_batch("_nix", &edges)?;
+                        store.edge_put_batch(&nix_ns, &edges)?;
                     }
 
                     // Create DerivedFrom edge if deriver is present
@@ -788,7 +791,7 @@ async fn main() {
                             value_kappa: None,
                             metadata: None,
                         };
-                        store.edge_put("_nix", &deriver_edge)?;
+                        store.edge_put(&nix_ns, &deriver_edge)?;
                     }
 
                     // Store signatures as blob metadata
@@ -828,7 +831,8 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("nar:{}", path);
                 let result = tokio::task::spawn_blocking(move || {
-                    let entry = store.tag_get("_nix", &tag_name)?;
+                    let nix_ns = NamespaceRef::from("_nix");
+                    let entry = store.tag_get(&nix_ns, &tag_name)?;
                     // Stream via blob_open for large NARs
                     let mut reader = store.blob_open(&entry.kappa)?;
                     let mut content = Vec::new();
@@ -858,16 +862,17 @@ async fn main() {
                         .map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
+                    let nix_ns = NamespaceRef::from("_nix");
                     let nar_kappa = kappa_core::kappa::kappa_from_bytes(&content);
                     store.ingest_verified(&nar_kappa, &content)?;
                     let tag_name = format!("nar:{}", path);
-                    store.tag_set("_nix", &tag_name, &nar_kappa)?;
+                    store.tag_set(&nix_ns, &tag_name, &nar_kappa)?;
 
                     // Deferred verification: check if any narinfo already references
                     // this NAR and verify NarHash + references now that the NAR is stored.
                     // Scan narinfo tags for entries whose URL field matches this NAR path.
                     // The narinfo stores the URL as "nar/{path}", the NAR tag is "nar:{path}".
-                    if let Ok(tags) = store.tag_list("_nix") {
+                    if let Ok(tags) = store.tag_list(&nix_ns) {
                         for tag in &tags {
                             if !tag.name.starts_with("narinfo:") {
                                 continue;
@@ -888,7 +893,7 @@ async fn main() {
                                                     error = %e,
                                                     "deferred NAR verification failed, removing narinfo"
                                                 );
-                                                let _ = store.tag_delete("_nix", &tag.name);
+                                                let _ = store.tag_delete(&nix_ns, &tag.name);
                                             }
                                         }
                                     }
@@ -999,7 +1004,7 @@ async fn main() {
             action: &str,
         ) -> Option<topcoat::router::Response> {
             let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-            let b = bucket.to_string();
+            let b = NamespaceRef::from(bucket);
             // Synchronous policy check -- policy blobs are small
             let policy_json = {
                 match store.tag_get(&b, "_config/policy") {
@@ -1138,6 +1143,7 @@ async fn main() {
                 };
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     let resp = kappa_module_s3::list_objects_v2(&*store, &bucket, &req)?;
                     Ok::<Vec<u8>, kappa_core::types::StoreError>(
                         kappa_module_s3::encode_list_objects_v2_xml(&resp),
@@ -1195,7 +1201,7 @@ async fn main() {
                 // If Expect: 100-continue is set and bucket does not exist,
                 // hyper never sends 100 Continue -- client sees 404 without uploading.
                 {
-                    let b = bucket.clone();
+                    let b = NamespaceRef::from(bucket.as_str());
                     let s = store.clone();
                     let exists = tokio::task::spawn_blocking(move || s.namespace_exists(&b))
                         .await.unwrap_or(Ok(false)).unwrap_or(false);
@@ -1260,6 +1266,7 @@ async fn main() {
                 let sse = sse_algo.clone();
                 let ct_for_store = content_type_header.clone();
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     let digest = kappa_core::kappa::kappa_from_bytes(&content);
                     let ingest = store.ingest_verified(&digest, &content)?;
 
@@ -1361,7 +1368,7 @@ async fn main() {
                 // Item 43: Object tagging GET
                 if query.contains_key("tagging") {
                     let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                    let b = bucket.clone();
+                    let b = NamespaceRef::from(bucket.as_str());
                     let k = key.clone();
                     let result = tokio::task::spawn_blocking(move || {
                         let entry = store.tag_get(&b, &k)?;
@@ -1392,7 +1399,7 @@ async fn main() {
                 // Item 48: GetObjectAttributes
                 if query.contains_key("attributes") {
                     let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                    let b = bucket.clone();
+                    let b = NamespaceRef::from(bucket.as_str());
                     let k = key.clone();
                     // x-amz-object-attributes header specifies which attributes to return
                     let requested_attrs = {
@@ -1433,6 +1440,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     let (kappa, content, vid) = match store.version_get(&bucket, &key, version_id.as_deref()) {
                         Ok(ve) => {
                             let kappa = ve.kappa.ok_or_else(|| {
@@ -1528,6 +1536,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     match store.version_get(&bucket, &key, version_id.as_deref()) {
                         Ok(ve) => {
                             let kappa = ve.kappa.ok_or_else(|| {
@@ -1611,6 +1620,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     match store.version_delete(&bucket, &key, version_id.as_deref()) {
                         Ok(dr) => Ok(dr),
                         Err(kappa_core::types::StoreError::Rejected(_)) => {
@@ -1653,6 +1663,7 @@ async fn main() {
 
                 // "Create" a bucket by touching a marker tag
                 let _ = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     store.tag_set(&bucket, "_bucket_marker", "sha256:0000000000000000000000000000000000000000000000000000000000000000")
                 }).await;
 
@@ -1672,6 +1683,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let exists = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     store.namespace_exists(&bucket).unwrap_or(false)
                 }).await.unwrap_or(false);
 
@@ -1699,6 +1711,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     // S3 DeleteBucket requires the bucket to be empty.
                     // Check tag_list: if any non-marker tags exist, reject.
                     let tags = store.tag_list(&bucket)?;
@@ -1793,6 +1806,7 @@ async fn main() {
                 let bucket_for_xml = bucket.clone();
                 let key_for_xml = key.clone();
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     store.upload_begin(&bucket, max_size)
                 }).await;
 
@@ -1975,6 +1989,7 @@ async fn main() {
                 }
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     let ingest_result = store.upload_complete(&upload_id, None)?;
                     store.tag_set(&bucket, &key, &ingest_result.kappa)?;
                     let now_ms = std::time::SystemTime::now()
@@ -2059,6 +2074,7 @@ async fn main() {
                 }
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     let mut deleted = Vec::new();
                     let mut errors: Vec<(String, String, String)> = Vec::new();
                     for key in &keys_to_delete {
@@ -2108,12 +2124,14 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     // Parse copy source: /bucket/key or bucket/key
                     let source = copy_source.strip_prefix('/').unwrap_or(&copy_source);
                     let (src_bucket, src_key) = source.split_once('/')
                         .ok_or_else(|| kappa_core::types::StoreError::Rejected("invalid copy source".into()))?;
 
-                    let src_entry = store.tag_get(src_bucket, src_key)?;
+                    let src_ns = NamespaceRef::from(src_bucket);
+                    let src_entry = store.tag_get(&src_ns, src_key)?;
                     store.tag_set(&bucket, &key, &src_entry.kappa)?;
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -2169,6 +2187,7 @@ async fn main() {
                 };
 
                 let _ = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     store.tag_set(&bucket, "_config/versioning", status_value)
                 }).await;
 
@@ -2187,6 +2206,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     match store.tag_get(&bucket, "_config/versioning") {
                         Ok(entry) => Ok(entry.kappa),
                         Err(kappa_core::types::StoreError::NotFound(_)) => Ok(String::new()),
@@ -2274,6 +2294,7 @@ async fn main() {
                     } else { break; }
                 }
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     let entry = store.tag_get(&bucket, &key)?;
                     let json = serde_json::to_vec(&tags)
                         .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
@@ -2301,6 +2322,7 @@ async fn main() {
                     .map(|(_, v)| v.to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     if let Ok(entry) = store.tag_get(&bucket, &key) {
                         let _ = store.blob_delete_meta(&entry.kappa, "_s3_tags");
                     }
@@ -2376,6 +2398,7 @@ async fn main() {
                 };
                 let tag_name = format!("_config/{}", config_key);
                 let _ = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     let kappa = kappa_core::kappa::kappa_from_bytes(&body_bytes);
                     let _ = store.ingest_verified(&kappa, &body_bytes);
                     store.tag_set(&bucket, &tag_name, &kappa)
@@ -2394,6 +2417,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("_config/{}", config_key);
                 let result = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     let entry = store.tag_get(&bucket, &tag_name)?;
                     store.blob_get(&entry.kappa)
                 }).await;
@@ -2422,6 +2446,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("_config/{}", config_key);
                 let _ = tokio::task::spawn_blocking(move || {
+                    let bucket = NamespaceRef::from(bucket);
                     store.tag_delete(&bucket, &tag_name)
                 }).await;
                 StatusCode::NO_CONTENT.into_response(cx)
@@ -2538,9 +2563,10 @@ async fn main() {
                     Ok(ns) => ns,
                     Err(_) => return,
                 };
-                for ns in &namespaces {
+                for ns_str in &namespaces {
+                    let ns = NamespaceRef::from(ns_str.as_str());
                     // Check if this namespace has a lifecycle config
-                    let lifecycle_tag = match s.tag_get(ns, "_config/lifecycle") {
+                    let lifecycle_tag = match s.tag_get(&ns, "_config/lifecycle") {
                         Ok(entry) => entry,
                         Err(_) => continue,
                     };
@@ -2558,7 +2584,7 @@ async fn main() {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_millis() as u64;
-                                if let Ok(tags) = s.tag_list(ns) {
+                                if let Ok(tags) = s.tag_list(&ns) {
                                     for tag in &tags {
                                         if tag.name.starts_with('_') { continue; }
                                         let created_ms = s.blob_get_meta(&tag.kappa, "_s3_created_ms")
@@ -2568,13 +2594,13 @@ async fn main() {
                                             .unwrap_or(0);
                                         if created_ms > 0 && now_ms.saturating_sub(created_ms) >= threshold_ms {
                                             tracing::info!(
-                                                ns = ns, key = %tag.name,
+                                                ns = ns.as_str(), key = %tag.name,
                                                 age_days = (now_ms - created_ms) / 86400000,
                                                 "lifecycle: expiring object"
                                             );
-                                            let _ = s.tag_delete(ns, &tag.name);
+                                            let _ = s.tag_delete(&ns, &tag.name);
                                         } else if threshold_ms == 0 {
-                                            let _ = s.tag_delete(ns, &tag.name);
+                                            let _ = s.tag_delete(&ns, &tag.name);
                                         }
                                     }
                                 }

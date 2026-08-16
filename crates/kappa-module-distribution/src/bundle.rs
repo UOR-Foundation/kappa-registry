@@ -11,6 +11,8 @@ use topcoat::router::{
     Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
+use kappa_core::types::NamespaceRef;
+
 use crate::{path_param, read_body, store};
 
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
@@ -30,20 +32,20 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn create_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        create(cx, ns, &bytes).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        create(cx, &ns, &bytes).await
     })
 }
 
 fn ingest_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        ingest(cx, ns, &bytes).await
+        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        ingest(cx, &ns, &bytes).await
     })
 }
 
-async fn create(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn create(cx: &Cx, _ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let kappas: Vec<String> = v["kappas"]
@@ -85,7 +87,7 @@ async fn create(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         .into_response(cx)
 }
 
-async fn ingest(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn ingest(cx: &Cx, _ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let s = store(cx).clone();
     let data = body.to_vec();
     let ingested = tokio::task::spawn_blocking(move || {
@@ -94,7 +96,6 @@ async fn ingest(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
             .map_err(|e| kappa_core::StoreError::Rejected(e.to_string()))?;
         let mut kappas = Vec::with_capacity(entries.len());
         for entry in &entries {
-            // Bundle entry already has the kappa -- store at that address
             s.ingest_verified(&entry.kappa,&entry.content)?;
             kappas.push(entry.kappa.clone());
         }

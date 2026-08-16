@@ -8,6 +8,7 @@ use topcoat::router::{to_bytes, Body, Response, StatusCode};
 
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 pub use kappa_core::types::MaxBlobSize;
 
@@ -140,10 +141,10 @@ fn hex_val(b: u8) -> Option<u8> {
 /// Returns Ok(None) if all filters pass, Ok(Some(response)) if rejected.
 pub async fn evaluate_filters(
     s: &Arc<dyn KappaStore>,
-    ns: &str,
+    ns: &NamespaceRef,
     content: &[u8],
 ) -> topcoat::Result<Option<Response>> {
-    let n = ns.to_string();
+    let n = ns.clone();
     let c = content.to_vec();
     let result = tokio::task::spawn_blocking({
         let s = s.clone();
@@ -202,10 +203,10 @@ pub async fn evaluate_filters(
 /// Must be called BEFORE blob_put -- rejected content is never stored.
 pub async fn validate_schemas(
     s: &Arc<dyn KappaStore>,
-    ns: &str,
+    ns: &NamespaceRef,
     content: &[u8],
 ) -> topcoat::Result<Option<Response>> {
-    let n = ns.to_string();
+    let n = ns.clone();
     let c = content.to_vec();
     let result = tokio::task::spawn_blocking({
         let s = s.clone();

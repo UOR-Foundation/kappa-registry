@@ -3,7 +3,7 @@
 use kappa_core::clock::ntp_lamport::NtpLamportClock;
 use kappa_core::store::memory::{InMemoryStore, MemoryStoreConfig};
 use kappa_core::store::KappaStore;
-use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation};
+use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef};
 use std::sync::Arc;
 
 fn new_store() -> (InMemoryStore, tempfile::TempDir) {
@@ -20,6 +20,7 @@ fn new_store() -> (InMemoryStore, tempfile::TempDir) {
 #[test]
 fn put_query_outbound() {
     let (s, _d) = new_store();
+    let ns = NamespaceRef::from("ns");
     let edge = Edge {
         source: "src".into(),
         target: "tgt".into(),
@@ -28,10 +29,10 @@ fn put_query_outbound() {
         value_kappa: None,
         metadata: None,
     };
-    s.edge_put("ns", &edge).unwrap();
+    s.edge_put(&ns, &edge).unwrap();
     let results = s
         .edge_query(
-            "ns",
+            &ns,
             &EdgeQuery {
                 anchor: "src".into(),
                 direction: Direction::Outbound,
@@ -47,6 +48,7 @@ fn put_query_outbound() {
 #[test]
 fn put_query_inbound() {
     let (s, _d) = new_store();
+    let ns = NamespaceRef::from("ns");
     let edge = Edge {
         source: "src".into(),
         target: "tgt".into(),
@@ -55,10 +57,10 @@ fn put_query_inbound() {
         value_kappa: None,
         metadata: None,
     };
-    s.edge_put("ns", &edge).unwrap();
+    s.edge_put(&ns, &edge).unwrap();
     let results = s
         .edge_query(
-            "ns",
+            &ns,
             &EdgeQuery {
                 anchor: "tgt".into(),
                 direction: Direction::Inbound,
@@ -74,8 +76,9 @@ fn put_query_inbound() {
 #[test]
 fn query_filters_by_relation() {
     let (s, _d) = new_store();
+    let ns = NamespaceRef::from("ns");
     s.edge_put(
-        "ns",
+        &ns,
         &Edge {
             source: "a".into(),
             target: "b".into(),
@@ -87,7 +90,7 @@ fn query_filters_by_relation() {
     )
     .unwrap();
     s.edge_put(
-        "ns",
+        &ns,
         &Edge {
             source: "a".into(),
             target: "c".into(),
@@ -100,7 +103,7 @@ fn query_filters_by_relation() {
     .unwrap();
     let results = s
         .edge_query(
-            "ns",
+            &ns,
             &EdgeQuery {
                 anchor: "a".into(),
                 direction: Direction::Outbound,
@@ -116,8 +119,9 @@ fn query_filters_by_relation() {
 #[test]
 fn delete_cleans_all_indexes() {
     let (s, _d) = new_store();
+    let ns = NamespaceRef::from("ns");
     s.edge_put(
-        "ns",
+        &ns,
         &Edge {
             source: "s".into(),
             target: "t".into(),
@@ -128,10 +132,10 @@ fn delete_cleans_all_indexes() {
         },
     )
     .unwrap();
-    s.edge_delete("ns", "s", "t", EdgeRelation::Owns).unwrap();
+    s.edge_delete(&ns, "s", "t", EdgeRelation::Owns).unwrap();
     let fwd = s
         .edge_query(
-            "ns",
+            &ns,
             &EdgeQuery {
                 anchor: "s".into(),
                 direction: Direction::Outbound,
@@ -143,7 +147,7 @@ fn delete_cleans_all_indexes() {
     assert!(fwd.is_empty());
     let rev = s
         .edge_query(
-            "ns",
+            &ns,
             &EdgeQuery {
                 anchor: "t".into(),
                 direction: Direction::Inbound,

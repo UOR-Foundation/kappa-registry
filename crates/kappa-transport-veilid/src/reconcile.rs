@@ -18,6 +18,7 @@ use std::sync::Arc;
 use kappa_core::membership::MembershipView;
 use kappa_core::store::KappaStore;
 use kappa_core::transport::PeerTransport;
+use kappa_core::types::NamespaceRef;
 use kappa_reconcile::NamespaceMst;
 
 /// Protocol bytes.
@@ -131,7 +132,8 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
                 };
 
                 // Compare with local
-                let local_kappa = self.store.epoch_current(ns).unwrap_or(None);
+                let ns_ref = NamespaceRef::from(ns.as_str());
+                let local_kappa = self.store.epoch_current(&ns_ref).unwrap_or(None);
                 if local_kappa.as_deref() == Some(&remote.root_kappa) {
                     continue; // identical
                 }
@@ -170,11 +172,11 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
 
                 let mut applied = 0u32;
                 for tag in &pull_resp.tags {
-                    match self.store.tag_set(ns, &tag.name, &tag.kappa) {
+                    match self.store.tag_set(&ns_ref, &tag.name, &tag.kappa) {
                         Ok(_) => applied += 1,
                         Err(e) => {
                             tracing::warn!(
-                                ns = ns, tag = %tag.name, error = %e,
+                                ns = ns.as_str(), tag = %tag.name, error = %e,
                                 "reconcile tag apply failed"
                             );
                         }
@@ -197,7 +199,8 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
         let namespaces = self.store.namespace_list()?;
         let mut msts = BTreeMap::new();
         for ns in &namespaces {
-            let tags = self.store.tag_list(ns)?;
+            let ns_ref = NamespaceRef::from(ns.as_str());
+            let tags = self.store.tag_list(&ns_ref)?;
             let mut tag_map = BTreeMap::new();
             for tag in &tags {
                 tag_map.insert(tag.name.clone(), tag.kappa.clone());
@@ -259,10 +262,11 @@ pub fn handle_reconcile_request(
         PROTO_PING => Ok(vec![PROTO_PING]),
 
         PROTO_EPOCH_ROOT_REQ => {
-            let namespace = std::str::from_utf8(&request[1..])
+            let namespace_str = std::str::from_utf8(&request[1..])
                 .map_err(|e| format!("invalid namespace utf8: {e}"))?;
+            let namespace = NamespaceRef::from(namespace_str);
 
-            let (epoch_number, root_kappa) = match store.epoch_current(namespace) {
+            let (epoch_number, root_kappa) = match store.epoch_current(&namespace) {
                 Ok(Some(ref ek)) => match store.epoch_get(ek) {
                     Ok(root) => (root.epoch_number, ek.clone()),
                     Err(e) => return Err(format!("epoch_get: {e}")),
@@ -286,9 +290,10 @@ pub fn handle_reconcile_request(
             let req: DiffPullRequest = postcard::from_bytes(&request[1..])
                 .map_err(|e| format!("decode: {e}"))?;
 
+            let req_ns = NamespaceRef::from(req.namespace.as_str());
             let tags = if req.tag_names.is_empty() {
                 store
-                    .tag_list(&req.namespace)
+                    .tag_list(&req_ns)
                     .map_err(|e| format!("tag_list: {e}"))?
                     .into_iter()
                     .map(|t| TagEntryWire {
@@ -301,7 +306,7 @@ pub fn handle_reconcile_request(
                 req.tag_names
                     .iter()
                     .filter_map(|name| {
-                        store.tag_get(&req.namespace, name).ok().map(|t| TagEntryWire {
+                        store.tag_get(&req_ns, name).ok().map(|t| TagEntryWire {
                             name: t.name,
                             kappa: t.kappa,
                             version: t.version,

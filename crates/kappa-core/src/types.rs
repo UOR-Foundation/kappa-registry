@@ -20,6 +20,37 @@ use dcbor::prelude::*;
 /// here so both crates import the same type -- no TypeId mismatch.
 pub struct MaxBlobSize(pub usize);
 
+// -- Namespace reference ----------------------------------------------------
+
+/// Opaque namespace identifier. All KappaStore trait methods that take a
+/// namespace parameter use this type instead of raw &str.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NamespaceRef(String);
+
+impl NamespaceRef {
+    pub fn new(s: impl Into<String>) -> Self { Self(s.into()) }
+    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn into_string(self) -> String { self.0 }
+}
+
+impl std::fmt::Display for NamespaceRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for NamespaceRef {
+    fn from(s: &str) -> Self { Self(s.to_string()) }
+}
+
+impl From<String> for NamespaceRef {
+    fn from(s: String) -> Self { Self(s) }
+}
+
+impl AsRef<str> for NamespaceRef {
+    fn as_ref(&self) -> &str { &self.0 }
+}
+
 // -- Errors -----------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
