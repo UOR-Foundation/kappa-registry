@@ -57,10 +57,28 @@ impl NodeIdentity {
         let position_kappa = blob_put_computed(store, b"unprobed")?;
         store.tag_set(&ns, "trust/position", &position_kappa)?;
 
+        // Root of trust: grant the node anchor read/write/admin on _root.
+        // All other authority flows from delegation edges created from
+        // the node anchor to configured token anchors at server startup.
+        // The node anchor is never exposed as a bearer token.
+        let root_ns = NamespaceRef::from("_root");
+        let ops_bytes = br#"{"ops":["read","write","admin"]}"#.to_vec();
+        store.edge_put(
+            &root_ns,
+            &crate::types::Edge {
+                source: anchor.as_str().to_string(),
+                target: "_root".to_string(),
+                relation: crate::types::EdgeRelation::Capability,
+                asserter: anchor.as_str().to_string(),
+                value_kappa: None,
+                metadata: Some(ops_bytes),
+            },
+        )?;
+
         tracing::info!(
             anchor = anchor.as_str(),
             algorithm = signer.algorithm(),
-            "node identity bootstrapped"
+            "node identity bootstrapped with _root capability"
         );
 
         Ok(Self {

@@ -34,6 +34,7 @@ fn relation_index(relation: &EdgeRelation) -> u64 {
         EdgeRelation::EvidenceProvenance => 13,
         EdgeRelation::SectionOf => 14,
         EdgeRelation::RefersTo => 15,
+        EdgeRelation::Delegation => 16,
     }
 }
 

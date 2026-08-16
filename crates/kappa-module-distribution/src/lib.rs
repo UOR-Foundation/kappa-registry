@@ -109,8 +109,15 @@ pub(crate) async fn read_body(body: Body) -> topcoat::Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-/// Get the registry's own anchor for edge asserter field.
+/// Get the caller's identity for edge asserter field.
+/// Prefers the authenticated caller's anchor from request context.
+/// Falls back to node anchor for unauthenticated deployments.
 pub(crate) fn registry_anchor(cx: &Cx) -> String {
+    if let Some(caller) = topcoat::context::try_request_context::<kappa_core::types::CallerIdentity>(cx) {
+        if caller.0 != "anonymous" {
+            return caller.0.clone();
+        }
+    }
     match try_app_context::<Arc<NodeIdentity>>(cx) {
         Some(ni) => ni.anchor().as_str().to_string(),
         None => "kappa-distribution".to_string(),

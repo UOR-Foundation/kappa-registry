@@ -15,7 +15,7 @@ use std::sync::RwLock;
 
 use kappa_core::identity::assertion::IdentityAssertion;
 use kappa_core::store::KappaStore;
-use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef, StoreError};
+use kappa_core::types::{DelegationScope, Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef, StoreError};
 
 use crate::ratelimit::OpClass;
 
@@ -69,8 +69,8 @@ pub fn authorize(
         return Ok(());
     }
 
-    // Superadmin: capability edge on _admin grants access to any namespace
-    let admin_ns = NamespaceRef::from("_admin");
+    // Root: capability edge on _root grants access to any namespace
+    let admin_ns = NamespaceRef::from("_root");
     let admin_query = EdgeQuery {
         anchor: asserter.to_string(),
         direction: Direction::Outbound,
@@ -158,9 +158,125 @@ pub fn authorize(
         }
     }
 
+    // Delegation chain walk: check the target namespace for delegation
+    // edges. check_delegation internally checks _root for the delegator's
+    // capability when verifying the delegation chain.
+    if check_delegation(store, ns, op, asserter, 0)? {
+        return Ok(());
+    }
+
     Err(AuthError::Forbidden {
         reason: "no capability edge for this operation on reserved namespace".to_owned(),
     })
+}
+
+/// Check if `target` is authorized via delegation chain.
+/// Returns `Ok(Some(delegation_depth))` if authorized (the depth from
+/// the edge that authorized `target`), `Ok(None)` if not.
+/// `hop` tracks recursion depth (max 5 hops).
+fn check_delegation(
+    store: &dyn KappaStore,
+    ns: &NamespaceRef,
+    op: OpClass,
+    target: &str,
+    hop: u32,
+) -> Result<bool, AuthError> {
+    check_delegation_inner(store, ns, op, target, hop)
+        .map(|r| r.is_some())
+}
+
+/// Inner delegation check returning the delegation_depth of the
+/// authorizing edge, or None if not authorized.
+fn check_delegation_inner(
+    store: &dyn KappaStore,
+    ns: &NamespaceRef,
+    op: OpClass,
+    target: &str,
+    hop: u32,
+) -> Result<Option<u32>, AuthError> {
+    if hop > 5 {
+        return Ok(None);
+    }
+
+    let op_str = match op {
+        OpClass::Read => "read",
+        OpClass::Write => "write",
+        OpClass::Admin => "admin",
+        OpClass::Exempt => return Ok(Some(u32::MAX)),
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let root_ns = NamespaceRef::from("_root");
+    let namespaces_to_check = [ns.clone(), root_ns];
+
+    let query = EdgeQuery {
+        anchor: target.to_string(),
+        direction: Direction::Inbound,
+        relation: Some(EdgeRelation::Delegation),
+        asserter: None,
+    };
+
+    for check_ns in &namespaces_to_check {
+        let edges = match store.edge_query(check_ns, &query) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for edge in &edges {
+            let Some(ref meta) = edge.metadata else { continue };
+            let Ok(scope) = serde_json::from_slice::<DelegationScope>(meta) else { continue };
+
+            if !scope.namespaces.is_empty()
+                && !scope.namespaces.iter().any(|n| ns.as_str().starts_with(n.as_str()))
+            {
+                continue;
+            }
+
+            if !scope.operations.iter().any(|o| o == op_str) {
+                continue;
+            }
+
+            if let Some(expires) = scope.expires_at_ms {
+                if now_ms > expires {
+                    continue;
+                }
+            }
+
+            let delegator = &edge.source;
+
+            // Check delegator's direct capability
+            let delegator_query = EdgeQuery {
+                anchor: delegator.clone(),
+                direction: Direction::Outbound,
+                relation: Some(EdgeRelation::Capability),
+                asserter: Some(delegator.clone()),
+            };
+            for cap_ns in &namespaces_to_check {
+                if let Ok(cap_edges) = store.edge_query(cap_ns, &delegator_query) {
+                    if cap_edges.iter().any(|e| cap_permits(e, op)) {
+                        return Ok(Some(scope.delegation_depth));
+                    }
+                }
+            }
+
+            // Delegator has no direct capability. Recurse to check
+            // if the delegator is authorized via its own delegation.
+            if let Some(parent_depth) = check_delegation_inner(store, ns, op, delegator, hop + 1)? {
+                // The parent delegation authorized the delegator with
+                // parent_depth. The delegator can re-delegate only if
+                // parent_depth >= 1.
+                if parent_depth >= 1 {
+                    return Ok(Some(scope.delegation_depth));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Check if a capability edge permits the requested operation class.
@@ -197,13 +313,25 @@ fn cap_permits(edge: &Edge, op: OpClass) -> bool {
 /// Exempt paths (/_status, /v2/, /v2/_health/*) bypass auth.
 /// When auth_required is false or the token list is empty, all
 /// requests pass (permissive default for backward compatibility).
+///
+/// Every token maps to an asserter anchor. The auth layer uses the
+/// anchor as the asserter identity for authorization decisions on
+/// reserved namespaces, delegation chains, and capability checks.
 pub struct BearerAuth {
-    tokens: std::collections::HashSet<String>,
+    /// token -> anchor.
+    tokens: std::collections::HashMap<String, String>,
     required: bool,
 }
 
+/// Result of a successful bearer auth check.
+pub struct AuthIdentity {
+    /// The asserter anchor for this request. "anonymous" if no
+    /// anchor is bound to the token.
+    pub asserter: String,
+}
+
 impl BearerAuth {
-    pub fn new(tokens: Vec<String>, required: bool) -> Self {
+    pub fn new(tokens: Vec<(String, String)>, required: bool) -> Self {
         Self {
             tokens: tokens.into_iter().collect(),
             required,
@@ -211,15 +339,17 @@ impl BearerAuth {
     }
 
     /// Check if a request is authorized.
-    /// Returns Ok(()) if allowed, Err(Response) with 401 if not.
-    #[allow(clippy::result_large_err)] // Response constructed once per 401, not a hot path
+    /// Returns Ok(AuthIdentity) if allowed, Err(Response) with 401 if not.
+    /// The AuthIdentity carries the resolved asserter anchor for downstream
+    /// authorization decisions.
+    #[allow(clippy::result_large_err)]
     pub fn check(
         &self,
         path: &str,
         headers: &topcoat::router::HeaderMap,
-    ) -> Result<(), topcoat::router::Response> {
+    ) -> Result<AuthIdentity, topcoat::router::Response> {
         if !self.required || self.tokens.is_empty() {
-            return Ok(());
+            return Ok(AuthIdentity { asserter: "anonymous".to_string() });
         }
         // Exempt paths: health, status, version check
         if path == "/_status"
@@ -227,28 +357,33 @@ impl BearerAuth {
             || path == "/v2"
             || path.starts_with("/v2/_health/")
         {
-            return Ok(());
+            return Ok(AuthIdentity { asserter: "anonymous".to_string() });
         }
         let token = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         match token {
-            Some(t) if self.tokens.contains(t) => Ok(()),
-            _ => {
-                let body = r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
-                let mut resp =
-                    topcoat::router::Response::new(topcoat::router::Body::from(body));
-                *resp.status_mut() = topcoat::router::StatusCode::UNAUTHORIZED;
-                resp.headers_mut().insert(
-                    "www-authenticate",
-                    r#"Bearer realm="kappa-registry""#.parse().unwrap(),
-                );
-                resp.headers_mut()
-                    .insert("content-type", "application/json".parse().unwrap());
-                Err(resp)
+            Some(t) => match self.tokens.get(t) {
+                Some(anchor) => Ok(AuthIdentity { asserter: anchor.clone() }),
+                None => Self::unauthorized(),
             }
+            None => Self::unauthorized(),
         }
+    }
+
+    fn unauthorized<T>() -> Result<T, topcoat::router::Response> {
+        let body = r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
+        let mut resp =
+            topcoat::router::Response::new(topcoat::router::Body::from(body));
+        *resp.status_mut() = topcoat::router::StatusCode::UNAUTHORIZED;
+        resp.headers_mut().insert(
+            "www-authenticate",
+            r#"Bearer realm="kappa-registry""#.parse().unwrap(),
+        );
+        resp.headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
+        Err(resp)
     }
 }
 

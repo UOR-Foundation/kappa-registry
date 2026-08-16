@@ -71,10 +71,15 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     /// Whether fsync is called on blob writes. Default true.
     pub fsync: bool,
-    /// Bearer token authentication tokens. Empty = no auth.
+    /// Bearer token authentication tokens with identity anchors.
+    /// Each entry is (token, anchor). Format: "token=anchor".
+    /// Every token MUST bind to an asserter anchor. The anchor is
+    /// the asserter identity used for authorization on reserved
+    /// namespaces and delegation chains.
     /// Parsed from KAPPA_AUTH_TOKENS: comma-separated, or @filepath
-    /// to read one token per line from a file.
-    pub auth_tokens: Vec<String>,
+    /// to read one token per line from a file. Entries without "="
+    /// are rejected at startup.
+    pub auth_tokens: Vec<(String, String)>,
     /// Whether bearer token auth is required. Default false.
     pub auth_required: bool,
     /// Disk pressure threshold in megabytes. Default 1024 (1 GiB).
@@ -222,12 +227,19 @@ where
 /// Parse auth tokens from the KAPPA_AUTH_TOKENS value.
 /// If the value starts with @, read tokens from the file (one per line).
 /// Otherwise split on comma.
-fn parse_auth_tokens(raw: &str) -> Vec<String> {
+///
+/// Each entry can be:
+///   "token"         -- authenticates, resolves to anonymous identity
+///   "token=anchor"  -- authenticates AND resolves to the specified anchor
+///
+/// The anchor is an asserter identity (e.g. "sha256:abc...") used for
+/// authorization decisions on reserved namespaces and delegation chains.
+fn parse_auth_tokens(raw: &str) -> Vec<(String, String)> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Vec::new();
     }
-    if let Some(path) = raw.strip_prefix('@') {
+    let lines: Vec<String> = if let Some(path) = raw.strip_prefix('@') {
         match std::fs::read_to_string(path) {
             Ok(contents) => contents
                 .lines()
@@ -243,7 +255,17 @@ fn parse_auth_tokens(raw: &str) -> Vec<String> {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect()
-    }
+    };
+    lines.into_iter().map(|entry| {
+        if let Some((token, anchor)) = entry.split_once('=') {
+            (token.to_string(), anchor.to_string())
+        } else {
+            config_exit(&format!(
+                "KAPPA_AUTH_TOKENS: entry {:?} missing '=anchor' -- format is 'token=anchor'",
+                entry
+            ));
+        }
+    }).collect()
 }
 
 /// Fatal configuration error. Prints message to stderr and exits.

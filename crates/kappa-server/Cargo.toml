@@ -137,6 +137,10 @@ path = "tests/integration/git_e2e.rs"
 name = "identity_http"
 path = "tests/integration/identity_http.rs"
 
+[[test]]
+name = "delegation"
+path = "tests/integration/delegation.rs"
+
 [features]
 default = ["oci", "identity-http", "distribution", "git", "s3", "nix"]
 oci = ["dep:kappa-module-oci"]

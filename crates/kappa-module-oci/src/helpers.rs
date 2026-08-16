@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use topcoat::context::{app_context, request_context, try_app_context, Cx};
+use topcoat::context::{app_context, request_context, try_app_context, try_request_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::{to_bytes, Body, Response, StatusCode};
 
@@ -61,6 +61,15 @@ pub fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
 
 /// Get the registry's own anchor for edge asserter field.
 pub fn registry_anchor(cx: &Cx) -> String {
+    // Prefer the authenticated caller's identity from request context.
+    // CallerIdentity is defined in kappa_core::types so protocol modules
+    // and the server can share the type without circular dependencies.
+    if let Some(caller) = try_request_context::<kappa_core::types::CallerIdentity>(cx) {
+        if caller.0 != "anonymous" {
+            return caller.0.clone();
+        }
+    }
+    // Fall back to node anchor for unauthenticated deployments
     match try_app_context::<Arc<NodeIdentity>>(cx) {
         Some(ni) => ni.anchor().to_string(),
         None => "oci-distribution".to_string(),

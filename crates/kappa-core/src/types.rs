@@ -135,6 +135,8 @@ pub enum EdgeRelation {
     SectionOf,
     #[cbor(n = 15)]
     RefersTo,
+    #[cbor(n = 16)]
+    Delegation,
 }
 
 impl EdgeRelation {
@@ -158,6 +160,7 @@ impl EdgeRelation {
             Self::EvidenceProvenance => "evidence-provenance",
             Self::SectionOf => "section-of",
             Self::RefersTo => "refers-to",
+            Self::Delegation => "delegation",
         }
     }
 
@@ -185,6 +188,7 @@ impl EdgeRelation {
             "evidence-provenance" => Some(Self::EvidenceProvenance),
             "section-of" => Some(Self::SectionOf),
             "refers-to" => Some(Self::RefersTo),
+            "delegation" => Some(Self::Delegation),
             _ => None,
         }
     }
@@ -210,8 +214,34 @@ impl EdgeRelation {
             Self::EvidenceProvenance => true,
             Self::SectionOf => true,
             Self::RefersTo => true,
+            Self::Delegation => true,
         }
     }
+}
+
+// -- Delegation scope -------------------------------------------------------
+
+/// Scope constraints for a Delegation edge. Stored as serialized
+/// metadata on the Edge. Restricts what the delegate can do, where,
+/// when, and whether they can re-delegate.
+///
+/// CBOR key assignments (PERMANENT):
+///   0: namespaces, 1: operations, 2: expires_at_ms, 3: delegation_depth
+#[derive(Debug, Clone, PartialEq, Eq, CBORCodable, serde::Serialize, serde::Deserialize)]
+pub struct DelegationScope {
+    /// Namespaces this delegation covers. Empty = all namespaces.
+    #[cbor(n = 0)]
+    pub namespaces: Vec<String>,
+    /// Operations permitted: "read", "write", "admin". Empty = none.
+    #[cbor(n = 1)]
+    pub operations: Vec<String>,
+    /// Expiration timestamp in milliseconds. None = no expiry.
+    #[cbor(n = 2)]
+    pub expires_at_ms: Option<u64>,
+    /// Re-delegation depth. 0 = delegate cannot re-delegate.
+    /// N = delegate can create Delegation edges with depth < N.
+    #[cbor(n = 3)]
+    pub delegation_depth: u32,
 }
 
 // -- Edge -------------------------------------------------------------------
@@ -393,6 +423,19 @@ pub enum ProtocolHint {
     Nix,
     None,
 }
+
+// -- Caller identity (request context) -----------------------------------------
+
+/// The authenticated caller's asserter anchor. Stored in the request
+/// context by the auth layer. Protocol module handlers read this to
+/// set the asserter field on edges, assertions, and other
+/// identity-bearing operations. "anonymous" when no auth is configured
+/// or the request is unauthenticated.
+///
+/// Defined in kappa-core so protocol modules and the server can share
+/// the type without circular dependencies.
+#[derive(Debug, Clone)]
+pub struct CallerIdentity(pub String);
 
 // -- Attestation digests (cannot produce KappaLabel) --------------------------
 
@@ -577,6 +620,7 @@ mod tests {
             EdgeRelation::EvidenceProvenance,
             EdgeRelation::SectionOf,
             EdgeRelation::RefersTo,
+            EdgeRelation::Delegation,
         ];
         for rel in all {
             // Just calling gc_reachable proves the match is exhaustive

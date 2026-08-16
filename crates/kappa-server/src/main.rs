@@ -205,9 +205,53 @@ async fn main() {
         None
     };
 
-    // -- Bearer auth --
+    // -- Root token + Bearer auth --
+    // KAPPA_ROOT_TOKEN=token=anchor creates a single _root delegation
+    // from the node anchor to the specified anchor. This is the only
+    // path from "configured token" to "root authority." All other
+    // KAPPA_AUTH_TOKENS authenticate but have no automatic authority.
+    // The root token holder delegates to others via Delegation edges.
+    let mut all_tokens = cfg.auth_tokens.clone();
+    if let Some(ref ni) = node_identity {
+        if let Ok(root_token_str) = std::env::var("KAPPA_ROOT_TOKEN") {
+            if let Some((token, anchor)) = root_token_str.split_once('=') {
+                let node_anchor = ni.anchor().as_str().to_string();
+                let root_ns = kappa_core::types::NamespaceRef::from("_root");
+                let scope = serde_json::json!({
+                    "namespaces": [],
+                    "operations": ["read", "write", "admin"],
+                    "delegation_depth": 1,
+                });
+                let scope_bytes = serde_json::to_vec(&scope).unwrap_or_default();
+                let edge = kappa_core::types::Edge {
+                    source: node_anchor.clone(),
+                    target: anchor.to_string(),
+                    relation: kappa_core::types::EdgeRelation::Delegation,
+                    asserter: node_anchor.clone(),
+                    value_kappa: None,
+                    metadata: Some(scope_bytes),
+                };
+                if let Err(e) = store.edge_put(&root_ns, &edge) {
+                    tracing::warn!(
+                        anchor = anchor,
+                        error = %e,
+                        "failed to create root delegation"
+                    );
+                } else {
+                    tracing::info!(
+                        anchor = anchor,
+                        "delegated _root authority to root token"
+                    );
+                }
+                // Include root token in authentication tokens
+                if !all_tokens.iter().any(|(t, _)| t == token) {
+                    all_tokens.push((token.to_string(), anchor.to_string()));
+                }
+            }
+        }
+    }
     let bearer_auth = Arc::new(auth::BearerAuth::new(
-        cfg.auth_tokens.clone(),
+        all_tokens,
         cfg.auth_required,
     ));
 

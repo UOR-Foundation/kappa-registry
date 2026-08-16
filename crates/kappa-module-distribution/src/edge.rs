@@ -108,22 +108,29 @@ async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Respons
 
     let s = store(cx).clone();
 
-    // Source must exist
-    let src = source.to_string();
-    let exists = tokio::task::spawn_blocking({
-        let s = s.clone();
-        move || s.blob_exists(&src)
-    })
-    .await
-    .map_err(|e| bad_request(e.to_string()))?
-    .map_err(crate::store_err)?;
+    // Source must exist for content edges. Identity edges (Capability,
+    // Delegation, Assertion) reference anchor strings, not blob kappas.
+    let skip_source_check = matches!(
+        relation,
+        EdgeRelation::Capability | EdgeRelation::Delegation | EdgeRelation::Assertion
+    );
+    if !skip_source_check {
+        let src = source.to_string();
+        let exists = tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.blob_exists(&src)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(crate::store_err)?;
 
-    if !exists {
-        return crate::error_response(
-            StatusCode::BAD_REQUEST,
-            "EDGE_SOURCE_ABSENT",
-            "source kappa does not exist",
-        );
+        if !exists {
+            return crate::error_response(
+                StatusCode::BAD_REQUEST,
+                "EDGE_SOURCE_ABSENT",
+                "source kappa does not exist",
+            );
+        }
     }
 
     let asserter = crate::registry_anchor(cx);
