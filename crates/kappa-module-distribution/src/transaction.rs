@@ -50,7 +50,7 @@ fn transactions(cx: &Cx) -> &Arc<TransactionManager> {
 fn begin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         begin(cx, &ns).await
     })
 }
@@ -58,7 +58,7 @@ fn begin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let id = path_param(cx, "id");
         let kappa = path_param(cx, "kappa");
         put(cx, &ns, id, kappa, &bytes).await
@@ -68,7 +68,7 @@ fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn commit_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let id = path_param(cx, "id");
         commit(cx, &ns, id).await
     })
@@ -77,7 +77,7 @@ fn commit_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn abort_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let id = path_param(cx, "id");
         abort(cx, &ns, id).await
     })

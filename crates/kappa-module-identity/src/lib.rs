@@ -195,7 +195,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let ab = assertion_bytes;
-            let ns = NamespaceRef::from(asserter_ns.as_str());
+            let ns = NamespaceRef::deterministic(asserter_ns.as_str());
             let subj = subject.clone();
             let facet = facet_for_edge;
             move || {
@@ -311,12 +311,17 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
             // Revocations and watermarks still need namespace scan
             // (not indexed cross-namespace yet)
-            let namespaces = s.namespace_list()?;
+            let namespaces = s.namespace_list(None)?;
             let mut revocations = Vec::new();
             let mut watermarks = Vec::new();
 
-            for ns_str in &namespaces {
-                let ns = NamespaceRef::from(ns_str.as_str());
+            for rec in &namespaces {
+                let alias = rec.aliases.first().map(|s| s.as_str()).unwrap_or(&rec.uuid_hex);
+                let uuid_bytes = hex::decode(&rec.uuid_hex).unwrap_or_default();
+                if uuid_bytes.len() != 16 { continue; }
+                let mut uuid_arr = [0u8; 16];
+                uuid_arr.copy_from_slice(&uuid_bytes);
+                let ns = NamespaceRef::with_name(uuid_arr, alias.to_string());
                 let rev_tags = s.tag_prefix(&ns, "revocation/")?;
                 for tag in &rev_tags {
                     if let Ok(blob) = s.blob_get(&tag.kappa) {
@@ -429,7 +434,7 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let rb = rev_bytes;
-            let ns = NamespaceRef::from(asserter.as_str());
+            let ns = NamespaceRef::deterministic(asserter.as_str());
             let rak = revoked_assertion_kappa;
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_revoke", ns = %ns).entered();
@@ -578,7 +583,7 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let wb = wm_bytes;
-            let ns = NamespaceRef::from(asserter.as_str());
+            let ns = NamespaceRef::deterministic(asserter.as_str());
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_watermark", ns = %ns).entered();
                 s.ingest_verified(&k,&wb)?;
@@ -703,7 +708,7 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 let kappa = kappa_from_bytes(&spec_bytes);
                 s.ingest_verified(&kappa,&spec_bytes)?;
                 s.blob_put_meta(&kappa, "object-type", b"anchor-spec")?;
-                let ns = NamespaceRef::from(a.as_str());
+                let ns = NamespaceRef::deterministic(a.as_str());
                 s.tag_set(&ns, "anchor/spec", &kappa)?;
                 if !ep.is_empty() {
                     s.tag_set(&ns, "anchor/endpoint", &kappa)?;
@@ -757,7 +762,7 @@ fn binding_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         };
 
         let s = store(cx).clone();
-        let ns = NamespaceRef::from(target.as_str());
+        let ns = NamespaceRef::deterministic(target.as_str());
         let result = tokio::task::spawn_blocking(move || {
             s.identity_binding_put(&ns, &binding)
         })
@@ -832,7 +837,7 @@ fn binding_delete_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             .to_string();
 
         let s = store(cx).clone();
-        let ns = NamespaceRef::from(target.as_str());
+        let ns = NamespaceRef::deterministic(target.as_str());
         tokio::task::spawn_blocking(move || {
             s.identity_binding_delete(&ns, &source, &target)
         })

@@ -56,10 +56,15 @@ pub fn compute_reachable(
 /// is retained. Everything else is eligible for collection.
 pub fn build_root_set(store: &dyn KappaStore) -> Result<Vec<String>, StoreError> {
     let mut roots = Vec::new();
-    let namespaces = store.namespace_list()?;
+    let namespaces = store.namespace_list(None)?;
 
-    for ns in &namespaces {
-        let ns_ref = NamespaceRef::from(ns.as_str());
+    for record in &namespaces {
+        let uuid = hex::decode(&record.uuid_hex).unwrap_or_default();
+        if uuid.len() != 16 { continue; }
+        let mut uuid_arr = [0u8; 16];
+        uuid_arr.copy_from_slice(&uuid);
+        let name = record.aliases.first().cloned().unwrap_or_default();
+        let ns_ref = NamespaceRef::with_name(uuid_arr, name);
         // All tagged kappas are roots (live name bindings)
         let tags = store.tag_list(&ns_ref)?;
         for tag in &tags {
@@ -175,7 +180,7 @@ mod tests {
         )
         .unwrap();
 
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let content = b"content-a";
         let k = kappa_from_bytes(content);
         store.ingest_verified(&k, content).unwrap();
@@ -202,7 +207,7 @@ mod tests {
         )
         .unwrap();
 
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let tagged_content = b"tagged-content";
         let tagged_k = kappa_from_bytes(tagged_content);
         let orphan_content = b"orphan-content";
@@ -232,7 +237,7 @@ mod tests {
         )
         .unwrap();
 
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let root_content = b"root-content";
         let root_k = kappa_from_bytes(root_content);
         let child_content = b"child-content";

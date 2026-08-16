@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn create_and_resolve_ref() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
         let resolved = resolve_ref(&*store, &ns, "refs/heads/main").unwrap();
         assert_eq!(resolved, Some("sha1:aaa".into()));
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn cas_update_ref() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
         update_ref(&*store, &ns, "refs/heads/main", "sha1:bbb", Some("sha1:aaa")).unwrap();
         let resolved = resolve_ref(&*store, &ns, "refs/heads/main").unwrap();
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn cas_rejects_wrong_old() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
         let result = update_ref(&*store, &ns, "refs/heads/main", "sha1:bbb", Some("sha1:wrong"));
         assert!(matches!(result, Err(RefError::UpdateRejected { .. })));
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn symbolic_ref_resolution() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
         set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/main").unwrap();
         let resolved = resolve_ref(&*store, &ns, "HEAD").unwrap();
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn symbolic_ref_chain() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
         set_symbolic_ref(&*store, &ns, "refs/heads/dev", "refs/heads/main").unwrap();
         set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/dev").unwrap();
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn resolve_missing_returns_none() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         let resolved = resolve_ref(&*store, &ns, "refs/heads/nonexistent").unwrap();
         assert!(resolved.is_none());
     }
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn list_refs_by_prefix() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
         update_ref(&*store, &ns, "refs/heads/dev", "sha1:bbb", None).unwrap();
         update_ref(&*store, &ns, "refs/tags/v1.0", "sha1:ccc", None).unwrap();
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn delete_ref_removes_it() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
         delete_ref(&*store, &ns, "refs/heads/main").unwrap();
         let resolved = resolve_ref(&*store, &ns, "refs/heads/main").unwrap();

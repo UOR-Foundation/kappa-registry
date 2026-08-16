@@ -33,7 +33,7 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn compose_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let op = path_param(cx, "op");
         compose(cx, &ns, op, &bytes).await
     })
@@ -42,7 +42,7 @@ fn compose_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn witness_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let kappa = path_param(cx, "kappa");
         witness(cx, &ns, kappa).await
     })

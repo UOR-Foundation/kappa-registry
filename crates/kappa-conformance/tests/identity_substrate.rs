@@ -30,7 +30,7 @@ fn test_store() -> InMemoryStore {
 #[test]
 fn binding_create_stores_and_returns_kappa() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     let binding = IdentityBinding {
         source: "user@example.com".into(),
         target: "sha256:anchor123".into(),
@@ -45,7 +45,7 @@ fn binding_create_stores_and_returns_kappa() {
 #[test]
 fn binding_get_returns_stored_binding() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     let binding = IdentityBinding {
         source: "user@example.com".into(),
         target: "sha256:anchor123".into(),
@@ -63,7 +63,7 @@ fn binding_get_returns_stored_binding() {
 #[test]
 fn binding_list_returns_all_for_subject() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     for i in 0..3 {
         let binding = IdentityBinding {
             source: "shared-subject".into(),
@@ -88,7 +88,7 @@ fn binding_list_empty_for_unknown_subject() {
 #[test]
 fn binding_delete_removes_binding() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     let binding = IdentityBinding {
         source: "delete-me@example.com".into(),
         target: "sha256:anchor-del".into(),
@@ -105,7 +105,7 @@ fn binding_delete_removes_binding() {
 #[test]
 fn binding_list_by_asserter() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     let asserter = "sha256:my-anchor";
     for source in &["email@a.com", "email@b.com", "email@c.com"] {
         let binding = IdentityBinding {
@@ -131,7 +131,7 @@ fn binding_list_by_asserter_empty() {
 #[test]
 fn binding_duplicate_source_target_is_idempotent() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     let binding = IdentityBinding {
         source: "dup@example.com".into(),
         target: "sha256:anchor-dup".into(),
@@ -149,7 +149,7 @@ fn binding_duplicate_source_target_is_idempotent() {
 #[test]
 fn binding_different_asserters_same_source() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     let b1 = IdentityBinding {
         source: "contested@example.com".into(),
         target: "sha256:anchor-a".into(),
@@ -173,7 +173,7 @@ fn binding_different_asserters_same_source() {
 #[test]
 fn binding_delete_nonexistent_is_noop() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     // Should not error on deleting something that doesn't exist
     store.identity_binding_delete(&ns, "ghost@nowhere.com", "sha256:ghost").unwrap();
 }
@@ -181,7 +181,7 @@ fn binding_delete_nonexistent_is_noop() {
 #[test]
 fn binding_query_isolation_by_source() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     let b1 = IdentityBinding {
         source: "alice@example.com".into(),
         target: "sha256:alice".into(),
@@ -206,7 +206,7 @@ fn binding_query_isolation_by_source() {
 #[test]
 fn binding_fields_preserved() {
     let store = test_store();
-    let ns = NamespaceRef::from("test-ns");
+    let ns = NamespaceRef::deterministic("test-ns");
     let binding = IdentityBinding {
         source: "fields@test.com".into(),
         target: "sha256:fields-anchor".into(),

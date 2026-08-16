@@ -22,7 +22,7 @@ use crate::{path_param, query_param, query_params_multi, read_body, store};
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let reference = path_param(cx, "reference");
         let ct = headers(cx)
             .get("content-type")
@@ -35,7 +35,7 @@ pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let reference = path_param(cx, "reference");
         manifest_get(cx, &ns, reference).await
     })
@@ -44,7 +44,7 @@ pub fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn head_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let reference = path_param(cx, "reference");
         manifest_head(cx, &ns, reference).await
     })
@@ -53,7 +53,7 @@ pub fn head_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let reference = path_param(cx, "reference");
         manifest_delete(cx, &ns, reference).await
     })
@@ -62,7 +62,7 @@ pub fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn tag_list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         tag_list(cx, &ns).await
     })
 }

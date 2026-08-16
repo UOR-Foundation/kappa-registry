@@ -13,7 +13,7 @@ use topcoat::router::{
 
 use kappa_core::types::NamespaceRef;
 
-use crate::{path_param, read_body, store};
+use crate::{read_body, store};
 
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder
@@ -32,7 +32,7 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn create_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         create(cx, &ns, &bytes).await
     })
 }
@@ -40,7 +40,7 @@ fn create_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn ingest_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         ingest(cx, &ns, &bytes).await
     })
 }

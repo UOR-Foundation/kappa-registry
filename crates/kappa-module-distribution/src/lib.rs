@@ -77,6 +77,33 @@ pub(crate) fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
     app_context::<Arc<dyn KappaStore>>(cx)
 }
 
+/// Resolve namespace for write operations (PUT/POST/DELETE).
+/// Creates on first use. kappa-distribution extends OCI, shares OCI namespace scope.
+pub(crate) async fn resolve_ns_write_async(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
+    let s = store(cx).clone();
+    let name = path_param(cx, "ns").to_string();
+    let owner = registry_anchor(cx);
+    tokio::task::spawn_blocking(move || {
+        s.namespace_resolve_or_create(&name, &owner, Some("oci"))
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(store_err)
+}
+
+/// Resolve namespace for read operations (GET/HEAD).
+/// Returns not_found if namespace does not exist.
+pub(crate) async fn resolve_ns_read_async(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
+    let s = store(cx).clone();
+    let name = path_param(cx, "ns").to_string();
+    tokio::task::spawn_blocking(move || {
+        s.namespace_resolve(&name, Some("oci"))
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(store_err)
+}
+
 /// Extract a path parameter by name from the matched route.
 pub(crate) fn path_param<'a>(cx: &'a Cx, key: &str) -> &'a str {
     use topcoat::router::RawPathParams;

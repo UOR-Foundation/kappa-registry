@@ -148,6 +148,40 @@ async fn main() {
     kappa_core::version::check_or_write_version(&cfg.store_root)
         .expect("store format version check failed");
 
+    // -- System namespace bootstrap (before identity, _root must exist first) --
+    // Create system namespaces with "anonymous" as temporary owner.
+    // Node identity bootstrap will create capability edges on _root.
+    // After identity bootstrap, the owner is updated to the node anchor.
+    {
+        let system_ns = [
+            ("_root", None),
+            ("_nix", Some("nix")),
+            ("_system", None),
+            ("_admin", None),
+            ("_aliases", None),
+            ("_handles", None),
+            ("_akd/identity", None),
+        ];
+        for (name, protocol) in &system_ns {
+            match store.namespace_resolve_or_create(name, "anonymous", *protocol) {
+                Ok(ns) => {
+                    tracing::debug!(
+                        namespace = name,
+                        uuid = %ns.uuid_hex(),
+                        "system namespace ready"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        namespace = name,
+                        error = %e,
+                        "system namespace bootstrap failed"
+                    );
+                }
+            }
+        }
+    }
+
     // -- Signing + Identity --
     let key_store = match KeyStore::new(cfg.store_root.join("keys")) {
         Ok(ks) => ks,
@@ -216,7 +250,8 @@ async fn main() {
         if let Ok(root_token_str) = std::env::var("KAPPA_ROOT_TOKEN") {
             if let Some((token, anchor)) = root_token_str.split_once('=') {
                 let node_anchor = ni.anchor().as_str().to_string();
-                let root_ns = kappa_core::types::NamespaceRef::from("_root");
+                let root_ns = store.namespace_resolve("_root", None)
+                    .expect("_root namespace must exist after bootstrap");
                 let scope = serde_json::json!({
                     "namespaces": [],
                     "operations": ["read", "write", "admin"],
@@ -478,8 +513,8 @@ async fn main() {
                 use topcoat::context::request_context;
                 use topcoat::router::RawPathParams;
                 let params: &RawPathParams = request_context(cx);
-                let repo = NamespaceRef::from(params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v).unwrap_or(""));
+                let repo_name = params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
                 // service comes from ?service= query param, not path param
                 let service = {
                     let parts: &http::request::Parts = request_context(cx);
@@ -499,6 +534,15 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let svc = service.clone();
                 let result = tokio::task::spawn_blocking(move || {
+                    // upload-pack (clone/fetch) is read -- namespace must exist.
+                    // receive-pack (push) is write -- create namespace on first push.
+                    let repo = if is_upload {
+                        store.namespace_resolve(&repo_name, Some("git"))
+                            .map_err(|e| std::io::Error::other(format!("repository '{}' not found: {}", repo_name, e)))?
+                    } else {
+                        store.namespace_resolve_or_create(&repo_name, "_git", Some("git"))
+                            .map_err(|e| std::io::Error::other(format!("namespace resolve '{}': {}", repo_name, e)))?
+                    };
                     let object_hash = repo_object_hash(&*store, &repo);
                     let mut out = Vec::new();
                     if is_v2 {
@@ -543,8 +587,8 @@ async fn main() {
                 use topcoat::context::request_context;
                 use topcoat::router::RawPathParams;
                 let params: &RawPathParams = request_context(cx);
-                let repo = NamespaceRef::from(params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v).unwrap_or(""));
+                let repo_name = params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
                 let is_v2 = {
                     let parts: &http::request::Parts = request_context(cx);
                     parts.headers.get("git-protocol")
@@ -558,6 +602,8 @@ async fn main() {
                     to_bytes(body, 256 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
+                    let repo = store.namespace_resolve(&repo_name, Some("git"))
+                        .map_err(|e| std::io::Error::other(format!("namespace resolve '{}': {}", repo_name, e)))?;
                     let object_hash = repo_object_hash(&*store, &repo);
                     let mut response = Vec::new();
                     if is_v2 {
@@ -590,14 +636,16 @@ async fn main() {
                 use topcoat::context::request_context;
                 use topcoat::router::RawPathParams;
                 let params: &RawPathParams = request_context(cx);
-                let repo = NamespaceRef::from(params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v).unwrap_or(""));
+                let repo_name = params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
                     to_bytes(body, 256 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
+                    let repo = store.namespace_resolve_or_create(&repo_name, "_git", Some("git"))
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
                     // Detect object format from push or stored config.
                     // For new repos, detect from ref update OID length (40=SHA-1, 64=SHA-256).
                     let object_hash = repo_object_hash(&*store, &repo);
@@ -630,8 +678,8 @@ async fn main() {
                 use topcoat::context::request_context;
                 use topcoat::router::RawPathParams;
                 let params: &RawPathParams = request_context(cx);
-                let repo = NamespaceRef::from(params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v).unwrap_or(""));
+                let repo_name = params.iter().find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
@@ -647,6 +695,8 @@ async fn main() {
                     format!("http://{}", host)
                 };
                 let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                    let repo = store.namespace_resolve_or_create(&repo_name, "_git", Some("git"))
+                        .map_err(|e| format!("namespace resolve: {e}"))?;
                     let batch_req: kappa_module_git::BatchRequest =
                         serde_json::from_slice(&request_bytes)
                             .map_err(|e| format!("invalid LFS batch request: {e}"))?;
@@ -706,7 +756,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("narinfo:{}", hash);
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = NamespaceRef::from("_nix");
+                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let entry = store.tag_get(&nix_ns, &tag_name)?;
                     store.blob_get(&entry.kappa)
                 }).await;
@@ -730,7 +780,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("narinfo:{}", hash);
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = NamespaceRef::from("_nix");
+                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let entry = store.tag_get(&nix_ns, &tag_name)?;
                     store.blob_size(&entry.kappa)
                 }).await;
@@ -758,7 +808,7 @@ async fn main() {
                         .map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = NamespaceRef::from("_nix");
+                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let narinfo_text = String::from_utf8(narinfo_bytes.clone())
                         .map_err(|e| kappa_core::types::StoreError::Rejected(
                             format!("narinfo is not valid UTF-8: {e}")
@@ -885,7 +935,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("nar:{}", path);
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = NamespaceRef::from("_nix");
+                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let entry = store.tag_get(&nix_ns, &tag_name)?;
                     let mut reader = store.blob_open_compressed(&entry.kappa)?;
                     let mut content = Vec::new();
@@ -915,7 +965,7 @@ async fn main() {
                         .map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = NamespaceRef::from("_nix");
+                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let nar_kappa = kappa_core::kappa::kappa_from_bytes(&content);
                     store.ingest_verified(&nar_kappa, &content)?;
                     let tag_name = format!("nar:{}", path);
@@ -1069,7 +1119,7 @@ async fn main() {
             action: &str,
         ) -> Option<topcoat::router::Response> {
             let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-            let b = NamespaceRef::from(bucket);
+            let b = match store.namespace_resolve(bucket, Some("s3")) { Ok(r) => r, Err(_) => return None };
             // Synchronous policy check -- policy blobs are small
             let policy_json = {
                 match store.tag_get(&b, "_config/policy") {
@@ -1208,7 +1258,7 @@ async fn main() {
                 };
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
                     let resp = kappa_module_s3::list_objects_v2(&*store, &bucket, &req)?;
                     Ok::<Vec<u8>, kappa_core::types::StoreError>(
                         kappa_module_s3::encode_list_objects_v2_xml(&resp),
@@ -1266,9 +1316,9 @@ async fn main() {
                 // If Expect: 100-continue is set and bucket does not exist,
                 // hyper never sends 100 Continue -- client sees 404 without uploading.
                 {
-                    let b = NamespaceRef::from(bucket.as_str());
+                    let bucket_name = bucket.clone();
                     let s = store.clone();
-                    let exists = tokio::task::spawn_blocking(move || s.namespace_exists(&b))
+                    let exists = tokio::task::spawn_blocking(move || s.namespace_exists(&bucket_name, Some("s3")))
                         .await.unwrap_or(Ok(false)).unwrap_or(false);
                     if !exists {
                         let err = kappa_module_s3::encode_s3_error_xml(
@@ -1331,7 +1381,7 @@ async fn main() {
                 let sse = sse_algo.clone();
                 let ct_for_store = content_type_header.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     let digest = kappa_core::kappa::kappa_from_bytes(&content);
                     let ingest = store.ingest_verified(&digest, &content)?;
 
@@ -1433,9 +1483,10 @@ async fn main() {
                 // Item 43: Object tagging GET
                 if query.contains_key("tagging") {
                     let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                    let b = NamespaceRef::from(bucket.as_str());
+                    let bucket_name = bucket.clone();
                     let k = key.clone();
                     let result = tokio::task::spawn_blocking(move || {
+                        let b = store.namespace_resolve(&bucket_name, Some("s3"))?;
                         let entry = store.tag_get(&b, &k)?;
                         match store.blob_get_meta(&entry.kappa, "_s3_tags") {
                             Ok(raw) => Ok(raw),
@@ -1464,7 +1515,7 @@ async fn main() {
                 // Item 48: GetObjectAttributes
                 if query.contains_key("attributes") {
                     let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                    let b = NamespaceRef::from(bucket.as_str());
+                    let bucket_name = bucket.clone();
                     let k = key.clone();
                     // x-amz-object-attributes header specifies which attributes to return
                     let requested_attrs = {
@@ -1476,6 +1527,7 @@ async fn main() {
                             .to_string()
                     };
                     let result = tokio::task::spawn_blocking(move || {
+                        let b = store.namespace_resolve(&bucket_name, Some("s3"))?;
                         let entry = store.tag_get(&b, &k)?;
                         let size = store.blob_size(&entry.kappa)?;
                         Ok::<(String, u64), kappa_core::types::StoreError>((entry.kappa, size))
@@ -1505,7 +1557,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
                     let (kappa, content, vid) = match store.version_get(&bucket, &key, version_id.as_deref()) {
                         Ok(ve) => {
                             let kappa = ve.kappa.ok_or_else(|| {
@@ -1601,7 +1653,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
                     match store.version_get(&bucket, &key, version_id.as_deref()) {
                         Ok(ve) => {
                             let kappa = ve.kappa.ok_or_else(|| {
@@ -1685,7 +1737,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     match store.version_delete(&bucket, &key, version_id.as_deref()) {
                         Ok(dr) => Ok(dr),
                         Err(kappa_core::types::StoreError::Rejected(_)) => {
@@ -1728,7 +1780,7 @@ async fn main() {
 
                 // "Create" a bucket by touching a marker tag
                 let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     store.tag_set(&bucket, "_bucket_marker", "sha256:0000000000000000000000000000000000000000000000000000000000000000")
                 }).await;
 
@@ -1748,8 +1800,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let exists = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
-                    store.namespace_exists(&bucket).unwrap_or(false)
+                    store.namespace_exists(&bucket, Some("s3")).unwrap_or(false)
                 }).await.unwrap_or(false);
 
                 if exists {
@@ -1776,7 +1827,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     // S3 DeleteBucket requires the bucket to be empty.
                     // Check tag_list: if any non-marker tags exist, reject.
                     let tags = store.tag_list(&bucket)?;
@@ -1831,7 +1882,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    store.namespace_list()
+                    store.namespace_list(Some("s3"))
                 }).await;
 
                 match result {
@@ -1839,10 +1890,12 @@ async fn main() {
                         let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
                         xml.push_str("<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
                         xml.push_str("<Buckets>");
-                        for ns in &namespaces {
-                            xml.push_str("<Bucket><Name>");
-                            xml.push_str(ns);
-                            xml.push_str("</Name><CreationDate>2026-01-01T00:00:00.000Z</CreationDate></Bucket>");
+                        for rec in &namespaces {
+                            for alias in &rec.aliases {
+                                xml.push_str("<Bucket><Name>");
+                                xml.push_str(alias);
+                                xml.push_str("</Name><CreationDate>2026-01-01T00:00:00.000Z</CreationDate></Bucket>");
+                            }
                         }
                         xml.push_str("</Buckets></ListAllMyBucketsResult>");
                         (StatusCode::OK, [
@@ -1871,7 +1924,7 @@ async fn main() {
                 let bucket_for_xml = bucket.clone();
                 let key_for_xml = key.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     store.upload_begin(&bucket, max_size)
                 }).await;
 
@@ -2054,7 +2107,7 @@ async fn main() {
                 }
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     let ingest_result = store.upload_complete(&upload_id, None)?;
                     store.tag_set(&bucket, &key, &ingest_result.kappa)?;
                     let now_ms = std::time::SystemTime::now()
@@ -2139,7 +2192,8 @@ async fn main() {
                 }
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))
+                        .map_err(|e| kappa_core::types::StoreError::Rejected(format!("namespace resolve '{}': {}", bucket, e)))?;
                     let mut deleted = Vec::new();
                     let mut errors: Vec<(String, String, String)> = Vec::new();
                     for key in &keys_to_delete {
@@ -2148,11 +2202,11 @@ async fn main() {
                             Err(e) => errors.push((key.clone(), "InternalError".into(), e.to_string())),
                         }
                     }
-                    (deleted, errors)
+                    Ok::<_, kappa_core::types::StoreError>((deleted, errors))
                 }).await;
 
                 match result {
-                    Ok((deleted, errors)) => {
+                    Ok(Ok((deleted, errors))) => {
                         let xml = kappa_module_s3::encode_delete_result_xml(&deleted, &errors);
                         (StatusCode::OK, [
                             ("content-type", "application/xml".to_string()),
@@ -2189,13 +2243,13 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     // Parse copy source: /bucket/key or bucket/key
                     let source = copy_source.strip_prefix('/').unwrap_or(&copy_source);
                     let (src_bucket, src_key) = source.split_once('/')
                         .ok_or_else(|| kappa_core::types::StoreError::Rejected("invalid copy source".into()))?;
 
-                    let src_ns = NamespaceRef::from(src_bucket);
+                    let src_ns = store.namespace_resolve(src_bucket, Some("s3"))?;
                     let src_entry = store.tag_get(&src_ns, src_key)?;
                     store.tag_set(&bucket, &key, &src_entry.kappa)?;
                     let now_ms = std::time::SystemTime::now()
@@ -2252,7 +2306,7 @@ async fn main() {
                 };
 
                 let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     store.tag_set(&bucket, "_config/versioning", status_value)
                 }).await;
 
@@ -2271,7 +2325,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
                     match store.tag_get(&bucket, "_config/versioning") {
                         Ok(entry) => Ok(entry.kappa),
                         Err(kappa_core::types::StoreError::NotFound(_)) => Ok(String::new()),
@@ -2359,7 +2413,7 @@ async fn main() {
                     } else { break; }
                 }
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     let entry = store.tag_get(&bucket, &key)?;
                     let json = serde_json::to_vec(&tags)
                         .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
@@ -2386,11 +2440,12 @@ async fn main() {
                 let key = params.iter().find(|(k, _)| *k == "key")
                     .map(|(_, v)| v.to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                let _ = tokio::task::spawn_blocking(move || -> Result<(), kappa_core::types::StoreError> {
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     if let Ok(entry) = store.tag_get(&bucket, &key) {
                         let _ = store.blob_delete_meta(&entry.kappa, "_s3_tags");
                     }
+                    Ok(())
                 }).await;
                 StatusCode::NO_CONTENT.into_response(cx)
             })
@@ -2463,7 +2518,7 @@ async fn main() {
                 };
                 let tag_name = format!("_config/{}", config_key);
                 let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     let kappa = kappa_core::kappa::kappa_from_bytes(&body_bytes);
                     let _ = store.ingest_verified(&kappa, &body_bytes);
                     store.tag_set(&bucket, &tag_name, &kappa)
@@ -2482,7 +2537,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("_config/{}", config_key);
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
                     let entry = store.tag_get(&bucket, &tag_name)?;
                     store.blob_get(&entry.kappa)
                 }).await;
@@ -2511,7 +2566,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("_config/{}", config_key);
                 let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = NamespaceRef::from(bucket);
+                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
                     store.tag_delete(&bucket, &tag_name)
                 }).await;
                 StatusCode::NO_CONTENT.into_response(cx)
@@ -2624,12 +2679,13 @@ async fn main() {
             interval.tick().await;
             let s = lifecycle_store.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                let namespaces = match s.namespace_list() {
+                let namespaces = match s.namespace_list(None) {
                     Ok(ns) => ns,
                     Err(_) => return,
                 };
-                for ns_str in &namespaces {
-                    let ns = NamespaceRef::from(ns_str.as_str());
+                for rec in &namespaces {
+                    let ns_name = rec.aliases.first().map(|s| s.as_str()).unwrap_or(&rec.uuid_hex);
+                    let uuid_bytes = hex::decode(&rec.uuid_hex).unwrap_or_default(); if uuid_bytes.len() != 16 { continue; } let mut uuid_arr = [0u8; 16]; uuid_arr.copy_from_slice(&uuid_bytes); let ns = NamespaceRef::with_name(uuid_arr, ns_name.to_string());
                     // Check if this namespace has a lifecycle config
                     let lifecycle_tag = match s.tag_get(&ns, "_config/lifecycle") {
                         Ok(entry) => entry,

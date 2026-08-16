@@ -47,7 +47,7 @@ impl NodeIdentity {
             crate::crypto::Signer::public_key(&signer),
         );
 
-        let ns = NamespaceRef::from(anchor.as_namespace());
+        let ns = NamespaceRef::deterministic(&anchor.as_namespace());
         let anchor_kappa = blob_put_computed(store, anchor.as_str().as_bytes())?;
         store.tag_set(&ns, "node/anchor", &anchor_kappa)?;
         let algo_kappa = blob_put_computed(store, signer.algorithm().as_bytes())?;
@@ -61,7 +61,8 @@ impl NodeIdentity {
         // All other authority flows from delegation edges created from
         // the node anchor to configured token anchors at server startup.
         // The node anchor is never exposed as a bearer token.
-        let root_ns = NamespaceRef::from("_root");
+        let root_ns = store.namespace_resolve("_root", None)
+            .map_err(|e| StoreError::Rejected(format!("_root namespace must exist before node bootstrap: {}", e)))?;
         let ops_bytes = br#"{"ops":["read","write","admin"]}"#.to_vec();
         store.edge_put(
             &root_ns,

@@ -20,7 +20,7 @@ fn new_store() -> (InMemoryStore, tempfile::TempDir) {
 #[test]
 fn put_query_outbound() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edge = Edge {
         source: "src".into(),
         target: "tgt".into(),
@@ -48,7 +48,7 @@ fn put_query_outbound() {
 #[test]
 fn put_query_inbound() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edge = Edge {
         source: "src".into(),
         target: "tgt".into(),
@@ -76,7 +76,7 @@ fn put_query_inbound() {
 #[test]
 fn query_filters_by_relation() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     s.edge_put(
         &ns,
         &Edge {
@@ -119,7 +119,7 @@ fn query_filters_by_relation() {
 #[test]
 fn delete_cleans_all_indexes() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     s.edge_put(
         &ns,
         &Edge {

@@ -36,7 +36,7 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn root_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         root(cx, &ns).await
     })
 }
@@ -44,7 +44,7 @@ fn root_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn proof_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let name = path_param(cx, "name");
         proof(cx, &ns, name).await
     })

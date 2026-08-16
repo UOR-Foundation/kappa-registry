@@ -29,7 +29,7 @@ pub struct DiskPressure(pub std::sync::atomic::AtomicBool);
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let client_digest = path_param(cx, "kappa");
         put(cx, &ns, client_digest, &bytes).await
     })
@@ -38,7 +38,7 @@ pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let kappa = path_param(cx, "kappa");
         get(cx, &ns, kappa).await
     })
@@ -47,7 +47,7 @@ pub fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn head_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let kappa = path_param(cx, "kappa");
         head(cx, &ns, kappa).await
     })
@@ -64,7 +64,7 @@ pub fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 pub fn meta_list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         meta_list(cx, &ns).await
     })
 }

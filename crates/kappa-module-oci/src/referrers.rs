@@ -10,7 +10,7 @@ use crate::{path_param, query_param, store};
 pub fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let digest = path_param(cx, "digest");
         list(cx, &ns, digest).await
     })

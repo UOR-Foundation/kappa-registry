@@ -53,6 +53,38 @@ impl IngestResult {
     }
 }
 
+/// Namespace metadata record returned by namespace_info and namespace_list.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NamespaceRecord {
+    /// Hex-encoded 16-byte UUID.
+    pub uuid_hex: String,
+    /// Asserter anchor of the namespace owner.
+    pub owner: String,
+    /// Creation timestamp in milliseconds since Unix epoch.
+    pub created_at_ms: u64,
+    /// Protocol scope: "oci", "s3", "git", "nix", or None (global).
+    pub protocol: Option<String>,
+    /// All alias names pointing to this UUID.
+    pub aliases: Vec<String>,
+    /// Whether this namespace has been tombstoned (pending GC).
+    pub tombstoned: bool,
+}
+
+/// A single entry in the alias history audit log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AliasEvent {
+    /// Action performed: "create", "rename", "add_alias", "delete", "transfer".
+    pub action: String,
+    /// The alias name involved.
+    pub alias: String,
+    /// Asserter anchor of the actor who performed the action.
+    pub actor: String,
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
+    /// Additional detail: old_name for rename, new_owner for transfer.
+    pub detail: Option<String>,
+}
+
 /// Content-addressed key-value store.
 ///
 /// Two ingest methods handle all writes:
@@ -361,10 +393,106 @@ pub trait KappaStore: Send + Sync {
         }
     }
 
-    // -- Namespace (2) --------------------------------------------------------
+    // -- Namespace (10) -------------------------------------------------------
 
-    fn namespace_list(&self) -> Result<Vec<String>, StoreError>;
-    fn namespace_exists(&self, ns: &NamespaceRef) -> Result<bool, StoreError>;
+    /// Create a namespace. Generates UUIDv7, creates alias, sets owner.
+    /// Returns the new NamespaceRef with UUID and display name.
+    /// Rejects if alias already exists in the same protocol scope.
+    fn namespace_create(
+        &self,
+        name: &str,
+        owner: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError>;
+
+    /// Resolve an alias to a NamespaceRef. Returns NotFound if alias
+    /// does not exist.
+    fn namespace_resolve(
+        &self,
+        name: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError>;
+
+    /// Resolve or create. If alias exists, return it. If not, create
+    /// with the given owner. Replaces implicit first-writer-claims.
+    fn namespace_resolve_or_create(
+        &self,
+        name: &str,
+        owner: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError>;
+
+    /// Rename an alias. UUID preserved. All content intact.
+    /// Only the owner (or delegated) can rename.
+    fn namespace_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let _ = (old_name, new_name, actor, protocol);
+        Err(StoreError::Rejected("namespace_rename not implemented".into()))
+    }
+
+    /// Add an additional alias to an existing namespace UUID.
+    fn namespace_add_alias(
+        &self,
+        uuid: &[u8; 16],
+        alias: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let _ = (uuid, alias, actor, protocol);
+        Err(StoreError::Rejected("namespace_add_alias not implemented".into()))
+    }
+
+    /// Transfer ownership of a namespace to a new anchor.
+    fn namespace_transfer(
+        &self,
+        uuid: &[u8; 16],
+        new_owner: &str,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (uuid, new_owner, actor);
+        Err(StoreError::Rejected("namespace_transfer not implemented".into()))
+    }
+
+    /// Get namespace metadata: UUID, owner, creation time, aliases.
+    fn namespace_info(
+        &self,
+        name: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRecord, StoreError> {
+        let _ = (name, protocol);
+        Err(StoreError::Rejected("namespace_info not implemented".into()))
+    }
+
+    /// List all namespaces. Returns records with display names.
+    /// Optional protocol filter.
+    fn namespace_list(
+        &self,
+        protocol: Option<&str>,
+    ) -> Result<Vec<NamespaceRecord>, StoreError>;
+
+    /// Check if a namespace exists by alias name.
+    fn namespace_exists(
+        &self,
+        name: &str,
+        protocol: Option<&str>,
+    ) -> Result<bool, StoreError>;
+
+    /// Delete a namespace. Marks as tombstoned. Removes all aliases.
+    /// Content remains until GC. Only owner can delete.
+    fn namespace_delete(
+        &self,
+        name: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let _ = (name, actor, protocol);
+        Err(StoreError::Rejected("namespace_delete not implemented".into()))
+    }
 
     // -- Versioning (5, optional) -------------------------------------------------
 

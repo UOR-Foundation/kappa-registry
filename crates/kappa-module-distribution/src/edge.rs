@@ -46,7 +46,7 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         put(cx, &ns, &bytes).await
     })
 }
@@ -54,7 +54,7 @@ fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn query_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let anchor = path_param(cx, "edge_key");
         let direction_str = query_param(cx, "direction").unwrap_or_else(|| "outbound".to_string());
         let relation_str = query_param(cx, "relation");
@@ -76,7 +76,7 @@ fn query_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let edge_kappa = path_param(cx, "edge_key");
         delete(cx, &ns, edge_kappa).await
     })
@@ -85,7 +85,7 @@ fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn diff_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         diff(cx, &ns, &bytes).await
     })
 }

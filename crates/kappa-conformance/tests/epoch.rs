@@ -20,7 +20,7 @@ fn new_store() -> (InMemoryStore, tempfile::TempDir) {
 #[test]
 fn advance_returns_kappa() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let k = s.epoch_advance(&ns, vec![]).unwrap();
     assert!(k.starts_with("sha256:"));
 }
@@ -28,7 +28,7 @@ fn advance_returns_kappa() {
 #[test]
 fn get_returns_epoch_root() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let k = s
         .epoch_advance(
             &ns,
@@ -49,7 +49,7 @@ fn get_returns_epoch_root() {
 #[test]
 fn chain_links() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let k1 = s.epoch_advance(&ns, vec![]).unwrap();
     let k2 = s.epoch_advance(&ns, vec![]).unwrap();
     let r2 = s.epoch_get(&k2).unwrap();
@@ -60,7 +60,7 @@ fn chain_links() {
 #[test]
 fn current_tracks_latest() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     assert!(s.epoch_current(&ns).unwrap().is_none());
     let k1 = s.epoch_advance(&ns, vec![]).unwrap();
     assert_eq!(s.epoch_current(&ns).unwrap(), Some(k1));
@@ -71,7 +71,7 @@ fn current_tracks_latest() {
 #[test]
 fn origin_has_no_prev() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let k = s.epoch_advance(&ns, vec![]).unwrap();
     let root = s.epoch_get(&k).unwrap();
     assert!(root.prev_root_kappa.is_none());
@@ -80,7 +80,7 @@ fn origin_has_no_prev() {
 #[test]
 fn selective_disclosure() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let k = s.epoch_advance(&ns, vec![]).unwrap();
     let root = s.epoch_get(&k).unwrap();
     let proof = root.proof_for_leaf(0).unwrap();
@@ -91,7 +91,7 @@ fn selective_disclosure() {
 #[test]
 fn selective_disclosure_rejects_wrong() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let k = s.epoch_advance(&ns, vec![]).unwrap();
     let root = s.epoch_get(&k).unwrap();
     let proof = root.proof_for_leaf(0).unwrap();

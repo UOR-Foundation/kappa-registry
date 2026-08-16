@@ -17,7 +17,7 @@ use crate::{path_param, query_param, read_body, store};
 pub fn tag_batch_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         tag_batch(cx, &ns, &bytes).await
     })
 }
@@ -79,7 +79,7 @@ async fn tag_batch(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<R
 pub fn tag_delete_prefix_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let prefix = query_param(cx, "prefix").unwrap_or_default();
         if prefix.is_empty() {
             return Err(bad_request("missing prefix parameter").into());
@@ -148,7 +148,7 @@ async fn tag_delete_prefix(cx: &Cx, ns: &NamespaceRef, prefix: &str) -> topcoat:
 pub fn tag_crud_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let method = topcoat::router::method(cx);
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         match method.as_str() {
             "POST" => {
                 let bytes = read_body(body).await?;
@@ -281,7 +281,7 @@ async fn tag_delete_by_query(cx: &Cx, ns: &NamespaceRef, name: &str) -> topcoat:
 pub fn tag_get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let name = path_param(cx, "name");
         let raw = query_param(cx, "raw").as_deref() == Some("true");
         tag_get(cx, &ns, name, raw).await
@@ -323,7 +323,7 @@ async fn tag_get(cx: &Cx, ns: &NamespaceRef, name: &str, raw: bool) -> topcoat::
 pub fn tag_put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let name = path_param(cx, "name");
         let kappa = query_param(cx, "kappa").unwrap_or_default();
         let symref = query_param(cx, "symref");

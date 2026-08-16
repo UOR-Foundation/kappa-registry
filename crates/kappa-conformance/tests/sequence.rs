@@ -20,14 +20,14 @@ fn new_store() -> (InMemoryStore, tempfile::TempDir) {
 #[test]
 fn starts_at_zero() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     assert_eq!(s.sequence_current(&ns, "seq").unwrap(), 0);
 }
 
 #[test]
 fn next_increments() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     assert_eq!(s.sequence_next(&ns, "seq").unwrap(), 1);
     assert_eq!(s.sequence_next(&ns, "seq").unwrap(), 2);
     assert_eq!(s.sequence_next(&ns, "seq").unwrap(), 3);
@@ -36,7 +36,7 @@ fn next_increments() {
 #[test]
 fn current_returns_last_value() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     s.sequence_next(&ns, "seq").unwrap();
     s.sequence_next(&ns, "seq").unwrap();
     assert_eq!(s.sequence_current(&ns, "seq").unwrap(), 2);
@@ -45,8 +45,8 @@ fn current_returns_last_value() {
 #[test]
 fn namespaces_independent() {
     let (s, _d) = new_store();
-    let ns1 = NamespaceRef::from("ns1");
-    let ns2 = NamespaceRef::from("ns2");
+    let ns1 = NamespaceRef::deterministic("ns1");
+    let ns2 = NamespaceRef::deterministic("ns2");
     s.sequence_next(&ns1, "seq").unwrap();
     s.sequence_next(&ns1, "seq").unwrap();
     assert_eq!(s.sequence_current(&ns1, "seq").unwrap(), 2);
@@ -56,7 +56,7 @@ fn namespaces_independent() {
 #[test]
 fn names_independent() {
     let (s, _d) = new_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     s.sequence_next(&ns, "a").unwrap();
     s.sequence_next(&ns, "a").unwrap();
     s.sequence_next(&ns, "b").unwrap();

@@ -106,7 +106,7 @@ impl CrdtManager {
 
 pub fn ws_crdt_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let doc = path_param(cx, "doc").to_string();
         let crdt = app_context::<Arc<CrdtManager>>(cx).clone();
         let upgrade = WebSocketUpgrade::from_request(cx, body).await?;

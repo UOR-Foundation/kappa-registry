@@ -208,7 +208,7 @@ mod tests {
     }
 
     fn seed_tags(store: &dyn KappaStore, keys: &[&str]) {
-        let ns = NamespaceRef::from("bucket");
+        let ns = NamespaceRef::deterministic("bucket");
         for key in keys {
             store.tag_set(&ns, key, "sha256:aaa").unwrap();
         }
@@ -222,7 +222,7 @@ mod tests {
             bucket: "bucket".into(),
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         assert_eq!(resp.contents.len(), 3);
         assert_eq!(resp.key_count, 3);
         assert!(!resp.is_truncated);
@@ -237,7 +237,7 @@ mod tests {
             prefix: Some("photos/".into()),
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         assert_eq!(resp.contents.len(), 2);
     }
 
@@ -253,7 +253,7 @@ mod tests {
             delimiter: Some("/".into()),
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         assert_eq!(resp.contents.len(), 0);
         assert_eq!(resp.common_prefixes.len(), 2);
         assert!(resp.common_prefixes.contains(&"a/b/".to_string()));
@@ -272,7 +272,7 @@ mod tests {
             delimiter: Some("/".into()),
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         assert_eq!(resp.contents.len(), 0);
         assert_eq!(resp.common_prefixes.len(), 2);
         assert!(resp.common_prefixes.contains(&"a/b/c/".to_string()));
@@ -289,7 +289,7 @@ mod tests {
             delimiter: Some("/".into()),
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         assert_eq!(resp.contents.len(), 2);
         assert_eq!(resp.common_prefixes.len(), 0);
     }
@@ -303,7 +303,7 @@ mod tests {
             max_keys: 2,
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         assert_eq!(resp.key_count, 2);
         assert!(resp.is_truncated);
         assert!(resp.next_continuation_token.is_some());
@@ -319,7 +319,7 @@ mod tests {
             max_keys: 2,
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         assert_eq!(resp.key_count, 2);
         assert!(resp.is_truncated);
         assert_eq!(resp.common_prefixes.len(), 2);
@@ -336,7 +336,7 @@ mod tests {
             max_keys: 2,
             ..Default::default()
         };
-        let resp1 = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req1).unwrap();
+        let resp1 = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req1).unwrap();
         assert!(resp1.is_truncated);
         let token = resp1.next_continuation_token.unwrap();
 
@@ -346,7 +346,7 @@ mod tests {
             continuation_token: Some(token),
             ..Default::default()
         };
-        let resp2 = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req2).unwrap();
+        let resp2 = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req2).unwrap();
         assert_eq!(resp2.contents.len(), 2);
         assert_eq!(resp2.contents[0].key, "c");
         assert_eq!(resp2.contents[1].key, "d");
@@ -364,7 +364,7 @@ mod tests {
             start_after: Some("a".into()),
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         // continuation_token resumes after "c", NOT after "a"
         assert_eq!(resp.contents[0].key, "d");
     }
@@ -379,7 +379,7 @@ mod tests {
             start_after: Some("c".into()),
             ..Default::default()
         };
-        let resp = list_objects_v2(&*store, &NamespaceRef::from("bucket"), &req).unwrap();
+        let resp = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req).unwrap();
         assert_eq!(resp.contents.len(), 2);
         assert_eq!(resp.contents[0].key, "d");
         assert_eq!(resp.contents[1].key, "e");

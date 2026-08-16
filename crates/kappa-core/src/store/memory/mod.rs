@@ -37,19 +37,18 @@ pub struct InMemoryStore {
     blob_root: PathBuf,
     clock: Arc<dyn Clock>,
     upload_timeout_secs: Option<u64>,
-    tags: RwLock<HashMap<(u64, u64), TagEntry>>,
+    tags: RwLock<HashMap<([u8; 16], u64), TagEntry>>,
     meta: DashMap<(u64, u64), Vec<u8>>,
-    /// Namespace-scoped metadata index: (ns_hash, key_hash, value_hash) -> Vec<kappa>
-    ns_meta: DashMap<(u64, u64, u64), Vec<String>>,
-    pub(crate) edges: RwLock<HashMap<(u64, u64), Edge>>,
-    pub(crate) fwd_index: RwLock<HashMap<(u64, u64), Vec<String>>>,
-    pub(crate) rev_index: RwLock<HashMap<(u64, u64), Vec<String>>>,
-    pub(crate) rel_index: RwLock<HashMap<(u64, u64), Vec<String>>>,
-    pub(crate) asr_index: RwLock<HashMap<(u64, u64), Vec<String>>>,
-    sequences: Mutex<HashMap<(u64, u64), u64>>,
-    namespaces: RwLock<std::collections::HashSet<String>>,
+    /// Namespace-scoped metadata index: (ns_uuid, key_hash, value_hash) -> Vec<kappa>
+    ns_meta: DashMap<([u8; 16], u64, u64), Vec<String>>,
+    pub(crate) edges: RwLock<HashMap<([u8; 16], u64), Edge>>,
+    pub(crate) fwd_index: RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
+    pub(crate) rev_index: RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
+    pub(crate) rel_index: RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
+    pub(crate) asr_index: RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
+    sequences: Mutex<HashMap<([u8; 16], u64), u64>>,
     epoch_roots: RwLock<HashMap<String, EpochRoot>>,
-    current_epochs: RwLock<HashMap<u64, String>>,
+    current_epochs: RwLock<HashMap<[u8; 16], String>>,
     uploads: Mutex<HashMap<String, UploadSession>>,
     /// Compression records: uncompressed_hash -> (kappa, algorithm, compressed_bytes, uncompressed_size)
     compression_records: DashMap<String, (String, String, Vec<u8>, u64)>,
@@ -59,6 +58,10 @@ pub struct InMemoryStore {
     identity_successions: DashMap<String, String>,
     /// Assertion inbound index: "{subject}\0{facet}" -> Vec<assertion_kappa>
     assertion_inbound: DashMap<String, Vec<String>>,
+    /// Namespace aliases: "{protocol}:{name}" or "{name}" -> uuid
+    ns_aliases: DashMap<String, [u8; 16]>,
+    /// Namespace records: uuid -> NamespaceRecord
+    ns_records: DashMap<[u8; 16], crate::store::NamespaceRecord>,
 }
 
 struct UploadSession {
@@ -85,7 +88,6 @@ impl InMemoryStore {
             rel_index: RwLock::new(HashMap::new()),
             asr_index: RwLock::new(HashMap::new()),
             sequences: Mutex::new(HashMap::new()),
-            namespaces: RwLock::new(std::collections::HashSet::new()),
             epoch_roots: RwLock::new(HashMap::new()),
             current_epochs: RwLock::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
@@ -93,6 +95,8 @@ impl InMemoryStore {
             identity_bindings: DashMap::new(),
             identity_successions: DashMap::new(),
             assertion_inbound: DashMap::new(),
+            ns_aliases: DashMap::new(),
+            ns_records: DashMap::new(),
         })
     }
 
@@ -101,15 +105,29 @@ impl InMemoryStore {
     }
 
     fn ensure_namespace(&self, ns: &NamespaceRef) {
-        self.namespaces.write().unwrap().insert(ns.as_str().to_string());
+        let uuid = *ns.uuid();
+        if !self.ns_records.contains_key(&uuid) {
+            let name = ns.display_name().unwrap_or("").to_string();
+            self.ns_records.insert(uuid, crate::store::NamespaceRecord {
+                uuid_hex: ns.uuid_hex(),
+                owner: String::new(),
+                created_at_ms: 0,
+                protocol: None,
+                aliases: if name.is_empty() { vec![] } else { vec![name.clone()] },
+                tombstoned: false,
+            });
+            if !name.is_empty() {
+                self.ns_aliases.insert(name, uuid);
+            }
+        }
     }
 
     fn collect_sorted_tags(&self, ns: &NamespaceRef) -> Vec<TagEntry> {
-        let ns_hash = namespace_hash(ns.as_str());
+        let uuid = *ns.uuid();
         let tags = self.tags.read().unwrap();
         let mut entries: Vec<TagEntry> = tags
             .iter()
-            .filter(|((nh, _), _)| *nh == ns_hash)
+            .filter(|((u, _), _)| *u == uuid)
             .map(|(_, e)| e.clone())
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -263,9 +281,9 @@ impl KappaStore for InMemoryStore {
     // -- Namespace-scoped metadata --------------------------------------------
 
     fn meta_set(&self, ns: &NamespaceRef, kappa: &str, key: &str, value: &str) -> Result<(), StoreError> {
-        tracing::debug!(ns = ns.as_str(), kappa = kappa, key = key, value = value, "meta_set");
+        tracing::debug!(ns = %ns, kappa = kappa, key = key, value = value, "meta_set");
         self.ensure_namespace(ns);
-        let idx_key = (namespace_hash(ns.as_str()), item_hash(key), item_hash(value));
+        let idx_key = (*ns.uuid(), item_hash(key), item_hash(value));
         self.ns_meta
             .entry(idx_key)
             .or_default()
@@ -274,14 +292,14 @@ impl KappaStore for InMemoryStore {
     }
 
     fn meta_query(&self, ns: &NamespaceRef, key: &str, value: &str) -> Result<Vec<String>, StoreError> {
-        tracing::trace!(ns = ns.as_str(), key = key, value = value, "meta_query");
+        tracing::trace!(ns = %ns, key = key, value = value, "meta_query");
+        let uuid = *ns.uuid();
         if value.is_empty() {
-            let ns_hash = namespace_hash(ns.as_str());
             let key_hash = item_hash(key);
             let mut results = Vec::new();
             for entry in self.ns_meta.iter() {
-                let (nh, kh, _vh) = *entry.key();
-                if nh == ns_hash && kh == key_hash {
+                let (u, kh, _vh) = *entry.key();
+                if u == uuid && kh == key_hash {
                     results.extend(entry.value().iter().cloned());
                 }
             }
@@ -289,7 +307,7 @@ impl KappaStore for InMemoryStore {
             results.dedup();
             Ok(results)
         } else {
-            let idx_key = (namespace_hash(ns.as_str()), item_hash(key), item_hash(value));
+            let idx_key = (uuid, item_hash(key), item_hash(value));
             match self.ns_meta.get(&idx_key) {
                 Some(kappas) => {
                     let mut results = kappas.value().clone();
@@ -305,9 +323,9 @@ impl KappaStore for InMemoryStore {
     // -- Tag ------------------------------------------------------------------
 
     fn tag_set(&self, ns: &NamespaceRef, name: &str, kappa: &str) -> Result<u64, StoreError> {
-        tracing::debug!(ns = ns.as_str(), tag = name, kappa = kappa, "tag_set");
+        tracing::debug!(ns = %ns, tag = name, kappa = kappa, "tag_set");
         self.ensure_namespace(ns);
-        let key = (namespace_hash(ns.as_str()), item_hash(name));
+        let key = (*ns.uuid(), item_hash(name));
         let mut tags = self.tags.write().unwrap();
         let version = tags.get(&key).map(|e| e.version + 1).unwrap_or(1);
         tags.insert(
@@ -322,34 +340,34 @@ impl KappaStore for InMemoryStore {
     }
 
     fn tag_get(&self, ns: &NamespaceRef, name: &str) -> Result<TagEntry, StoreError> {
-        tracing::trace!(ns = ns.as_str(), tag = name, "tag_get");
+        tracing::trace!(ns = %ns, tag = name, "tag_get");
         let tags = self.tags.read().unwrap();
-        tags.get(&(namespace_hash(ns.as_str()), item_hash(name)))
+        tags.get(&(*ns.uuid(), item_hash(name)))
             .cloned()
-            .ok_or_else(|| StoreError::NotFound(format!("{}/{}", ns.as_str(), name)))
+            .ok_or_else(|| StoreError::NotFound(format!("{}/{}", ns, name)))
     }
 
     fn tag_delete(&self, ns: &NamespaceRef, name: &str) -> Result<(), StoreError> {
-        tracing::debug!(ns = ns.as_str(), tag = name, "tag_delete");
+        tracing::debug!(ns = %ns, tag = name, "tag_delete");
         self.tags
             .write()
             .unwrap()
-            .remove(&(namespace_hash(ns.as_str()), item_hash(name)));
+            .remove(&(*ns.uuid(), item_hash(name)));
         Ok(())
     }
 
     fn tag_list(&self, ns: &NamespaceRef) -> Result<Vec<TagEntry>, StoreError> {
-        tracing::trace!(ns = ns.as_str(), "tag_list");
+        tracing::trace!(ns = %ns, "tag_list");
         Ok(self.collect_sorted_tags(ns))
     }
 
     fn tag_prefix(&self, ns: &NamespaceRef, prefix: &str) -> Result<Vec<TagEntry>, StoreError> {
-        tracing::trace!(ns = ns.as_str(), prefix = prefix, "tag_prefix");
-        let ns_hash = namespace_hash(ns.as_str());
+        tracing::trace!(ns = %ns, prefix = prefix, "tag_prefix");
+        let uuid = *ns.uuid();
         let tags = self.tags.read().unwrap();
         let mut result: Vec<TagEntry> = tags
             .iter()
-            .filter(|((nh, _), e)| *nh == ns_hash && e.name.starts_with(prefix))
+            .filter(|((u, _), e)| *u == uuid && e.name.starts_with(prefix))
             .map(|(_, e)| e.clone())
             .collect();
         result.sort_by(|a, b| a.name.cmp(&b.name));
@@ -357,15 +375,15 @@ impl KappaStore for InMemoryStore {
     }
 
     fn tag_set_batch(&self, ns: &NamespaceRef, updates: &[TagUpdate]) -> Result<(), StoreError> {
-        tracing::debug!(ns = ns.as_str(), count = updates.len(), "tag_set_batch");
+        tracing::debug!(ns = %ns, count = updates.len(), "tag_set_batch");
         self.ensure_namespace(ns);
-        let ns_hash = namespace_hash(ns.as_str());
+        let uuid = *ns.uuid();
         let mut tags = self.tags.write().unwrap();
 
         for update in updates {
             if let Some(expected) = update.expected_version {
                 let current = tags
-                    .get(&(ns_hash, item_hash(&update.name)))
+                    .get(&(uuid, item_hash(&update.name)))
                     .map(|e| e.version)
                     .unwrap_or(0);
                 if expected != current {
@@ -378,7 +396,7 @@ impl KappaStore for InMemoryStore {
         }
 
         for update in updates {
-            let key = (ns_hash, item_hash(&update.name));
+            let key = (uuid, item_hash(&update.name));
             let version = tags.get(&key).map(|e| e.version + 1).unwrap_or(1);
             tags.insert(
                 key,
@@ -429,9 +447,9 @@ impl KappaStore for InMemoryStore {
     // -- Sequence -------------------------------------------------------------
 
     fn sequence_next(&self, ns: &NamespaceRef, name: &str) -> Result<u64, StoreError> {
-        tracing::debug!(ns = ns.as_str(), seq = name, "sequence_next");
+        tracing::debug!(ns = %ns, seq = name, "sequence_next");
         self.ensure_namespace(ns);
-        let key = (namespace_hash(ns.as_str()), item_hash(name));
+        let key = (*ns.uuid(), item_hash(name));
         let mut seqs = self.sequences.lock().unwrap();
         let counter = seqs.entry(key).or_insert(0);
         *counter += 1;
@@ -439,10 +457,10 @@ impl KappaStore for InMemoryStore {
     }
 
     fn sequence_current(&self, ns: &NamespaceRef, name: &str) -> Result<u64, StoreError> {
-        tracing::trace!(ns = ns.as_str(), seq = name, "sequence_current");
+        tracing::trace!(ns = %ns, seq = name, "sequence_current");
         let seqs = self.sequences.lock().unwrap();
         Ok(seqs
-            .get(&(namespace_hash(ns.as_str()), item_hash(name)))
+            .get(&(*ns.uuid(), item_hash(name)))
             .copied()
             .unwrap_or(0))
     }
@@ -450,12 +468,12 @@ impl KappaStore for InMemoryStore {
     // -- Epoch ----------------------------------------------------------------
 
     fn epoch_advance(&self, ns: &NamespaceRef, mutations: Vec<EpochMutation>) -> Result<String, StoreError> {
-        tracing::debug!(ns = ns.as_str(), mutation_count = mutations.len(), "epoch_advance");
+        tracing::debug!(ns = %ns, mutation_count = mutations.len(), "epoch_advance");
         self.ensure_namespace(ns);
-        let ns_hash = namespace_hash(ns.as_str());
+        let uuid = *ns.uuid();
         let epoch_number = {
             let mut seqs = self.sequences.lock().unwrap();
-            let key = (ns_hash, item_hash("_epoch"));
+            let key = (uuid, item_hash("_epoch"));
             let counter = seqs.entry(key).or_insert(0);
             *counter += 1;
             *counter
@@ -468,7 +486,7 @@ impl KappaStore for InMemoryStore {
         let timestamp_ms = self.clock.now_ms();
 
         let epoch_root = EpochRoot::build(EpochRootFields {
-            namespace: ns.as_str().to_string(),
+            namespace: ns.to_string(),
             epoch_number,
             prev_root_kappa,
             state_root,
@@ -491,7 +509,7 @@ impl KappaStore for InMemoryStore {
         self.current_epochs
             .write()
             .unwrap()
-            .insert(ns_hash, kappa.clone());
+            .insert(uuid, kappa.clone());
 
         // Persist the current epoch pointer as a tag so epoch_current
         // survives process restart without scanning all blobs.
@@ -501,13 +519,14 @@ impl KappaStore for InMemoryStore {
     }
 
     fn epoch_current(&self, ns: &NamespaceRef) -> Result<Option<String>, StoreError> {
-        tracing::trace!(ns = ns.as_str(), "epoch_current");
+        tracing::trace!(ns = %ns, "epoch_current");
+        let uuid = *ns.uuid();
         // Check in-memory cache first
         if let Some(k) = self
             .current_epochs
             .read()
             .unwrap()
-            .get(&namespace_hash(ns.as_str()))
+            .get(&uuid)
             .cloned()
         {
             return Ok(Some(k));
@@ -518,7 +537,7 @@ impl KappaStore for InMemoryStore {
                 self.current_epochs
                     .write()
                     .unwrap()
-                    .insert(namespace_hash(ns.as_str()), entry.kappa.clone());
+                    .insert(uuid, entry.kappa.clone());
                 Ok(Some(entry.kappa))
             }
             Err(StoreError::NotFound(_)) => Ok(None),
@@ -545,17 +564,213 @@ impl KappaStore for InMemoryStore {
 
     // -- Namespace ------------------------------------------------------------
 
-    fn namespace_list(&self) -> Result<Vec<String>, StoreError> {
+    fn namespace_create(
+        &self,
+        name: &str,
+        owner: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError> {
+        let alias_key = alias_key(name, protocol);
+        if self.ns_aliases.contains_key(&alias_key) {
+            return Err(StoreError::Conflict(format!("namespace alias already exists: {}", alias_key)));
+        }
+        let ns = NamespaceRef::generate(name);
+        let uuid = *ns.uuid();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.ns_aliases.insert(alias_key, uuid);
+        self.ns_records.insert(uuid, crate::store::NamespaceRecord {
+            uuid_hex: ns.uuid_hex(),
+            owner: owner.to_string(),
+            created_at_ms: now_ms,
+            protocol: protocol.map(|s| s.to_string()),
+            aliases: vec![name.to_string()],
+            tombstoned: false,
+        });
+        Ok(ns)
+    }
+
+    fn namespace_resolve(
+        &self,
+        name: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError> {
+        let key = alias_key(name, protocol);
+        let uuid = self.ns_aliases.get(&key)
+            .map(|r| *r.value())
+            .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", key)))?;
+        Ok(NamespaceRef::with_name(uuid, name.to_string()))
+    }
+
+    fn namespace_resolve_or_create(
+        &self,
+        name: &str,
+        owner: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError> {
+        match self.namespace_resolve(name, protocol) {
+            Ok(ns) => Ok(ns),
+            Err(StoreError::NotFound(_)) => {
+                match self.namespace_create(name, owner, protocol) {
+                    Ok(ns) => Ok(ns),
+                    Err(StoreError::Conflict(_)) => self.namespace_resolve(name, protocol),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn namespace_list(
+        &self,
+        protocol: Option<&str>,
+    ) -> Result<Vec<crate::store::NamespaceRecord>, StoreError> {
         tracing::trace!("namespace_list");
-        let nss = self.namespaces.read().unwrap();
-        let mut result: Vec<String> = nss.iter().cloned().collect();
-        result.sort();
+        let mut result: Vec<crate::store::NamespaceRecord> = self.ns_records.iter()
+            .map(|r| r.value().clone())
+            .filter(|r| {
+                if let Some(p) = protocol {
+                    r.protocol.as_deref() == Some(p)
+                } else {
+                    true
+                }
+            })
+            .collect();
+        result.sort_by(|a, b| a.aliases.first().cmp(&b.aliases.first()));
         Ok(result)
     }
 
-    fn namespace_exists(&self, ns: &NamespaceRef) -> Result<bool, StoreError> {
-        tracing::trace!(ns = ns.as_str(), "namespace_exists");
-        Ok(self.namespaces.read().unwrap().contains(ns.as_str()))
+    fn namespace_exists(
+        &self,
+        name: &str,
+        protocol: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let key = alias_key(name, protocol);
+        Ok(self.ns_aliases.contains_key(&key))
+    }
+
+    fn namespace_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let old_key = alias_key(old_name, protocol);
+        let new_key = alias_key(new_name, protocol);
+        let uuid = self.ns_aliases.get(&old_key)
+            .map(|r| *r.value())
+            .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", old_key)))?;
+        if self.ns_aliases.contains_key(&new_key) {
+            return Err(StoreError::Conflict(format!("target alias already exists: {}", new_key)));
+        }
+        if let Some(mut record) = self.ns_records.get_mut(&uuid) {
+            if record.owner != actor {
+                return Err(StoreError::Rejected(format!(
+                    "only owner {} can rename, actor is {}", record.owner, actor
+                )));
+            }
+            record.aliases.retain(|a| a != old_name);
+            record.aliases.push(new_name.to_string());
+        }
+        self.ns_aliases.remove(&old_key);
+        self.ns_aliases.insert(new_key, uuid);
+        Ok(())
+    }
+
+    fn namespace_add_alias(
+        &self,
+        uuid: &[u8; 16],
+        alias: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let key = alias_key(alias, protocol);
+        if self.ns_aliases.contains_key(&key) {
+            return Err(StoreError::Conflict(format!("alias already exists: {}", key)));
+        }
+        let mut record = self.ns_records.get_mut(uuid)
+            .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+        if record.owner != actor {
+            return Err(StoreError::Rejected(format!(
+                "only owner {} can add alias, actor is {}", record.owner, actor
+            )));
+        }
+        if !record.aliases.contains(&alias.to_string()) {
+            record.aliases.push(alias.to_string());
+        }
+        drop(record);
+        self.ns_aliases.insert(key, *uuid);
+        Ok(())
+    }
+
+    fn namespace_transfer(
+        &self,
+        uuid: &[u8; 16],
+        new_owner: &str,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        let mut record = self.ns_records.get_mut(uuid)
+            .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+        if record.owner != actor {
+            let resolved = self.identity_succession_resolve(&record.owner)?;
+            if resolved != actor {
+                return Err(StoreError::Rejected(format!(
+                    "only owner {} (or successor) can transfer, actor is {}", record.owner, actor
+                )));
+            }
+        }
+        record.owner = new_owner.to_string();
+        Ok(())
+    }
+
+    fn namespace_info(
+        &self,
+        name: &str,
+        protocol: Option<&str>,
+    ) -> Result<crate::store::NamespaceRecord, StoreError> {
+        let key = alias_key(name, protocol);
+        let uuid = self.ns_aliases.get(&key)
+            .map(|r| *r.value())
+            .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", key)))?;
+        self.ns_records.get(&uuid)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))
+    }
+
+    fn namespace_delete(
+        &self,
+        name: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let key = alias_key(name, protocol);
+        let uuid = self.ns_aliases.get(&key)
+            .map(|r| *r.value())
+            .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", key)))?;
+        {
+            let record = self.ns_records.get(&uuid)
+                .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+            if record.owner != actor {
+                return Err(StoreError::Rejected(format!(
+                    "only owner {} can delete, actor is {}", record.owner, actor
+                )));
+            }
+        }
+        // Remove all aliases
+        if let Some(mut record) = self.ns_records.get_mut(&uuid) {
+            for alias_name in record.aliases.clone() {
+                self.ns_aliases.remove(&alias_name);
+                if let Some(ref proto) = record.protocol {
+                    let scoped = format!("{}:{}", proto, alias_name);
+                    self.ns_aliases.remove(&scoped);
+                }
+            }
+            record.tombstoned = true;
+        }
+        Ok(())
     }
 
     // -- Streaming upload (in-memory) -----------------------------------------
@@ -564,7 +779,7 @@ impl KappaStore for InMemoryStore {
         let id = uuid::Uuid::new_v4().to_string();
         let mut uploads = self.uploads.lock().unwrap();
         uploads.insert(id.clone(), UploadSession {
-            namespace: namespace.as_str().to_string(),
+            namespace: namespace.to_string(),
             data: Vec::new(),
             max_size,
             created_at: std::time::Instant::now(),
@@ -927,6 +1142,13 @@ impl KappaStore for InMemoryStore {
                 None => return Ok(chain),
             }
         }
+    }
+}
+
+fn alias_key(name: &str, protocol: Option<&str>) -> String {
+    match protocol {
+        Some(p) => format!("{}:{}", p, name),
+        None => name.to_string(),
     }
 }
 

@@ -17,7 +17,7 @@ use topcoat::router::{
 use kappa_core::events::EventLog;
 use kappa_core::types::NamespaceRef;
 
-use crate::{path_param, query_param};
+use crate::query_param;
 
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder.route(RouteFn::new(
@@ -30,7 +30,7 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn events_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let prefix = query_param(cx, "prefix");
         let since: u64 = query_param(cx, "since")
             .and_then(|s| s.parse().ok())

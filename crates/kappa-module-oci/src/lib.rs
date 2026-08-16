@@ -16,7 +16,8 @@ pub use helpers::MaxBlobSize;
 // Re-export helpers for use by handler modules via crate::
 pub(crate) use helpers::{
     evaluate_filters, oci_error, path_param, query_param, query_params_multi, read_body,
-    registry_anchor, store, store_err, validate_schemas,
+    registry_anchor, resolve_ns_read_async,
+    resolve_ns_write_async, store, store_err, validate_schemas,
 };
 
 /// Register all OCI distribution spec routes on the router builder.

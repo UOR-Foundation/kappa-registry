@@ -53,6 +53,22 @@ pub const NS_META: MultimapTableDefinition<&str, &str> =
 // Key: "{ns}"  Value: () (presence-only)
 pub const NAMESPACES: TableDefinition<&str, ()> = TableDefinition::new("namespaces");
 
+// -- Namespace aliases --------------------------------------------------------
+// Key: "{protocol}:{name}" or "{name}"  Value: 16-byte UUID
+pub const NAMESPACE_ALIASES: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("namespace_aliases");
+
+// -- Namespace records --------------------------------------------------------
+// Key: 16-byte UUID  Value: dCBOR/JSON-encoded NamespaceRecord
+pub const NAMESPACE_RECORDS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("namespace_records");
+
+// -- Alias history ------------------------------------------------------------
+// Key: [uuid:16][timestamp_be:8]  Value: JSON-encoded AliasEvent
+// Append-only audit log of alias changes (create, rename, delete, transfer).
+pub const ALIAS_HISTORY: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("alias_history");
+
 // -- Epoch current pointer ----------------------------------------------------
 // Key: "{ns}"  Value: "{kappa}" of the current epoch root
 pub const EPOCH_CURRENT: TableDefinition<&str, &str> =

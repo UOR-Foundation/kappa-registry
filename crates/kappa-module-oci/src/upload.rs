@@ -26,7 +26,7 @@ fn max_blob_size(cx: &Cx) -> u64 {
 pub fn start_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let digest = query_param(cx, "digest");
         let mount = query_param(cx, "mount");
 
@@ -348,7 +348,10 @@ async fn release_upload_pin(cx: &Cx, id: &str) {
     let upload_id = id.to_string();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(ns_str) = s.upload_namespace(&upload_id) {
-            let ns = NamespaceRef::from(ns_str);
+            let ns = match s.namespace_resolve(&ns_str, Some("oci")) {
+                Ok(n) => n,
+                Err(_) => return,
+            };
             let tag_name = format!("_upload/{}", upload_id);
             let _ = s.tag_delete(&ns, &tag_name);
         }

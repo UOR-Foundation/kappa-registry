@@ -125,7 +125,7 @@ fn blob_meta_delete() {
 #[test]
 fn tag_set_get() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     assert_eq!(store.tag_set(&ns, "latest", "sha256:aaa").unwrap(), 1);
     let e = store.tag_get(&ns, "latest").unwrap();
     assert_eq!(e.name, "latest");
@@ -136,7 +136,7 @@ fn tag_set_get() {
 #[test]
 fn tag_version_increments() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     assert_eq!(store.tag_set(&ns, "t", "sha256:a").unwrap(), 1);
     assert_eq!(store.tag_set(&ns, "t", "sha256:b").unwrap(), 2);
     assert_eq!(store.tag_set(&ns, "t", "sha256:c").unwrap(), 3);
@@ -145,7 +145,7 @@ fn tag_version_increments() {
 #[test]
 fn tag_delete_and_not_found() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     store.tag_set(&ns, "t", "sha256:a").unwrap();
     store.tag_delete(&ns, "t").unwrap();
     assert!(matches!(
@@ -157,7 +157,7 @@ fn tag_delete_and_not_found() {
 #[test]
 fn tag_list_sorted() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     store.tag_set(&ns, "c", "sha256:c").unwrap();
     store.tag_set(&ns, "a", "sha256:a").unwrap();
     store.tag_set(&ns, "b", "sha256:b").unwrap();
@@ -169,7 +169,7 @@ fn tag_list_sorted() {
 #[test]
 fn tag_prefix_filters() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     store.tag_set(&ns, "v1.0", "sha256:a").unwrap();
     store.tag_set(&ns, "v1.1", "sha256:b").unwrap();
     store.tag_set(&ns, "v2.0", "sha256:c").unwrap();
@@ -179,7 +179,7 @@ fn tag_prefix_filters() {
 #[test]
 fn tag_set_batch_all_or_nothing() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     store.tag_set(&ns, "a", "sha256:1").unwrap();
     let updates = vec![
         TagUpdate {
@@ -203,7 +203,7 @@ fn tag_set_batch_all_or_nothing() {
 #[test]
 fn tag_set_batch_unconditional() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let updates = vec![
         TagUpdate {
             name: "x".into(),
@@ -226,7 +226,7 @@ fn tag_set_batch_unconditional() {
 #[test]
 fn edge_put_query_outbound() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edge = Edge {
         source: "sha256:src".into(),
         target: "sha256:tgt".into(),
@@ -254,7 +254,7 @@ fn edge_put_query_outbound() {
 #[test]
 fn edge_put_query_inbound() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edge = Edge {
         source: "sha256:src".into(),
         target: "sha256:tgt".into(),
@@ -282,7 +282,7 @@ fn edge_put_query_inbound() {
 #[test]
 fn edge_query_filters_relation() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     store
         .edge_put(
             &ns,
@@ -327,7 +327,7 @@ fn edge_query_filters_relation() {
 #[test]
 fn edge_delete_cleans_indexes() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     store
         .edge_put(
             &ns,
@@ -363,7 +363,7 @@ fn edge_delete_cleans_indexes() {
 #[test]
 fn sequence_monotonic() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     assert_eq!(store.sequence_current(&ns, "epoch").unwrap(), 0);
     assert_eq!(store.sequence_next(&ns, "epoch").unwrap(), 1);
     assert_eq!(store.sequence_next(&ns, "epoch").unwrap(), 2);
@@ -374,8 +374,8 @@ fn sequence_monotonic() {
 #[test]
 fn sequence_isolated_by_namespace() {
     let (store, _dir) = test_store();
-    let ns1 = NamespaceRef::from("ns1");
-    let ns2 = NamespaceRef::from("ns2");
+    let ns1 = NamespaceRef::deterministic("ns1");
+    let ns2 = NamespaceRef::deterministic("ns2");
     store.sequence_next(&ns1, "seq").unwrap();
     store.sequence_next(&ns1, "seq").unwrap();
     assert_eq!(store.sequence_current(&ns1, "seq").unwrap(), 2);
@@ -387,7 +387,7 @@ fn sequence_isolated_by_namespace() {
 #[test]
 fn epoch_advance_and_get() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let mutations = vec![EpochMutation {
         op: MutationOp::TagSet,
         namespace: "ns".into(),
@@ -406,7 +406,7 @@ fn epoch_advance_and_get() {
 #[test]
 fn epoch_chain_links() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let k1 = store.epoch_advance(&ns, vec![]).unwrap();
     let k2 = store.epoch_advance(&ns, vec![]).unwrap();
     let r2 = store.epoch_get(&k2).unwrap();
@@ -417,7 +417,7 @@ fn epoch_chain_links() {
 #[test]
 fn epoch_current_tracks_latest() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     assert!(store.epoch_current(&ns).unwrap().is_none());
     let k1 = store.epoch_advance(&ns, vec![]).unwrap();
     assert_eq!(store.epoch_current(&ns).unwrap(), Some(k1));
@@ -466,11 +466,12 @@ fn blob_open_default_matches_blob_get() {
 #[test]
 fn namespace_tracked() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
-    assert!(!store.namespace_exists(&ns).unwrap());
+    let ns = NamespaceRef::deterministic("ns");
+    assert!(!store.namespace_exists("ns", None).unwrap());
     store.tag_set(&ns, "t", "sha256:a").unwrap();
-    assert!(store.namespace_exists(&ns).unwrap());
-    assert!(store.namespace_list().unwrap().contains(&"ns".to_string()));
+    assert!(store.namespace_exists("ns", None).unwrap());
+    let records = store.namespace_list(None).unwrap();
+    assert!(records.iter().any(|r| r.aliases.contains(&"ns".to_string())));
 }
 
 // -- Multi-axis ingest --------------------------------------------------------
@@ -562,7 +563,7 @@ fn test_store_with_timeout(timeout_secs: u64) -> (InMemoryStore, tempfile::TempD
 #[test]
 fn upload_put_part_on_expired_session() {
     let (store, _dir) = test_store_with_timeout(0);
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let id = store.upload_begin(&ns, 0).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let result = store.upload_put_part(&id, 0, b"data");
@@ -573,7 +574,7 @@ fn upload_put_part_on_expired_session() {
 fn upload_complete_on_expired_session() {
     // Use timeout 1 so put_part succeeds, then sleep past expiry
     let (store, _dir) = test_store_with_timeout(1);
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let id = store.upload_begin(&ns, 0).unwrap();
     store.upload_put_part(&id, 0, b"data").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -584,7 +585,7 @@ fn upload_complete_on_expired_session() {
 #[test]
 fn upload_bytes_received_on_expired_session() {
     let (store, _dir) = test_store_with_timeout(0);
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let id = store.upload_begin(&ns, 0).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(store.upload_bytes_received(&id).is_none());
@@ -593,7 +594,7 @@ fn upload_bytes_received_on_expired_session() {
 #[test]
 fn upload_namespace_on_expired_session() {
     let (store, _dir) = test_store_with_timeout(0);
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let id = store.upload_begin(&ns, 0).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(store.upload_namespace(&id).is_none());
@@ -602,7 +603,7 @@ fn upload_namespace_on_expired_session() {
 #[test]
 fn upload_evict_expired_returns_correct_count() {
     let (store, _dir) = test_store_with_timeout(0);
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     for _ in 0..5 {
         store.upload_begin(&ns, 0).unwrap();
     }
@@ -613,7 +614,7 @@ fn upload_evict_expired_returns_correct_count() {
 #[test]
 fn upload_evict_expired_preserves_active() {
     let (store, _dir) = test_store_with_timeout(10);
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     store.upload_begin(&ns, 0).unwrap();
     store.upload_begin(&ns, 0).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -643,14 +644,14 @@ fn compression_memory_store_roundtrip() {
 #[test]
 fn edge_put_batch_empty() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     store.edge_put_batch(&ns, &[]).unwrap();
 }
 
 #[test]
 fn edge_put_batch_single() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edge = Edge {
         source: "sha256:src".into(),
         target: "sha256:tgt".into(),
@@ -674,7 +675,7 @@ fn edge_put_batch_single() {
 #[test]
 fn edge_put_batch_multiple() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edges: Vec<Edge> = (0..10).map(|i| Edge {
         source: format!("sha256:src{i}"),
         target: format!("sha256:tgt{i}"),
@@ -699,7 +700,7 @@ fn edge_put_batch_multiple() {
 #[test]
 fn edge_put_batch_large() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edges: Vec<Edge> = (0..500).map(|i| Edge {
         source: "sha256:root".into(),
         target: format!("sha256:dep{i}"),
@@ -722,7 +723,7 @@ fn edge_put_batch_large() {
 #[test]
 fn edge_put_batch_mixed_relations() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edges = vec![
         Edge { source: "s".into(), target: "t1".into(), relation: EdgeRelation::Owns, asserter: "a".into(), value_kappa: None, metadata: None },
         Edge { source: "s".into(), target: "t2".into(), relation: EdgeRelation::DerivedFrom, asserter: "a".into(), value_kappa: None, metadata: None },
@@ -738,7 +739,7 @@ fn edge_put_batch_mixed_relations() {
 #[test]
 fn edge_put_batch_all_queryable_by_target() {
     let (store, _dir) = test_store();
-    let ns = NamespaceRef::from("ns");
+    let ns = NamespaceRef::deterministic("ns");
     let edges: Vec<Edge> = (0..5).map(|i| Edge {
         source: format!("sha256:src{i}"),
         target: "sha256:shared_target".into(),

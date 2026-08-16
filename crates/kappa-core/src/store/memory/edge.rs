@@ -45,7 +45,7 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
     let edge_kappa = kappa_from_bytes(&edge_bytes);
     store.ingest_compute(crate::kappa::Axis::Sha256, &edge_bytes)?;
 
-    let ns_hash = namespace_hash(ns.as_str());
+    let uuid = *ns.uuid();
     let ek_hash = item_hash(&edge_kappa);
 
     {
@@ -53,44 +53,44 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
             .edges
             .write()
             .unwrap()
-            .insert((ns_hash, ek_hash), edge.clone());
+            .insert((uuid, ek_hash), edge.clone());
     }
 
     fn push_index(
-        index: &RwLock<HashMap<(u64, u64), Vec<String>>>,
-        ns_hash: u64,
+        index: &RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
+        uuid: [u8; 16],
         key_hash: u64,
         edge_kappa: &str,
     ) {
         index
             .write()
             .unwrap()
-            .entry((ns_hash, key_hash))
+            .entry((uuid, key_hash))
             .or_default()
             .push(edge_kappa.to_string());
     }
 
     push_index(
         &store.fwd_index,
-        ns_hash,
+        uuid,
         item_hash(&edge.source),
         &edge_kappa,
     );
     push_index(
         &store.rev_index,
-        ns_hash,
+        uuid,
         item_hash(&edge.target),
         &edge_kappa,
     );
     push_index(
         &store.rel_index,
-        ns_hash,
+        uuid,
         relation_index(&edge.relation),
         &edge_kappa,
     );
     push_index(
         &store.asr_index,
-        ns_hash,
+        uuid,
         item_hash(&edge.asserter),
         &edge_kappa,
     );
@@ -103,7 +103,7 @@ pub(super) fn edge_query(
     ns: &NamespaceRef,
     query: &EdgeQuery,
 ) -> Result<Vec<Edge>, StoreError> {
-    let ns_hash = namespace_hash(ns.as_str());
+    let uuid = *ns.uuid();
     let anchor_hash = item_hash(&query.anchor);
 
     let kappas = match query.direction {
@@ -111,14 +111,14 @@ pub(super) fn edge_query(
             .fwd_index
             .read()
             .unwrap()
-            .get(&(ns_hash, anchor_hash))
+            .get(&(uuid, anchor_hash))
             .cloned()
             .unwrap_or_default(),
         Direction::Inbound => store
             .rev_index
             .read()
             .unwrap()
-            .get(&(ns_hash, anchor_hash))
+            .get(&(uuid, anchor_hash))
             .cloned()
             .unwrap_or_default(),
     };
@@ -127,7 +127,7 @@ pub(super) fn edge_query(
     let mut result = Vec::new();
     for ek in &kappas {
         let ek_hash = item_hash(ek);
-        if let Some(edge) = edges.get(&(ns_hash, ek_hash)) {
+        if let Some(edge) = edges.get(&(uuid, ek_hash)) {
             if let Some(ref rel) = query.relation {
                 if edge.relation != *rel {
                     continue;
@@ -151,18 +151,18 @@ pub(super) fn edge_delete(
     target: &str,
     relation: EdgeRelation,
 ) -> Result<(), StoreError> {
-    let ns_hash = namespace_hash(ns.as_str());
+    let uuid = *ns.uuid();
 
     // Find the edge kappa by scanning the source's forward index
     let edges = store.edges.read().unwrap();
     let edge_kappa = {
         let fwd = store.fwd_index.read().unwrap();
         let src_hash = item_hash(source);
-        let candidates = fwd.get(&(ns_hash, src_hash)).cloned().unwrap_or_default();
+        let candidates = fwd.get(&(uuid, src_hash)).cloned().unwrap_or_default();
         let mut found = None;
         for ek in &candidates {
             let ek_hash = item_hash(ek);
-            if let Some(edge) = edges.get(&(ns_hash, ek_hash)) {
+            if let Some(edge) = edges.get(&(uuid, ek_hash)) {
                 if edge.source == source && edge.target == target && edge.relation == relation {
                     found = Some(ek.clone());
                     break;
@@ -178,41 +178,41 @@ pub(super) fn edge_delete(
     };
 
     let ek_hash = item_hash(&edge_kappa);
-    let edge = store.edges.write().unwrap().remove(&(ns_hash, ek_hash));
+    let edge = store.edges.write().unwrap().remove(&(uuid, ek_hash));
 
     if let Some(edge) = edge {
         fn remove_from(
-            index: &RwLock<HashMap<(u64, u64), Vec<String>>>,
-            ns_hash: u64,
+            index: &RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
+            uuid: [u8; 16],
             key_hash: u64,
             kappa: &str,
         ) {
-            if let Some(vec) = index.write().unwrap().get_mut(&(ns_hash, key_hash)) {
+            if let Some(vec) = index.write().unwrap().get_mut(&(uuid, key_hash)) {
                 vec.retain(|k| k != kappa);
             }
         }
 
         remove_from(
             &store.fwd_index,
-            ns_hash,
+            uuid,
             item_hash(&edge.source),
             &edge_kappa,
         );
         remove_from(
             &store.rev_index,
-            ns_hash,
+            uuid,
             item_hash(&edge.target),
             &edge_kappa,
         );
         remove_from(
             &store.rel_index,
-            ns_hash,
+            uuid,
             relation_index(&edge.relation),
             &edge_kappa,
         );
         remove_from(
             &store.asr_index,
-            ns_hash,
+            uuid,
             item_hash(&edge.asserter),
             &edge_kappa,
         );

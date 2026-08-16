@@ -16,7 +16,7 @@ use topcoat::router::{
 use kappa_core::store::{blob_put_computed, KappaStore};
 use kappa_core::types::{Direction, EdgeQuery, NamespaceRef};
 
-use crate::{path_param, read_body, store};
+use crate::{read_body, store};
 
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder
@@ -45,7 +45,7 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn pin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         pin(cx, &ns, &bytes).await
     })
 }
@@ -53,7 +53,7 @@ fn pin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn unpin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         unpin(cx, &ns, &bytes).await
     })
 }
@@ -61,7 +61,7 @@ fn unpin_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn sweep_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         sweep(cx, &ns).await
     })
 }
@@ -69,7 +69,7 @@ fn sweep_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn status_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         status(cx, &ns).await
     })
 }

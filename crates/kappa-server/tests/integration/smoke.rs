@@ -319,6 +319,14 @@ fn test_sequence_next() {
 #[test]
 fn test_namespace_root() {
     let (guard, base) = start_server();
+    // Create namespace first
+    let content = br#"{"schemaVersion":2}"#;
+    client()
+        .put(format!("{}/v2/test/manifests/setup", base))
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(content.to_vec())
+        .send()
+        .unwrap();
     let resp = client()
         .get(format!("{}/v2/test/_root", base))
         .send()
@@ -385,6 +393,13 @@ fn test_gc_sweep() {
 #[test]
 fn test_events_sse() {
     let (guard, base) = start_server();
+    // Create namespace first
+    client()
+        .put(format!("{}/v2/test/manifests/setup", base))
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(br#"{"schemaVersion":2}"#.to_vec())
+        .send()
+        .unwrap();
     let resp = client()
         .get(format!("{}/v2/test/_events", base))
         .send()

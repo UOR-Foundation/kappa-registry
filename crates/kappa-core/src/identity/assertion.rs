@@ -91,8 +91,8 @@ pub fn assert_double_entry(
     let bytes_b = crate::canonical::canonical_bytes(assertion_b);
     let kappa_b = crate::kappa::kappa_from_bytes(&bytes_b);
 
-    let ns_a = NamespaceRef::from(assertion_a.asserter.as_str());
-    let ns_b = NamespaceRef::from(assertion_b.asserter.as_str());
+    let ns_a = NamespaceRef::deterministic(&assertion_a.asserter);
+    let ns_b = NamespaceRef::deterministic(&assertion_b.asserter);
 
     // Store both blobs
     store.ingest_verified(&kappa_a, &bytes_a)?;
@@ -245,7 +245,7 @@ mod tests {
         assert!(store.blob_exists(&kb).unwrap());
 
         // Asserter-a namespace has exactly one epoch (the double-entry)
-        let ns_a = NamespaceRef::from("asserter-a");
+        let ns_a = NamespaceRef::deterministic("asserter-a");
         let epoch_kappa = store.epoch_current(&ns_a).unwrap();
         assert!(epoch_kappa.is_some());
         let epoch = store.epoch_get(epoch_kappa.as_ref().unwrap()).unwrap();

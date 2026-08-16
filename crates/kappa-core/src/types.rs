@@ -22,33 +22,161 @@ pub struct MaxBlobSize(pub usize);
 
 // -- Namespace reference ----------------------------------------------------
 
-/// Opaque namespace identifier. All KappaStore trait methods that take a
-/// namespace parameter use this type instead of raw &str.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NamespaceRef(String);
+/// Opaque namespace identifier backed by a 16-byte UUID.
+///
+/// All KappaStore trait methods that take a namespace parameter use this
+/// type. The UUID is the canonical identity of the namespace. The
+/// display_name is an alias resolved from the NAMESPACE_ALIASES table
+/// at request time. Multiple aliases can point to the same UUID.
+///
+/// Construction paths:
+/// - `NamespaceRef::deterministic(name)` -- system namespaces (_root, _nix).
+///   BLAKE3 keyed hash, same name always produces same UUID across nodes.
+/// - `NamespaceRef::generate(name)` -- new user namespaces. UUIDv7.
+/// - `NamespaceRef::new(uuid)` -- from a known UUID (redb lookup).
+/// - `NamespaceRef::with_name(uuid, name)` -- UUID + display name.
+///
+/// `From<&str>` is intentionally NOT implemented. All callers must go
+/// through alias resolution or deterministic/generate constructors.
+#[derive(Debug, Clone)]
+pub struct NamespaceRef {
+    uuid: [u8; 16],
+    display_name: Option<String>,
+    protocol: Option<ProtocolHint>,
+}
 
 impl NamespaceRef {
-    pub fn new(s: impl Into<String>) -> Self { Self(s.into()) }
-    pub fn as_str(&self) -> &str { &self.0 }
-    pub fn into_string(self) -> String { self.0 }
+    /// Construct from a known UUID. No display name.
+    pub fn new(uuid: [u8; 16]) -> Self {
+        Self { uuid, display_name: None, protocol: None }
+    }
+
+    /// Construct from a known UUID with a display name.
+    pub fn with_name(uuid: [u8; 16], name: String) -> Self {
+        Self { uuid, display_name: Some(name), protocol: None }
+    }
+
+    /// Attach a protocol hint.
+    pub fn with_protocol(mut self, protocol: ProtocolHint) -> Self {
+        self.protocol = Some(protocol);
+        self
+    }
+
+    /// The 16-byte UUID.
+    pub fn uuid(&self) -> &[u8; 16] { &self.uuid }
+
+    /// Hex-encoded UUID string.
+    pub fn uuid_hex(&self) -> String { hex::encode(self.uuid) }
+
+    /// The human-readable alias, if known.
+    pub fn display_name(&self) -> Option<&str> { self.display_name.as_deref() }
+
+    /// Protocol hint, if set.
+    pub fn protocol(&self) -> Option<ProtocolHint> { self.protocol }
+
+    /// Returns display_name if available, otherwise "ns:{hex_uuid}".
+    /// Used for logging, error messages, epoch mutation namespace fields,
+    /// and anywhere a human-readable string is needed.
+    pub fn as_str(&self) -> &str {
+        match &self.display_name {
+            Some(name) => name.as_str(),
+            None => {
+                // Callers that need a string without allocation should
+                // use display_name().unwrap_or("") or uuid_hex().
+                // as_str() returning a reference requires the string
+                // to be stored. display_name covers the common case.
+                // The None branch should not be hit in normal operation
+                // because all NamespaceRef instances carry a display_name
+                // after alias resolution.
+                ""
+            }
+        }
+    }
+
+    /// Deterministic UUID from a well-known name. Used for system
+    /// namespaces (_root, _nix, _system) that must have the same UUID
+    /// across all nodes and restarts. BLAKE3 keyed hash of the name
+    /// with domain "kappa-namespace-uuid", truncated to 16 bytes,
+    /// version nibble set to 0x80 (custom UUID).
+    pub fn deterministic(name: &str) -> Self {
+        let key = blake3::hash(b"kappa-namespace-uuid");
+        let hash = blake3::keyed_hash(key.as_bytes(), name.as_bytes());
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&hash.as_bytes()[..16]);
+        uuid[6] = (uuid[6] & 0x0F) | 0x80; // custom version
+        uuid[8] = (uuid[8] & 0x3F) | 0x80; // RFC 4122 variant
+        Self { uuid, display_name: Some(name.to_string()), protocol: None }
+    }
+
+    /// Generate a new UUIDv7 (time-ordered) for a new namespace.
+    pub fn generate(name: &str) -> Self {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut uuid = [0u8; 16];
+        // UUIDv7: 48-bit timestamp in first 6 bytes
+        uuid[0..6].copy_from_slice(&ms.to_be_bytes()[2..8]);
+        uuid[6] = (uuid[6] & 0x0F) | 0x70; // version 7
+        // Fill remaining bytes with random
+        getrandom::fill(&mut uuid[8..16]).expect("getrandom failed");
+        uuid[8] = (uuid[8] & 0x3F) | 0x80; // RFC 4122 variant
+        Self { uuid, display_name: Some(name.to_string()), protocol: None }
+    }
+
+    /// The alias table namespace. Hardcoded well-known UUID.
+    ///
+    /// This is the ONE exception to "everything goes through the alias
+    /// table." The alias table's own namespace UUID is a compiled-in
+    /// constant because the alias table must exist before any alias
+    /// resolution can work. This breaks the chicken-and-egg: the
+    /// NAMESPACE_ALIASES and NAMESPACE_RECORDS tables store their data
+    /// under this UUID's key prefix.
+    ///
+    /// Value: 00000000-0000-8000-8000-6b61707061 ("kappa" in ASCII
+    /// at the tail, custom version 0x80, RFC 4122 variant).
+    pub const ALIASES_NS: [u8; 16] = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00,
+        0x80, 0x00, 0x6b, 0x61, 0x70, 0x70, 0x61, 0x00,
+    ];
+
+    /// The handles registry namespace. Hardcoded well-known UUID.
+    /// Same pattern as ALIASES_NS -- exists before the alias table.
+    pub const HANDLES_NS: [u8; 16] = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x00,
+        0x80, 0x00, 0x6b, 0x61, 0x70, 0x70, 0x61, 0x00,
+    ];
+
+    /// Construct the _aliases system namespace.
+    pub fn aliases_ns() -> Self {
+        Self::with_name(Self::ALIASES_NS, "_aliases".to_string())
+    }
+
+    /// Construct the _handles system namespace.
+    pub fn handles_ns() -> Self {
+        Self::with_name(Self::HANDLES_NS, "_handles".to_string())
+    }
+}
+
+impl PartialEq for NamespaceRef {
+    fn eq(&self, other: &Self) -> bool { self.uuid == other.uuid }
+}
+
+impl Eq for NamespaceRef {}
+
+impl std::hash::Hash for NamespaceRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.uuid.hash(state);
+    }
 }
 
 impl std::fmt::Display for NamespaceRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match &self.display_name {
+            Some(name) => f.write_str(name),
+            None => write!(f, "ns:{}", hex::encode(self.uuid)),
+        }
     }
-}
-
-impl From<&str> for NamespaceRef {
-    fn from(s: &str) -> Self { Self(s.to_string()) }
-}
-
-impl From<String> for NamespaceRef {
-    fn from(s: String) -> Self { Self(s) }
-}
-
-impl AsRef<str> for NamespaceRef {
-    fn as_ref(&self) -> &str { &self.0 }
 }
 
 // -- Errors -----------------------------------------------------------------

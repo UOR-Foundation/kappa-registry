@@ -168,6 +168,12 @@ impl PersistentStore {
                 .map_err(Self::redb_err)?;
             txn.open_table(tables::IDENTITY_SUCCESSIONS)
                 .map_err(Self::redb_err)?;
+            txn.open_table(tables::NAMESPACE_ALIASES)
+                .map_err(Self::redb_err)?;
+            txn.open_table(tables::NAMESPACE_RECORDS)
+                .map_err(Self::redb_err)?;
+            txn.open_table(tables::ALIAS_HISTORY)
+                .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
 
@@ -573,11 +579,87 @@ impl KappaStore for PersistentStore {
     ) -> Result<Box<dyn kappa_core::store::BlobReader>, StoreError> {
         self.blob_open_decompressed_impl(uncompressed_hash)
     }
-    fn namespace_list(&self) -> Result<Vec<String>, StoreError> {
-        self.namespace_list_impl()
+    fn namespace_create(
+        &self,
+        name: &str,
+        owner: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError> {
+        self.namespace_create_impl(name, owner, protocol)
     }
-    fn namespace_exists(&self, ns: &NamespaceRef) -> Result<bool, StoreError> {
-        self.namespace_exists_impl(ns.as_str())
+    fn namespace_resolve(
+        &self,
+        name: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError> {
+        self.namespace_resolve_impl(name, protocol)
+    }
+    fn namespace_resolve_or_create(
+        &self,
+        name: &str,
+        owner: &str,
+        protocol: Option<&str>,
+    ) -> Result<NamespaceRef, StoreError> {
+        match self.namespace_resolve_impl(name, protocol) {
+            Ok(ns) => Ok(ns),
+            Err(StoreError::NotFound(_)) => {
+                match self.namespace_create_impl(name, owner, protocol) {
+                    Ok(ns) => Ok(ns),
+                    // Concurrent creation race: another thread created it
+                    // between our resolve and create. Re-resolve.
+                    Err(StoreError::Conflict(_)) => self.namespace_resolve_impl(name, protocol),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn namespace_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.namespace_rename_impl(old_name, new_name, actor, protocol)
+    }
+    fn namespace_add_alias(
+        &self,
+        uuid: &[u8; 16],
+        alias: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.namespace_add_alias_impl(uuid, alias, actor, protocol)
+    }
+    fn namespace_transfer(
+        &self,
+        uuid: &[u8; 16],
+        new_owner: &str,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        self.namespace_transfer_impl(uuid, new_owner, actor)
+    }
+    fn namespace_info(
+        &self,
+        name: &str,
+        protocol: Option<&str>,
+    ) -> Result<kappa_core::store::NamespaceRecord, StoreError> {
+        self.namespace_info_impl(name, protocol)
+    }
+    fn namespace_list(&self, protocol: Option<&str>) -> Result<Vec<kappa_core::store::NamespaceRecord>, StoreError> {
+        self.namespace_list_impl_v2(protocol)
+    }
+    fn namespace_exists(&self, name: &str, protocol: Option<&str>) -> Result<bool, StoreError> {
+        self.namespace_exists_impl_v2(name, protocol)
+    }
+    fn namespace_delete(
+        &self,
+        name: &str,
+        actor: &str,
+        protocol: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.namespace_delete_impl(name, actor, protocol)
     }
     fn assertion_index_put(
         &self,
@@ -1269,7 +1351,7 @@ mod tests {
     #[test]
     fn tag_set_get() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         assert_eq!(s.tag_set(&ns, "latest", "sha256:aaa").unwrap(), 1);
         let e = s.tag_get(&ns, "latest").unwrap();
         assert_eq!(e.kappa, "sha256:aaa");
@@ -1279,7 +1361,7 @@ mod tests {
     #[test]
     fn tag_list_sorted() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         s.tag_set(&ns, "c", "k3").unwrap();
         s.tag_set(&ns, "a", "k1").unwrap();
         s.tag_set(&ns, "b", "k2").unwrap();
@@ -1291,7 +1373,7 @@ mod tests {
     #[test]
     fn tag_survives_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         {
             let s = reopen(tmp.path());
             let k = blob_put_computed(&s, b"persist").unwrap();
@@ -1309,7 +1391,7 @@ mod tests {
     #[test]
     fn edge_put_query() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let edge = Edge {
             source: "sha256:src".into(),
             target: "sha256:tgt".into(),
@@ -1337,7 +1419,7 @@ mod tests {
     #[test]
     fn edge_survives_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         {
             let s = reopen(tmp.path());
             s.edge_put(
@@ -1375,7 +1457,7 @@ mod tests {
     #[test]
     fn sequence_survives_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         {
             let s = reopen(tmp.path());
             for _ in 0..5 {
@@ -1394,15 +1476,16 @@ mod tests {
     #[test]
     fn namespace_survives_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let ns = NamespaceRef::from("test-ns");
         {
             let s = reopen(tmp.path());
+            let ns = s.namespace_resolve_or_create("test-ns", "owner", None).unwrap();
             s.tag_set(&ns, "t", "k").unwrap();
         }
         {
             let s = reopen(tmp.path());
-            assert!(s.namespace_exists(&ns).unwrap());
-            assert!(s.namespace_list().unwrap().contains(&"test-ns".to_string()));
+            assert!(s.namespace_exists("test-ns", None).unwrap());
+            let records = s.namespace_list(None).unwrap();
+            assert!(records.iter().any(|r| r.aliases.contains(&"test-ns".to_string())));
         }
     }
 
@@ -1411,7 +1494,7 @@ mod tests {
     #[test]
     fn epoch_survives_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let epoch_k;
         {
             let s = reopen(tmp.path());
@@ -1430,7 +1513,7 @@ mod tests {
     #[test]
     fn meta_query_survives_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         {
             let s = reopen(tmp.path());
             let k = blob_put_computed(&s, b"mq").unwrap();
@@ -1515,7 +1598,7 @@ mod tests {
     #[test]
     fn upload_lifecycle_begin_put_complete() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("test-ns");
+        let ns = NamespaceRef::deterministic("test-ns");
         let content = b"streaming upload test content";
         let digest = kappa_from_bytes(content);
 
@@ -1539,7 +1622,7 @@ mod tests {
     #[test]
     fn upload_abort_cleans_up() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("test-ns");
+        let ns = NamespaceRef::deterministic("test-ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         s.upload_put_part(&id, 0, b"some data").unwrap();
         s.upload_abort(&id).unwrap();
@@ -1551,7 +1634,7 @@ mod tests {
     #[test]
     fn upload_wrong_digest_rejected() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("test-ns");
+        let ns = NamespaceRef::deterministic("test-ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         s.upload_put_part(&id, 0, b"real content").unwrap();
         let wrong = format!("sha256:{}", "0".repeat(64));
@@ -1562,7 +1645,7 @@ mod tests {
     #[test]
     fn upload_out_of_order_rejected() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("test-ns");
+        let ns = NamespaceRef::deterministic("test-ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         s.upload_put_part(&id, 0, b"first").unwrap();
         let result = s.upload_put_part(&id, 10, b"wrong");
@@ -1572,7 +1655,7 @@ mod tests {
     #[test]
     fn upload_size_limit_enforced() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("test-ns");
+        let ns = NamespaceRef::deterministic("test-ns");
         let id = s.upload_begin(&ns, 10).unwrap();
         s.upload_put_part(&id, 0, b"12345").unwrap();
         let result = s.upload_put_part(&id, 5, b"678901");
@@ -1582,7 +1665,7 @@ mod tests {
     #[test]
     fn upload_evict_expired() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("test-ns");
+        let ns = NamespaceRef::deterministic("test-ns");
         let _id = s.upload_begin(&ns, 0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         let evicted = s.upload_evict_expired(0);
@@ -1606,7 +1689,7 @@ mod tests {
     #[test]
     fn upload_lifecycle_encrypted() {
         let (s, _d) = new_encrypted_store();
-        let ns = NamespaceRef::from("test-ns");
+        let ns = NamespaceRef::deterministic("test-ns");
         let content = b"encrypted streaming upload test content here";
         let digest = kappa_from_bytes(content);
 
@@ -1635,7 +1718,7 @@ mod tests {
     #[test]
     fn upload_encrypted_wrong_digest_rejected() {
         let (s, _d) = new_encrypted_store();
-        let ns = NamespaceRef::from("test-ns");
+        let ns = NamespaceRef::deterministic("test-ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         s.upload_put_part(&id, 0, b"real content").unwrap();
         let wrong = format!("sha256:{}", "0".repeat(64));
@@ -1660,7 +1743,7 @@ mod tests {
     #[test]
     fn upload_put_part_on_expired_session() {
         let (s, _d) = new_store_with_timeout(0);
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         let result = s.upload_put_part(&id, 0, b"data");
@@ -1670,7 +1753,7 @@ mod tests {
     #[test]
     fn upload_complete_on_expired_session() {
         let (s, _d) = new_store_with_timeout(1);
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         s.upload_put_part(&id, 0, b"data").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -1681,7 +1764,7 @@ mod tests {
     #[test]
     fn upload_bytes_received_on_expired_session() {
         let (s, _d) = new_store_with_timeout(0);
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(s.upload_bytes_received(&id).is_none());
@@ -1690,7 +1773,7 @@ mod tests {
     #[test]
     fn upload_namespace_on_expired_session() {
         let (s, _d) = new_store_with_timeout(0);
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(s.upload_namespace(&id).is_none());
@@ -1699,7 +1782,7 @@ mod tests {
     #[test]
     fn upload_evict_expired_returns_correct_count() {
         let (s, _d) = new_store_with_timeout(0);
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         for _ in 0..5 {
             s.upload_begin(&ns, 0).unwrap();
         }
@@ -1710,7 +1793,7 @@ mod tests {
     #[test]
     fn upload_evict_expired_preserves_active() {
         let (s, _d) = new_store_with_timeout(10);
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         s.upload_begin(&ns, 0).unwrap();
         s.upload_begin(&ns, 0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1720,7 +1803,7 @@ mod tests {
     #[test]
     fn upload_staging_file_removed_on_expiry_eviction() {
         let (s, _d) = new_store_with_timeout(1);
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let id = s.upload_begin(&ns, 0).unwrap();
         s.upload_put_part(&id, 0, b"staging data").unwrap();
         let staging_path = s.staging_root.join(&id);
@@ -1735,14 +1818,14 @@ mod tests {
     #[test]
     fn edge_put_batch_empty() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         s.edge_put_batch(&ns, &[]).unwrap();
     }
 
     #[test]
     fn edge_put_batch_single() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let edge = Edge {
             source: "sha256:bsrc".into(), target: "sha256:btgt".into(),
             relation: EdgeRelation::Owns, asserter: "a".into(),
@@ -1756,7 +1839,7 @@ mod tests {
     #[test]
     fn edge_put_batch_multiple() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let edges: Vec<Edge> = (0..10).map(|i| Edge {
             source: format!("sha256:bs{i}"), target: format!("sha256:bt{i}"),
             relation: EdgeRelation::RefersTo, asserter: "a".into(),
@@ -1772,7 +1855,7 @@ mod tests {
     #[test]
     fn edge_put_batch_large() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let edges: Vec<Edge> = (0..500).map(|i| Edge {
             source: "sha256:broot".into(), target: format!("sha256:bdep{i}"),
             relation: EdgeRelation::RefersTo, asserter: "a".into(),
@@ -1786,7 +1869,7 @@ mod tests {
     #[test]
     fn edge_put_batch_mixed_relations() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let edges = vec![
             Edge { source: "s".into(), target: "t1".into(), relation: EdgeRelation::Owns, asserter: "a".into(), value_kappa: None, metadata: None },
             Edge { source: "s".into(), target: "t2".into(), relation: EdgeRelation::DerivedFrom, asserter: "a".into(), value_kappa: None, metadata: None },
@@ -1800,7 +1883,7 @@ mod tests {
     #[test]
     fn edge_put_batch_all_queryable_by_target() {
         let (s, _d) = new_store();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         let edges: Vec<Edge> = (0..5).map(|i| Edge {
             source: format!("sha256:bsrc{i}"), target: "sha256:bshared".into(),
             relation: EdgeRelation::RefersTo, asserter: "a".into(),
@@ -1814,7 +1897,7 @@ mod tests {
     #[test]
     fn edge_put_batch_survives_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let ns = NamespaceRef::from("ns");
+        let ns = NamespaceRef::deterministic("ns");
         {
             let s = reopen(tmp.path());
             let edges: Vec<Edge> = (0..3).map(|i| Edge {

@@ -59,6 +59,49 @@ pub fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
     app_context::<Arc<dyn KappaStore>>(cx)
 }
 
+/// Resolve a namespace for write operations (PUT/POST/PATCH/DELETE).
+/// Creates the namespace on first use (first-writer-claims).
+/// Must be called inside spawn_blocking or from a blocking context.
+pub fn resolve_ns_write(store: &dyn KappaStore, name: &str, owner: &str) -> Result<NamespaceRef, kappa_core::StoreError> {
+    store.namespace_resolve_or_create(name, owner, Some("oci"))
+}
+
+/// Resolve a namespace for read operations (GET/HEAD).
+/// Returns NotFound if the namespace does not exist.
+/// Does NOT create the namespace -- prevents namespace squatting via pulls.
+/// Must be called inside spawn_blocking or from a blocking context.
+pub fn resolve_ns_read(store: &dyn KappaStore, name: &str) -> Result<NamespaceRef, kappa_core::StoreError> {
+    store.namespace_resolve(name, Some("oci"))
+}
+
+/// Resolve a namespace from request context for write paths.
+/// Extracts namespace name from path params and asserter from caller identity.
+/// Returns the resolved NamespaceRef via spawn_blocking.
+pub async fn resolve_ns_write_async(cx: &Cx) -> topcoat::Result<NamespaceRef> {
+    let s = store(cx).clone();
+    let name = path_param(cx, "ns").to_string();
+    let owner = registry_anchor(cx);
+    tokio::task::spawn_blocking(move || {
+        s.namespace_resolve_or_create(&name, &owner, Some("oci"))
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(store_err)
+}
+
+/// Resolve a namespace from request context for read paths.
+/// Returns topcoat not_found error if namespace does not exist.
+pub async fn resolve_ns_read_async(cx: &Cx) -> topcoat::Result<NamespaceRef> {
+    let s = store(cx).clone();
+    let name = path_param(cx, "ns").to_string();
+    tokio::task::spawn_blocking(move || {
+        s.namespace_resolve(&name, Some("oci"))
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(store_err)
+}
+
 /// Get the registry's own anchor for edge asserter field.
 pub fn registry_anchor(cx: &Cx) -> String {
     // Prefer the authenticated caller's identity from request context.

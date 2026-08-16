@@ -39,7 +39,7 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn register_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let scope = path_param(cx, "filter_key");
         register_filter(cx, &ns, scope, &bytes).await
     })
@@ -48,7 +48,7 @@ fn register_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         list(cx, &ns).await
     })
 }
@@ -56,7 +56,7 @@ fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let kappa = path_param(cx, "filter_key");
         delete(cx, &ns, kappa).await
     })

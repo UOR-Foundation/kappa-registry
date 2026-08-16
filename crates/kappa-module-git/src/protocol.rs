@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn ref_advertisement_empty_repo() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("test-repo");
+        let ns = NamespaceRef::deterministic("test-repo");
         let mut output = Vec::new();
         write_ref_advertisement(&*store, &ns, "git-upload-pack", &mut output, gix_hash::Kind::Sha1).unwrap();
 
@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn ref_advertisement_with_refs() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo");
+        let ns = NamespaceRef::deterministic("repo");
         refs::update_ref(&*store, &ns, "refs/heads/main", "sha1:aabbccddee", None).unwrap();
         refs::set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/main").unwrap();
 
@@ -1190,7 +1190,7 @@ mod tests {
         let commit = store_git_commit(&*store, &tree, &[], "initial commit");
 
         let (need, _shallows) = compute_need_set(
-            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit)], &HashSet::new(), gix_hash::Kind::Sha1,
+            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit)], &HashSet::new(), gix_hash::Kind::Sha1,
             &FetchOptions::default(),
         );
 
@@ -1220,7 +1220,7 @@ mod tests {
         let mut common = HashSet::new();
         common.insert(hex_oid(&commit1));
         let (need, _shallows) = compute_need_set(
-            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit2)], &common, gix_hash::Kind::Sha1,
+            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit2)], &common, gix_hash::Kind::Sha1,
             &FetchOptions::default(),
         );
 
@@ -1248,7 +1248,7 @@ mod tests {
             ..Default::default()
         };
         let (need, shallows) = compute_need_set(
-            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit3)], &HashSet::new(),
+            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit3)], &HashSet::new(),
             gix_hash::Kind::Sha1, &opts,
         );
 
@@ -1276,7 +1276,7 @@ mod tests {
             ..Default::default()
         };
         let (need, shallows) = compute_need_set(
-            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit3)], &HashSet::new(),
+            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit3)], &HashSet::new(),
             gix_hash::Kind::Sha1, &opts,
         );
 
@@ -1302,7 +1302,7 @@ mod tests {
             ..Default::default()
         };
         let (need, _) = compute_need_set(
-            &*store, &NamespaceRef::from("repo"), &[hex_oid(&commit)], &HashSet::new(),
+            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit)], &HashSet::new(),
             gix_hash::Kind::Sha1, &opts,
         );
 
@@ -1458,7 +1458,7 @@ mod tests {
         let commit = store_git_commit_sha256(&*store, &tree, &[], "init");
         let commit_hex = kappa_to_hex_oid(&commit);
 
-        let ns = NamespaceRef::from("repo256");
+        let ns = NamespaceRef::deterministic("repo256");
         refs::update_ref(&*store, &ns, "refs/heads/main", &commit, None).unwrap();
         refs::set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/main").unwrap();
 
@@ -1479,7 +1479,7 @@ mod tests {
         let commit = store_git_commit_sha256(&*store, &tree, &[], "sha256 commit");
 
         let (need, _shallows) = compute_need_set(
-            &*store, &NamespaceRef::from("repo256"), &[hex_oid(&commit)], &HashSet::new(),
+            &*store, &NamespaceRef::deterministic("repo256"), &[hex_oid(&commit)], &HashSet::new(),
             gix_hash::Kind::Sha256, &FetchOptions::default(),
         );
 
@@ -1510,7 +1510,7 @@ mod tests {
     fn repo_object_format_default_sha1() {
         let (store, _tmp) = test_store();
         // No _config/object_format tag -- defaults to SHA-1
-        let ns = NamespaceRef::from("newrepo");
+        let ns = NamespaceRef::deterministic("newrepo");
         let kind = match store.tag_get(&ns, "_config/object_format") {
             Ok(entry) => match entry.kappa.as_str() {
                 "sha256" => gix_hash::Kind::Sha256,
@@ -1524,7 +1524,7 @@ mod tests {
     #[test]
     fn repo_object_format_stored_sha256() {
         let (store, _tmp) = test_store();
-        let ns = NamespaceRef::from("repo256");
+        let ns = NamespaceRef::deterministic("repo256");
         store.tag_set(&ns, "_config/object_format", "sha256").unwrap();
         let kind = match store.tag_get(&ns, "_config/object_format") {
             Ok(entry) => match entry.kappa.as_str() {

@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use kappa_core::types::NamespaceRef;
 use topcoat::context::{app_context, try_app_context, CxBuilder};
 use topcoat::router::{Body, Next, Response, StatusCode};
 
@@ -48,10 +47,11 @@ pub fn auth_layer<'a>(
                 if !matches!(op, OpClass::Exempt) {
                     let store = app_context::<Arc<dyn KappaStore>>(cx);
                     let s = store.clone();
-                    let ns_owned = NamespaceRef::from(ns.clone());
+                    let ns_name = ns.clone();
                     let asserter_owned = asserter.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        authorize(&*s, &ns_owned, op, &asserter_owned)
+                        // /v2/ paths are OCI protocol scope
+                        authorize(&*s, &ns_name, Some("oci"), op, &asserter_owned)
                     })
                     .await;
 

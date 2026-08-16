@@ -39,7 +39,7 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn register_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let scope = path_param(cx, "scope");
         register_schema(cx, &ns, scope, &bytes).await
     })
@@ -48,7 +48,7 @@ fn register_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let scope = path_param(cx, "scope");
         get(cx, &ns, scope).await
     })
@@ -57,7 +57,7 @@ fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = NamespaceRef::from(path_param(cx, "ns"));
+        let ns = crate::resolve_ns_read_async(cx).await?;
         list(cx, &ns).await
     })
 }

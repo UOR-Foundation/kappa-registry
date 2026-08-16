@@ -83,7 +83,8 @@ echo "5 files uploaded"
 
 echo ""
 echo "=== list with prefix (raw XML) ==="
-curl -s "$ENDPOINT/testbucket?list-type=2&prefix=dir/&delimiter=/" | xxd | head -30
+XML_RESPONSE=$(curl -s "$ENDPOINT/testbucket?list-type=2&prefix=dir/&delimiter=/")
+echo "$XML_RESPONSE" | xxd | head -30
 echo ""
 echo "=== list with prefix (aws cli) ==="
 $AWS s3 ls s3://testbucket/dir/ 2>&1 || echo "s3 ls prefix exit: $?"

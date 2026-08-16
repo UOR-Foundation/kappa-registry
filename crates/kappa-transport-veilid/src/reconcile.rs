@@ -18,7 +18,6 @@ use std::sync::Arc;
 use kappa_core::membership::MembershipView;
 use kappa_core::store::KappaStore;
 use kappa_core::transport::PeerTransport;
-use kappa_core::types::NamespaceRef;
 use kappa_reconcile::NamespaceMst;
 
 /// Protocol bytes.
@@ -95,13 +94,16 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
         let peers = self.membership.members();
         let self_id = self.membership.self_id().to_string();
 
-        let namespaces = match self.store.namespace_list() {
+        let ns_records = match self.store.namespace_list(None) {
             Ok(ns) => ns,
             Err(e) => {
                 report.errors.push(("self".into(), e.to_string()));
                 return report;
             }
         };
+        let namespaces: Vec<String> = ns_records.iter()
+            .flat_map(|r| r.aliases.first().cloned())
+            .collect();
 
         for peer in &peers {
             if peer.id == self_id || !peer.healthy {
@@ -132,7 +134,10 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
                 };
 
                 // Compare with local
-                let ns_ref = NamespaceRef::from(ns.as_str());
+                let ns_ref = match self.store.namespace_resolve(ns.as_str(), None) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
                 let local_kappa = self.store.epoch_current(&ns_ref).unwrap_or(None);
                 if local_kappa.as_deref() == Some(&remote.root_kappa) {
                     continue; // identical
@@ -196,18 +201,25 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
     pub fn build_msts(
         &self,
     ) -> Result<BTreeMap<String, NamespaceMst>, kappa_core::types::StoreError> {
-        let namespaces = self.store.namespace_list()?;
+        let ns_records = self.store.namespace_list(None)?;
         let mut msts = BTreeMap::new();
-        for ns in &namespaces {
-            let ns_ref = NamespaceRef::from(ns.as_str());
+        for record in &ns_records {
+            let name = match record.aliases.first() {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            let ns_ref = match self.store.namespace_resolve(&name, None) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             let tags = self.store.tag_list(&ns_ref)?;
             let mut tag_map = BTreeMap::new();
             for tag in &tags {
                 tag_map.insert(tag.name.clone(), tag.kappa.clone());
             }
-            let mut mst = NamespaceMst::new(ns.clone());
+            let mut mst = NamespaceMst::new(name.clone());
             mst.rebuild(&tag_map);
-            msts.insert(ns.clone(), mst);
+            msts.insert(name, mst);
         }
         Ok(msts)
     }
@@ -264,7 +276,17 @@ pub fn handle_reconcile_request(
         PROTO_EPOCH_ROOT_REQ => {
             let namespace_str = std::str::from_utf8(&request[1..])
                 .map_err(|e| format!("invalid namespace utf8: {e}"))?;
-            let namespace = NamespaceRef::from(namespace_str);
+            let namespace = match store.namespace_resolve(namespace_str, None) {
+                Ok(r) => r,
+                Err(_) => return Ok({
+                    let resp = EpochRootResponse { epoch_number: 0, root_kappa: String::new() };
+                    let mut resp_bytes = vec![PROTO_EPOCH_ROOT_RESP];
+                    resp_bytes.extend_from_slice(
+                        &postcard::to_stdvec(&resp).map_err(|e| format!("encode: {e}"))?,
+                    );
+                    resp_bytes
+                }),
+            };
 
             let (epoch_number, root_kappa) = match store.epoch_current(&namespace) {
                 Ok(Some(ref ek)) => match store.epoch_get(ek) {
@@ -290,7 +312,8 @@ pub fn handle_reconcile_request(
             let req: DiffPullRequest = postcard::from_bytes(&request[1..])
                 .map_err(|e| format!("decode: {e}"))?;
 
-            let req_ns = NamespaceRef::from(req.namespace.as_str());
+            let req_ns = store.namespace_resolve(req.namespace.as_str(), None)
+                .map_err(|e| format!("namespace resolve: {e}"))?;
             let tags = if req.tag_names.is_empty() {
                 store
                     .tag_list(&req_ns)

@@ -75,9 +75,15 @@ fn auth_required_rejects_without_token() {
 
 #[test]
 fn auth_required_accepts_with_token() {
-    // FAILS UNTIL: BearerAuth middleware implemented
     let (guard, base, _tmp) = authed_server();
     let c = client();
+    // Create namespace first with auth token
+    c.put(format!("{}/v2/auth-ns/manifests/setup", base))
+        .header("Authorization", "Bearer test-secret-token")
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(br#"{"schemaVersion":2}"#.to_vec())
+        .send()
+        .unwrap();
     let resp = c
         .get(format!("{}/v2/auth-ns/tags/list", base))
         .header("Authorization", "Bearer test-secret-token")
@@ -147,6 +153,8 @@ fn auth_exempt_health() {
 fn auth_not_required_allows_all() {
     let (guard, base, _tmp) = start_server();
     let c = client();
+    // Create namespace first -- namespaces must exist before reading
+    push_manifest(&c, &base, "noauth", "setup", br#"{"schemaVersion":2}"#);
     let resp = c
         .get(format!("{}/v2/noauth/tags/list", base))
         .send()
@@ -161,9 +169,15 @@ fn auth_not_required_allows_all() {
 
 #[test]
 fn auth_multiple_tokens_all_valid() {
-    // FAILS UNTIL: BearerAuth middleware implemented
     let (guard, base, _tmp) = authed_server();
     let c = client();
+    // Create namespace first
+    c.put(format!("{}/v2/multi/manifests/setup", base))
+        .header("Authorization", "Bearer test-secret-token")
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(br#"{"schemaVersion":2}"#.to_vec())
+        .send()
+        .unwrap();
 
     let resp1 = c
         .get(format!("{}/v2/multi/tags/list", base))
@@ -286,12 +300,9 @@ fn auth_delete_requires_token() {
 
 #[test]
 fn auth_layer_before_ratelimit() {
-    // FAILS UNTIL: BearerAuth middleware implemented and layered before ratelimit
-    //
     // Uses 60000ms period (60s) to avoid timing sensitivity from GCRA replenishment.
     // Governor replenishes tokens continuously. With a 1s period, tokens replenish
     // during the test. 60s ensures no replenishment during the test window.
-    // Ref: tower-governor/src/tests.rs:108-165
     let (guard, base, _tmp) = start_server_with_env(&[
         ("KAPPA_AUTH_REQUIRED", "true"),
         ("KAPPA_AUTH_TOKENS", &format!("rate-test-token={}", anchor_from_seed(&[3u8; 32]))),
@@ -299,6 +310,13 @@ fn auth_layer_before_ratelimit() {
         ("KAPPA_RATELIMIT_READ_BURST", "3"),
     ]);
     let c = client();
+    // Create namespace first
+    c.put(format!("{}/v2/rl-auth/manifests/setup", base))
+        .header("Authorization", "Bearer rate-test-token")
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(br#"{"schemaVersion":2}"#.to_vec())
+        .send()
+        .unwrap();
 
     // 5 unauthenticated requests -- all should be 401, NOT 429
     // If auth runs before ratelimit, no tokens are consumed.
@@ -352,6 +370,14 @@ fn auth_token_from_file() {
     ]);
     let c = client();
 
+    // Create namespace first
+    c.put(format!("{}/v2/file-auth/manifests/setup", base))
+        .header("Authorization", "Bearer file-token-one")
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(br#"{"schemaVersion":2}"#.to_vec())
+        .send()
+        .unwrap();
+
     let resp = c
         .get(format!("{}/v2/file-auth/tags/list", base))
         .header("Authorization", "Bearer file-token-one")
@@ -381,11 +407,11 @@ fn auth_empty_token_list_allows_all() {
     // Rationale: no tokens configured means authentication cannot be performed,
     // so the server operates in open mode. The alternative (deny all) would
     // brick a misconfigured server with no recovery path.
-    // If this decision is wrong, change this test to expect 401.
-    // FAILS UNTIL: BearerAuth middleware implemented
     let (guard, base, _tmp) =
         start_server_with_env(&[("KAPPA_AUTH_REQUIRED", "true"), ("KAPPA_AUTH_TOKENS", "")]);
     let c = client();
+    // Create namespace first
+    push_manifest(&c, &base, "empty-auth", "setup", br#"{"schemaVersion":2}"#);
     let resp = c
         .get(format!("{}/v2/empty-auth/tags/list", base))
         .send()
