@@ -1227,6 +1227,31 @@ impl KappaStore for PersistentStore {
             ).map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
+
+        // Create watermark voiding old anchor's assertions.
+        // KeyCompromise: void everything (timestamp 0).
+        // Other reasons: void assertions before effective_at.
+        let watermark_ts = if succession.reason == "key-compromise" {
+            0u64
+        } else {
+            succession.effective_at_ms
+        };
+        {
+            let now_ms = self.clock.now_ms();
+            let watermark = kappa_core::identity::watermark::Watermark {
+                asserter: succession.old_anchor.clone(),
+                invalidate_before_ms: watermark_ts,
+                reason: format!("{} succession", succession.reason),
+                set_at_ms: now_ms,
+            };
+            let wm_bytes = kappa_core::canonical::canonical_bytes(&watermark);
+            let wm_kappa = kappa_core::kappa::kappa_from_bytes(&wm_bytes);
+            let _ = self.ingest_verified(&wm_kappa, &wm_bytes);
+            // Tag under the asserter's anchor namespace so resolve_handler finds it
+            let wm_tag = format!("watermark/{}", wm_kappa);
+            let _ = self.tag_set_impl(&succession.old_anchor, &wm_tag, &wm_kappa);
+        }
+
         Ok(kappa)
     }
 

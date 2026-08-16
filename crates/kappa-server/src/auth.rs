@@ -15,7 +15,7 @@ use std::sync::RwLock;
 
 use kappa_core::identity::assertion::IdentityAssertion;
 use kappa_core::store::KappaStore;
-use kappa_core::types::{DelegationScope, Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef, StoreError};
+use kappa_core::types::{DelegationScope, Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef, ResolvedNamespace, StoreError};
 
 use crate::ratelimit::OpClass;
 
@@ -39,172 +39,174 @@ pub fn is_reserved(ns: &str) -> bool {
     RESERVED_PREFIXES.iter().any(|r| ns.starts_with(r))
 }
 
+#[derive(Debug, Clone)]
+pub enum AuthDecision {
+    Allowed,
+    AllowCreateNew,
+    AllowedViaDelegation,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("forbidden: {reason}")]
     Forbidden { reason: String },
+    #[error("not found")]
+    NotFound,
     #[error("store error during auth check: {0}")]
     Store(#[from] StoreError),
 }
 
 /// Authorize an operation on a namespace.
 ///
-/// - Exempt operations always pass (health checks, version).
-/// - Non-reserved namespaces always pass (open by default).
-/// - Reserved namespaces require a capability edge from the namespace
-///   authority granting the asserter the requested op class. This
-///   includes reads -- reserved content is not public.
+/// Takes the already-resolved namespace from the interceptor layer.
+/// The _root authority check resolves _root internally (it's the
+/// authority namespace, not the request namespace).
 ///
-/// Namespace hierarchy: if `ns` contains '/', the authorization check
-/// walks up the hierarchy. A capability edge on "org" grants access to
-/// "org/team" and "org/team/repo". The first match wins. This enables
-/// organization-level capability grants that apply to all sub-namespaces.
+/// Returns AuthDecision::AllowCreateNew when a write targets a
+/// non-reserved namespace that doesn't exist yet (first-writer-claims).
+/// The handler creates the namespace; the auth layer never does.
 pub fn authorize(
     store: &dyn KappaStore,
-    ns_name: &str,
-    protocol: Option<&str>,
+    ns: &ResolvedNamespace,
     op: OpClass,
     asserter: &str,
-) -> Result<(), AuthError> {
+) -> Result<AuthDecision, AuthError> {
     if matches!(op, OpClass::Exempt) {
-        return Ok(());
+        return Ok(AuthDecision::Allowed);
     }
 
-    // Root: capability edge on _root grants access to any namespace.
-    // Checked BEFORE namespace resolution -- a caller with _root authority
-    // can operate on namespaces that don't exist yet (they will be created
-    // by the handler). The _root namespace is bootstrapped at server start
-    // and always exists.
-    let root_ns = store.namespace_resolve("_root", None)
-        .map_err(|e| AuthError::Store(e))?;
-    let admin_query = EdgeQuery {
-        anchor: asserter.to_string(),
-        direction: Direction::Outbound,
-        relation: Some(EdgeRelation::Capability),
-        asserter: Some(asserter.to_string()),
-    };
-    if let Ok(edges) = store.edge_query(&root_ns, &admin_query) {
-        if edges.iter().any(|e| cap_permits(e, op)) {
-            return Ok(());
-        }
-    }
-
-    // Delegation chain walk on _root: check if asserter has delegated
-    // authority from _root. Checked BEFORE namespace resolution for the
-    // same reason as the direct _root check.
-    if check_delegation(store, &root_ns, op, asserter, 0)? {
-        return Ok(());
-    }
-
-    // Resolve the target namespace. If it doesn't exist, deny for reserved
-    // namespaces (no capability edges can exist on a nonexistent namespace),
-    // allow for non-reserved (first-writer-claims).
-    let ns = match store.namespace_resolve(ns_name, protocol) {
-        Ok(r) => r,
-        Err(_) => {
-            if is_reserved(ns_name) {
-                return Err(AuthError::Forbidden {
-                    reason: format!(
-                        "reserved namespace '{}' does not exist and caller lacks _root authority",
-                        ns_name
-                    ),
-                });
-            } else {
-                // Non-reserved, namespace doesn't exist yet.
-                // First-writer-claims: the handler will create it.
-                return Ok(());
-            }
-        }
-    };
-
-    // Non-reserved namespace: first-writer-claims model.
-    // If no capability edges exist for this namespace, it is unclaimed
-    // and anyone can write. Once claimed, only holders of capability
-    // edges can access it.
-    if !is_reserved(ns_name) {
-        let any_caps_query = EdgeQuery {
-            anchor: String::new(),
-            direction: Direction::Outbound,
-            relation: Some(EdgeRelation::Capability),
-            asserter: None,
-        };
-        match store.edge_query(&ns, &any_caps_query) {
-            Ok(caps) if caps.is_empty() => return Ok(()), // unclaimed
-            Ok(_) => {} // claimed -- fall through to capability check
-            Err(_) => return Ok(()), // error reading = treat as unclaimed
-        }
-    }
-
-    // Walk namespace hierarchy: "org/team/repo" -> "org/team" -> "org"
-    let mut check_ns_str = ns_name;
-    loop {
-        let check_ns = match store.namespace_resolve(check_ns_str, protocol) {
-            Ok(r) => r,
-            Err(_) => {
-                // Parent namespace doesn't exist -- no capability edges
-                match check_ns_str.rfind('/') {
-                    Some(pos) => { check_ns_str = &check_ns_str[..pos]; continue; }
-                    None => break,
-                }
-            }
-        };
-        let query = EdgeQuery {
+    // Step 1: _root check (always, regardless of namespace state).
+    // The _root namespace is bootstrapped at server start and always exists.
+    if let Ok(root_ns) = store.namespace_resolve("_root", None) {
+        let admin_query = EdgeQuery {
             anchor: asserter.to_string(),
             direction: Direction::Outbound,
             relation: Some(EdgeRelation::Capability),
             asserter: Some(asserter.to_string()),
         };
-        if let Ok(edges) = store.edge_query(&check_ns, &query) {
+        if let Ok(edges) = store.edge_query(&root_ns, &admin_query) {
             if edges.iter().any(|e| cap_permits(e, op)) {
-                return Ok(());
+                return Ok(AuthDecision::Allowed);
             }
         }
-
-        // Walk up to parent namespace
-        match check_ns_str.rfind('/') {
-            Some(pos) => check_ns_str = &check_ns_str[..pos],
-            None => break,
+        // Delegation chain walk on _root
+        if check_delegation(store, &root_ns, op, asserter, 0)? {
+            return Ok(AuthDecision::Allowed);
         }
     }
 
-    // Two-hop role check: asserter -> role (holds-role) -> namespace (capability)
-    let role_query = EdgeQuery {
-        anchor: asserter.to_string(),
-        direction: Direction::Outbound,
-        relation: Some(EdgeRelation::Capability),
-        asserter: None,
-    };
-    if let Ok(role_edges) = store.edge_query(&ns, &role_query) {
-        for role_edge in &role_edges {
-            if let Some(ref meta) = role_edge.metadata {
-                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(meta) {
-                    if parsed.get("type").and_then(|v| v.as_str()) == Some("holds-role") {
-                        let role_anchor = &role_edge.target;
-                        let role_cap_query = EdgeQuery {
-                            anchor: role_anchor.clone(),
-                            direction: Direction::Outbound,
-                            relation: Some(EdgeRelation::Capability),
-                            asserter: Some(role_anchor.clone()),
-                        };
-                        if let Ok(role_caps) = store.edge_query(&ns, &role_cap_query) {
-                            if role_caps.iter().any(|e| cap_permits(e, op)) {
-                                return Ok(());
+    match ns {
+        ResolvedNamespace::Exists(ns_ref) => {
+            let ns_name = ns_ref.as_str();
+
+            // Step 2: owner check
+            if let Ok(info) = store.namespace_info(ns_name, None) {
+                if info.owner == asserter {
+                    return Ok(AuthDecision::Allowed);
+                }
+            }
+
+            // Step 3: non-reserved unclaimed namespace check
+            if !is_reserved(ns_name) {
+                let any_caps_query = EdgeQuery {
+                    anchor: String::new(),
+                    direction: Direction::Outbound,
+                    relation: Some(EdgeRelation::Capability),
+                    asserter: None,
+                };
+                match store.edge_query(ns_ref, &any_caps_query) {
+                    Ok(caps) if caps.is_empty() => return Ok(AuthDecision::Allowed),
+                    Ok(_) => {}
+                    Err(_) => return Ok(AuthDecision::Allowed),
+                }
+            }
+
+            // Step 4: direct capability check on target namespace
+            let query = EdgeQuery {
+                anchor: asserter.to_string(),
+                direction: Direction::Outbound,
+                relation: Some(EdgeRelation::Capability),
+                asserter: Some(asserter.to_string()),
+            };
+            if let Ok(edges) = store.edge_query(ns_ref, &query) {
+                if edges.iter().any(|e| cap_permits(e, op)) {
+                    return Ok(AuthDecision::Allowed);
+                }
+            }
+
+            // Step 5: namespace hierarchy walk
+            let mut check_ns_str = ns_name;
+            while let Some(pos) = check_ns_str.rfind('/') {
+                check_ns_str = &check_ns_str[..pos];
+                if let Ok(parent_ns) = store.namespace_resolve(check_ns_str, None) {
+                    let parent_query = EdgeQuery {
+                        anchor: asserter.to_string(),
+                        direction: Direction::Outbound,
+                        relation: Some(EdgeRelation::Capability),
+                        asserter: Some(asserter.to_string()),
+                    };
+                    if let Ok(edges) = store.edge_query(&parent_ns, &parent_query) {
+                        if edges.iter().any(|e| cap_permits(e, op)) {
+                            return Ok(AuthDecision::Allowed);
+                        }
+                    }
+                }
+            }
+
+            // Step 6: two-hop role check
+            let role_query = EdgeQuery {
+                anchor: asserter.to_string(),
+                direction: Direction::Outbound,
+                relation: Some(EdgeRelation::Capability),
+                asserter: None,
+            };
+            if let Ok(role_edges) = store.edge_query(ns_ref, &role_query) {
+                for role_edge in &role_edges {
+                    if let Some(ref meta) = role_edge.metadata {
+                        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(meta) {
+                            if parsed.get("type").and_then(|v| v.as_str()) == Some("holds-role") {
+                                let role_anchor = &role_edge.target;
+                                let role_cap_query = EdgeQuery {
+                                    anchor: role_anchor.clone(),
+                                    direction: Direction::Outbound,
+                                    relation: Some(EdgeRelation::Capability),
+                                    asserter: Some(role_anchor.clone()),
+                                };
+                                if let Ok(role_caps) = store.edge_query(ns_ref, &role_cap_query) {
+                                    if role_caps.iter().any(|e| cap_permits(e, op)) {
+                                        return Ok(AuthDecision::Allowed);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+
+            // Step 7: delegation chain walk on target namespace
+            if check_delegation(store, ns_ref, op, asserter, 0)? {
+                return Ok(AuthDecision::AllowedViaDelegation);
+            }
+
+            Err(AuthError::Forbidden {
+                reason: "access denied".to_owned(),
+            })
+        }
+        ResolvedNamespace::NotFound { name, .. } => {
+            if is_reserved(name) {
+                Err(AuthError::Forbidden {
+                    reason: format!("reserved namespace '{}' requires _root authority", name),
+                })
+            } else if op.is_write() {
+                Ok(AuthDecision::AllowCreateNew)
+            } else {
+                Err(AuthError::NotFound)
+            }
+        }
+        ResolvedNamespace::NoNamespace => {
+            Ok(AuthDecision::Allowed)
         }
     }
-
-    // Namespace-specific delegation chain walk
-    if check_delegation(store, &ns, op, asserter, 0)? {
-        return Ok(());
-    }
-
-    Err(AuthError::Forbidden {
-        reason: "no capability edge for this operation on reserved namespace".to_owned(),
-    })
 }
 
 /// Check if `target` is authorized via delegation chain.

@@ -16,7 +16,7 @@ use topcoat::router::{
 
 use kappa_core::canonical::canonical_bytes;
 use kappa_core::kappa::kappa_from_bytes;
-use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef};
+use kappa_core::types::{DelegationScope, Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef};
 
 use crate::{path_param, query_param, read_body, store};
 
@@ -145,6 +145,65 @@ async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Respons
         value_kappa: None,
         metadata,
     };
+
+    // Delegation depth enforcement at creation time.
+    // When creating a Delegation edge, verify the delegator has remaining
+    // depth to re-delegate. Owners have unlimited depth.
+    if edge.relation == EdgeRelation::Delegation {
+        if let Some(ref meta) = edge.metadata {
+            if let Ok(scope) = serde_json::from_slice::<DelegationScope>(meta) {
+                let delegator = edge.source.clone();
+                let n = ns.clone();
+                let s2 = s.clone();
+                let depth_result = tokio::task::spawn_blocking(move || {
+                    // Check if delegator is the namespace owner
+                    if let Ok(info) = s2.namespace_info(n.as_str(), None) {
+                        if info.owner == delegator {
+                            return Ok(u32::MAX); // owners have unlimited depth
+                        }
+                    }
+                    // Find delegator's own delegation depth
+                    let query = EdgeQuery {
+                        anchor: delegator.clone(),
+                        direction: Direction::Inbound,
+                        relation: Some(EdgeRelation::Delegation),
+                        asserter: None,
+                    };
+                    if let Ok(edges) = s2.edge_query(&n, &query) {
+                        for e in &edges {
+                            if let Some(ref m) = e.metadata {
+                                if let Ok(parent_scope) = serde_json::from_slice::<DelegationScope>(m) {
+                                    return Ok(parent_scope.delegation_depth);
+                                }
+                            }
+                        }
+                    }
+                    Ok::<u32, kappa_core::StoreError>(0)
+                })
+                .await
+                .map_err(|e| bad_request(e.to_string()))?
+                .map_err(crate::store_err)?;
+
+                if depth_result == 0 {
+                    return crate::error_response(
+                        StatusCode::FORBIDDEN,
+                        "DELEGATION_DEPTH_EXCEEDED",
+                        "delegator has depth=0 and cannot re-delegate",
+                    );
+                }
+                if scope.delegation_depth >= depth_result {
+                    return crate::error_response(
+                        StatusCode::FORBIDDEN,
+                        "DELEGATION_DEPTH_EXCEEDED",
+                        &format!(
+                            "new delegation depth {} exceeds delegator remaining depth {}",
+                            scope.delegation_depth, depth_result - 1
+                        ),
+                    );
+                }
+            }
+        }
+    }
 
     // Compute the edge kappa for the response (same as store does internally)
     let edge_kappa = kappa_from_bytes(&canonical_bytes(&edge));

@@ -48,6 +48,37 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
     let uuid = *ns.uuid();
     let ek_hash = item_hash(&edge_kappa);
 
+    // Upsert: check for existing edge with same (source, target, relation, asserter)
+    {
+        let src_hash = item_hash(&edge.source);
+        let fwd = store.fwd_index.read().unwrap();
+        if let Some(existing_kappas) = fwd.get(&(uuid, src_hash)) {
+            let edges = store.edges.read().unwrap();
+            for ek in existing_kappas {
+                let ekh = item_hash(ek);
+                if let Some(existing) = edges.get(&(uuid, ekh)) {
+                    if existing.source == edge.source
+                        && existing.target == edge.target
+                        && existing.relation == edge.relation
+                        && existing.asserter == edge.asserter
+                    {
+                        if existing.value_kappa == edge.value_kappa
+                            && existing.metadata == edge.metadata
+                        {
+                            return Ok(()); // exact duplicate, skip
+                        }
+                        // Same logical edge, different value/metadata: update in place
+                        drop(edges);
+                        drop(fwd);
+                        store.edges.write().unwrap().insert((uuid, ekh), edge.clone());
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    // New edge: insert and index
     {
         store
             .edges

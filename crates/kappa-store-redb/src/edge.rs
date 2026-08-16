@@ -29,6 +29,75 @@ impl PersistentStore {
             ns_table.insert(ns, ()).map_err(Self::redb_err)?;
             drop(ns_table);
 
+            // Upsert: check for existing edge with same (source, target, relation, asserter).
+            // Collect results first, then drop all table handles before acting.
+            let fwd_key = format!("{}\x00{}", ns, edge.source);
+            enum UpsertAction {
+                Skip,
+                Update(String), // existing edge key to overwrite
+                Insert,
+            }
+            let action = {
+                let fwd_table = txn.open_multimap_table(EDGE_FWD).map_err(Self::redb_err)?;
+                let edges_table = txn.open_table(EDGES).map_err(Self::redb_err)?;
+                let candidate_kappas: Vec<String> = fwd_table
+                    .get(fwd_key.as_str()).map_err(Self::redb_err)?
+                    .filter_map(|r| r.ok().map(|v| v.value().to_string()))
+                    .collect();
+                let mut result = UpsertAction::Insert;
+                for ek in &candidate_kappas {
+                    let existing_key = format!("{}\x00{}", ns, ek);
+                    if let Some(val) = edges_table.get(existing_key.as_str()).map_err(Self::redb_err)? {
+                        let raw_bytes = val.value();
+                        let decrypted = match &self.table_encryptor {
+                            Some(enc) => enc.decrypt_value(&existing_key, raw_bytes)
+                                .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+                            None => raw_bytes.to_vec(),
+                        };
+                        if let Ok(existing) = from_canonical::<Edge>(&decrypted) {
+                            if existing.source == edge.source
+                                && existing.target == edge.target
+                                && existing.relation == edge.relation
+                                && existing.asserter == edge.asserter
+                            {
+                                if existing.value_kappa == edge.value_kappa
+                                    && existing.metadata == edge.metadata
+                                {
+                                    result = UpsertAction::Skip;
+                                } else {
+                                    result = UpsertAction::Update(existing_key);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                result
+            }; // all table handles dropped here
+
+            match action {
+                UpsertAction::Skip => {
+                    txn.commit().map_err(Self::redb_err)?;
+                    return Ok(());
+                }
+                UpsertAction::Update(existing_key) => {
+                    let stored_bytes: Vec<u8> = match &self.table_encryptor {
+                        Some(enc) => enc.encrypt_value(&existing_key, &edge_bytes)
+                            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+                        None => edge_bytes.clone(),
+                    };
+                    {
+                        let mut edges = txn.open_table(EDGES).map_err(Self::redb_err)?;
+                        edges.insert(existing_key.as_str(), stored_bytes.as_slice())
+                            .map_err(Self::redb_err)?;
+                    }
+                    txn.commit().map_err(Self::redb_err)?;
+                    return Ok(());
+                }
+                UpsertAction::Insert => {} // fall through to new edge insertion
+            }
+
+            // New edge: insert into all tables
             let edge_key = format!("{}\x00{}", ns, edge_kappa);
             let stored_bytes: Vec<u8> = match &self.table_encryptor {
                 Some(enc) => enc.encrypt_value(&edge_key, &edge_bytes)
@@ -41,7 +110,6 @@ impl PersistentStore {
                 .map_err(Self::redb_err)?;
             drop(edges);
 
-            let fwd_key = format!("{}\x00{}", ns, edge.source);
             let mut fwd = txn.open_multimap_table(EDGE_FWD).map_err(Self::redb_err)?;
             fwd.insert(fwd_key.as_str(), edge_kappa.as_str())
                 .map_err(Self::redb_err)?;

@@ -44,6 +44,13 @@ pub enum OpClass {
     Admin,
 }
 
+impl OpClass {
+    /// Whether this operation class modifies state.
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::Write | Self::Admin)
+    }
+}
+
 /// Result of a rate limit check on a successful (non-rejected) request.
 /// Carried through to attach headers to the response.
 #[derive(Debug, Clone, Copy)]

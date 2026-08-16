@@ -1081,6 +1081,31 @@ impl KappaStore for InMemoryStore {
             succession.old_anchor.clone(),
             succession.new_anchor.clone(),
         );
+
+        // Create watermark voiding old anchor's assertions.
+        // KeyCompromise: void everything (timestamp 0).
+        // Other reasons: void assertions before effective_at.
+        let watermark_ts = if succession.reason == "key-compromise" {
+            0u64
+        } else {
+            succession.effective_at_ms
+        };
+        let now_ms = self.clock.now_ms();
+        let watermark = crate::identity::watermark::Watermark {
+            asserter: succession.old_anchor.clone(),
+            invalidate_before_ms: watermark_ts,
+            reason: format!("{} succession", succession.reason),
+            set_at_ms: now_ms,
+        };
+        let wm_bytes = crate::canonical::canonical_bytes(&watermark);
+        let wm_kappa = crate::kappa::kappa_from_bytes(&wm_bytes);
+        let _ = self.ingest_verified(&wm_kappa, &wm_bytes);
+        // Tag under the asserter's anchor namespace so resolve_handler finds it
+        let anchor_ns = NamespaceRef::deterministic(&succession.old_anchor);
+        self.ensure_namespace(&anchor_ns);
+        let wm_tag = format!("watermark/{}", wm_kappa);
+        let _ = self.tag_set(&anchor_ns, &wm_tag, &wm_kappa);
+
         Ok(kappa)
     }
 
