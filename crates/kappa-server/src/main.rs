@@ -793,13 +793,16 @@ async fn main() {
                         ).map_err(|e| kappa_core::types::StoreError::Rejected(
                             format!("NAR verification failed: {e}")
                         ))?;
-                        // Create compression record so NAR is addressable by NarHash
+                        // Create compression record and retag NAR by NarHash
                         let _ = store.ingest_compressed(
                             &narinfo.nar_hash,
                             &nar_bytes,
                             &narinfo.compression,
                             narinfo.nar_size,
                         );
+                        let nar_path = narinfo.url.strip_prefix("nar/").unwrap_or(&narinfo.url);
+                        let nar_tag = format!("nar:{}", nar_path);
+                        store.tag_set(&nix_ns, &nar_tag, &narinfo.nar_hash)?;
                     }
 
                     // Store narinfo text as blob
@@ -884,8 +887,7 @@ async fn main() {
                 let result = tokio::task::spawn_blocking(move || {
                     let nix_ns = NamespaceRef::from("_nix");
                     let entry = store.tag_get(&nix_ns, &tag_name)?;
-                    // Stream via blob_open for large NARs
-                    let mut reader = store.blob_open(&entry.kappa)?;
+                    let mut reader = store.blob_open_compressed(&entry.kappa)?;
                     let mut content = Vec::new();
                     std::io::Read::read_to_end(&mut *reader, &mut content)?;
                     Ok::<Vec<u8>, kappa_core::types::StoreError>(content)
@@ -940,14 +942,14 @@ async fn main() {
                                                 &narinfo.references,
                                             ) {
                                                 Ok(()) => {
-                                                    // Verification passed. Create compression record
-                                                    // so the NAR is addressable by NarHash (uncompressed hash).
                                                     let _ = store.ingest_compressed(
                                                         &narinfo.nar_hash,
                                                         &content,
                                                         &narinfo.compression,
                                                         narinfo.nar_size,
                                                     );
+                                                    let nar_tag = format!("nar:{}", path);
+                                                    let _ = store.tag_set(&nix_ns, &nar_tag, &narinfo.nar_hash);
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!(
