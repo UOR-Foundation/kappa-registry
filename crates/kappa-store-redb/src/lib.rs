@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use redb::{Database, ReadableDatabase};
+use redb::{Database, ReadableDatabase, ReadableMultimapTable};
 
 struct DiskUploadSession {
     namespace: String,
@@ -163,6 +163,10 @@ impl PersistentStore {
             txn.open_table(tables::VERSIONS)
                 .map_err(Self::redb_err)?;
             txn.open_table(tables::COMPRESSION_RECORDS)
+                .map_err(Self::redb_err)?;
+            txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+                .map_err(Self::redb_err)?;
+            txn.open_table(tables::IDENTITY_SUCCESSIONS)
                 .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
@@ -1003,6 +1007,211 @@ impl KappaStore for PersistentStore {
             }
         }
         before - sessions.len()
+    }
+
+    // -- Identity binding (redb IDENTITY_BINDINGS multimap) -------------------
+
+    fn identity_binding_put(
+        &self,
+        _ns: &NamespaceRef,
+        binding: &kappa_core::identity::IdentityBinding,
+    ) -> Result<String, StoreError> {
+        let kappa = kappa_core::kappa::kappa_from_value(binding);
+        let binding_json = serde_json::to_string(binding)
+            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+        // Read phase: check for duplicate
+        let is_dup = {
+            let txn = self.db.begin_read().map_err(Self::redb_err)?;
+            let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+                .map_err(Self::redb_err)?;
+            table.get(binding.source.as_str())
+                .map_err(Self::redb_err)?
+                .filter_map(|v| v.ok().map(|v| v.value().to_string()))
+                .any(|json_str| {
+                    serde_json::from_str::<serde_json::Value>(&json_str)
+                        .ok()
+                        .and_then(|v| v["target"].as_str().map(|t| t == binding.target))
+                        .unwrap_or(false)
+                })
+        };
+        // Write phase: insert if not duplicate
+        if !is_dup {
+            let txn = self.db.begin_write().map_err(Self::redb_err)?;
+            {
+                let mut table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+                    .map_err(Self::redb_err)?;
+                table.insert(binding.source.as_str(), binding_json.as_str())
+                    .map_err(Self::redb_err)?;
+            }
+            txn.commit().map_err(Self::redb_err)?;
+        }
+        Ok(kappa)
+    }
+
+    fn identity_binding_get(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<kappa_core::identity::IdentityBinding>, StoreError> {
+        let txn = self.db.begin_read().map_err(Self::redb_err)?;
+        let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+            .map_err(Self::redb_err)?;
+        let mut results = Vec::new();
+        if let Ok(values) = table.get(subject) {
+            for v in values.flatten() {
+                if let Ok(b) = serde_json::from_str::<kappa_core::identity::IdentityBinding>(v.value()) {
+                    results.push(b);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn identity_binding_delete(
+        &self,
+        _ns: &NamespaceRef,
+        subject: &str,
+        target: &str,
+    ) -> Result<(), StoreError> {
+        // Read phase: find JSON strings to remove
+        let to_remove: Vec<String> = {
+            let txn = self.db.begin_read().map_err(Self::redb_err)?;
+            let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+                .map_err(Self::redb_err)?;
+            table.get(subject)
+                .map_err(Self::redb_err)?
+                .filter_map(|v| v.ok().map(|v| v.value().to_string()))
+                .filter(|json_str| {
+                    serde_json::from_str::<serde_json::Value>(json_str)
+                        .ok()
+                        .and_then(|v| v["target"].as_str().map(|t| t == target))
+                        .unwrap_or(false)
+                })
+                .collect()
+        };
+        // Write phase: remove matching entries
+        if !to_remove.is_empty() {
+            let txn = self.db.begin_write().map_err(Self::redb_err)?;
+            {
+                let mut table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+                    .map_err(Self::redb_err)?;
+                for json_str in &to_remove {
+                    table.remove(subject, json_str.as_str()).map_err(Self::redb_err)?;
+                }
+            }
+            txn.commit().map_err(Self::redb_err)?;
+        }
+        Ok(())
+    }
+
+    fn identity_binding_list_by_asserter(
+        &self,
+        asserter: &str,
+    ) -> Result<Vec<kappa_core::identity::IdentityBinding>, StoreError> {
+        let txn = self.db.begin_read().map_err(Self::redb_err)?;
+        let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+            .map_err(Self::redb_err)?;
+        let mut results = Vec::new();
+        // Full scan -- IDENTITY_BINDINGS is keyed by source, not target/asserter
+        for entry in table.iter().map_err(Self::redb_err)? {
+            let (_key, values) = entry.map_err(Self::redb_err)?;
+            for v in values.flatten() {
+                if let Ok(b) = serde_json::from_str::<kappa_core::identity::IdentityBinding>(v.value()) {
+                    if b.target == asserter {
+                        results.push(b);
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    // -- Identity succession (redb IDENTITY_SUCCESSIONS table) ----------------
+
+    fn identity_succession_put(
+        &self,
+        succession: &kappa_core::identity::IdentitySuccession,
+    ) -> Result<String, StoreError> {
+        if succession.old_anchor == succession.new_anchor {
+            return Err(StoreError::Rejected("cannot succeed to self".into()));
+        }
+        let kappa = kappa_core::kappa::kappa_from_value(succession);
+        let txn = self.db.begin_write().map_err(Self::redb_err)?;
+        {
+            let mut table = txn.open_table(tables::IDENTITY_SUCCESSIONS)
+                .map_err(Self::redb_err)?;
+            table.insert(
+                succession.old_anchor.as_str(),
+                succession.new_anchor.as_str(),
+            ).map_err(Self::redb_err)?;
+        }
+        txn.commit().map_err(Self::redb_err)?;
+        Ok(kappa)
+    }
+
+    fn identity_succession_resolve(
+        &self,
+        anchor: &str,
+    ) -> Result<String, StoreError> {
+        let txn = self.db.begin_read().map_err(Self::redb_err)?;
+        let table = txn.open_table(tables::IDENTITY_SUCCESSIONS)
+            .map_err(Self::redb_err)?;
+        let mut current = anchor.to_string();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(current.clone());
+        loop {
+            match table.get(current.as_str()).map_err(Self::redb_err)? {
+                Some(val) => {
+                    let next = val.value().to_string();
+                    if visited.contains(&next) {
+                        return Err(StoreError::Rejected(format!(
+                            "succession cycle detected at {next}"
+                        )));
+                    }
+                    if visited.len() >= 10 {
+                        return Err(StoreError::Rejected(
+                            "succession chain exceeds 10 hops".into()
+                        ));
+                    }
+                    visited.insert(next.clone());
+                    current = next;
+                }
+                None => return Ok(current),
+            }
+        }
+    }
+
+    fn identity_succession_chain(
+        &self,
+        anchor: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let txn = self.db.begin_read().map_err(Self::redb_err)?;
+        let table = txn.open_table(tables::IDENTITY_SUCCESSIONS)
+            .map_err(Self::redb_err)?;
+        let mut chain = vec![anchor.to_string()];
+        let mut current = anchor.to_string();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(current.clone());
+        loop {
+            match table.get(current.as_str()).map_err(Self::redb_err)? {
+                Some(val) => {
+                    let next = val.value().to_string();
+                    if visited.contains(&next) {
+                        return Err(StoreError::Rejected(format!(
+                            "succession cycle detected at {next}"
+                        )));
+                    }
+                    if visited.len() >= 10 {
+                        return Err(StoreError::Rejected(
+                            "succession chain exceeds 10 hops".into()
+                        ));
+                    }
+                    visited.insert(next.clone());
+                    chain.push(next.clone());
+                    current = next;
+                }
+                None => return Ok(chain),
+            }
+        }
     }
 }
 

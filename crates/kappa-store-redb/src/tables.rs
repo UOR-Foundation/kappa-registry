@@ -88,6 +88,16 @@ pub const VERSIONS: TableDefinition<&[u8], &[u8]> =
 pub const COMPRESSION_RECORDS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("compression_records");
 
+// -- Identity bindings --------------------------------------------------------
+// Key: "{source}"  Values: JSON-serialized IdentityBinding
+pub const IDENTITY_BINDINGS: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("identity_bindings");
+
+// -- Identity successions -----------------------------------------------------
+// Key: "{old_anchor}"  Value: "{new_anchor}"
+pub const IDENTITY_SUCCESSIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("identity_successions");
+
 // -- Identity assertion inbound index -----------------------------------------
 // Key: "{subject}\x00{facet}"  Values: assertion kappa strings
 // Cross-namespace: assertions from any namespace are indexed here.

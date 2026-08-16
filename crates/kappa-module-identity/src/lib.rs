@@ -1,11 +1,21 @@
 //! Identity HTTP protocol module for kappa-registry.
 //!
 //! Endpoints:
-//!   GET  /identity/whoami        - node identity and trust position
-//!   POST /identity/assert        - publish an identity assertion
-//!   GET  /identity/resolve/{sub} - resolve assertions about a subject
-//!   POST /identity/revoke        - revoke an assertion
-//!   GET  /identity/absence/{sub}/{facet} - absence proof (requires AKD)
+//!   GET  /identity/whoami                      - node identity and trust position
+//!   POST /identity/assert                      - publish an identity assertion
+//!   GET  /identity/resolve/{sub}               - resolve assertions about a subject
+//!   POST /identity/revoke                      - revoke an assertion
+//!   GET  /identity/absence/{sub}/{facet}       - absence proof (requires AKD)
+//!   POST /identity/watermark                   - set a watermark
+//!   GET  /identity/audit/{start}/{end}         - AKD audit proof
+//!   POST /identity/anchor                      - register an anchor
+//!   POST /identity/binding                     - create an identity binding
+//!   GET  /identity/binding/{source}            - list bindings for identifier
+//!   DELETE /identity/binding                   - delete a binding
+//!   GET  /identity/binding/asserter/{anchor}   - list bindings by asserter
+//!   POST /identity/succession                  - create identity succession
+//!   GET  /identity/succession/{anchor}         - resolve to current anchor
+//!   GET  /identity/succession/{anchor}/chain   - full succession chain
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -22,6 +32,8 @@ use kappa_core::identity::assertion::IdentityAssertion;
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::identity::resolution;
 use kappa_core::identity::revocation::{Revocation, RevocationReason};
+use kappa_core::identity::binding::IdentityBinding;
+use kappa_core::identity::succession::IdentitySuccession;
 use kappa_core::kappa::kappa_from_bytes;
 use kappa_core::store::KappaStore;
 use kappa_core::types::NamespaceRef;
@@ -713,6 +725,269 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
+// -- Binding PUT ------------------------------------------------------------
+
+fn binding_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = read_body(body).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
+
+        let source = v["source"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing source"))?
+            .to_string();
+        let target = v["target"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing target"))?
+            .to_string();
+        let method = v["method"]
+            .as_str()
+            .unwrap_or("self-asserted")
+            .to_string();
+        let trust_level = v["trust_level"].as_u64().unwrap_or(1);
+        let verified_at_ms = v["verified_at_ms"].as_u64().unwrap_or(0);
+
+        let binding = IdentityBinding {
+            source,
+            target: target.clone(),
+            method,
+            trust_level,
+            verified_at_ms,
+        };
+
+        let s = store(cx).clone();
+        let ns = NamespaceRef::from(target.as_str());
+        let result = tokio::task::spawn_blocking(move || {
+            s.identity_binding_put(&ns, &binding)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"kappa": result});
+        (
+            StatusCode::CREATED,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Binding GET by source --------------------------------------------------
+
+fn binding_get_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let source = path_param(cx, "source");
+        let s = store(cx).clone();
+        let src = source.to_string();
+
+        let bindings = tokio::task::spawn_blocking(move || {
+            s.identity_binding_get(&src)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let items: Vec<serde_json::Value> = bindings
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "source": b.source,
+                    "target": b.target,
+                    "method": b.method,
+                    "trust_level": b.trust_level,
+                    "verified_at_ms": b.verified_at_ms,
+                })
+            })
+            .collect();
+
+        let resp = serde_json::json!({"bindings": items});
+        (
+            StatusCode::OK,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Binding DELETE ---------------------------------------------------------
+
+fn binding_delete_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = read_body(body).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
+
+        let source = v["source"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing source"))?
+            .to_string();
+        let target = v["target"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing target"))?
+            .to_string();
+
+        let s = store(cx).clone();
+        let ns = NamespaceRef::from(target.as_str());
+        tokio::task::spawn_blocking(move || {
+            s.identity_binding_delete(&ns, &source, &target)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        StatusCode::NO_CONTENT.into_response(cx)
+    })
+}
+
+// -- Binding list by asserter -----------------------------------------------
+
+fn binding_list_by_asserter_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let anchor = path_param(cx, "anchor");
+        let s = store(cx).clone();
+        let a = anchor.to_string();
+
+        let bindings = tokio::task::spawn_blocking(move || {
+            s.identity_binding_list_by_asserter(&a)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let items: Vec<serde_json::Value> = bindings
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "source": b.source,
+                    "target": b.target,
+                    "method": b.method,
+                    "trust_level": b.trust_level,
+                    "verified_at_ms": b.verified_at_ms,
+                })
+            })
+            .collect();
+
+        let resp = serde_json::json!({"bindings": items});
+        (
+            StatusCode::OK,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Succession PUT ---------------------------------------------------------
+
+fn succession_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = read_body(body).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
+
+        let old_anchor = v["old_anchor"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing old_anchor"))?
+            .to_string();
+        let new_anchor = v["new_anchor"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing new_anchor"))?
+            .to_string();
+        let reason = v["reason"]
+            .as_str()
+            .unwrap_or("rotation")
+            .to_string();
+        let effective_at_ms = v["effective_at_ms"].as_u64().unwrap_or(0);
+        let old_signature_hex = v["old_signature"].as_str().unwrap_or("");
+        let old_signature = hex::decode(old_signature_hex).unwrap_or_default();
+        let new_signature_hex = v["new_signature"].as_str().unwrap_or("");
+        let new_signature = hex::decode(new_signature_hex).unwrap_or_default();
+
+        let succession = IdentitySuccession {
+            old_anchor,
+            new_anchor,
+            reason,
+            effective_at_ms,
+            old_signature,
+            new_signature,
+        };
+
+        let s = store(cx).clone();
+        let result = tokio::task::spawn_blocking(move || {
+            s.identity_succession_put(&succession)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"kappa": result});
+        (
+            StatusCode::CREATED,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Succession resolve -----------------------------------------------------
+
+fn succession_resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let anchor = path_param(cx, "anchor");
+        let s = store(cx).clone();
+        let a = anchor.to_string();
+
+        let current = tokio::task::spawn_blocking(move || {
+            s.identity_succession_resolve(&a)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"current": current});
+        (
+            StatusCode::OK,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Succession chain -------------------------------------------------------
+
+fn succession_chain_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let anchor = path_param(cx, "anchor");
+        let s = store(cx).clone();
+        let a = anchor.to_string();
+
+        let chain = tokio::task::spawn_blocking(move || {
+            s.identity_succession_chain(&a)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"chain": chain});
+        (
+            StatusCode::OK,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
 /// Register all identity HTTP routes on the router builder.
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder
@@ -755,5 +1030,45 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
             Method::POST,
             Cow::Borrowed(Path::new("/identity/anchor")),
             anchor_handler,
+        ))
+        // Identity binding endpoints
+        .route(RouteFn::new(
+            Method::POST,
+            Cow::Borrowed(Path::new("/identity/binding")),
+            binding_put_handler,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            Cow::Borrowed(Path::new("/identity/binding")),
+            binding_delete_handler,
+        ))
+        // binding/asserter/{anchor} must be registered before binding/{source}
+        // because "asserter" is a literal prefix, not a param value
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/binding/asserter/{anchor}")),
+            binding_list_by_asserter_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/binding/{source}")),
+            binding_get_handler,
+        ))
+        // Identity succession endpoints
+        .route(RouteFn::new(
+            Method::POST,
+            Cow::Borrowed(Path::new("/identity/succession")),
+            succession_put_handler,
+        ))
+        // succession/{anchor}/chain must be registered before succession/{anchor}
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/succession/{anchor}/chain")),
+            succession_chain_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/succession/{anchor}")),
+            succession_resolve_handler,
         ))
 }

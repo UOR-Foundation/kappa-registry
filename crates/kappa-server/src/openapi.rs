@@ -103,6 +103,13 @@ const ROUTES: &[&str] = &[
     "get|/identity/audit/{start}/{end}|identity_audit|Audit proof|Identity|start:path!,end:path!|-|j",
     "post|/identity/watermark|identity_watermark|Advance watermark|Identity||j|j",
     "post|/identity/anchor|identity_anchor|Register anchor spec|Identity||j|j",
+    "post|/identity/binding|identity_binding_put|Create identity binding|Identity||j|j",
+    "delete|/identity/binding|identity_binding_delete|Delete identity binding|Identity||j|-",
+    "get|/identity/binding/asserter/{anchor}|identity_binding_list_by_asserter|List bindings by asserter|Identity|anchor:path!|-|j",
+    "get|/identity/binding/{source}|identity_binding_get|List bindings for identifier|Identity|source:path!|-|j",
+    "post|/identity/succession|identity_succession_put|Create identity succession|Identity||j|j",
+    "get|/identity/succession/{anchor}/chain|identity_succession_chain|Full succession chain|Identity|anchor:path!|-|j",
+    "get|/identity/succession/{anchor}|identity_succession_resolve|Resolve to current anchor|Identity|anchor:path!|-|j",
     // Cluster
     "get|/cluster/members|cluster_members|List cluster members|System||-|j",
     "get|/cluster/status|cluster_status|Cluster status|System||-|j",

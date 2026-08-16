@@ -133,6 +133,10 @@ path = "tests/integration/websocket.rs"
 name = "git_e2e"
 path = "tests/integration/git_e2e.rs"
 
+[[test]]
+name = "identity_http"
+path = "tests/integration/identity_http.rs"
+
 [features]
 default = ["oci", "identity-http", "distribution", "git", "s3", "nix"]
 oci = ["dep:kappa-module-oci"]

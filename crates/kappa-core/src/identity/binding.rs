@@ -15,7 +15,7 @@ use dcbor::prelude::*;
 ///   2: method (how ownership was verified)
 ///   3: trust_level (0=unverified, 1=self-asserted, 2=peer-verified, 3=threshold-attested)
 ///   4: verified_at_ms (when the verification was performed)
-#[derive(Debug, Clone, PartialEq, Eq, CBORCodable)]
+#[derive(Debug, Clone, PartialEq, Eq, CBORCodable, serde::Serialize, serde::Deserialize)]
 pub struct IdentityBinding {
     #[cbor(n = 0)]
     pub source: String,
