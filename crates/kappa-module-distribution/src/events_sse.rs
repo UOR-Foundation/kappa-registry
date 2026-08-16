@@ -10,8 +10,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use topcoat::context::{try_app_context, Cx};
+use topcoat::router::response::Response;
 use topcoat::router::{
-    Body, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_core::events::EventLog;

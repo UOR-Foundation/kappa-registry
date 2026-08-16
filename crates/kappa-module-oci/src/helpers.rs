@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
-use topcoat::context::{app_context, request_context, try_app_context, try_request_context, Cx};
+use topcoat::context::{app_context, try_app_context, try_request_context, Cx};
 use topcoat::router::error::bad_request;
-use topcoat::router::{to_bytes, Body, Response, StatusCode};
+use topcoat::router::request::Bytes;
+use topcoat::router::response::Response;
+use topcoat::router::{to_bytes, raw_path_params, Body, StatusCode};
 
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::store::KappaStore;
@@ -14,18 +16,15 @@ pub use kappa_core::types::MaxBlobSize;
 
 /// Extract a path parameter by name from the matched route.
 pub fn path_param<'a>(cx: &'a Cx, key: &str) -> &'a str {
-    use topcoat::router::RawPathParams;
-    let params: &RawPathParams = request_context(cx);
-    params
-        .iter()
+    raw_path_params(cx)
         .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+        .map(|(_, v)| v.as_str())
         .unwrap_or("")
 }
 
 /// Extract a query parameter by name.
 pub fn query_param(cx: &Cx, key: &str) -> Option<String> {
-    let query = topcoat::router::uri(cx).query()?;
+    let query = topcoat::router::request::uri(cx).query()?;
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == key {
@@ -38,7 +37,7 @@ pub fn query_param(cx: &Cx, key: &str) -> Option<String> {
 
 /// Extract all values for a repeated query parameter.
 pub fn query_params_multi(cx: &Cx, key: &str) -> Vec<String> {
-    let Some(query) = topcoat::router::uri(cx).query() else {
+    let Some(query) = topcoat::router::request::uri(cx).query() else {
         return Vec::new();
     };
     query
@@ -152,7 +151,7 @@ pub fn oci_error(
 }
 
 /// Read request body.
-pub async fn read_body(body: Body) -> topcoat::Result<topcoat::router::Bytes> {
+pub async fn read_body(body: Body) -> topcoat::Result<Bytes> {
     to_bytes(body, usize::MAX)
         .await
         .map_err(|e| bad_request(format!("failed to read request body: {e}")).into())

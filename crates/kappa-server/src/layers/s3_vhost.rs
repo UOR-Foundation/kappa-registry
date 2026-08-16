@@ -27,7 +27,8 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
 use tokio::sync::watch;
 
-use topcoat::router::{Body, Listener, Response, Router};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, Listener, Router};
 
 /// Extract the bucket name from a Host header value given a base domain.
 ///

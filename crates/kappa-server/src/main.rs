@@ -12,10 +12,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use topcoat::context::{app_context, try_app_context, Cx};
+use topcoat::context::{app_context, request_context, try_app_context, Cx};
+use topcoat::router::response::IntoResponse;
 use topcoat::router::{
-    Body, Compression, IntoResponse, LayerFn, Method, Path, RouteFn, RouteFuture, Router,
-    StatusCode,
+    Body, Compression, LayerFn, Method, Path, RouteFn, RouteFuture, Router,
+    StatusCode, raw_path_params,
 };
 
 use kappa_core::clock::ntp_lamport::NtpLamportClock;
@@ -51,16 +52,10 @@ fn version_check(cx: &Cx, _body: Body) -> RouteFuture<'_> {
 
 fn health_handler(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
-        let probe = {
-            use topcoat::context::request_context;
-            use topcoat::router::RawPathParams;
-            let params: &RawPathParams = request_context(cx);
-            params
-                .iter()
+        let probe = raw_path_params(cx)
                 .find(|(k, _)| *k == "probe")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default()
-        };
+                .map(|(_, v)| v.as_str().to_string())
+                .unwrap_or_default();
         match probe.as_str() {
             "ready" => {
                 #[cfg(feature = "oci")]
@@ -322,18 +317,18 @@ async fn main() {
         .compression(Compression::off());
 
     // Layer chain: outermost to innermost
-    builder = builder.layer(LayerFn::new(p("/"), warning_layer));
-    builder = builder.layer(LayerFn::new(p("/"), cache_layer));
-    builder = builder.layer(LayerFn::new(p("/"), response_compliance_layer));
-    builder = builder.layer(LayerFn::new(p("/"), request_id_layer));
-    builder = builder.layer(LayerFn::new(p("/"), proxy_trust_layer));
-    builder = builder.layer(LayerFn::new(p("/"), request_log_layer));
-    builder = builder.layer(LayerFn::new(p("/"), security_headers_layer));
-    builder = builder.layer(LayerFn::new(p("/"), cors_layer));
-    builder = builder.layer(LayerFn::new(p("/"), timeout_layer));
-    builder = builder.layer(LayerFn::new(p("/"), rate_limit_layer));
-    builder = builder.layer(LayerFn::new(p("/"), body_limit_layer));
-    builder = builder.layer(LayerFn::new(p("/"), auth_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),warning_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),cache_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),response_compliance_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),request_id_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),proxy_trust_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),request_log_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),security_headers_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),cors_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),timeout_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),rate_limit_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),body_limit_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),auth_layer));
 
     // Routes
     builder = builder
@@ -510,11 +505,8 @@ async fn main() {
 
         fn git_info_refs(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let repo_name = params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let repo_name = raw_path_params(cx).find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 // service comes from ?service= query param, not path param
                 let service = {
                     let parts: &http::request::Parts = request_context(cx);
@@ -584,11 +576,8 @@ async fn main() {
 
         fn git_upload_pack(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let repo_name = params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let repo_name = raw_path_params(cx).find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let is_v2 = {
                     let parts: &http::request::Parts = request_context(cx);
                     parts.headers.get("git-protocol")
@@ -633,11 +622,8 @@ async fn main() {
 
         fn git_receive_pack(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let repo_name = params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let repo_name = raw_path_params(cx).find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
@@ -675,11 +661,8 @@ async fn main() {
 
         fn git_lfs_batch(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let repo_name = params.iter().find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let repo_name = raw_path_params(cx).find(|(k, _)| *k == "repo")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
@@ -748,11 +731,8 @@ async fn main() {
 
         fn nix_narinfo_get(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let hash = params.iter().find(|(k, _)| *k == "hash")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let hash = raw_path_params(cx).find(|(k, _)| *k == "hash")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("narinfo:{}", hash);
                 let result = tokio::task::spawn_blocking(move || {
@@ -772,11 +752,8 @@ async fn main() {
 
         fn nix_narinfo_head(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let hash = params.iter().find(|(k, _)| *k == "hash")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let hash = raw_path_params(cx).find(|(k, _)| *k == "hash")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("narinfo:{}", hash);
                 let result = tokio::task::spawn_blocking(move || {
@@ -796,11 +773,8 @@ async fn main() {
 
         fn nix_narinfo_put(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let url_hash = params.iter().find(|(k, _)| *k == "hash")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let url_hash = raw_path_params(cx).find(|(k, _)| *k == "hash")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let narinfo_bytes = {
                     use topcoat::router::to_bytes;
@@ -927,11 +901,8 @@ async fn main() {
 
         fn nix_nar_get(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let path = params.iter().find(|(k, _)| *k == "path")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let path = raw_path_params(cx).find(|(k, _)| *k == "path")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("nar:{}", path);
                 let result = tokio::task::spawn_blocking(move || {
@@ -953,11 +924,8 @@ async fn main() {
 
         fn nix_nar_put(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let path = params.iter().find(|(k, _)| *k == "path")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let path = raw_path_params(cx).find(|(k, _)| *k == "path")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let content = {
                     use topcoat::router::to_bytes;
@@ -1052,18 +1020,15 @@ async fn main() {
     {
         /// Check SigV4 auth and bucket policy on an S3 request.
         /// Returns None if auth + policy pass. Some(Response) on failure.
-        fn s3_auth_check(cx: &Cx) -> Option<topcoat::router::Response> {
+        fn s3_auth_check(cx: &Cx) -> Option<topcoat::router::response::Response> {
             // Step 1: SigV4 credential verification
             match layers::sigv4::verify_request(cx, None) {
                 Ok(_) => {}
                 Err(response) => return Some(response),
             }
             // Step 2: Bucket policy evaluation
-            use topcoat::context::request_context;
-            use topcoat::router::RawPathParams;
-            let params: &RawPathParams = request_context(cx);
-            let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                .map(|(_, v)| v.to_string());
+            let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                .map(|(_, v)| v.as_str().to_string());
             if let Some(ref b) = bucket {
                 let query = parse_s3_query(cx);
                 let parts: &http::request::Parts = request_context(cx);
@@ -1117,7 +1082,7 @@ async fn main() {
             cx: &Cx,
             bucket: &str,
             action: &str,
-        ) -> Option<topcoat::router::Response> {
+        ) -> Option<topcoat::router::response::Response> {
             let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
             let b = match store.namespace_resolve(bucket, Some("s3")) { Ok(r) => r, Err(_) => return None };
             // Synchronous policy check -- policy blobs are small
@@ -1227,11 +1192,8 @@ async fn main() {
         fn s3_list_objects(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
@@ -1284,13 +1246,10 @@ async fn main() {
         fn s3_put_object(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 // Item 46: SSE-C rejection
                 {
@@ -1447,13 +1406,10 @@ async fn main() {
         fn s3_get_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let query = parse_s3_query(cx);
                 let version_id = query.get("versionId").cloned();
 
@@ -1640,13 +1596,10 @@ async fn main() {
         fn s3_head_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let query = parse_s3_query(cx);
                 let version_id = query.get("versionId").cloned();
 
@@ -1724,13 +1677,10 @@ async fn main() {
 
         fn s3_delete_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let query = parse_s3_query(cx);
                 let version_id = query.get("versionId").cloned();
 
@@ -1770,11 +1720,8 @@ async fn main() {
 
         fn s3_create_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
@@ -1791,11 +1738,8 @@ async fn main() {
         fn s3_head_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
@@ -1818,11 +1762,8 @@ async fn main() {
 
         fn s3_delete_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
@@ -1911,13 +1852,10 @@ async fn main() {
 
         fn s3_initiate_multipart(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let max_size = app_context::<MaxBlobSize>(cx).0 as u64;
 
@@ -2003,13 +1941,10 @@ async fn main() {
 
         fn s3_complete_multipart(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let query = parse_s3_query(cx);
                 let upload_id = query.get("uploadId").cloned().unwrap_or_default();
 
@@ -2163,11 +2098,8 @@ async fn main() {
         fn s3_delete_objects(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let body_bytes = {
@@ -2222,13 +2154,10 @@ async fn main() {
 
         fn s3_copy_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 // x-amz-copy-source header: /source-bucket/source-key
                 let copy_source = {
@@ -2283,11 +2212,8 @@ async fn main() {
         // PUT/GET /{bucket}?versioning -- versioning configuration
         fn s3_put_versioning(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let body_bytes = {
@@ -2316,11 +2242,8 @@ async fn main() {
 
         fn s3_get_versioning(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
@@ -2380,13 +2303,10 @@ async fn main() {
         // Item 43: PUT /{bucket}/{key}?tagging
         fn s3_put_tagging(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let body_bytes = {
                     use topcoat::router::to_bytes;
@@ -2432,13 +2352,10 @@ async fn main() {
         // Item 43: DELETE /{bucket}/{key}?tagging
         fn s3_delete_tagging(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
-                let key = params.iter().find(|(k, _)| *k == "key")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let key = raw_path_params(cx).find(|(k, _)| *k == "key")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let _ = tokio::task::spawn_blocking(move || -> Result<(), kappa_core::types::StoreError> {
                     let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
@@ -2506,11 +2423,8 @@ async fn main() {
         // Item 44/45: Generic bucket config PUT/GET/DELETE for lifecycle, cors, policy
         fn s3_put_bucket_config<'a>(cx: &'a Cx, body: Body, config_key: &'static str) -> RouteFuture<'a> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let body_bytes = {
                     use topcoat::router::to_bytes;
@@ -2529,11 +2443,8 @@ async fn main() {
 
         fn s3_get_bucket_config<'a>(cx: &'a Cx, _body: Body, config_key: &'static str) -> RouteFuture<'a> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("_config/{}", config_key);
                 let result = tokio::task::spawn_blocking(move || {
@@ -2558,11 +2469,8 @@ async fn main() {
 
         fn s3_delete_bucket_config<'a>(cx: &'a Cx, _body: Body, config_key: &'static str) -> RouteFuture<'a> {
             Box::pin(async move {
-                use topcoat::context::request_context;
-                use topcoat::router::RawPathParams;
-                let params: &RawPathParams = request_context(cx);
-                let bucket = params.iter().find(|(k, _)| *k == "bucket")
-                    .map(|(_, v)| v.to_string()).unwrap_or_default();
+                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("_config/{}", config_key);
                 let _ = tokio::task::spawn_blocking(move || {

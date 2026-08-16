@@ -1,20 +1,20 @@
 //! ETag generation, Cache-Control headers, and If-None-Match / 304 handling.
 //! Runs post-handler on the response.
 
-use topcoat::context::CxBuilder;
+use topcoat::context::Cx;
 use topcoat::router::{Body, Next, StatusCode};
 
 pub fn cache_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
-        let if_none_match = topcoat::router::headers(cx)
+        let if_none_match = topcoat::router::request::headers(cx)
             .get("if-none-match")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim_matches('"').to_owned());
-        let path = topcoat::router::uri(cx).path().to_owned();
+        let path = topcoat::router::request::uri(cx).path().to_owned();
 
         let mut response = next.run(cx, body).await?;
 
@@ -57,7 +57,7 @@ pub fn cache_layer<'a>(
     })
 }
 
-fn set_etag_from_digest(response: &mut topcoat::router::Response) {
+fn set_etag_from_digest(response: &mut topcoat::router::response::Response) {
     if let Some(digest) = response.headers().get("docker-content-digest").cloned() {
         if let Ok(s) = digest.to_str() {
             if let Ok(val) = format!("\"{}\"", s).parse() {

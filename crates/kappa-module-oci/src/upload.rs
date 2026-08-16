@@ -7,7 +7,9 @@
 
 use topcoat::context::{app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
-use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
+use topcoat::router::request::headers;
+use topcoat::router::response::{IntoResponse, Response};
+use topcoat::router::{Body, RouteFuture, StatusCode};
 
 use kappa_core::kappa::KappaLabel;
 use kappa_core::store::blob_put_computed;

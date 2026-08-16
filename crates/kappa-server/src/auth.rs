@@ -385,7 +385,7 @@ impl BearerAuth {
         &self,
         path: &str,
         headers: &topcoat::router::HeaderMap,
-    ) -> Result<AuthIdentity, topcoat::router::Response> {
+    ) -> Result<AuthIdentity, topcoat::router::response::Response> {
         if !self.required || self.tokens.is_empty() {
             return Ok(AuthIdentity { asserter: "anonymous".to_string() });
         }
@@ -410,10 +410,10 @@ impl BearerAuth {
         }
     }
 
-    fn unauthorized<T>() -> Result<T, topcoat::router::Response> {
+    fn unauthorized<T>() -> Result<T, topcoat::router::response::Response> {
         let body = r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
         let mut resp =
-            topcoat::router::Response::new(topcoat::router::Body::from(body));
+            topcoat::router::response::Response::new(topcoat::router::Body::from(body));
         *resp.status_mut() = topcoat::router::StatusCode::UNAUTHORIZED;
         resp.headers_mut().insert(
             "www-authenticate",

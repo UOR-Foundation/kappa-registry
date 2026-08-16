@@ -22,7 +22,8 @@ use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 
 use http::header::HeaderValue;
-use topcoat::router::{Body, Response, StatusCode};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, StatusCode};
 
 use crate::config::{ClassConfig, RateLimitConfig};
 

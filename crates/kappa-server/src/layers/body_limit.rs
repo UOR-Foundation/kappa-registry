@@ -7,8 +7,9 @@
 //! Both configurable via environment variables. Checks Content-Length
 //! header. Returns 413 with OCI error envelope if exceeded.
 
-use topcoat::context::{try_app_context, CxBuilder};
-use topcoat::router::{Body, Next, Response, StatusCode};
+use topcoat::context::{try_app_context, Cx};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, Next, StatusCode};
 
 use kappa_core::types::MaxBlobSize;
 
@@ -21,12 +22,12 @@ fn is_blob_path(path: &str) -> bool {
 }
 
 pub fn body_limit_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
-        let path = topcoat::router::uri(cx).path().to_owned();
+        let path = topcoat::router::request::uri(cx).path().to_owned();
         let is_blob = is_blob_path(&path);
 
         let limit = if is_blob {
@@ -43,7 +44,7 @@ pub fn body_limit_layer<'a>(
         );
 
         if let Some(max) = limit {
-            if let Some(cl) = topcoat::router::headers(cx)
+            if let Some(cl) = topcoat::router::request::headers(cx)
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<usize>().ok())

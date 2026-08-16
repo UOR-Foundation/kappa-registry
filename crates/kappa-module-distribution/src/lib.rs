@@ -31,9 +31,10 @@ pub mod ws_events;
 
 use std::sync::Arc;
 
-use topcoat::context::{app_context, request_context, try_app_context, Cx};
+use topcoat::context::{app_context, try_app_context, Cx};
 use topcoat::router::error::bad_request;
-use topcoat::router::{to_bytes, Body, Response, RouterBuilder, StatusCode};
+use topcoat::router::response::Response;
+use topcoat::router::{to_bytes, raw_path_params, Body, RouterBuilder, StatusCode};
 
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::store::KappaStore;
@@ -106,18 +107,15 @@ pub(crate) async fn resolve_ns_read_async(cx: &Cx) -> topcoat::Result<kappa_core
 
 /// Extract a path parameter by name from the matched route.
 pub(crate) fn path_param<'a>(cx: &'a Cx, key: &str) -> &'a str {
-    use topcoat::router::RawPathParams;
-    let params: &RawPathParams = request_context(cx);
-    params
-        .iter()
+    raw_path_params(cx)
         .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+        .map(|(_, v)| v.as_str())
         .unwrap_or("")
 }
 
 /// Extract a query parameter by name.
 pub(crate) fn query_param(cx: &Cx, key: &str) -> Option<String> {
-    let query = topcoat::router::uri(cx).query()?;
+    let query = topcoat::router::request::uri(cx).query()?;
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == key {

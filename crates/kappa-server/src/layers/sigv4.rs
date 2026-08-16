@@ -10,7 +10,8 @@
 use std::sync::Arc;
 
 use topcoat::context::{try_app_context, Cx};
-use topcoat::router::{Body, Response, StatusCode};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, StatusCode};
 
 use kappa_core::crypto::sigv4;
 

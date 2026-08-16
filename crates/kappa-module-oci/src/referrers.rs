@@ -1,7 +1,8 @@
 //! OCI referrers API: list manifests that refer to a given digest.
 
 use topcoat::context::Cx;
-use topcoat::router::{Body, Response, RouteFuture, StatusCode};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, RouteFuture, StatusCode};
 
 use kappa_core::types::{Direction, EdgeQuery, EdgeRelation, NamespaceRef};
 

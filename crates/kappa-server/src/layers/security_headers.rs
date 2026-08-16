@@ -1,7 +1,7 @@
 //! Security headers on every response.
 //! X-Content-Type-Options, X-Frame-Options, Referrer-Policy, CSP, HSTS.
 
-use topcoat::context::{try_app_context, CxBuilder};
+use topcoat::context::{try_app_context, Cx};
 use topcoat::router::{Body, Next};
 
 /// Marker type in app_context when TLS is enabled.
@@ -10,7 +10,7 @@ use topcoat::router::{Body, Next};
 pub struct TlsEnabled;
 
 pub fn security_headers_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {

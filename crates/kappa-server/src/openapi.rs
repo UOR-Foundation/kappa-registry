@@ -7,7 +7,8 @@
 //! When a route is added to any module, add a matching entry here.
 
 use topcoat::context::Cx;
-use topcoat::router::{Body, IntoResponse, RouteFuture, StatusCode};
+use topcoat::router::response::IntoResponse;
+use topcoat::router::{Body, RouteFuture, StatusCode};
 
 use serde_json::{json, Map, Value};
 

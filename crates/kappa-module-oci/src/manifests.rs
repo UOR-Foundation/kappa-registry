@@ -11,7 +11,9 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use topcoat::context::{try_app_context, Cx};
 use topcoat::router::error::bad_request;
-use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
+use topcoat::router::request::headers;
+use topcoat::router::response::{IntoResponse, Response};
+use topcoat::router::{Body, RouteFuture, StatusCode};
 
 use kappa_core::kappa::{kappa_from_bytes, verify_kappa, KappaLabel};
 use kappa_core::types::{Edge, EdgeRelation, EpochMutation, MutationOp, NamespaceRef};

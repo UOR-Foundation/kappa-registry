@@ -13,9 +13,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{broadcast, RwLock};
 use topcoat::context::{app_context, Cx};
-use topcoat::router::FromRequest;
+use topcoat::router::request::FromRequest;
 use topcoat::router::{Body, RouteFuture};
-use topcoat::router::websocket::{Message, WebSocketUpgrade};
+use topcoat::router::content::websocket::{Message, WebSocketUpgrade};
 
 use kappa_core::store::KappaStore;
 use kappa_core::types::NamespaceRef;

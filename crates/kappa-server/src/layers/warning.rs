@@ -10,11 +10,12 @@
 //! paths. Error responses are converted to HTTP responses with the
 //! error's status code and body so the Warning header can be attached.
 
-use topcoat::context::CxBuilder;
-use topcoat::router::{Body, Next, Response};
+use topcoat::context::Cx;
+use topcoat::router::response::Response;
+use topcoat::router::{Body, Next};
 
 pub fn warning_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {

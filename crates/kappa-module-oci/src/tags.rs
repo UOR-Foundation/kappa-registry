@@ -6,7 +6,9 @@
 
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
-use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
+use topcoat::router::request::headers;
+use topcoat::router::response::{IntoResponse, Response};
+use topcoat::router::{Body, RouteFuture, StatusCode};
 
 use kappa_core::types::{EpochMutation, MutationOp, NamespaceRef, TagUpdate};
 
@@ -147,7 +149,7 @@ async fn tag_delete_prefix(cx: &Cx, ns: &NamespaceRef, prefix: &str) -> topcoat:
 
 pub fn tag_crud_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
-        let method = topcoat::router::method(cx);
+        let method = topcoat::router::request::method(cx);
         let ns = crate::resolve_ns_write_async(cx).await?;
         match method.as_str() {
             "POST" => {

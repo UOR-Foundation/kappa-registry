@@ -20,10 +20,12 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use topcoat::context::{app_context, request_context, try_app_context, Cx};
+use topcoat::context::{app_context, try_app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::request::Bytes;
+use topcoat::router::response::IntoResponse;
 use topcoat::router::{
-    to_bytes, Body, IntoResponse, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    to_bytes, raw_path_params, Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_akd::AkdManager;
@@ -52,12 +54,9 @@ fn store_err(e: kappa_core::StoreError) -> topcoat::Error {
 }
 
 fn path_param<'a>(cx: &'a Cx, key: &str) -> &'a str {
-    use topcoat::router::RawPathParams;
-    let params: &RawPathParams = request_context(cx);
-    params
-        .iter()
+    raw_path_params(cx)
         .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+        .map(|(_, v)| v.as_str())
         .unwrap_or("")
 }
 
@@ -65,7 +64,7 @@ fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
     app_context::<Arc<dyn KappaStore>>(cx)
 }
 
-async fn read_body(body: Body) -> topcoat::Result<topcoat::router::Bytes> {
+async fn read_body(body: Body) -> topcoat::Result<Bytes> {
     to_bytes(body, usize::MAX)
         .await
         .map_err(|e| bad_request(format!("failed to read body: {e}")).into())
@@ -280,13 +279,9 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
         // Optional query parameter: at_ms for point-in-time resolution
         let at_ms: Option<u64> = {
-            use topcoat::router::RawPathParams;
-            use topcoat::context::request_context;
-            let params: &RawPathParams = request_context(cx);
-            params
-                .iter()
+            raw_path_params(cx)
                 .find(|(k, _)| *k == "at_ms")
-                .and_then(|(_, v)| v.parse().ok())
+                .and_then(|(_, v)| v.as_str().parse().ok())
         };
 
         // TrustPolicy filter: if registered in app_context, apply it.

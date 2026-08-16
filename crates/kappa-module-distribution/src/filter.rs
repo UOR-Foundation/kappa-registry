@@ -8,8 +8,9 @@ use std::borrow::Cow;
 
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
+use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
-    Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_core::store::blob_put_computed;

@@ -1,8 +1,9 @@
 //! CORS handling. OPTIONS preflight bypasses auth/ratelimit.
 //! Actual requests get Access-Control-Allow-Origin and Expose-Headers.
 
-use topcoat::context::CxBuilder;
-use topcoat::router::{Body, Method, Next, Response, StatusCode};
+use topcoat::context::Cx;
+use topcoat::router::response::Response;
+use topcoat::router::{Body, Method, Next, StatusCode};
 
 const ALLOW_METHODS: &str = "GET, HEAD, PUT, POST, DELETE, PATCH, OPTIONS";
 
@@ -15,13 +16,13 @@ const EXPOSE_HEADERS: &str = "Docker-Content-Digest, WWW-Authenticate, Link, \
     Accept-Ranges, X-Kappa-Label, X-Kappa-Axis";
 
 pub fn cors_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
-        let method = topcoat::router::method(cx).clone();
-        let origin = topcoat::router::headers(cx).get("origin").cloned();
+        let method = topcoat::router::request::method(cx).clone();
+        let origin = topcoat::router::request::headers(cx).get("origin").cloned();
 
         if method == Method::OPTIONS {
             let mut response = Response::new(Body::empty());

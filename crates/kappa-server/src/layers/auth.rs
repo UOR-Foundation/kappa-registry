@@ -8,8 +8,9 @@
 
 use std::sync::Arc;
 
-use topcoat::context::{app_context, try_app_context, CxBuilder};
-use topcoat::router::{Body, Next, Response, StatusCode};
+use topcoat::context::{app_context, try_app_context, Cx};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, Next, StatusCode};
 
 use kappa_core::store::KappaStore;
 
@@ -18,17 +19,17 @@ use crate::ratelimit::{classify_request, OpClass};
 
 
 pub fn auth_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
-        let path = topcoat::router::uri(cx).path().to_string();
-        let method = topcoat::router::method(cx).to_string();
+        let path = topcoat::router::request::uri(cx).path().to_string();
+        let method = topcoat::router::request::method(cx).to_string();
 
         // 1. Bearer token authentication -> resolved asserter identity
         let asserter = if let Some(bearer) = try_app_context::<Arc<BearerAuth>>(cx) {
-            let hdrs = topcoat::router::headers(cx);
+            let hdrs = topcoat::router::request::headers(cx);
             match bearer.check(&path, hdrs) {
                 Ok(identity) => identity.asserter,
                 Err(rejection) => return Ok(rejection),
@@ -38,14 +39,14 @@ pub fn auth_layer<'a>(
         };
 
         // Store caller identity in request context for downstream handlers
-        cx.insert(kappa_core::types::CallerIdentity(asserter.clone()));
+        let cx = cx.with(kappa_core::types::CallerIdentity(asserter.clone()));
 
         // 2. Reserved namespace authorization using resolved identity
         if let Some(ns) = extract_namespace(&path) {
             if is_reserved(&ns) {
                 let op = classify_request(&method, &path);
                 if !matches!(op, OpClass::Exempt) {
-                    let store = app_context::<Arc<dyn KappaStore>>(cx);
+                    let store = app_context::<Arc<dyn KappaStore>>(&cx);
                     let s = store.clone();
                     let ns_name = ns.clone();
                     let asserter_owned = asserter.clone();
@@ -70,7 +71,7 @@ pub fn auth_layer<'a>(
             }
         }
 
-        next.run(cx, body).await
+        next.run(&cx, body).await
     })
 }
 
