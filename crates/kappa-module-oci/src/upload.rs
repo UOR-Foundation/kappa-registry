@@ -286,6 +286,10 @@ async fn complete(
         }
     }
 
+    // Capture namespace from the upload session before complete removes it.
+    // The complete route is /v2/_uploads/{id} -- no {ns} path parameter.
+    let upload_ns = s.upload_namespace(&upload_id).unwrap_or_default();
+
     // Streaming hash verification + store
     let digest = client_digest.to_string();
     let uid = upload_id.clone();
@@ -325,14 +329,12 @@ async fn complete(
 
     release_upload_pin(cx, id).await;
 
-    let ns = path_param(cx, "ns");
-
     (
         StatusCode::CREATED,
         [
             ("x-kappa-label", result_kappa.clone()),
             ("docker-content-digest", result_kappa.clone()),
-            ("location", format!("/v2/{}/blobs/{}", ns, result_kappa)),
+            ("location", format!("/v2/{}/blobs/{}", upload_ns, result_kappa)),
             ("content-length", "0".to_string()),
         ],
     )
