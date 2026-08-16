@@ -41,6 +41,9 @@ serde = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+zstd = "0.13"
+xz2 = "0.1"
+bzip2 = "0.5"
 
 [dev-dependencies]
 tempfile = { workspace = true }

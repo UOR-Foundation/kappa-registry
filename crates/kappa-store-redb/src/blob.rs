@@ -14,7 +14,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use kappa_core::kappa::kappa_from_bytes;
 use kappa_core::types::StoreError;
 
-use crate::tables::{BINDING_RECORDS, BLOB_META, NAMESPACES};
+use crate::tables::{BINDING_RECORDS, BLOB_META, COMPRESSION_RECORDS, NAMESPACES};
 use crate::PersistentStore;
 
 /// Binding record on-disk format:
@@ -51,6 +51,56 @@ fn decode_binding(data: &[u8]) -> Result<DecodedBinding, StoreError> {
         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?
         .to_string();
     Ok(DecodedBinding { kappa, base_nonce, plaintext_size })
+}
+
+/// Compression record on-disk format:
+/// [algo_len:1][algo:N][kappa_len:2 BE][kappa:M][uncompressed_size:8 BE]
+pub(crate) fn encode_compression_record(kappa: &str, algo: &str, uncompressed_size: u64) -> Vec<u8> {
+    let ab = algo.as_bytes();
+    let kb = kappa.as_bytes();
+    let klen = kb.len() as u16;
+    let mut buf = Vec::with_capacity(1 + ab.len() + 2 + kb.len() + 8);
+    buf.push(ab.len() as u8);
+    buf.extend_from_slice(ab);
+    buf.extend_from_slice(&klen.to_be_bytes());
+    buf.extend_from_slice(kb);
+    buf.extend_from_slice(&uncompressed_size.to_be_bytes());
+    buf
+}
+
+pub(crate) struct DecodedCompression {
+    pub kappa: String,
+    pub algorithm: String,
+    pub uncompressed_size: u64,
+}
+
+pub(crate) fn decode_compression_record(data: &[u8]) -> Result<DecodedCompression, StoreError> {
+    if data.is_empty() {
+        return Err(StoreError::Io(std::io::Error::other("compression record empty")));
+    }
+    let algo_len = data[0] as usize;
+    if data.len() < 1 + algo_len + 2 {
+        return Err(StoreError::Io(std::io::Error::other("compression record truncated")));
+    }
+    let algorithm = std::str::from_utf8(&data[1..1 + algo_len])
+        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?
+        .to_string();
+    let kappa_len = u16::from_be_bytes([
+        data[1 + algo_len],
+        data[1 + algo_len + 1],
+    ]) as usize;
+    let kappa_start = 1 + algo_len + 2;
+    if data.len() < kappa_start + kappa_len + 8 {
+        return Err(StoreError::Io(std::io::Error::other("compression record truncated")));
+    }
+    let kappa = std::str::from_utf8(&data[kappa_start..kappa_start + kappa_len])
+        .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?
+        .to_string();
+    let size_start = kappa_start + kappa_len;
+    let uncompressed_size = u64::from_be_bytes(
+        data[size_start..size_start + 8].try_into().unwrap()
+    );
+    Ok(DecodedCompression { kappa, algorithm, uncompressed_size })
 }
 
 impl PersistentStore {
@@ -169,6 +219,14 @@ impl PersistentStore {
     }
 
     pub(crate) fn blob_exists_impl(&self, sigma: &str) -> Result<bool, StoreError> {
+        // Check compression records first (cheapest: single redb read)
+        {
+            let txn = self.db.begin_read().map_err(Self::redb_err)?;
+            let table = txn.open_table(COMPRESSION_RECORDS).map_err(Self::redb_err)?;
+            if table.get(sigma).map_err(Self::redb_err)?.is_some() {
+                return Ok(true);
+            }
+        }
         if self.encryption_key.is_some() {
             let txn = self.db.begin_read().map_err(Self::redb_err)?;
             let table = txn.open_table(BINDING_RECORDS).map_err(Self::redb_err)?;
@@ -217,6 +275,15 @@ impl PersistentStore {
     }
 
     pub(crate) fn blob_size_impl(&self, sigma: &str) -> Result<u64, StoreError> {
+        // Check compression records first: return uncompressed_size
+        {
+            let txn = self.db.begin_read().map_err(Self::redb_err)?;
+            let table = txn.open_table(COMPRESSION_RECORDS).map_err(Self::redb_err)?;
+            if let Some(val) = table.get(sigma).map_err(Self::redb_err)? {
+                let cr = decode_compression_record(val.value())?;
+                return Ok(cr.uncompressed_size);
+            }
+        }
         if self.encryption_key.is_some() {
             let txn = self.db.begin_read().map_err(Self::redb_err)?;
             let table = txn.open_table(BINDING_RECORDS).map_err(Self::redb_err)?;
@@ -353,6 +420,100 @@ impl PersistentStore {
             kappas.sort();
             Ok(kappas)
         }
+    }
+
+    // -- Compression-transparent blob storage -----------------------------------
+
+    pub(crate) fn ingest_compressed_impl(
+        &self,
+        uncompressed_hash: &str,
+        compressed_content: &[u8],
+        compression: &str,
+        uncompressed_size: u64,
+    ) -> Result<kappa_core::store::IngestResult, StoreError> {
+        // Hash the compressed content for the storage kappa
+        let kappa = kappa_from_bytes(compressed_content);
+
+        // Write compressed bytes to disk at kappa path
+        let path = kappa_core::kappa::blob_path_for(&self.blob_root, &kappa)?;
+        let newly_stored = if path.exists() {
+            false
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
+            }
+            let tmp = path.with_extension("tmp");
+            {
+                use std::io::Write;
+                let file = std::fs::File::create(&tmp).map_err(StoreError::Io)?;
+                let mut w = std::io::BufWriter::new(file);
+                w.write_all(compressed_content).map_err(StoreError::Io)?;
+                let f = w.into_inner().map_err(|e| StoreError::Io(e.into_error()))?;
+                if self.fsync { f.sync_all().map_err(StoreError::Io)?; }
+            }
+            std::fs::rename(&tmp, &path).map_err(StoreError::Io)?;
+            if self.fsync {
+                if let Some(p) = path.parent() {
+                    if let Ok(d) = std::fs::File::open(p) { let _ = d.sync_all(); }
+                }
+            }
+            true
+        };
+
+        // Insert compression record: uncompressed_hash -> (kappa, algo, size)
+        let txn = self.db.begin_write().map_err(Self::redb_err)?;
+        {
+            let mut table = txn.open_table(COMPRESSION_RECORDS).map_err(Self::redb_err)?;
+            let rec = encode_compression_record(&kappa, compression, uncompressed_size);
+            table.insert(uncompressed_hash, rec.as_slice()).map_err(Self::redb_err)?;
+        }
+        txn.commit().map_err(Self::redb_err)?;
+
+        Ok(kappa_core::store::IngestResult::new(kappa, newly_stored))
+    }
+
+    pub(crate) fn blob_open_compressed_impl(
+        &self,
+        uncompressed_hash: &str,
+    ) -> Result<Box<dyn kappa_core::store::BlobReader>, StoreError> {
+        let txn = self.db.begin_read().map_err(Self::redb_err)?;
+        let table = txn.open_table(COMPRESSION_RECORDS).map_err(Self::redb_err)?;
+        let val = table.get(uncompressed_hash).map_err(Self::redb_err)?
+            .ok_or_else(|| StoreError::NotFound(uncompressed_hash.to_string()))?;
+        let cr = decode_compression_record(val.value())?;
+        drop(table);
+        drop(txn);
+
+        let path = kappa_core::kappa::blob_path_for(&self.blob_root, &cr.kappa)?;
+        let file = std::fs::File::open(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(uncompressed_hash.to_string())
+            } else { StoreError::Io(e) }
+        })?;
+        Ok(Box::new(file))
+    }
+
+    pub(crate) fn blob_open_decompressed_impl(
+        &self,
+        uncompressed_hash: &str,
+    ) -> Result<Box<dyn kappa_core::store::BlobReader>, StoreError> {
+        let txn = self.db.begin_read().map_err(Self::redb_err)?;
+        let table = txn.open_table(COMPRESSION_RECORDS).map_err(Self::redb_err)?;
+        let val = table.get(uncompressed_hash).map_err(Self::redb_err)?
+            .ok_or_else(|| StoreError::NotFound(uncompressed_hash.to_string()))?;
+        let cr = decode_compression_record(val.value())?;
+        drop(table);
+        drop(txn);
+
+        let path = kappa_core::kappa::blob_path_for(&self.blob_root, &cr.kappa)?;
+        let compressed = std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(uncompressed_hash.to_string())
+            } else { StoreError::Io(e) }
+        })?;
+
+        let decompressed = crate::decompress_reader::decompress(&compressed, &cr.algorithm)?;
+        Ok(Box::new(std::io::Cursor::new(decompressed)))
     }
 
     // -- Blob metadata (redb BLOB_META table) ---------------------------------

@@ -17,6 +17,7 @@
 
 mod blob;
 pub mod credentials;
+pub(crate) mod decompress_reader;
 mod edge;
 pub mod encrypted;
 mod epoch;
@@ -160,6 +161,8 @@ impl PersistentStore {
             txn.open_table(tables::CREDENTIALS)
                 .map_err(Self::redb_err)?;
             txn.open_table(tables::VERSIONS)
+                .map_err(Self::redb_err)?;
+            txn.open_table(tables::COMPRESSION_RECORDS)
                 .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
@@ -544,6 +547,27 @@ impl KappaStore for PersistentStore {
     }
     fn blob_open(&self, kappa: &str) -> Result<Box<dyn kappa_core::store::BlobReader>, StoreError> {
         self.blob_open_impl(kappa)
+    }
+    fn ingest_compressed(
+        &self,
+        uncompressed_hash: &str,
+        compressed_content: &[u8],
+        compression: &str,
+        uncompressed_size: u64,
+    ) -> Result<kappa_core::store::IngestResult, StoreError> {
+        self.ingest_compressed_impl(uncompressed_hash, compressed_content, compression, uncompressed_size)
+    }
+    fn blob_open_compressed(
+        &self,
+        uncompressed_hash: &str,
+    ) -> Result<Box<dyn kappa_core::store::BlobReader>, StoreError> {
+        self.blob_open_compressed_impl(uncompressed_hash)
+    }
+    fn blob_open_decompressed(
+        &self,
+        uncompressed_hash: &str,
+    ) -> Result<Box<dyn kappa_core::store::BlobReader>, StoreError> {
+        self.blob_open_decompressed_impl(uncompressed_hash)
     }
     fn namespace_list(&self) -> Result<Vec<String>, StoreError> {
         self.namespace_list_impl()
@@ -1408,5 +1432,374 @@ mod tests {
         let wrong = format!("sha256:{}", "0".repeat(64));
         let result = s.upload_complete(&id, Some(wrong.as_str()));
         assert!(result.is_err());
+    }
+
+    // -- Upload lifecycle expiration tests ----------------------------------------
+
+    fn new_store_with_timeout(timeout_secs: u64) -> (PersistentStore, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = PersistentStoreConfig::new(
+            tmp.path().join("blobs"), tmp.path().join("state.redb"),
+        );
+        config.fsync = false;
+        config.upload_timeout_secs = Some(timeout_secs);
+        let clock = Arc::new(NtpLamportClock::new());
+        let store = PersistentStore::new(config, clock).unwrap();
+        (store, tmp)
+    }
+
+    #[test]
+    fn upload_put_part_on_expired_session() {
+        let (s, _d) = new_store_with_timeout(0);
+        let ns = NamespaceRef::from("ns");
+        let id = s.upload_begin(&ns, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let result = s.upload_put_part(&id, 0, b"data");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn upload_complete_on_expired_session() {
+        let (s, _d) = new_store_with_timeout(1);
+        let ns = NamespaceRef::from("ns");
+        let id = s.upload_begin(&ns, 0).unwrap();
+        s.upload_put_part(&id, 0, b"data").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let result = s.upload_complete(&id, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn upload_bytes_received_on_expired_session() {
+        let (s, _d) = new_store_with_timeout(0);
+        let ns = NamespaceRef::from("ns");
+        let id = s.upload_begin(&ns, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(s.upload_bytes_received(&id).is_none());
+    }
+
+    #[test]
+    fn upload_namespace_on_expired_session() {
+        let (s, _d) = new_store_with_timeout(0);
+        let ns = NamespaceRef::from("ns");
+        let id = s.upload_begin(&ns, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(s.upload_namespace(&id).is_none());
+    }
+
+    #[test]
+    fn upload_evict_expired_returns_correct_count() {
+        let (s, _d) = new_store_with_timeout(0);
+        let ns = NamespaceRef::from("ns");
+        for _ in 0..5 {
+            s.upload_begin(&ns, 0).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(s.upload_evict_expired(0), 5);
+    }
+
+    #[test]
+    fn upload_evict_expired_preserves_active() {
+        let (s, _d) = new_store_with_timeout(10);
+        let ns = NamespaceRef::from("ns");
+        s.upload_begin(&ns, 0).unwrap();
+        s.upload_begin(&ns, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(s.upload_evict_expired(10), 0);
+    }
+
+    #[test]
+    fn upload_staging_file_removed_on_expiry_eviction() {
+        let (s, _d) = new_store_with_timeout(1);
+        let ns = NamespaceRef::from("ns");
+        let id = s.upload_begin(&ns, 0).unwrap();
+        s.upload_put_part(&id, 0, b"staging data").unwrap();
+        let staging_path = s.staging_root.join(&id);
+        assert!(staging_path.exists(), "staging file should exist after put_part");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        s.upload_evict_expired(0);
+        assert!(!staging_path.exists(), "staging file should be removed after eviction");
+    }
+
+    // -- edge_put_batch adversarial tests ----------------------------------------
+
+    #[test]
+    fn edge_put_batch_empty() {
+        let (s, _d) = new_store();
+        let ns = NamespaceRef::from("ns");
+        s.edge_put_batch(&ns, &[]).unwrap();
+    }
+
+    #[test]
+    fn edge_put_batch_single() {
+        let (s, _d) = new_store();
+        let ns = NamespaceRef::from("ns");
+        let edge = Edge {
+            source: "sha256:bsrc".into(), target: "sha256:btgt".into(),
+            relation: EdgeRelation::Owns, asserter: "a".into(),
+            value_kappa: None, metadata: None,
+        };
+        s.edge_put_batch(&ns, &[edge]).unwrap();
+        let q = EdgeQuery { anchor: "sha256:bsrc".into(), direction: Direction::Outbound, relation: None, asserter: None };
+        assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn edge_put_batch_multiple() {
+        let (s, _d) = new_store();
+        let ns = NamespaceRef::from("ns");
+        let edges: Vec<Edge> = (0..10).map(|i| Edge {
+            source: format!("sha256:bs{i}"), target: format!("sha256:bt{i}"),
+            relation: EdgeRelation::RefersTo, asserter: "a".into(),
+            value_kappa: None, metadata: None,
+        }).collect();
+        s.edge_put_batch(&ns, &edges).unwrap();
+        for i in 0..10 {
+            let q = EdgeQuery { anchor: format!("sha256:bs{i}"), direction: Direction::Outbound, relation: None, asserter: None };
+            assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn edge_put_batch_large() {
+        let (s, _d) = new_store();
+        let ns = NamespaceRef::from("ns");
+        let edges: Vec<Edge> = (0..500).map(|i| Edge {
+            source: "sha256:broot".into(), target: format!("sha256:bdep{i}"),
+            relation: EdgeRelation::RefersTo, asserter: "a".into(),
+            value_kappa: None, metadata: None,
+        }).collect();
+        s.edge_put_batch(&ns, &edges).unwrap();
+        let q = EdgeQuery { anchor: "sha256:broot".into(), direction: Direction::Outbound, relation: Some(EdgeRelation::RefersTo), asserter: None };
+        assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 500);
+    }
+
+    #[test]
+    fn edge_put_batch_mixed_relations() {
+        let (s, _d) = new_store();
+        let ns = NamespaceRef::from("ns");
+        let edges = vec![
+            Edge { source: "s".into(), target: "t1".into(), relation: EdgeRelation::Owns, asserter: "a".into(), value_kappa: None, metadata: None },
+            Edge { source: "s".into(), target: "t2".into(), relation: EdgeRelation::DerivedFrom, asserter: "a".into(), value_kappa: None, metadata: None },
+            Edge { source: "s".into(), target: "t3".into(), relation: EdgeRelation::RefersTo, asserter: "a".into(), value_kappa: None, metadata: None },
+        ];
+        s.edge_put_batch(&ns, &edges).unwrap();
+        let q = EdgeQuery { anchor: "s".into(), direction: Direction::Outbound, relation: Some(EdgeRelation::DerivedFrom), asserter: None };
+        assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn edge_put_batch_all_queryable_by_target() {
+        let (s, _d) = new_store();
+        let ns = NamespaceRef::from("ns");
+        let edges: Vec<Edge> = (0..5).map(|i| Edge {
+            source: format!("sha256:bsrc{i}"), target: "sha256:bshared".into(),
+            relation: EdgeRelation::RefersTo, asserter: "a".into(),
+            value_kappa: None, metadata: None,
+        }).collect();
+        s.edge_put_batch(&ns, &edges).unwrap();
+        let q = EdgeQuery { anchor: "sha256:bshared".into(), direction: Direction::Inbound, relation: None, asserter: None };
+        assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn edge_put_batch_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ns = NamespaceRef::from("ns");
+        {
+            let s = reopen(tmp.path());
+            let edges: Vec<Edge> = (0..3).map(|i| Edge {
+                source: "sha256:reopen_src".into(), target: format!("sha256:reopen_tgt{i}"),
+                relation: EdgeRelation::Owns, asserter: "a".into(),
+                value_kappa: None, metadata: None,
+            }).collect();
+            s.edge_put_batch(&ns, &edges).unwrap();
+        }
+        {
+            let s = reopen(tmp.path());
+            let q = EdgeQuery { anchor: "sha256:reopen_src".into(), direction: Direction::Outbound, relation: None, asserter: None };
+            assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 3);
+        }
+    }
+
+    // -- Compression-transparent blob storage ----------------------------------
+
+    #[test]
+    fn compression_zstd_roundtrip() {
+        let (s, _d) = new_store();
+        let original = b"zstd compression roundtrip test content for kappa registry";
+        let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
+        let nar_hash = kappa_from_bytes(original);
+
+        let result = s.ingest_compressed(&nar_hash, &compressed, "zstd", original.len() as u64).unwrap();
+        assert!(result.newly_stored);
+
+        // blob_open_compressed returns exact compressed bytes
+        let mut reader = s.blob_open_compressed(&nar_hash).unwrap();
+        let mut got = Vec::new();
+        use std::io::Read;
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, compressed);
+
+        // blob_open_decompressed returns original content
+        let mut reader = s.blob_open_decompressed(&nar_hash).unwrap();
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn compression_xz_roundtrip() {
+        let (s, _d) = new_store();
+        let original = b"xz compression roundtrip test content";
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = xz2::write::XzEncoder::new(&mut compressed, 6);
+            enc.write_all(original).unwrap();
+            enc.finish().unwrap();
+        }
+        let hash = kappa_from_bytes(original);
+
+        s.ingest_compressed(&hash, &compressed, "xz", original.len() as u64).unwrap();
+
+        let mut reader = s.blob_open_decompressed(&hash).unwrap();
+        let mut got = Vec::new();
+        use std::io::Read;
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn compression_bzip2_roundtrip() {
+        let (s, _d) = new_store();
+        let original = b"bzip2 compression roundtrip test content";
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = bzip2::write::BzEncoder::new(&mut compressed, bzip2::Compression::default());
+            enc.write_all(original).unwrap();
+            enc.finish().unwrap();
+        }
+        let hash = kappa_from_bytes(original);
+
+        s.ingest_compressed(&hash, &compressed, "bzip2", original.len() as u64).unwrap();
+
+        let mut reader = s.blob_open_decompressed(&hash).unwrap();
+        let mut got = Vec::new();
+        use std::io::Read;
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn compression_none_roundtrip() {
+        let (s, _d) = new_store();
+        let original = b"no compression test";
+        let hash = kappa_from_bytes(original);
+
+        s.ingest_compressed(&hash, original, "none", original.len() as u64).unwrap();
+
+        let mut reader = s.blob_open_compressed(&hash).unwrap();
+        let mut got = Vec::new();
+        use std::io::Read;
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, original);
+
+        let mut reader = s.blob_open_decompressed(&hash).unwrap();
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn compression_record_fields() {
+        use crate::blob::{encode_compression_record, decode_compression_record};
+        let rec = encode_compression_record("sha256:abc123", "zstd", 42000);
+        let decoded = decode_compression_record(&rec).unwrap();
+        assert_eq!(decoded.kappa, "sha256:abc123");
+        assert_eq!(decoded.algorithm, "zstd");
+        assert_eq!(decoded.uncompressed_size, 42000);
+    }
+
+    #[test]
+    fn compression_sigma_not_found() {
+        let (s, _d) = new_store();
+        let result = s.blob_open_decompressed("sha256:0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compression_blob_exists_via_sigma() {
+        let (s, _d) = new_store();
+        let original = b"exists check content";
+        let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
+        let hash = kappa_from_bytes(original);
+
+        assert!(!s.blob_exists(&hash).unwrap());
+        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+        assert!(s.blob_exists(&hash).unwrap());
+    }
+
+    #[test]
+    fn compression_blob_size_returns_uncompressed() {
+        let (s, _d) = new_store();
+        let original = b"size check: this is the uncompressed content for blob_size test";
+        let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
+        let hash = kappa_from_bytes(original);
+
+        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+        let size = s.blob_size(&hash).unwrap();
+        assert_eq!(size, original.len() as u64);
+        assert_ne!(size, compressed.len() as u64);
+    }
+
+    #[test]
+    fn compression_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = b"survives reopen content";
+        let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
+        let hash = kappa_from_bytes(original);
+        {
+            let s = reopen(tmp.path());
+            s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+        }
+        {
+            let s = reopen(tmp.path());
+            assert!(s.blob_exists(&hash).unwrap());
+            assert_eq!(s.blob_size(&hash).unwrap(), original.len() as u64);
+
+            let mut reader = s.blob_open_compressed(&hash).unwrap();
+            let mut got = Vec::new();
+            use std::io::Read;
+            reader.read_to_end(&mut got).unwrap();
+            assert_eq!(got, compressed);
+
+            let mut reader = s.blob_open_decompressed(&hash).unwrap();
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).unwrap();
+            assert_eq!(got, original);
+        }
+    }
+
+    #[test]
+    fn compression_decompressed_seek_to_start() {
+        let (s, _d) = new_store();
+        let original = b"seek test content for decompressed reader";
+        let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
+        let hash = kappa_from_bytes(original);
+        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+
+        let mut reader = s.blob_open_decompressed(&hash).unwrap();
+        use std::io::{Read, Seek, SeekFrom};
+        let mut first_read = Vec::new();
+        reader.read_to_end(&mut first_read).unwrap();
+
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut second_read = Vec::new();
+        reader.read_to_end(&mut second_read).unwrap();
+
+        assert_eq!(first_read, second_read);
+        assert_eq!(first_read, original);
     }
 }

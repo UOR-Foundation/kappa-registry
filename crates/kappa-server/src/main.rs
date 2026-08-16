@@ -749,6 +749,13 @@ async fn main() {
                         ).map_err(|e| kappa_core::types::StoreError::Rejected(
                             format!("NAR verification failed: {e}")
                         ))?;
+                        // Create compression record so NAR is addressable by NarHash
+                        let _ = store.ingest_compressed(
+                            &narinfo.nar_hash,
+                            &nar_bytes,
+                            &narinfo.compression,
+                            narinfo.nar_size,
+                        );
                     }
 
                     // Store narinfo text as blob
@@ -882,18 +889,30 @@ async fn main() {
                                     if let Ok(narinfo) = kappa_module_nix::narinfo::NarInfo::parse(&narinfo_text) {
                                         let narinfo_nar_path = narinfo.url.strip_prefix("nar/").unwrap_or(&narinfo.url);
                                         if narinfo_nar_path == path {
-                                            if let Err(e) = kappa_module_nix::refs::decompress_and_verify(
+                                            match kappa_module_nix::refs::decompress_and_verify(
                                                 &content,
                                                 &narinfo.compression,
                                                 &narinfo.nar_hash,
                                                 &narinfo.references,
                                             ) {
-                                                tracing::warn!(
-                                                    narinfo = %tag.name,
-                                                    error = %e,
-                                                    "deferred NAR verification failed, removing narinfo"
-                                                );
-                                                let _ = store.tag_delete(&nix_ns, &tag.name);
+                                                Ok(()) => {
+                                                    // Verification passed. Create compression record
+                                                    // so the NAR is addressable by NarHash (uncompressed hash).
+                                                    let _ = store.ingest_compressed(
+                                                        &narinfo.nar_hash,
+                                                        &content,
+                                                        &narinfo.compression,
+                                                        narinfo.nar_size,
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        narinfo = %tag.name,
+                                                        error = %e,
+                                                        "deferred NAR verification failed, removing narinfo"
+                                                    );
+                                                    let _ = store.tag_delete(&nix_ns, &tag.name);
+                                                }
                                             }
                                         }
                                     }

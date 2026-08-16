@@ -79,6 +79,15 @@ pub const CREDENTIALS: TableDefinition<&str, &[u8]> =
 pub const VERSIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("versions");
 
+// -- Compression records (sigma-to-kappa mapping for compressed blobs) --------
+// Key: "{uncompressed_hash}" (sigma -- hash of uncompressed content)
+// Value: encoded CompressionRecord
+// Maps the uncompressed content hash to the compressed blob's storage kappa
+// plus the compression algorithm and uncompressed size. Same pattern as
+// BINDING_RECORDS for encryption: sigma -> (kappa, metadata).
+pub const COMPRESSION_RECORDS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("compression_records");
+
 // -- Identity assertion inbound index -----------------------------------------
 // Key: "{subject}\x00{facet}"  Values: assertion kappa strings
 // Cross-namespace: assertions from any namespace are indexed here.

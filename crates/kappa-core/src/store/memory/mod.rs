@@ -51,6 +51,14 @@ pub struct InMemoryStore {
     epoch_roots: RwLock<HashMap<String, EpochRoot>>,
     current_epochs: RwLock<HashMap<u64, String>>,
     uploads: Mutex<HashMap<String, UploadSession>>,
+    /// Compression records: uncompressed_hash -> (kappa, algorithm, compressed_bytes, uncompressed_size)
+    compression_records: DashMap<String, (String, String, Vec<u8>, u64)>,
+    /// Identity bindings: source -> Vec<IdentityBinding>
+    identity_bindings: DashMap<String, Vec<crate::identity::IdentityBinding>>,
+    /// Identity successions: old_anchor -> new_anchor
+    identity_successions: DashMap<String, String>,
+    /// Assertion inbound index: "{subject}\0{facet}" -> Vec<assertion_kappa>
+    assertion_inbound: DashMap<String, Vec<String>>,
 }
 
 struct UploadSession {
@@ -81,6 +89,10 @@ impl InMemoryStore {
             epoch_roots: RwLock::new(HashMap::new()),
             current_epochs: RwLock::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
+            compression_records: DashMap::new(),
+            identity_bindings: DashMap::new(),
+            identity_successions: DashMap::new(),
+            assertion_inbound: DashMap::new(),
         })
     }
 
@@ -698,5 +710,247 @@ impl KappaStore for InMemoryStore {
         let before = uploads.len();
         uploads.retain(|_, s| s.created_at.elapsed() <= std::time::Duration::from_secs(timeout_secs));
         before - uploads.len()
+    }
+
+    // -- Compression-transparent blob storage ---------------------------------
+
+    fn ingest_compressed(
+        &self,
+        uncompressed_hash: &str,
+        compressed_content: &[u8],
+        compression: &str,
+        uncompressed_size: u64,
+    ) -> Result<crate::store::IngestResult, StoreError> {
+        let kappa = crate::kappa::kappa_from_bytes(compressed_content);
+        // Store compressed bytes on disk at kappa path
+        let path = self.blob_path(&kappa)?;
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, compressed_content)?;
+            std::fs::rename(&tmp, &path)?;
+        }
+        // Store compression record
+        self.compression_records.insert(
+            uncompressed_hash.to_string(),
+            (kappa.clone(), compression.to_string(), compressed_content.to_vec(), uncompressed_size),
+        );
+        Ok(crate::store::IngestResult::new(kappa, true))
+    }
+
+    fn blob_open_compressed(
+        &self,
+        uncompressed_hash: &str,
+    ) -> Result<Box<dyn crate::store::BlobReader>, StoreError> {
+        let entry = self.compression_records.get(uncompressed_hash)
+            .ok_or_else(|| StoreError::NotFound(uncompressed_hash.to_string()))?;
+        let compressed_bytes = entry.value().2.clone();
+        Ok(Box::new(std::io::Cursor::new(compressed_bytes)))
+    }
+
+    fn blob_open_decompressed(
+        &self,
+        uncompressed_hash: &str,
+    ) -> Result<Box<dyn crate::store::BlobReader>, StoreError> {
+        let entry = self.compression_records.get(uncompressed_hash)
+            .ok_or_else(|| StoreError::NotFound(uncompressed_hash.to_string()))?;
+        let (_, ref algo, ref compressed, _) = *entry.value();
+        let decompressed = decompress_bytes(compressed, algo)?;
+        Ok(Box::new(std::io::Cursor::new(decompressed)))
+    }
+
+    // -- Assertion inbound index ----------------------------------------------
+
+    fn assertion_index_put(
+        &self,
+        subject: &str,
+        facet: &str,
+        assertion_kappa: &str,
+    ) -> Result<(), StoreError> {
+        let key = format!("{}\x00{}", subject, facet);
+        self.assertion_inbound
+            .entry(key)
+            .or_default()
+            .push(assertion_kappa.to_string());
+        Ok(())
+    }
+
+    fn assertion_index_query_subject(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let prefix = format!("{}\x00", subject);
+        let mut results = Vec::new();
+        for entry in self.assertion_inbound.iter() {
+            if entry.key().starts_with(&prefix) {
+                results.extend(entry.value().iter().cloned());
+            }
+        }
+        results.sort();
+        results.dedup();
+        Ok(results)
+    }
+
+    // -- Identity binding -----------------------------------------------------
+
+    fn identity_binding_put(
+        &self,
+        _ns: &NamespaceRef,
+        binding: &crate::identity::IdentityBinding,
+    ) -> Result<String, StoreError> {
+        let kappa = crate::kappa::kappa_from_value(binding);
+        // Check for duplicate (same source + target)
+        let mut bindings = self.identity_bindings
+            .entry(binding.source.clone())
+            .or_default();
+        if !bindings.iter().any(|b| b.source == binding.source && b.target == binding.target) {
+            bindings.push(binding.clone());
+        }
+        Ok(kappa)
+    }
+
+    fn identity_binding_get(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<crate::identity::IdentityBinding>, StoreError> {
+        match self.identity_bindings.get(subject) {
+            Some(bindings) => Ok(bindings.value().clone()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn identity_binding_delete(
+        &self,
+        _ns: &NamespaceRef,
+        subject: &str,
+        target: &str,
+    ) -> Result<(), StoreError> {
+        if let Some(mut bindings) = self.identity_bindings.get_mut(subject) {
+            bindings.retain(|b| b.target != target);
+            if bindings.is_empty() {
+                drop(bindings);
+                self.identity_bindings.remove(subject);
+            }
+        }
+        Ok(())
+    }
+
+    fn identity_binding_list_by_asserter(
+        &self,
+        asserter: &str,
+    ) -> Result<Vec<crate::identity::IdentityBinding>, StoreError> {
+        let mut results = Vec::new();
+        for entry in self.identity_bindings.iter() {
+            for binding in entry.value() {
+                if binding.target == asserter {
+                    results.push(binding.clone());
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    // -- Identity succession --------------------------------------------------
+
+    fn identity_succession_put(
+        &self,
+        succession: &crate::identity::IdentitySuccession,
+    ) -> Result<String, StoreError> {
+        if succession.old_anchor == succession.new_anchor {
+            return Err(StoreError::Rejected("cannot succeed to self".into()));
+        }
+        let kappa = crate::kappa::kappa_from_value(succession);
+        self.identity_successions.insert(
+            succession.old_anchor.clone(),
+            succession.new_anchor.clone(),
+        );
+        Ok(kappa)
+    }
+
+    fn identity_succession_resolve(
+        &self,
+        anchor: &str,
+    ) -> Result<String, StoreError> {
+        let mut current = anchor.to_string();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(current.clone());
+        loop {
+            match self.identity_successions.get(&current) {
+                Some(next) => {
+                    let next_val = next.value().clone();
+                    if visited.contains(&next_val) {
+                        return Err(StoreError::Rejected(format!(
+                            "succession cycle detected at {next_val}"
+                        )));
+                    }
+                    if visited.len() >= 10 {
+                        return Err(StoreError::Rejected(
+                            "succession chain exceeds 10 hops".into()
+                        ));
+                    }
+                    visited.insert(next_val.clone());
+                    current = next_val;
+                }
+                None => return Ok(current),
+            }
+        }
+    }
+
+    fn identity_succession_chain(
+        &self,
+        anchor: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut chain = vec![anchor.to_string()];
+        let mut current = anchor.to_string();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(current.clone());
+        loop {
+            match self.identity_successions.get(&current) {
+                Some(next) => {
+                    let next_val = next.value().clone();
+                    if visited.contains(&next_val) {
+                        return Err(StoreError::Rejected(format!(
+                            "succession cycle detected at {next_val}"
+                        )));
+                    }
+                    if visited.len() >= 10 {
+                        return Err(StoreError::Rejected(
+                            "succession chain exceeds 10 hops".into()
+                        ));
+                    }
+                    visited.insert(next_val.clone());
+                    chain.push(next_val.clone());
+                    current = next_val;
+                }
+                None => return Ok(chain),
+            }
+        }
+    }
+}
+
+fn decompress_bytes(data: &[u8], algorithm: &str) -> Result<Vec<u8>, StoreError> {
+    match algorithm {
+        "none" => Ok(data.to_vec()),
+        "zstd" => zstd::decode_all(std::io::Cursor::new(data))
+            .map_err(|e| StoreError::Io(std::io::Error::other(format!("zstd: {e}")))),
+        "xz" | "lzma" => {
+            use std::io::Read;
+            let mut decoder = xz2::read::XzDecoder::new(data);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out)
+                .map_err(|e| StoreError::Io(std::io::Error::other(format!("xz: {e}"))))?;
+            Ok(out)
+        }
+        "bzip2" => {
+            use std::io::Read;
+            let mut decoder = bzip2::read::BzDecoder::new(data);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out)
+                .map_err(|e| StoreError::Io(std::io::Error::other(format!("bzip2: {e}"))))?;
+            Ok(out)
+        }
+        other => Err(StoreError::Rejected(format!("unsupported compression: {other}"))),
     }
 }

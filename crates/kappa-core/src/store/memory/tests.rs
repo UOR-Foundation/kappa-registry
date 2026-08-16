@@ -547,3 +547,229 @@ fn multi_axis_idempotent() {
     assert!(!r2.newly_stored);
     assert_eq!(r1.additional_kappas, r2.additional_kappas);
 }
+
+// -- Upload lifecycle expiration tests ----------------------------------------
+
+fn test_store_with_timeout(timeout_secs: u64) -> (InMemoryStore, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = super::MemoryStoreConfig::new(dir.path().join("blobs"));
+    config.upload_timeout_secs = Some(timeout_secs);
+    let clock = Arc::new(NtpLamportClock::new());
+    let store = InMemoryStore::new(config, clock).unwrap();
+    (store, dir)
+}
+
+#[test]
+fn upload_put_part_on_expired_session() {
+    let (store, _dir) = test_store_with_timeout(0);
+    let ns = NamespaceRef::from("ns");
+    let id = store.upload_begin(&ns, 0).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let result = store.upload_put_part(&id, 0, b"data");
+    assert!(result.is_err(), "put_part on expired session should fail");
+}
+
+#[test]
+fn upload_complete_on_expired_session() {
+    // Use timeout 1 so put_part succeeds, then sleep past expiry
+    let (store, _dir) = test_store_with_timeout(1);
+    let ns = NamespaceRef::from("ns");
+    let id = store.upload_begin(&ns, 0).unwrap();
+    store.upload_put_part(&id, 0, b"data").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let result = store.upload_complete(&id, None);
+    assert!(result.is_err(), "complete on expired session should fail");
+}
+
+#[test]
+fn upload_bytes_received_on_expired_session() {
+    let (store, _dir) = test_store_with_timeout(0);
+    let ns = NamespaceRef::from("ns");
+    let id = store.upload_begin(&ns, 0).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(store.upload_bytes_received(&id).is_none());
+}
+
+#[test]
+fn upload_namespace_on_expired_session() {
+    let (store, _dir) = test_store_with_timeout(0);
+    let ns = NamespaceRef::from("ns");
+    let id = store.upload_begin(&ns, 0).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(store.upload_namespace(&id).is_none());
+}
+
+#[test]
+fn upload_evict_expired_returns_correct_count() {
+    let (store, _dir) = test_store_with_timeout(0);
+    let ns = NamespaceRef::from("ns");
+    for _ in 0..5 {
+        store.upload_begin(&ns, 0).unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(store.upload_evict_expired(0), 5);
+}
+
+#[test]
+fn upload_evict_expired_preserves_active() {
+    let (store, _dir) = test_store_with_timeout(10);
+    let ns = NamespaceRef::from("ns");
+    store.upload_begin(&ns, 0).unwrap();
+    store.upload_begin(&ns, 0).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(store.upload_evict_expired(10), 0);
+}
+
+// -- Compression-transparent blob storage ------------------------------------
+
+#[test]
+fn compression_memory_store_roundtrip() {
+    let (store, _dir) = test_store();
+    let original = b"InMemoryStore compression roundtrip test content";
+    let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
+    let hash = crate::kappa::kappa_from_bytes(original);
+
+    store.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+
+    let mut reader = store.blob_open_decompressed(&hash).unwrap();
+    let mut got = Vec::new();
+    use std::io::Read;
+    reader.read_to_end(&mut got).unwrap();
+    assert_eq!(got, original);
+}
+
+// -- edge_put_batch adversarial tests ----------------------------------------
+
+#[test]
+fn edge_put_batch_empty() {
+    let (store, _dir) = test_store();
+    let ns = NamespaceRef::from("ns");
+    store.edge_put_batch(&ns, &[]).unwrap();
+}
+
+#[test]
+fn edge_put_batch_single() {
+    let (store, _dir) = test_store();
+    let ns = NamespaceRef::from("ns");
+    let edge = Edge {
+        source: "sha256:src".into(),
+        target: "sha256:tgt".into(),
+        relation: EdgeRelation::Owns,
+        asserter: "a".into(),
+        value_kappa: None,
+        metadata: None,
+    };
+    store.edge_put_batch(&ns, &[edge]).unwrap();
+    let q = EdgeQuery {
+        anchor: "sha256:src".into(),
+        direction: Direction::Outbound,
+        relation: None,
+        asserter: None,
+    };
+    let results = store.edge_query(&ns, &q).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].target, "sha256:tgt");
+}
+
+#[test]
+fn edge_put_batch_multiple() {
+    let (store, _dir) = test_store();
+    let ns = NamespaceRef::from("ns");
+    let edges: Vec<Edge> = (0..10).map(|i| Edge {
+        source: format!("sha256:src{i}"),
+        target: format!("sha256:tgt{i}"),
+        relation: EdgeRelation::RefersTo,
+        asserter: "a".into(),
+        value_kappa: None,
+        metadata: None,
+    }).collect();
+    store.edge_put_batch(&ns, &edges).unwrap();
+    for i in 0..10 {
+        let q = EdgeQuery {
+            anchor: format!("sha256:src{i}"),
+            direction: Direction::Outbound,
+            relation: None,
+            asserter: None,
+        };
+        let results = store.edge_query(&ns, &q).unwrap();
+        assert_eq!(results.len(), 1, "missing edge {i}");
+    }
+}
+
+#[test]
+fn edge_put_batch_large() {
+    let (store, _dir) = test_store();
+    let ns = NamespaceRef::from("ns");
+    let edges: Vec<Edge> = (0..500).map(|i| Edge {
+        source: "sha256:root".into(),
+        target: format!("sha256:dep{i}"),
+        relation: EdgeRelation::RefersTo,
+        asserter: "a".into(),
+        value_kappa: None,
+        metadata: None,
+    }).collect();
+    store.edge_put_batch(&ns, &edges).unwrap();
+    let q = EdgeQuery {
+        anchor: "sha256:root".into(),
+        direction: Direction::Outbound,
+        relation: Some(EdgeRelation::RefersTo),
+        asserter: None,
+    };
+    let results = store.edge_query(&ns, &q).unwrap();
+    assert_eq!(results.len(), 500);
+}
+
+#[test]
+fn edge_put_batch_mixed_relations() {
+    let (store, _dir) = test_store();
+    let ns = NamespaceRef::from("ns");
+    let edges = vec![
+        Edge { source: "s".into(), target: "t1".into(), relation: EdgeRelation::Owns, asserter: "a".into(), value_kappa: None, metadata: None },
+        Edge { source: "s".into(), target: "t2".into(), relation: EdgeRelation::DerivedFrom, asserter: "a".into(), value_kappa: None, metadata: None },
+        Edge { source: "s".into(), target: "t3".into(), relation: EdgeRelation::RefersTo, asserter: "a".into(), value_kappa: None, metadata: None },
+    ];
+    store.edge_put_batch(&ns, &edges).unwrap();
+    let q = EdgeQuery { anchor: "s".into(), direction: Direction::Outbound, relation: Some(EdgeRelation::DerivedFrom), asserter: None };
+    let results = store.edge_query(&ns, &q).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].target, "t2");
+}
+
+#[test]
+fn edge_put_batch_all_queryable_by_target() {
+    let (store, _dir) = test_store();
+    let ns = NamespaceRef::from("ns");
+    let edges: Vec<Edge> = (0..5).map(|i| Edge {
+        source: format!("sha256:src{i}"),
+        target: "sha256:shared_target".into(),
+        relation: EdgeRelation::RefersTo,
+        asserter: "a".into(),
+        value_kappa: None,
+        metadata: None,
+    }).collect();
+    store.edge_put_batch(&ns, &edges).unwrap();
+    let q = EdgeQuery {
+        anchor: "sha256:shared_target".into(),
+        direction: Direction::Inbound,
+        relation: None,
+        asserter: None,
+    };
+    let results = store.edge_query(&ns, &q).unwrap();
+    assert_eq!(results.len(), 5);
+}
+
+#[test]
+fn compression_memory_store_compressed_reader() {
+    let (store, _dir) = test_store();
+    let original = b"InMemoryStore compressed reader test";
+    let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
+    let hash = crate::kappa::kappa_from_bytes(original);
+
+    store.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+
+    let mut reader = store.blob_open_compressed(&hash).unwrap();
+    let mut got = Vec::new();
+    use std::io::Read;
+    reader.read_to_end(&mut got).unwrap();
+    assert_eq!(got, compressed);
+}

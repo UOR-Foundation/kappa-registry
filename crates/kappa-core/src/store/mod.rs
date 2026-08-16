@@ -272,6 +272,71 @@ pub trait KappaStore: Send + Sync {
     /// Evict uploads older than `timeout_secs`. Returns count evicted.
     fn upload_evict_expired(&self, timeout_secs: u64) -> usize;
 
+    // -- Compression-transparent blob storage (3) --------------------------------
+
+    /// Store pre-compressed content with a known uncompressed content hash.
+    ///
+    /// `uncompressed_hash`: hash of the uncompressed content (the addressing
+    /// identity, e.g. NarHash for Nix, diff_id for OCI layers).
+    /// `compressed_content`: the compressed bytes to store on disk.
+    /// `compression`: algorithm name ("zstd", "xz", "bzip2", "none").
+    /// `uncompressed_size`: byte length of the uncompressed content.
+    ///
+    /// The store hashes `compressed_content` for the storage kappa, writes
+    /// the compressed bytes to disk, and inserts a compression record:
+    ///   uncompressed_hash -> (kappa, compression, uncompressed_size)
+    ///
+    /// After this call:
+    /// - `blob_open_compressed(uncompressed_hash)` returns the compressed bytes
+    /// - `blob_open_decompressed(uncompressed_hash)` returns a decompressing reader
+    /// - `blob_exists(uncompressed_hash)` returns true (via compression record)
+    /// - `blob_size(uncompressed_hash)` returns uncompressed_size
+    ///
+    /// The caller is responsible for verifying that `uncompressed_hash` is
+    /// the correct hash of the uncompressed content. The store does NOT
+    /// decompress and re-hash to verify.
+    fn ingest_compressed(
+        &self,
+        uncompressed_hash: &str,
+        compressed_content: &[u8],
+        compression: &str,
+        uncompressed_size: u64,
+    ) -> Result<IngestResult, StoreError>;
+
+    /// Open the raw compressed bytes of a blob identified by its
+    /// uncompressed content hash.
+    ///
+    /// Returns a reader over the compressed bytes as stored on disk.
+    /// The caller is responsible for decompression. Use this for:
+    /// - Serving pre-compressed content to clients that accept the
+    ///   compression format (Nix NAR clients expect zstd/xz/bzip2)
+    /// - Range requests where client-side decompression is cheaper
+    ///   than server-side seek-to-offset decompression
+    ///
+    /// Returns NotFound if no compression record exists for the hash.
+    fn blob_open_compressed(
+        &self,
+        uncompressed_hash: &str,
+    ) -> Result<Box<dyn BlobReader>, StoreError>;
+
+    /// Open a decompressed view of a compressed blob identified by its
+    /// uncompressed content hash.
+    ///
+    /// Returns a reader that decompresses on construction. The reader
+    /// implements Read + Seek + Send (BlobReader trait) but Seek is O(N):
+    /// seeking to offset N decompresses and discards bytes 0..N from the
+    /// start of the stream. Use for sequential reads (Nix NAR serving,
+    /// full GET). For range requests on compressed content, use
+    /// blob_open_compressed and decompress client-side.
+    ///
+    /// Memory: holds the full decompressed content in memory. For
+    /// streaming decompression with bounded memory, use blob_open_compressed
+    /// and a protocol-specific streaming decompressor.
+    fn blob_open_decompressed(
+        &self,
+        uncompressed_hash: &str,
+    ) -> Result<Box<dyn BlobReader>, StoreError>;
+
     // -- Blob reader for streaming (1) ----------------------------------------
 
     fn blob_open(&self, kappa: &str) -> Result<Box<dyn BlobReader>, StoreError> {
@@ -364,6 +429,71 @@ pub trait KappaStore: Send + Sync {
         _subject: &str,
     ) -> Result<Vec<String>, StoreError> {
         Ok(Vec::new())
+    }
+
+    // -- Identity binding (4, forcing function) --------------------------------
+
+    /// Store an identity binding. Returns the kappa of the stored binding blob.
+    fn identity_binding_put(
+        &self,
+        _ns: &NamespaceRef,
+        _binding: &crate::identity::IdentityBinding,
+    ) -> Result<String, StoreError> {
+        Err(StoreError::Rejected("identity_binding_put not implemented".into()))
+    }
+
+    /// Query bindings for a subject (external identifier).
+    fn identity_binding_get(
+        &self,
+        _subject: &str,
+    ) -> Result<Vec<crate::identity::IdentityBinding>, StoreError> {
+        Err(StoreError::Rejected("identity_binding_get not implemented".into()))
+    }
+
+    /// Delete a binding by subject and target.
+    fn identity_binding_delete(
+        &self,
+        _ns: &NamespaceRef,
+        _subject: &str,
+        _target: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Rejected("identity_binding_delete not implemented".into()))
+    }
+
+    /// List all bindings for an asserter anchor.
+    fn identity_binding_list_by_asserter(
+        &self,
+        _asserter: &str,
+    ) -> Result<Vec<crate::identity::IdentityBinding>, StoreError> {
+        Err(StoreError::Rejected("identity_binding_list_by_asserter not implemented".into()))
+    }
+
+    // -- Identity succession (3, forcing function) ----------------------------
+
+    /// Store a succession declaration. Returns the kappa of the stored blob.
+    fn identity_succession_put(
+        &self,
+        _succession: &crate::identity::IdentitySuccession,
+    ) -> Result<String, StoreError> {
+        Err(StoreError::Rejected("identity_succession_put not implemented".into()))
+    }
+
+    /// Resolve the current anchor at the end of a succession chain.
+    /// Follows succession edges from the given anchor, up to 10 hops.
+    fn identity_succession_resolve(
+        &self,
+        _anchor: &str,
+    ) -> Result<String, StoreError> {
+        Err(StoreError::Rejected("identity_succession_resolve not implemented".into()))
+    }
+
+    /// Get the full succession chain from an anchor.
+    /// Returns the ordered list of anchors: [original, successor1, successor2, ...current].
+    fn identity_succession_chain(
+        &self,
+        _anchor: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        Err(StoreError::Rejected("identity_succession_chain not implemented".into()))
     }
 }
 

@@ -3467,6 +3467,7 @@ name = "kappa-core"
 version = "0.2.0"
 dependencies = [
  "blake3",
+ "bzip2",
  "chrono",
  "crc-fast",
  "dashmap 6.2.1",
@@ -3495,7 +3496,9 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "uuid",
+ "xz2",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]
@@ -3667,6 +3670,7 @@ version = "0.2.0"
 dependencies = [
  "base64-simd",
  "blake3",
+ "bzip2",
  "crc-fast",
  "getrandom 0.4.3",
  "hex",
@@ -3680,6 +3684,8 @@ dependencies = [
  "tempfile",
  "tracing",
  "uuid",
+ "xz2",
+ "zstd",
 ]
 
 [[package]]
