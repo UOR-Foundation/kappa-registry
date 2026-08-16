@@ -58,47 +58,37 @@ pub fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
     app_context::<Arc<dyn KappaStore>>(cx)
 }
 
-/// Resolve a namespace for write operations (PUT/POST/PATCH/DELETE).
-/// Creates the namespace on first use (first-writer-claims).
-/// Must be called inside spawn_blocking or from a blocking context.
-pub fn resolve_ns_write(store: &dyn KappaStore, name: &str, owner: &str) -> Result<NamespaceRef, kappa_core::StoreError> {
-    store.namespace_resolve_or_create(name, owner, Some("oci"))
-}
-
-/// Resolve a namespace for read operations (GET/HEAD).
-/// Returns NotFound if the namespace does not exist.
-/// Does NOT create the namespace -- prevents namespace squatting via pulls.
-/// Must be called inside spawn_blocking or from a blocking context.
-pub fn resolve_ns_read(store: &dyn KappaStore, name: &str) -> Result<NamespaceRef, kappa_core::StoreError> {
-    store.namespace_resolve(name, Some("oci"))
-}
-
-/// Resolve a namespace from request context for write paths.
-/// Extracts namespace name from path params and asserter from caller identity.
-/// Returns the resolved NamespaceRef via spawn_blocking.
+/// Read resolved namespace from context. Write path: creates on first write.
 pub async fn resolve_ns_write_async(cx: &Cx) -> topcoat::Result<NamespaceRef> {
-    let s = store(cx).clone();
-    let name = path_param(cx, "ns").to_string();
-    let owner = registry_anchor(cx);
-    tokio::task::spawn_blocking(move || {
-        s.namespace_resolve_or_create(&name, &owner, Some("oci"))
-    })
-    .await
-    .map_err(|e| bad_request(e.to_string()))?
-    .map_err(store_err)
+    use topcoat::context::request_context;
+    use kappa_core::types::ResolvedNamespace;
+    match request_context::<ResolvedNamespace>(cx) {
+        ResolvedNamespace::Exists(ns) => Ok(ns.clone()),
+        ResolvedNamespace::NotFound { name, protocol } => {
+            let s = store(cx).clone();
+            let owner = registry_anchor(cx);
+            let name = name.clone();
+            let protocol = protocol.clone();
+            tokio::task::spawn_blocking(move || {
+                s.namespace_resolve_or_create(&name, &owner, Some(&protocol))
+            })
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)
+        }
+        ResolvedNamespace::NoNamespace => {
+            Err(bad_request("no namespace in request path").into())
+        }
+    }
 }
 
-/// Resolve a namespace from request context for read paths.
-/// Returns topcoat not_found error if namespace does not exist.
+/// Read resolved namespace from context. Read path: 404 if not found.
 pub async fn resolve_ns_read_async(cx: &Cx) -> topcoat::Result<NamespaceRef> {
-    let s = store(cx).clone();
-    let name = path_param(cx, "ns").to_string();
-    tokio::task::spawn_blocking(move || {
-        s.namespace_resolve(&name, Some("oci"))
-    })
-    .await
-    .map_err(|e| bad_request(e.to_string()))?
-    .map_err(store_err)
+    use topcoat::context::request_context;
+    use kappa_core::types::ResolvedNamespace;
+    request_context::<ResolvedNamespace>(cx)
+        .expect_exists()
+        .map_err(|_| topcoat::router::error::not_found().into())
 }
 
 /// Get the registry's own anchor for edge asserter field.

@@ -565,6 +565,53 @@ pub enum ProtocolHint {
 #[derive(Debug, Clone)]
 pub struct CallerIdentity(pub String);
 
+// -- Resolved namespace (request-scoped, not persisted) -----------------------
+
+/// Result of namespace resolution by the interceptor layer.
+/// Stored in request context via `cx.with(resolved)`.
+/// Handlers read it with `request_context::<ResolvedNamespace>(cx)`.
+#[derive(Debug, Clone)]
+pub enum ResolvedNamespace {
+    /// Namespace exists. Handler uses the NamespaceRef directly.
+    Exists(NamespaceRef),
+    /// Namespace does not exist. Write handlers may create it.
+    /// Read handlers return 404.
+    NotFound { name: String, protocol: String },
+    /// No namespace in this request path (/_status, /v2/, /docs, etc.).
+    NoNamespace,
+}
+
+/// Errors from namespace resolution in handler code.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum NamespaceError {
+    #[error("namespace not found: {0}")]
+    NotFound(String),
+    #[error("no namespace in request path")]
+    NoNamespace,
+}
+
+impl ResolvedNamespace {
+    /// Extract the NamespaceRef if the namespace exists.
+    /// Returns NamespaceError::NotFound or NoNamespace otherwise.
+    /// Used by read-path handlers: `let ns = resolved.expect_exists()?;`
+    pub fn expect_exists(&self) -> Result<NamespaceRef, NamespaceError> {
+        match self {
+            Self::Exists(ns) => Ok(ns.clone()),
+            Self::NotFound { name, .. } => Err(NamespaceError::NotFound(name.clone())),
+            Self::NoNamespace => Err(NamespaceError::NoNamespace),
+        }
+    }
+
+    /// Returns (name, protocol) if the namespace was not found.
+    /// Used by write-path handlers to decide whether to create.
+    pub fn name_if_missing(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::NotFound { name, protocol } => Some((name, protocol)),
+            _ => None,
+        }
+    }
+}
+
 // -- Attestation digests (cannot produce KappaLabel) --------------------------
 
 /// Digest algorithms that attest to content but do NOT produce content

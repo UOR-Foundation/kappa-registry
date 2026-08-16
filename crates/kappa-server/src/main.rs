@@ -317,6 +317,8 @@ async fn main() {
         .compression(Compression::off());
 
     // Layer chain: outermost to innermost
+    // Namespace resolution runs on every request (pathless), before auth.
+    builder = builder.layer(LayerFn::new(None::<&Path>, namespace::namespace_layer));
     builder = builder.layer(LayerFn::new(Some("/"),warning_layer));
     builder = builder.layer(LayerFn::new(Some("/"),cache_layer));
     builder = builder.layer(LayerFn::new(Some("/"),response_compliance_layer));
@@ -505,8 +507,7 @@ async fn main() {
 
         fn git_info_refs(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let repo_name = raw_path_params(cx).find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                // repo_name extracted by namespace interceptor layer
                 // service comes from ?service= query param, not path param
                 let service = {
                     let parts: &http::request::Parts = request_context(cx);
@@ -523,18 +524,27 @@ async fn main() {
                         .map(|s| s.contains("version=2"))
                         .unwrap_or(false)
                 };
+                let repo = {
+                    use kappa_core::types::ResolvedNamespace;
+                    match request_context::<ResolvedNamespace>(cx) {
+                        ResolvedNamespace::Exists(ns) => ns.clone(),
+                        ResolvedNamespace::NotFound { name, protocol } if !is_upload => {
+                            // receive-pack (push) creates namespace on first push
+                            let s = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                            let name = name.clone();
+                            let protocol = protocol.clone();
+                            tokio::task::spawn_blocking(move || {
+                                s.namespace_resolve_or_create(&name, "_git", Some(&protocol))
+                            }).await
+                                .map_err(|e| std::io::Error::other(e.to_string()))?
+                                .map_err(|e| std::io::Error::other(e.to_string()))?
+                        }
+                        _ => return StatusCode::NOT_FOUND.into_response(cx),
+                    }
+                };
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let svc = service.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    // upload-pack (clone/fetch) is read -- namespace must exist.
-                    // receive-pack (push) is write -- create namespace on first push.
-                    let repo = if is_upload {
-                        store.namespace_resolve(&repo_name, Some("git"))
-                            .map_err(|e| std::io::Error::other(format!("repository '{}' not found: {}", repo_name, e)))?
-                    } else {
-                        store.namespace_resolve_or_create(&repo_name, "_git", Some("git"))
-                            .map_err(|e| std::io::Error::other(format!("namespace resolve '{}': {}", repo_name, e)))?
-                    };
                     let object_hash = repo_object_hash(&*store, &repo);
                     let mut out = Vec::new();
                     if is_v2 {
@@ -576,8 +586,7 @@ async fn main() {
 
         fn git_upload_pack(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let repo_name = raw_path_params(cx).find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                // repo_name extracted by namespace interceptor layer
                 let is_v2 = {
                     let parts: &http::request::Parts = request_context(cx);
                     parts.headers.get("git-protocol")
@@ -585,14 +594,17 @@ async fn main() {
                         .map(|s| s.contains("version=2"))
                         .unwrap_or(false)
                 };
+                let repo = {
+                    use kappa_core::types::ResolvedNamespace;
+                    request_context::<ResolvedNamespace>(cx).expect_exists()
+                        .map_err(|_| topcoat::router::error::not_found())?
+                };
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
                     to_bytes(body, 256 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
-                    let repo = store.namespace_resolve(&repo_name, Some("git"))
-                        .map_err(|e| std::io::Error::other(format!("namespace resolve '{}': {}", repo_name, e)))?;
                     let object_hash = repo_object_hash(&*store, &repo);
                     let mut response = Vec::new();
                     if is_v2 {
@@ -622,18 +634,29 @@ async fn main() {
 
         fn git_receive_pack(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let repo_name = raw_path_params(cx).find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let repo = {
+                    use kappa_core::types::ResolvedNamespace;
+                    match request_context::<ResolvedNamespace>(cx) {
+                        ResolvedNamespace::Exists(ns) => ns.clone(),
+                        ResolvedNamespace::NotFound { name, protocol } => {
+                            let s = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                            let name = name.clone();
+                            let protocol = protocol.clone();
+                            tokio::task::spawn_blocking(move || {
+                                s.namespace_resolve_or_create(&name, "_git", Some(&protocol))
+                            }).await
+                                .map_err(|e| std::io::Error::other(e.to_string()))?
+                                .map_err(|e| std::io::Error::other(e.to_string()))?
+                        }
+                        ResolvedNamespace::NoNamespace => return StatusCode::NOT_FOUND.into_response(cx),
+                    }
+                };
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
                     to_bytes(body, 256 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
-                    let repo = store.namespace_resolve_or_create(&repo_name, "_git", Some("git"))
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    // Detect object format from push or stored config.
-                    // For new repos, detect from ref update OID length (40=SHA-1, 64=SHA-256).
                     let object_hash = repo_object_hash(&*store, &repo);
                     let mut response = Vec::new();
                     kappa_module_git::handle_receive_pack(
@@ -661,15 +684,29 @@ async fn main() {
 
         fn git_lfs_batch(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let repo_name = raw_path_params(cx).find(|(k, _)| *k == "repo")
-                    .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let repo = {
+                    use kappa_core::types::ResolvedNamespace;
+                    match request_context::<ResolvedNamespace>(cx) {
+                        ResolvedNamespace::Exists(ns) => ns.clone(),
+                        ResolvedNamespace::NotFound { name, protocol } => {
+                            let s = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                            let name = name.clone();
+                            let protocol = protocol.clone();
+                            tokio::task::spawn_blocking(move || {
+                                s.namespace_resolve_or_create(&name, "_git", Some(&protocol))
+                            }).await
+                                .map_err(|e| std::io::Error::other(e.to_string()))?
+                                .map_err(|e| std::io::Error::other(e.to_string()))?
+                        }
+                        ResolvedNamespace::NoNamespace => return StatusCode::NOT_FOUND.into_response(cx),
+                    }
+                };
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let request_bytes = {
                     use topcoat::router::to_bytes;
                     to_bytes(body, 10 * 1024 * 1024).await
                         .map(|b| b.to_vec()).unwrap_or_default()
                 };
-                // Determine base URL from Host header
                 let base_url = {
                     let parts: &http::request::Parts = request_context(cx);
                     let host = parts.headers.get("host")
@@ -678,8 +715,6 @@ async fn main() {
                     format!("http://{}", host)
                 };
                 let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-                    let repo = store.namespace_resolve_or_create(&repo_name, "_git", Some("git"))
-                        .map_err(|e| format!("namespace resolve: {e}"))?;
                     let batch_req: kappa_module_git::BatchRequest =
                         serde_json::from_slice(&request_bytes)
                             .map_err(|e| format!("invalid LFS batch request: {e}"))?;
@@ -731,12 +766,16 @@ async fn main() {
 
         fn nix_narinfo_get(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
+                let nix_ns = {
+                    use kappa_core::types::ResolvedNamespace;
+                    request_context::<ResolvedNamespace>(cx).expect_exists()
+                        .map_err(|_| topcoat::router::error::not_found())?
+                };
                 let hash = raw_path_params(cx).find(|(k, _)| *k == "hash")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("narinfo:{}", hash);
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let entry = store.tag_get(&nix_ns, &tag_name)?;
                     store.blob_get(&entry.kappa)
                 }).await;
@@ -752,12 +791,16 @@ async fn main() {
 
         fn nix_narinfo_head(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
+                let nix_ns = {
+                    use kappa_core::types::ResolvedNamespace;
+                    request_context::<ResolvedNamespace>(cx).expect_exists()
+                        .map_err(|_| topcoat::router::error::not_found())?
+                };
                 let hash = raw_path_params(cx).find(|(k, _)| *k == "hash")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("narinfo:{}", hash);
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let entry = store.tag_get(&nix_ns, &tag_name)?;
                     store.blob_size(&entry.kappa)
                 }).await;
@@ -775,6 +818,12 @@ async fn main() {
             Box::pin(async move {
                 let url_hash = raw_path_params(cx).find(|(k, _)| *k == "hash")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let nix_ns = {
+                    use topcoat::context::request_context;
+                    use kappa_core::types::ResolvedNamespace;
+                    request_context::<ResolvedNamespace>(cx).expect_exists()
+                        .map_err(|_| topcoat::router::error::not_found())?
+                };
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let narinfo_bytes = {
                     use topcoat::router::to_bytes;
@@ -782,7 +831,6 @@ async fn main() {
                         .map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let narinfo_text = String::from_utf8(narinfo_bytes.clone())
                         .map_err(|e| kappa_core::types::StoreError::Rejected(
                             format!("narinfo is not valid UTF-8: {e}")
@@ -901,12 +949,16 @@ async fn main() {
 
         fn nix_nar_get(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
+                let nix_ns = {
+                    use kappa_core::types::ResolvedNamespace;
+                    request_context::<ResolvedNamespace>(cx).expect_exists()
+                        .map_err(|_| topcoat::router::error::not_found())?
+                };
                 let path = raw_path_params(cx).find(|(k, _)| *k == "path")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("nar:{}", path);
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let entry = store.tag_get(&nix_ns, &tag_name)?;
                     let mut reader = store.blob_open_compressed(&entry.kappa)?;
                     let mut content = Vec::new();
@@ -926,6 +978,12 @@ async fn main() {
             Box::pin(async move {
                 let path = raw_path_params(cx).find(|(k, _)| *k == "path")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
+                let nix_ns = {
+                    use topcoat::context::request_context;
+                    use kappa_core::types::ResolvedNamespace;
+                    request_context::<ResolvedNamespace>(cx).expect_exists()
+                        .map_err(|_| topcoat::router::error::not_found())?
+                };
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let content = {
                     use topcoat::router::to_bytes;
@@ -933,7 +991,6 @@ async fn main() {
                         .map(|b| b.to_vec()).unwrap_or_default()
                 };
                 let result = tokio::task::spawn_blocking(move || {
-                    let nix_ns = store.namespace_resolve("_nix", Some("nix")).map_err(|e| kappa_core::types::StoreError::Rejected(format!("_nix namespace: {}", e)))?;
                     let nar_kappa = kappa_core::kappa::kappa_from_bytes(&content);
                     store.ingest_verified(&nar_kappa, &content)?;
                     let tag_name = format!("nar:{}", path);
@@ -1133,6 +1190,36 @@ async fn main() {
             None
         }
 
+        /// Resolve S3 bucket namespace from interceptor context. Read path.
+        fn s3_bucket_read(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
+            use kappa_core::types::ResolvedNamespace;
+            request_context::<ResolvedNamespace>(cx)
+                .expect_exists()
+                .map_err(|_| topcoat::router::error::not_found().into())
+        }
+
+        /// Resolve S3 bucket namespace from interceptor context. Write path: creates on first write.
+        async fn s3_bucket_write(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
+            use kappa_core::types::ResolvedNamespace;
+            match request_context::<ResolvedNamespace>(cx) {
+                ResolvedNamespace::Exists(ns) => Ok(ns.clone()),
+                ResolvedNamespace::NotFound { name, protocol } => {
+                    let s = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                    let name = name.clone();
+                    let protocol = protocol.clone();
+                    tokio::task::spawn_blocking(move || {
+                        s.namespace_resolve_or_create(&name, "_s3", Some(&protocol))
+                    })
+                    .await
+                    .map_err(|e| topcoat::router::error::bad_request(e.to_string()))?
+                    .map_err(|e| topcoat::router::error::bad_request(e.to_string()).into())
+                }
+                ResolvedNamespace::NoNamespace => {
+                    Err(topcoat::router::error::not_found().into())
+                }
+            }
+        }
+
         /// Parse query parameters from a URI string.
         fn parse_s3_query(cx: &Cx) -> std::collections::HashMap<String, String> {
             use topcoat::context::request_context;
@@ -1192,6 +1279,7 @@ async fn main() {
         fn s3_list_objects(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let bucket_ns = s3_bucket_read(cx)?;
                 let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
@@ -1220,7 +1308,7 @@ async fn main() {
                 };
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     let resp = kappa_module_s3::list_objects_v2(&*store, &bucket, &req)?;
                     Ok::<Vec<u8>, kappa_core::types::StoreError>(
                         kappa_module_s3::encode_list_objects_v2_xml(&resp),
@@ -1246,6 +1334,7 @@ async fn main() {
         fn s3_put_object(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let bucket_ns = s3_bucket_write(cx).await?;
                 let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
@@ -1340,7 +1429,7 @@ async fn main() {
                 let sse = sse_algo.clone();
                 let ct_for_store = content_type_header.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     let digest = kappa_core::kappa::kappa_from_bytes(&content);
                     let ingest = store.ingest_verified(&digest, &content)?;
 
@@ -1406,6 +1495,7 @@ async fn main() {
         fn s3_get_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let bucket_ns = s3_bucket_read(cx)?;
                 let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
@@ -1439,10 +1529,10 @@ async fn main() {
                 // Item 43: Object tagging GET
                 if query.contains_key("tagging") {
                     let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                    let bucket_name = bucket.clone();
+                    let _bucket_name = bucket.clone();
                     let k = key.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        let b = store.namespace_resolve(&bucket_name, Some("s3"))?;
+                        let b = bucket_ns.clone();
                         let entry = store.tag_get(&b, &k)?;
                         match store.blob_get_meta(&entry.kappa, "_s3_tags") {
                             Ok(raw) => Ok(raw),
@@ -1471,7 +1561,7 @@ async fn main() {
                 // Item 48: GetObjectAttributes
                 if query.contains_key("attributes") {
                     let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                    let bucket_name = bucket.clone();
+                    let _bucket_name = bucket.clone();
                     let k = key.clone();
                     // x-amz-object-attributes header specifies which attributes to return
                     let requested_attrs = {
@@ -1483,7 +1573,7 @@ async fn main() {
                             .to_string()
                     };
                     let result = tokio::task::spawn_blocking(move || {
-                        let b = store.namespace_resolve(&bucket_name, Some("s3"))?;
+                        let b = bucket_ns.clone();
                         let entry = store.tag_get(&b, &k)?;
                         let size = store.blob_size(&entry.kappa)?;
                         Ok::<(String, u64), kappa_core::types::StoreError>((entry.kappa, size))
@@ -1513,7 +1603,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     let (kappa, content, vid) = match store.version_get(&bucket, &key, version_id.as_deref()) {
                         Ok(ve) => {
                             let kappa = ve.kappa.ok_or_else(|| {
@@ -1596,7 +1686,8 @@ async fn main() {
         fn s3_head_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_read(cx)?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
@@ -1606,7 +1697,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     match store.version_get(&bucket, &key, version_id.as_deref()) {
                         Ok(ve) => {
                             let kappa = ve.kappa.ok_or_else(|| {
@@ -1677,7 +1768,8 @@ async fn main() {
 
         fn s3_delete_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
@@ -1687,7 +1779,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     match store.version_delete(&bucket, &key, version_id.as_deref()) {
                         Ok(dr) => Ok(dr),
                         Err(kappa_core::types::StoreError::Rejected(_)) => {
@@ -1720,14 +1812,15 @@ async fn main() {
 
         fn s3_create_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 // "Create" a bucket by touching a marker tag
                 let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     store.tag_set(&bucket, "_bucket_marker", "sha256:0000000000000000000000000000000000000000000000000000000000000000")
                 }).await;
 
@@ -1738,6 +1831,7 @@ async fn main() {
         fn s3_head_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
+                let _bucket_ns = s3_bucket_read(cx)?;
                 let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
@@ -1762,13 +1856,14 @@ async fn main() {
 
         fn s3_delete_bucket(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     // S3 DeleteBucket requires the bucket to be empty.
                     // Check tag_list: if any non-marker tags exist, reject.
                     let tags = store.tag_list(&bucket)?;
@@ -1852,6 +1947,7 @@ async fn main() {
 
         fn s3_initiate_multipart(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
+                let bucket_ns = s3_bucket_write(cx).await?;
                 let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
@@ -1862,7 +1958,7 @@ async fn main() {
                 let bucket_for_xml = bucket.clone();
                 let key_for_xml = key.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     store.upload_begin(&bucket, max_size)
                 }).await;
 
@@ -1941,6 +2037,7 @@ async fn main() {
 
         fn s3_complete_multipart(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
+                let bucket_ns = s3_bucket_write(cx).await?;
                 let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
@@ -2042,7 +2139,7 @@ async fn main() {
                 }
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     let ingest_result = store.upload_complete(&upload_id, None)?;
                     store.tag_set(&bucket, &key, &ingest_result.kappa)?;
                     let now_ms = std::time::SystemTime::now()
@@ -2098,7 +2195,8 @@ async fn main() {
         fn s3_delete_objects(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 if let Some(r) = s3_auth_check(cx) { return Ok(r); }
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
@@ -2124,8 +2222,7 @@ async fn main() {
                 }
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))
-                        .map_err(|e| kappa_core::types::StoreError::Rejected(format!("namespace resolve '{}': {}", bucket, e)))?;
+                    let bucket = bucket_ns.clone();
                     let mut deleted = Vec::new();
                     let mut errors: Vec<(String, String, String)> = Vec::new();
                     for key in &keys_to_delete {
@@ -2154,7 +2251,8 @@ async fn main() {
 
         fn s3_copy_object(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
@@ -2172,7 +2270,7 @@ async fn main() {
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     // Parse copy source: /bucket/key or bucket/key
                     let source = copy_source.strip_prefix('/').unwrap_or(&copy_source);
                     let (src_bucket, src_key) = source.split_once('/')
@@ -2212,7 +2310,8 @@ async fn main() {
         // PUT/GET /{bucket}?versioning -- versioning configuration
         fn s3_put_versioning(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
@@ -2232,7 +2331,7 @@ async fn main() {
                 };
 
                 let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     store.tag_set(&bucket, "_config/versioning", status_value)
                 }).await;
 
@@ -2242,13 +2341,14 @@ async fn main() {
 
         fn s3_get_versioning(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_read(cx)?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
 
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
 
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     match store.tag_get(&bucket, "_config/versioning") {
                         Ok(entry) => Ok(entry.kappa),
                         Err(kappa_core::types::StoreError::NotFound(_)) => Ok(String::new()),
@@ -2303,7 +2403,8 @@ async fn main() {
         // Item 43: PUT /{bucket}/{key}?tagging
         fn s3_put_tagging(cx: &Cx, body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
@@ -2333,7 +2434,7 @@ async fn main() {
                     } else { break; }
                 }
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     let entry = store.tag_get(&bucket, &key)?;
                     let json = serde_json::to_vec(&tags)
                         .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
@@ -2352,13 +2453,14 @@ async fn main() {
         // Item 43: DELETE /{bucket}/{key}?tagging
         fn s3_delete_tagging(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let key = raw_path_params(cx).find(|(k, _)| *k == "key")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let _ = tokio::task::spawn_blocking(move || -> Result<(), kappa_core::types::StoreError> {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     if let Ok(entry) = store.tag_get(&bucket, &key) {
                         let _ = store.blob_delete_meta(&entry.kappa, "_s3_tags");
                     }
@@ -2423,7 +2525,8 @@ async fn main() {
         // Item 44/45: Generic bucket config PUT/GET/DELETE for lifecycle, cors, policy
         fn s3_put_bucket_config<'a>(cx: &'a Cx, body: Body, config_key: &'static str) -> RouteFuture<'a> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let body_bytes = {
@@ -2432,7 +2535,7 @@ async fn main() {
                 };
                 let tag_name = format!("_config/{}", config_key);
                 let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     let kappa = kappa_core::kappa::kappa_from_bytes(&body_bytes);
                     let _ = store.ingest_verified(&kappa, &body_bytes);
                     store.tag_set(&bucket, &tag_name, &kappa)
@@ -2443,12 +2546,13 @@ async fn main() {
 
         fn s3_get_bucket_config<'a>(cx: &'a Cx, _body: Body, config_key: &'static str) -> RouteFuture<'a> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_read(cx)?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("_config/{}", config_key);
                 let result = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve(&bucket, Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     let entry = store.tag_get(&bucket, &tag_name)?;
                     store.blob_get(&entry.kappa)
                 }).await;
@@ -2469,12 +2573,13 @@ async fn main() {
 
         fn s3_delete_bucket_config<'a>(cx: &'a Cx, _body: Body, config_key: &'static str) -> RouteFuture<'a> {
             Box::pin(async move {
-                let bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
+                let bucket_ns = s3_bucket_write(cx).await?;
+                let _bucket = raw_path_params(cx).find(|(k, _)| *k == "bucket")
                     .map(|(_, v)| v.as_str().to_string()).unwrap_or_default();
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
                 let tag_name = format!("_config/{}", config_key);
                 let _ = tokio::task::spawn_blocking(move || {
-                    let bucket = store.namespace_resolve_or_create(&bucket, "_s3", Some("s3"))?;
+                    let bucket = bucket_ns.clone();
                     store.tag_delete(&bucket, &tag_name)
                 }).await;
                 StatusCode::NO_CONTENT.into_response(cx)

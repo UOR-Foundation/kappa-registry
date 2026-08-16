@@ -78,31 +78,37 @@ pub(crate) fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
     app_context::<Arc<dyn KappaStore>>(cx)
 }
 
-/// Resolve namespace for write operations (PUT/POST/DELETE).
-/// Creates on first use. kappa-distribution extends OCI, shares OCI namespace scope.
+/// Read resolved namespace from context. Write path: creates on first write.
 pub(crate) async fn resolve_ns_write_async(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
-    let s = store(cx).clone();
-    let name = path_param(cx, "ns").to_string();
-    let owner = registry_anchor(cx);
-    tokio::task::spawn_blocking(move || {
-        s.namespace_resolve_or_create(&name, &owner, Some("oci"))
-    })
-    .await
-    .map_err(|e| bad_request(e.to_string()))?
-    .map_err(store_err)
+    use topcoat::context::request_context;
+    use kappa_core::types::ResolvedNamespace;
+    match request_context::<ResolvedNamespace>(cx) {
+        ResolvedNamespace::Exists(ns) => Ok(ns.clone()),
+        ResolvedNamespace::NotFound { name, protocol } => {
+            let s = store(cx).clone();
+            let owner = registry_anchor(cx);
+            let name = name.clone();
+            let protocol = protocol.clone();
+            tokio::task::spawn_blocking(move || {
+                s.namespace_resolve_or_create(&name, &owner, Some(&protocol))
+            })
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)
+        }
+        ResolvedNamespace::NoNamespace => {
+            Err(bad_request("no namespace in request path").into())
+        }
+    }
 }
 
-/// Resolve namespace for read operations (GET/HEAD).
-/// Returns not_found if namespace does not exist.
+/// Read resolved namespace from context. Read path: 404 if not found.
 pub(crate) async fn resolve_ns_read_async(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
-    let s = store(cx).clone();
-    let name = path_param(cx, "ns").to_string();
-    tokio::task::spawn_blocking(move || {
-        s.namespace_resolve(&name, Some("oci"))
-    })
-    .await
-    .map_err(|e| bad_request(e.to_string()))?
-    .map_err(store_err)
+    use topcoat::context::request_context;
+    use kappa_core::types::ResolvedNamespace;
+    request_context::<ResolvedNamespace>(cx)
+        .expect_exists()
+        .map_err(|_| topcoat::router::error::not_found().into())
 }
 
 /// Extract a path parameter by name from the matched route.
