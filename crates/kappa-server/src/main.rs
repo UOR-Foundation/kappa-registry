@@ -363,6 +363,13 @@ async fn main() {
     )));
     builder = builder.app_context(MaxApiBodyBytes(cfg.max_api_body_bytes));
 
+    // S3 virtual-hosted-style base domain for bucket routing
+    let s3_base_domain = std::env::var("KAPPA_S3_BASE_DOMAIN").unwrap_or_default();
+    if !s3_base_domain.is_empty() {
+        tracing::info!(base_domain = %s3_base_domain, "S3 virtual-hosted-style enabled");
+    }
+    builder = builder.app_context(namespace::S3BaseDomain(s3_base_domain));
+
     if let Some(proxy_header) = &cfg.proxy_trusted_header {
         builder = builder.app_context(ProxyTrustConfig {
             trusted_header: Some(proxy_header.clone()),
@@ -2758,22 +2765,12 @@ async fn main() {
     });
 
     // -- Start --
-    // When KAPPA_S3_BASE_DOMAIN is set, use the vhost-rewriting accept loop
-    // so virtual-hosted-style S3 requests (Host: bucket.domain) are rewritten
-    // to path-style (/{bucket}/key) before routing. When unset, use topcoat's
-    // Always use serve_with_vhost: it handles both S3 vhost URI rewriting
-    // (when KAPPA_S3_BASE_DOMAIN is set) AND Git .git/ -> /_git/ rewriting.
-    // When base_domain is empty, the vhost rewrite is a no-op. The git
-    // rewrite always runs. topcoat layers cannot rewrite URIs because
-    // routing resolves before layers run.
-    let s3_base_domain = std::env::var("KAPPA_S3_BASE_DOMAIN").unwrap_or_default();
+    // Git .git/ -> /_git/, Nix /nix/ -> /_nix/, and S3 vhost rewrites
+    // are handled by the namespace interceptor layer via topcoat rewrite().
+    // The custom serve_with_vhost accept loop is no longer needed.
+    use topcoat::router::{RouterService, internal_serve};
 
-    if !s3_base_domain.is_empty() {
-        tracing::info!(
-            base_domain = %s3_base_domain,
-            "S3 virtual-hosted-style enabled"
-        );
-    }
+    let service = RouterService::new(router).shutdown_timeout(Duration::from_secs(30));
 
     match tls_config {
         Some(tls_cfg) => {
@@ -2789,15 +2786,9 @@ async fn main() {
                 mtls = tls_cfg.client_ca_path.is_some(),
                 "kappa-registry starting with TLS"
             );
-            layers::s3_vhost::serve_with_vhost(
-                listener,
-                router,
-                s3_base_domain,
-                Duration::from_secs(30),
-                shutdown_signal(),
-            )
-            .await
-            .expect("TLS server error");
+            internal_serve(listener, service, shutdown_signal())
+                .await
+                .expect("TLS server error");
         }
         None => {
             tracing::info!(
@@ -2808,15 +2799,9 @@ async fn main() {
             let tcp = tokio::net::TcpListener::bind(&cfg.listen_addr)
                 .await
                 .expect("failed to bind TCP listener");
-            layers::s3_vhost::serve_with_vhost(
-                tcp,
-                router,
-                s3_base_domain,
-                Duration::from_secs(30),
-                shutdown_signal(),
-            )
-            .await
-            .expect("server error");
+            internal_serve(tcp, service, shutdown_signal())
+                .await
+                .expect("server error");
         }
     }
 }

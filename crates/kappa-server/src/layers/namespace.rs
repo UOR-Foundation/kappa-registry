@@ -1,22 +1,33 @@
-//! Namespace resolution interceptor layer.
+//! Namespace resolution interceptor layer with integrated URI rewriting.
 //!
-//! Pathless layer that runs on every request. Extracts namespace name
-//! and protocol from the URL path, resolves via store.namespace_resolve
-//! (read-only, never creates), and stores the result in request context
-//! as ResolvedNamespace.
+//! Pathless layer that runs on every request. Two responsibilities:
 //!
-//! Handlers read `request_context::<ResolvedNamespace>(cx)` and call
-//! `.expect_exists()?` for read paths or match on NotFound for write
-//! paths that need to create on first write.
+//! 1. URI rewriting: transforms external protocol URLs into internal
+//!    routing paths before topcoat dispatches the route handler.
+//!    - Git `.git/` suffix -> `/_git/` prefix
+//!    - Nix `/nix/` prefix -> `/_nix/` prefix (with `.narinfo` normalization)
+//!    - S3 virtual-hosted-style `bucket.domain/key` -> `/{bucket}/key`
+//!    Rewrites return `Err(rewrite(...))` causing the router to re-dispatch.
+//!
+//! 2. Namespace resolution: extracts namespace name and protocol from
+//!    the (possibly rewritten) URL path, resolves via store.namespace_resolve
+//!    (read-only, never creates), and stores the result in request context
+//!    as ResolvedNamespace.
 
 use std::sync::Arc;
 
-use topcoat::context::{app_context, Cx};
+use topcoat::context::{app_context, try_app_context, Cx};
 use topcoat::router::{Body, Next};
-use topcoat::router::request::uri;
+use topcoat::router::request::{headers, uri};
+use topcoat::router::error::rewrite;
 
 use kappa_core::store::KappaStore;
 use kappa_core::types::ResolvedNamespace;
+
+/// S3 base domain for virtual-hosted-style bucket routing.
+/// Registered in app context from KAPPA_S3_BASE_DOMAIN env var.
+#[derive(Debug, Clone)]
+pub struct S3BaseDomain(pub String);
 
 pub fn namespace_layer<'a>(
     cx: &'a Cx,
@@ -24,11 +35,54 @@ pub fn namespace_layer<'a>(
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
-        let path = uri(cx).path().to_string();
+        let request_uri = uri(cx).clone();
+        let path = request_uri.path().to_string();
+
+        // Phase 1: URI rewriting (returns Err(rewrite) to re-dispatch)
+        if let Some(rewritten) = super::git_rewrite::rewrite_git_path(&request_uri) {
+            let pq = rewritten.path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or(rewritten.path());
+            return Err(rewrite(pq, body).into());
+        }
+        #[cfg(feature = "nix")]
+        if let Some(rewritten) = super::nix_rewrite::rewrite_nix_path(&request_uri) {
+            let pq = rewritten.path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or(rewritten.path());
+            return Err(rewrite(pq, body).into());
+        }
+        if let Some(base_domain) = try_app_context::<S3BaseDomain>(cx) {
+            if !base_domain.0.is_empty() {
+                if let Some(host) = headers(cx).get("host").and_then(|v| v.to_str().ok()) {
+                    if let Some(bucket) = extract_s3_bucket(host, &base_domain.0) {
+                        let original_path = request_uri.path();
+                        let new_path = format!("/{bucket}{original_path}");
+                        let pq = match request_uri.query() {
+                            Some(q) => format!("{new_path}?{q}"),
+                            None => new_path,
+                        };
+                        return Err(rewrite(&pq, body).into());
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Namespace resolution (runs on final path after any rewrite)
         let resolved = resolve_from_path(cx, &path).await;
         let cx = cx.with(resolved);
         next.run(&cx, body).await
     })
+}
+
+/// Extract bucket name from Host header subdomain.
+fn extract_s3_bucket(host: &str, base_domain: &str) -> Option<String> {
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    let suffix = format!(".{}", base_domain);
+    host_no_port
+        .strip_suffix(&suffix)
+        .filter(|bucket| !bucket.is_empty() && !bucket.contains('.'))
+        .map(|b| b.to_string())
 }
 
 async fn resolve_from_path(cx: &Cx, path: &str) -> ResolvedNamespace {
