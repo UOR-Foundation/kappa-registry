@@ -47,6 +47,9 @@ fn ws_close(
 #[test]
 fn ws_events_connects_and_upgrades() {
     let (guard, base, _tmp) = start_server();
+    // Create namespace via blob push (first-writer-claims)
+    let c = client();
+    push_blob(&c, &base, "ws-test", b"ws-events-test-content");
     let ws_url = base.replace("http://", "ws://");
     let url = format!("{}/v2/ws-test/_events/_ws", ws_url);
 
@@ -101,6 +104,8 @@ fn ws_events_receives_replay() {
 #[test]
 fn ws_crdt_connects_and_receives_initial_state() {
     let (guard, base, _tmp) = start_server();
+    let c = client();
+    push_blob(&c, &base, "crdt-test", b"crdt-init");
     let ws_url = base.replace("http://", "ws://");
     let url = format!("{}/v2/crdt-test/_crdt/doc1/_ws", ws_url);
 
@@ -135,6 +140,8 @@ fn ws_crdt_connects_and_receives_initial_state() {
 #[test]
 fn ws_crdt_persists_state_after_disconnect() {
     let (guard, base, _tmp) = start_server();
+    let c = client();
+    push_blob(&c, &base, "crdt-persist", b"crdt-persist-init");
     let ws_url = base.replace("http://", "ws://");
     let url = format!("{}/v2/crdt-persist/_crdt/doc2/_ws", ws_url);
 
@@ -183,6 +190,8 @@ fn ws_crdt_persists_state_after_disconnect() {
 #[test]
 fn ws_crdt_two_clients_see_updates() {
     let (guard, base, _tmp) = start_server();
+    let c = reqwest::blocking::Client::new();
+    create_namespace(&c, &base, "crdt-multi");
     let ws_url = base.replace("http://", "ws://");
     let url = format!("{}/v2/crdt-multi/_crdt/shared/_ws", ws_url);
 

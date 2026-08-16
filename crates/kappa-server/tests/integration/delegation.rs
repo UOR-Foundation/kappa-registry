@@ -244,16 +244,27 @@ fn delegation_depth_0_cannot_redelegate() {
     });
     create_delegation(&c, &base, "owner-token", ns, &owner_anchor(), &middle_anchor(), &scope);
 
-    // Middle delegates to outsider (depth=0 means middle cannot redelegate effectively)
+    // Middle tries to delegate to outsider — rejected at creation time
+    // because middle's delegation_depth=0 means it cannot re-delegate.
     let scope2 = serde_json::json!({
         "namespaces": [ns],
         "operations": ["read"],
         "delegation_depth": 0,
     });
-    create_delegation(&c, &base, "middle-token", ns, &middle_anchor(), &outsider_anchor(), &scope2);
+    let resp = c
+        .put(format!("{}/v2/{}/edges/", base, ns))
+        .header("Authorization", "Bearer middle-token")
+        .json(&serde_json::json!({
+            "source": middle_anchor(),
+            "target": outsider_anchor(),
+            "relation": "delegation",
+            "metadata": scope2,
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 403, "depth=0 delegate should not be able to re-delegate");
 
-    // Outsider should NOT have access because middle's delegation_depth=0
-    // means check_delegation won't recurse from outsider -> middle -> owner
+    // Outsider should NOT have access (delegation was never created)
     let resp = c
         .get(format!("{}/v2/{}/tags/list", base, ns))
         .header("Authorization", "Bearer outsider-token")

@@ -5,6 +5,11 @@
 //!    Resolves the token to an asserter anchor for authorization.
 //! 2. Authorization: checks capability edges and delegation chains using
 //!    the ResolvedNamespace from the interceptor layer's context.
+//!
+//! All auth decisions return Ok(Response), never Err. Only internal store
+//! failures return Err. This ensures every response-modifying layer
+//! (Warning, CORS, rate limit, logging) sees all responses including
+//! 403 and 404 from auth.
 
 use std::sync::Arc;
 
@@ -13,7 +18,7 @@ use topcoat::router::response::Response;
 use topcoat::router::{Body, Next, StatusCode};
 
 use kappa_core::store::KappaStore;
-use kappa_core::types::ResolvedNamespace;
+use kappa_core::types::{DetectedOperation, ResolvedNamespace};
 
 use crate::auth::{authorize, AuthDecision, AuthError, BearerAuth};
 use crate::ratelimit::{classify_request, OpClass};
@@ -47,7 +52,15 @@ pub fn auth_layer<'a>(
             .cloned()
             .unwrap_or(ResolvedNamespace::NoNamespace);
 
-        let op = classify_request(&method, &path);
+        let mut op = classify_request(&method, &path);
+        // Override op class when the protocol detection identified a write-discovery
+        // (e.g. GET /info/refs?service=git-receive-pack). This makes the auth layer
+        // treat it as a write for namespace creation purposes.
+        if let Some(detected) = try_request_context::<DetectedOperation>(&cx) {
+            if detected.is_write() && op == OpClass::Read {
+                op = OpClass::Write;
+            }
+        }
         if !matches!(op, OpClass::Exempt) {
             let store = app_context::<Arc<dyn KappaStore>>(&cx);
             let s = store.clone();
@@ -62,7 +75,9 @@ pub fn auth_layer<'a>(
                 Ok(Ok(AuthDecision::Allowed | AuthDecision::AllowedViaDelegation)) => {}
                 Ok(Ok(AuthDecision::AllowCreateNew)) => {}
                 Ok(Err(AuthError::NotFound)) => {
-                    return Err(topcoat::router::error::not_found().into());
+                    let mut response = Response::new(Body::from("not found"));
+                    *response.status_mut() = StatusCode::NOT_FOUND;
+                    return Ok(response);
                 }
                 Ok(Err(AuthError::Forbidden { reason })) => {
                     let body_str = format!(
@@ -75,7 +90,14 @@ pub fn auth_layer<'a>(
                         .insert("content-type", "application/json".parse().unwrap());
                     return Ok(response);
                 }
-                Ok(Err(AuthError::Store(_))) | Err(_) => {
+                Ok(Err(AuthError::Store(e))) => {
+                    tracing::error!(error = %e, "store error during auth check");
+                    let mut response = Response::new(Body::from("internal server error"));
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "auth spawn_blocking failed");
                     let mut response = Response::new(Body::from("internal server error"));
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                     return Ok(response);

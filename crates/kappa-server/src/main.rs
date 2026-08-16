@@ -24,7 +24,7 @@ use kappa_core::crypto::keystore::KeyStore;
 use kappa_core::events::InMemoryEventLog;
 use kappa_core::store::KappaStore;
 use kappa_core::transaction::TransactionManager;
-use kappa_core::types::{MaxBlobSize, NamespaceRef};
+use kappa_core::types::{CallerIdentity, MaxBlobSize, NamespaceRef, ResolvedNamespace};
 use kappa_store_redb::PersistentStore;
 
 use auth::TrustPolicy;
@@ -88,6 +88,50 @@ fn health_handler(cx: &Cx, _body: Body) -> RouteFuture<'_> {
 
 fn p(s: &'static str) -> Cow<'static, Path> {
     Cow::Borrowed(Path::new(s))
+}
+
+// -- Namespace create endpoint ------------------------------------------------
+
+fn namespace_create_route(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let resolved = request_context::<ResolvedNamespace>(cx);
+        let caller = request_context::<CallerIdentity>(cx).0.clone();
+        let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+
+        match resolved {
+            ResolvedNamespace::Exists(_) => {
+                (StatusCode::CONFLICT, r#"{"error":"namespace already exists"}"#).into_response(cx)
+            }
+            ResolvedNamespace::NotFound { name, protocol } => {
+                let name = name.clone();
+                let protocol = protocol.clone();
+                let caller_for_closure = caller.clone();
+                let protocol_for_closure = protocol.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.namespace_resolve_or_create(&name, &caller_for_closure, Some(&protocol_for_closure))
+                })
+                .await
+                .map_err(|e| topcoat::router::error::bad_request(e.to_string()))?
+                .map_err(|e| topcoat::router::error::bad_request(e.to_string()))?;
+
+                let info = serde_json::json!({
+                    "uuid": result.uuid_hex(),
+                    "name": result.display_name().unwrap_or(""),
+                    "protocol": protocol,
+                    "owner": caller,
+                });
+                (
+                    StatusCode::CREATED,
+                    [("content-type", "application/json")],
+                    serde_json::to_string(&info).unwrap_or_default(),
+                )
+                    .into_response(cx)
+            }
+            ResolvedNamespace::NoNamespace => {
+                (StatusCode::BAD_REQUEST, r#"{"error":"no namespace in path"}"#).into_response(cx)
+            }
+        }
+    })
 }
 
 // Warning header is applied by warning_layer, not a response hook.
@@ -316,21 +360,31 @@ async fn main() {
     let mut builder = Router::builder()
         .compression(Compression::off());
 
-    // Layer chain: outermost to innermost
-    // Namespace resolution runs on every request (pathless), before auth.
+    // Layer chain: topcoat runs the LAST registered layer OUTERMOST.
+    // Registration order: innermost first, outermost last.
+    //
+    // Execution order (outermost → innermost):
+    //   warning → request_log → proxy_trust → request_id →
+    //   security_headers → cors → timeout → auth →
+    //   rate_limit → body_limit → response_compliance → cache → handler
+    //
+    // Auth before rate_limit: unauthenticated requests get 401 before
+    // consuming rate limit tokens.
+    // Warning outermost: sees ALL responses including auth 403/404.
+    // Namespace interceptor is pathless: runs on every request including 404/405.
     builder = builder.layer(LayerFn::new(None::<&Path>, namespace::namespace_layer));
-    builder = builder.layer(LayerFn::new(Some("/"),warning_layer));
     builder = builder.layer(LayerFn::new(Some("/"),cache_layer));
     builder = builder.layer(LayerFn::new(Some("/"),response_compliance_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),body_limit_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),rate_limit_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),auth_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),timeout_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),cors_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),security_headers_layer));
     builder = builder.layer(LayerFn::new(Some("/"),request_id_layer));
     builder = builder.layer(LayerFn::new(Some("/"),proxy_trust_layer));
     builder = builder.layer(LayerFn::new(Some("/"),request_log_layer));
-    builder = builder.layer(LayerFn::new(Some("/"),security_headers_layer));
-    builder = builder.layer(LayerFn::new(Some("/"),cors_layer));
-    builder = builder.layer(LayerFn::new(Some("/"),timeout_layer));
-    builder = builder.layer(LayerFn::new(Some("/"),rate_limit_layer));
-    builder = builder.layer(LayerFn::new(Some("/"),body_limit_layer));
-    builder = builder.layer(LayerFn::new(Some("/"),auth_layer));
+    builder = builder.layer(LayerFn::new(Some("/"),warning_layer));
 
     // Routes
     builder = builder
@@ -453,6 +507,168 @@ async fn main() {
         builder = builder.app_context(crdt_manager);
 
         builder = kappa_module_distribution::register(builder);
+    }
+
+    // -- Namespace management routes --
+    {
+        use topcoat::router::response::IntoResponse;
+        use kappa_core::types::ResolvedNamespace;
+
+        fn namespace_info_handler(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let ns = topcoat::context::request_context::<ResolvedNamespace>(cx)
+                    .expect_exists()
+                    .map_err(|_| topcoat::router::error::not_found())?;
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let ns_name = ns.as_str().to_string();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.namespace_info(&ns_name, None)
+                }).await;
+                match result {
+                    Ok(Ok(info)) => {
+                        let body = serde_json::to_string(&info).unwrap_or_default();
+                        (StatusCode::OK, [("content-type", "application/json")], body).into_response(cx)
+                    }
+                    _ => StatusCode::NOT_FOUND.into_response(cx),
+                }
+            })
+        }
+
+        fn namespace_rename_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let ns = topcoat::context::request_context::<ResolvedNamespace>(cx)
+                    .expect_exists()
+                    .map_err(|_| topcoat::router::error::not_found())?;
+                let asserter = topcoat::context::try_request_context::<kappa_core::types::CallerIdentity>(cx)
+                    .map(|ci| ci.0.clone()).unwrap_or_else(|| "anonymous".to_string());
+                let bytes = topcoat::router::to_bytes(body, 64 * 1024).await
+                    .map(|b| b.to_vec()).unwrap_or_default();
+                let v: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+                let new_name = v["new_name"].as_str()
+                    .ok_or_else(|| topcoat::router::error::bad_request("missing new_name"))?
+                    .to_string();
+                let old_name = ns.as_str().to_string();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.namespace_rename(&old_name, &new_name, &asserter, None)
+                }).await;
+                match result {
+                    Ok(Ok(())) => StatusCode::OK.into_response(cx),
+                    Ok(Err(e)) => (StatusCode::FORBIDDEN, e.to_string()).into_response(cx),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(cx),
+                }
+            })
+        }
+
+        fn namespace_transfer_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let ns = topcoat::context::request_context::<ResolvedNamespace>(cx)
+                    .expect_exists()
+                    .map_err(|_| topcoat::router::error::not_found())?;
+                let asserter = topcoat::context::try_request_context::<kappa_core::types::CallerIdentity>(cx)
+                    .map(|ci| ci.0.clone()).unwrap_or_else(|| "anonymous".to_string());
+                let bytes = topcoat::router::to_bytes(body, 64 * 1024).await
+                    .map(|b| b.to_vec()).unwrap_or_default();
+                let v: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+                let new_owner = v["new_owner"].as_str()
+                    .ok_or_else(|| topcoat::router::error::bad_request("missing new_owner"))?
+                    .to_string();
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let ns_uuid = *ns.uuid();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.namespace_transfer(&ns_uuid, &new_owner, &asserter)
+                }).await;
+                match result {
+                    Ok(Ok(())) => StatusCode::OK.into_response(cx),
+                    Ok(Err(e)) => (StatusCode::FORBIDDEN, e.to_string()).into_response(cx),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(cx),
+                }
+            })
+        }
+
+        fn namespace_delete_handler(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let ns = topcoat::context::request_context::<ResolvedNamespace>(cx)
+                    .expect_exists()
+                    .map_err(|_| topcoat::router::error::not_found())?;
+                let asserter = topcoat::context::try_request_context::<kappa_core::types::CallerIdentity>(cx)
+                    .map(|ci| ci.0.clone()).unwrap_or_else(|| "anonymous".to_string());
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let ns_name = ns.as_str().to_string();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.namespace_delete(&ns_name, &asserter, None)
+                }).await;
+                match result {
+                    Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(cx),
+                    Ok(Err(e)) => (StatusCode::FORBIDDEN, e.to_string()).into_response(cx),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(cx),
+                }
+            })
+        }
+
+        fn namespace_add_alias_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let ns = topcoat::context::request_context::<ResolvedNamespace>(cx)
+                    .expect_exists()
+                    .map_err(|_| topcoat::router::error::not_found())?;
+                let asserter = topcoat::context::try_request_context::<kappa_core::types::CallerIdentity>(cx)
+                    .map(|ci| ci.0.clone()).unwrap_or_else(|| "anonymous".to_string());
+                let bytes = topcoat::router::to_bytes(body, 64 * 1024).await
+                    .map(|b| b.to_vec()).unwrap_or_default();
+                let v: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+                let alias = v["alias"].as_str()
+                    .ok_or_else(|| topcoat::router::error::bad_request("missing alias"))?
+                    .to_string();
+                let protocol = v["protocol"].as_str().map(|s| s.to_string());
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let ns_uuid = *ns.uuid();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.namespace_add_alias(&ns_uuid, &alias, &asserter, protocol.as_deref())
+                }).await;
+                match result {
+                    Ok(Ok(())) => StatusCode::CREATED.into_response(cx),
+                    Ok(Err(e)) => (StatusCode::CONFLICT, e.to_string()).into_response(cx),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(cx),
+                }
+            })
+        }
+
+        fn namespace_list_handler(cx: &Cx, _body: Body) -> RouteFuture<'_> {
+            Box::pin(async move {
+                let query_protocol = {
+                    let uri = topcoat::router::request::uri(cx);
+                    uri.query().and_then(|q| {
+                        q.split('&').find_map(|pair| {
+                            let (k, v) = pair.split_once('=')?;
+                            if k == "protocol" { Some(v.to_string()) } else { None }
+                        })
+                    })
+                };
+                let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.namespace_list(query_protocol.as_deref())
+                }).await;
+                match result {
+                    Ok(Ok(records)) => {
+                        let body = serde_json::to_string(&records).unwrap_or_default();
+                        (StatusCode::OK, [("content-type", "application/json")], body).into_response(cx)
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(cx),
+                }
+            })
+        }
+
+        builder = builder
+            .route(RouteFn::new(Method::POST, p("/v2/{*ns}/_namespace/create"), namespace_create_route))
+            .route(RouteFn::new(Method::GET, p("/v2/{*ns}/_namespace/info"), namespace_info_handler))
+            .route(RouteFn::new(Method::POST, p("/v2/{*ns}/_namespace/rename"), namespace_rename_handler))
+            .route(RouteFn::new(Method::POST, p("/v2/{*ns}/_namespace/transfer"), namespace_transfer_handler))
+            .route(RouteFn::new(Method::DELETE, p("/v2/{*ns}/_namespace"), namespace_delete_handler))
+            .route(RouteFn::new(Method::POST, p("/v2/{*ns}/_namespace/alias"), namespace_add_alias_handler))
+            .route(RouteFn::new(Method::GET, p("/v2/_namespaces"), namespace_list_handler));
     }
 
     // -- Veilid transport (optional) --
@@ -757,6 +973,55 @@ async fn main() {
     // -- Nix binary cache routes --
     #[cfg(feature = "nix")]
     {
+        /// Resolves Nix signing key names to identity anchors from static config.
+        /// Simplest ExternalIdentifierResolver: no network, local config lookup.
+        struct NixKeyResolver {
+            keys: Vec<(String, Vec<u8>)>,
+        }
+
+        impl NixKeyResolver {
+            fn from_env() -> Self {
+                let raw = std::env::var("KAPPA_NIX_TRUSTED_KEYS").unwrap_or_default();
+                let keys = raw.split(',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|entry| {
+                        let (name, b64) = entry.split_once(':')?;
+                        let pubkey = base64_simd::STANDARD.decode_to_vec(b64.as_bytes()).ok()?;
+                        Some((name.to_string(), pubkey))
+                    })
+                    .collect();
+                Self { keys }
+            }
+        }
+
+        impl kappa_core::identity::resolver::ExternalIdentifierResolver for NixKeyResolver {
+            fn id_type(&self) -> &str { "nix-key" }
+
+            fn resolve(&self, identifier: &str) -> Result<Option<kappa_core::identity::resolver::ResolvedIdentity>, String> {
+                for (name, pubkey) in &self.keys {
+                    if name == identifier {
+                        let anchor = kappa_core::crypto::anchor::anchor_from_key_str("ed25519", pubkey);
+                        return Ok(Some(kappa_core::identity::resolver::ResolvedIdentity {
+                            anchor,
+                            public_key: pubkey.clone(),
+                            algorithm: "ed25519".to_string(),
+                            service_endpoint: None,
+                            handle: name.clone(),
+                            evidence: None,
+                        }));
+                    }
+                }
+                Ok(None)
+            }
+
+            fn cache_ttl_secs(&self) -> u64 {
+                u64::MAX // static config, never expires
+            }
+        }
+
+        let nix_resolver = Arc::new(NixKeyResolver::from_env());
+        builder = builder.app_context(nix_resolver as Arc<dyn kappa_core::identity::resolver::ExternalIdentifierResolver>);
+
         fn nix_cache_info(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
                 let priority = std::env::var("KAPPA_NIX_PRIORITY")
@@ -832,6 +1097,7 @@ async fn main() {
                         .map_err(|_| topcoat::router::error::not_found())?
                 };
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                let nix_resolver = try_app_context::<Arc<dyn kappa_core::identity::resolver::ExternalIdentifierResolver>>(cx).cloned();
                 let narinfo_bytes = {
                     use topcoat::router::to_bytes;
                     to_bytes(body, 64 * 1024).await
@@ -927,12 +1193,31 @@ async fn main() {
                         store.edge_put(&nix_ns, &deriver_edge)?;
                     }
 
-                    // Store signatures as blob metadata
+                    // Store signatures as blob metadata and create identity bindings
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
                     for (i, sig) in narinfo.signatures.iter().enumerate() {
                         let meta_key = format!("_nix_sig_{}", i);
                         store.blob_put_meta(
                             &narinfo_result.kappa, &meta_key, sig.as_bytes()
                         )?;
+                        // Resolve signing key name to anchor via NixKeyResolver
+                        if let Some(ref resolver) = nix_resolver {
+                            if let Some((key_name, _)) = sig.split_once(':') {
+                                if let Ok(Some(identity)) = resolver.resolve(key_name) {
+                                    let binding = kappa_core::identity::binding::IdentityBinding {
+                                        source: key_name.to_string(),
+                                        target: identity.anchor.clone(),
+                                        method: "nix-key".to_string(),
+                                        trust_level: 3,
+                                        verified_at_ms: now_ms,
+                                    };
+                                    let _ = store.identity_binding_put(&nix_ns, &binding);
+                                }
+                            }
+                        }
                     }
 
                     Ok(())
@@ -2764,10 +3049,57 @@ async fn main() {
         }
     });
 
+    // -- Federation probe background task --
+    if !cfg.federation_peers.is_empty() {
+        let probe_store = store.clone();
+        let probe_identity = node_identity.clone();
+        let peers = cfg.federation_peers.clone();
+        let probe_interval = cfg.probe_interval_secs;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(probe_interval));
+            loop {
+                ticker.tick().await;
+                let mut results = Vec::new();
+                for peer_url in &peers {
+                    let result = match reqwest::get(format!("{peer_url}/_status")).await {
+                        Ok(resp) if resp.status().is_success() => {
+                            kappa_core::identity::probe::ProbeResult::Verified(
+                                kappa_core::identity::trust::PeerRecord {
+                                    endpoint: peer_url.to_string(),
+                                    asserter_anchor: peer_url.to_string(),
+                                    last_epoch: 0,
+                                    state_root: String::new(),
+                                }
+                            )
+                        }
+                        _ => kappa_core::identity::probe::ProbeResult::Unreachable(
+                            format!("failed to reach {peer_url}")
+                        ),
+                    };
+                    results.push(result);
+                }
+                if let Some(ref ni) = probe_identity {
+                    ni.update_from_probes(&results);
+                    // Store trust position as tag in _system namespace
+                    let system_ns = kappa_core::types::NamespaceRef::deterministic("_system");
+                    let position = ni.position();
+                    let key = format!("trust/position/{}", ni.anchor().as_str());
+                    let _ = probe_store.tag_set(&system_ns, &key, position.as_str());
+                }
+            }
+        });
+        tracing::info!(
+            peers = cfg.federation_peers.len(),
+            interval_secs = cfg.probe_interval_secs,
+            "federation probe task started"
+        );
+    }
+
     // -- Start --
-    // Git .git/ -> /_git/, Nix /nix/ -> /_nix/, and S3 vhost rewrites
-    // are handled by the namespace interceptor layer via topcoat rewrite().
-    // The custom serve_with_vhost accept loop is no longer needed.
+    // Git, Nix, and S3 vhost rewrites are handled by the namespace
+    // interceptor layer via topcoat rewrite(). Protocol detection uses
+    // request signals (path suffixes, headers, query params), not URL
+    // conventions.
     use topcoat::router::{RouterService, internal_serve};
 
     let service = RouterService::new(router).shutdown_timeout(Duration::from_secs(30));

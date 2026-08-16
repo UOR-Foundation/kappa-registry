@@ -126,6 +126,22 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
         &edge_kappa,
     );
 
+    // Write identity-relevant edge types to the inbound assertion index
+    // so resolve_all and assertion_index_query_subject find them.
+    let inbound_relations = [
+        EdgeRelation::Assertion,
+        EdgeRelation::Revocation,
+        EdgeRelation::Capability,
+        EdgeRelation::Delegation,
+    ];
+    if inbound_relations.contains(&edge.relation) {
+        let key = format!("{}\x00{}", edge.target, edge.relation.as_str());
+        store.assertion_inbound
+            .entry(key)
+            .or_default()
+            .push(edge_kappa.clone());
+    }
+
     Ok(())
 }
 

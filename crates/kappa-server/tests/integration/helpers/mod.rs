@@ -251,8 +251,27 @@ pub fn resolve_location(base: &str, location: &str) -> String {
     }
 }
 
+/// Create a namespace explicitly via the namespace create endpoint.
+/// Idempotent: 201 on first call, 409 on subsequent calls (both are success).
+/// Every test that needs a namespace calls this. No test assumes side-effect
+/// creation from push operations.
+pub fn create_namespace(c: &reqwest::blocking::Client, base: &str, ns: &str) {
+    let resp = c
+        .post(format!("{}/v2/{}/_namespace/create", base, ns))
+        .send()
+        .unwrap();
+    let status = resp.status().as_u16();
+    assert!(
+        status == 201 || status == 409,
+        "create namespace '{}': expected 201 or 409, got {}",
+        ns, status
+    );
+}
+
 /// Push a blob via monolithic PUT and return the status code.
+/// Creates the namespace first if it doesn't exist.
 pub fn push_blob(c: &reqwest::blocking::Client, base: &str, ns: &str, content: &[u8]) -> u16 {
+    create_namespace(c, base, ns);
     let digest = sha256_digest(content);
     let resp = c
         .put(format!("{}/v2/{}/blobs/{}", base, ns, digest))
@@ -263,6 +282,7 @@ pub fn push_blob(c: &reqwest::blocking::Client, base: &str, ns: &str, content: &
 }
 
 /// Push a manifest with a tag and return the status code.
+/// Creates the namespace first if it doesn't exist.
 pub fn push_manifest(
     c: &reqwest::blocking::Client,
     base: &str,
@@ -270,6 +290,7 @@ pub fn push_manifest(
     tag: &str,
     content: &[u8],
 ) -> u16 {
+    create_namespace(c, base, ns);
     let resp = c
         .put(format!("{}/v2/{}/manifests/{}", base, ns, tag))
         .header("content-type", "application/vnd.oci.image.manifest.v1+json")

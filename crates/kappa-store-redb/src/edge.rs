@@ -131,6 +131,22 @@ impl PersistentStore {
             let mut asr = txn.open_multimap_table(EDGE_ASR).map_err(Self::redb_err)?;
             asr.insert(asr_key.as_str(), edge_kappa.as_str())
                 .map_err(Self::redb_err)?;
+            drop(asr);
+
+            // Write identity-relevant edge types to ASSERTION_INBOUND
+            let inbound_relations = [
+                EdgeRelation::Assertion,
+                EdgeRelation::Revocation,
+                EdgeRelation::Capability,
+                EdgeRelation::Delegation,
+            ];
+            if inbound_relations.contains(&edge.relation) {
+                let inbound_key = format!("{}\x00{}", edge.target, edge.relation.as_str());
+                let mut inbound = txn.open_multimap_table(ASSERTION_INBOUND)
+                    .map_err(Self::redb_err)?;
+                inbound.insert(inbound_key.as_str(), edge_kappa.as_str())
+                    .map_err(Self::redb_err)?;
+            }
         }
         txn.commit().map_err(Self::redb_err)?;
         Ok(())

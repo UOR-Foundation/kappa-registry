@@ -106,6 +106,10 @@ pub struct Config {
     pub veilid_namespace: Option<String>,
     /// Veilid transport: allow insecure protected store (testing only).
     pub veilid_insecure: bool,
+    /// Federation peer URLs for epoch probing.
+    pub federation_peers: Vec<String>,
+    /// Probe interval in seconds.
+    pub probe_interval_secs: u64,
 }
 
 impl Config {
@@ -168,6 +172,13 @@ impl Config {
         let veilid_namespace = std::env::var("KAPPA_VEILID_NAMESPACE").ok();
         let veilid_insecure = env_or("KAPPA_VEILID_INSECURE", "false") == "true";
 
+        let federation_peers: Vec<String> = env_or("KAPPA_FEDERATION_PEERS", "")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().to_string())
+            .collect();
+        let probe_interval_secs: u64 = env_parse("KAPPA_PROBE_INTERVAL_SECS", 60);
+
         Config {
             listen_addr,
             store_root,
@@ -191,6 +202,8 @@ impl Config {
             veilid_storage_dir,
             veilid_namespace,
             veilid_insecure,
+            federation_peers,
+            probe_interval_secs,
         }
     }
 
@@ -325,6 +338,8 @@ mod tests {
             veilid_storage_dir: None,
             veilid_namespace: None,
             veilid_insecure: false,
+            federation_peers: Vec::new(),
+            probe_interval_secs: 60,
         };
         assert_eq!(cfg.listen_host(), "10.0.0.1");
         assert_eq!(cfg.listen_port(), "8080");

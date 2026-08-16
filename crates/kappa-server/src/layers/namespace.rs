@@ -25,7 +25,7 @@ use topcoat::router::request::{headers, uri};
 use topcoat::router::error::rewrite;
 
 use kappa_core::store::KappaStore;
-use kappa_core::types::ResolvedNamespace;
+use kappa_core::types::{DetectedOperation, ResolvedNamespace};
 
 /// S3 base domain for virtual-hosted-style bucket routing.
 /// Registered in app context from KAPPA_S3_BASE_DOMAIN env var.
@@ -38,7 +38,8 @@ enum DetectedProtocol {
     S3,
     Git,
     Nix,
-    System, // /_status, /v2/, /docs, /openapi.json, /identity
+    System,  // /_status, /v2/, /docs, /openapi.json, /identity
+    Unknown, // no protocol signal matched — 404
 }
 
 pub fn namespace_layer<'a>(
@@ -99,83 +100,133 @@ pub fn namespace_layer<'a>(
             _ => {}
         }
 
-        // Phase 2: Namespace resolution
-        let resolved = resolve_from_path(cx, &path, protocol).await;
+        // Phase 2: Detect operation intent from protocol signals
+        let method = topcoat::router::request::method(cx);
+        let detected_op = detect_operation(&path, query, method, protocol);
+        let cx = cx.with(detected_op);
+
+        // Phase 3: Namespace resolution
+        let resolved = resolve_from_path(&cx, &path, protocol).await;
         let cx = cx.with(resolved);
         next.run(&cx, body).await
     })
 }
 
 fn detect_protocol(path: &str, query: &str, hdrs: &topcoat::router::HeaderMap) -> DetectedProtocol {
-    // Definitive prefix matches (fastest, no ambiguity)
-    if path.starts_with("/v2/") || path == "/v2" || path == "/v2/" {
-        return DetectedProtocol::Oci;
+    // 1. Content-Type header (definitive for Git POST, gRPC)
+    if let Some(ct) = hdrs.get("content-type").and_then(|v| v.to_str().ok()) {
+        if ct.starts_with("application/x-git-") {
+            return DetectedProtocol::Git;
+        }
     }
 
-    // System endpoints
-    if path == "/_status"
-        || path == "/openapi.json"
-        || path == "/docs"
-        || path.starts_with("/identity/")
-    {
-        return DetectedProtocol::System;
+    // 2. S3 headers (definitive, present on EVERY conformant S3 request)
+    if hdrs.contains_key("x-amz-content-sha256") {
+        return DetectedProtocol::S3;
     }
-
-    // Internal prefixes from prior rewrites
-    if path.starts_with("/_git/") {
-        return DetectedProtocol::Git;
-    }
-    if path.starts_with("/_nix/") {
-        return DetectedProtocol::Nix;
-    }
-
-    // S3: definitive header matches
-    if hdrs.contains_key("x-amz-content-sha256")
-        || hdrs.get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.starts_with("AWS4-HMAC-SHA256"))
-            .unwrap_or(false)
+    if hdrs.get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("AWS4-HMAC-SHA256"))
+        .unwrap_or(false)
     {
         return DetectedProtocol::S3;
     }
 
-    // Git: path suffix signals
-    if path.ends_with("/info/refs")
-        || path.ends_with("/git-upload-pack")
-        || path.ends_with("/git-receive-pack")
-        || path.contains("/git-lfs/")
-        || path.ends_with("/HEAD")
-        || path.ends_with("/info/packs")
-    {
-        return DetectedProtocol::Git;
-    }
-
-    // Git: query parameter signal
+    // 3. Git query parameter (definitive for discovery)
     if query.contains("service=git-upload-pack")
         || query.contains("service=git-receive-pack")
     {
         return DetectedProtocol::Git;
     }
 
-    // Git: content-type signal
-    if hdrs.get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.starts_with("application/x-git-"))
-        .unwrap_or(false)
-    {
+    // 4. Path prefix (unambiguous, cheap byte compare)
+    if path.starts_with("/v2/") || path == "/v2" || path == "/v2/" {
+        return DetectedProtocol::Oci;
+    }
+    if path.starts_with("/_git/") {
         return DetectedProtocol::Git;
     }
+    if path.starts_with("/_nix/") {
+        return DetectedProtocol::Nix;
+    }
+    if path == "/_status"
+        || path.starts_with("/_status/")
+        || path == "/openapi.json"
+        || path == "/docs"
+        || path == "/"
+        || path.starts_with("/identity/")
+    {
+        return DetectedProtocol::System;
+    }
 
-    // Nix: path signals
+    // 5. Nix path signals
     if path == "/nix-cache-info"
+        || path.starts_with("/nix/")
         || path.ends_with(".narinfo")
         || path.starts_with("/nar/")
     {
         return DetectedProtocol::Nix;
     }
 
-    // Default: S3 path-style
-    DetectedProtocol::S3
+    // 6. Git path signals (after Nix, because /nix/ must not hit Git)
+    if path.contains("/info/refs")
+        || path.ends_with("/git-upload-pack")
+        || path.ends_with("/git-receive-pack")
+        || path.contains("/git-lfs/")
+        || path.contains("/info/lfs/")
+    {
+        return DetectedProtocol::Git;
+    }
+
+    // 7. Git dumb HTTP (must not match OCI or Nix paths)
+    if (path.ends_with("/HEAD") || path.contains("/objects/") || path.contains("/info/packs"))
+        && !path.starts_with("/v2")
+        && !path.starts_with("/nix")
+        && !path.starts_with("/nar")
+    {
+        return DetectedProtocol::Git;
+    }
+
+    // 8. No protocol signal matched
+    DetectedProtocol::Unknown
+}
+
+/// Detect the operation intent from protocol-specific signals.
+/// The auth layer uses this to decide whether a nonexistent namespace
+/// should return 404 (read) or AllowCreateNew (write/write-discovery).
+fn detect_operation(
+    path: &str,
+    query: &str,
+    method: &http::Method,
+    protocol: DetectedProtocol,
+) -> DetectedOperation {
+    match protocol {
+        DetectedProtocol::Git => {
+            // git-receive-pack discovery: GET with ?service=git-receive-pack
+            if query.contains("service=git-receive-pack") {
+                return DetectedOperation::WriteDiscovery;
+            }
+            // git-receive-pack data: POST
+            if path.ends_with("/git-receive-pack") || path.ends_with("/git_receive_pack") {
+                return DetectedOperation::Write;
+            }
+            DetectedOperation::Read
+        }
+        DetectedProtocol::Nix => {
+            if *method == http::Method::PUT {
+                DetectedOperation::Write
+            } else {
+                DetectedOperation::Read
+            }
+        }
+        _ => {
+            if *method == http::Method::GET || *method == http::Method::HEAD {
+                DetectedOperation::Read
+            } else {
+                DetectedOperation::Write
+            }
+        }
+    }
 }
 
 /// Rewrite git protocol URLs to internal /_git/ routing prefix.
@@ -221,12 +272,21 @@ fn rewrite_nix_to_internal(path: &str) -> Option<String> {
         return Some("/_nix/nix-cache-info".to_string());
     }
     if path.ends_with(".narinfo") {
-        // /{hash}.narinfo -> /_nix/{hash}.narinfo
-        return Some(format!("/_nix{path}"));
+        // /{hash}.narinfo -> /_nix/narinfo/{hash}
+        // /nix/{hash}.narinfo -> /_nix/narinfo/{hash}
+        let stripped = path.strip_prefix("/nix/").unwrap_or(path.strip_prefix('/').unwrap_or(path));
+        let hash = stripped.strip_suffix(".narinfo").unwrap_or(stripped);
+        return Some(format!("/_nix/narinfo/{hash}"));
     }
     if path.starts_with("/nar/") {
         // /nar/{filehash}.nar.zst -> /_nix/nar/{rest}
         return Some(format!("/_nix{path}"));
+    }
+    if path.starts_with("/nix/") {
+        // /nix/nix-cache-info -> /_nix/nix-cache-info
+        // /nix/nar/{rest} -> /_nix/nar/{rest}
+        let rest = &path[4..]; // strip "/nix"
+        return Some(format!("/_nix{rest}"));
     }
     None
 }
@@ -273,6 +333,7 @@ fn extract_namespace(path: &str, protocol: DetectedProtocol) -> Option<(String, 
         DetectedProtocol::Nix => Some(("_nix".to_string(), "nix".to_string())),
         DetectedProtocol::S3 => extract_s3_namespace(path),
         DetectedProtocol::System => None,
+        DetectedProtocol::Unknown => None,
     }
 }
 
@@ -417,8 +478,17 @@ mod tests {
     }
 
     #[test]
-    fn s3_default_for_unknown() {
-        assert_eq!(detect_protocol("/mybucket/mykey", "", &HeaderMap::new()), DetectedProtocol::S3);
+    fn unknown_path_no_headers_is_unknown() {
+        assert_eq!(detect_protocol("/mybucket/mykey", "", &HeaderMap::new()), DetectedProtocol::Unknown);
+    }
+
+    #[test]
+    fn s3_detected_only_from_headers() {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        assert_eq!(detect_protocol("/mybucket/mykey", "", &hdrs), DetectedProtocol::S3);
+        // Without S3 headers, same path is Unknown
+        assert_eq!(detect_protocol("/mybucket/mykey", "", &HeaderMap::new()), DetectedProtocol::Unknown);
     }
 
     #[test]
@@ -498,7 +568,15 @@ mod tests {
     fn nix_rewrite_narinfo() {
         assert_eq!(
             rewrite_nix_to_internal("/r5sjd57x.narinfo"),
-            Some("/_nix/r5sjd57x.narinfo".to_string())
+            Some("/_nix/narinfo/r5sjd57x".to_string())
+        );
+    }
+
+    #[test]
+    fn nix_rewrite_narinfo_with_prefix() {
+        assert_eq!(
+            rewrite_nix_to_internal("/nix/r5sjd57x.narinfo"),
+            Some("/_nix/narinfo/r5sjd57x".to_string())
         );
     }
 
@@ -585,11 +663,22 @@ mod tests {
     }
 
     #[test]
-    fn s3_bucket_key() {
+    fn s3_bucket_key_with_headers() {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        let protocol = detect_protocol("/mybucket/mykey", "", &hdrs);
+        assert_eq!(protocol, DetectedProtocol::S3);
         assert_eq!(
-            extract_namespace("/mybucket/mykey", DetectedProtocol::S3),
+            extract_namespace("/mybucket/mykey", protocol),
             Some(("mybucket".to_string(), "s3".to_string()))
         );
+    }
+
+    #[test]
+    fn s3_bucket_key_without_headers_is_unknown() {
+        let protocol = detect_protocol("/mybucket/mykey", "", &HeaderMap::new());
+        assert_eq!(protocol, DetectedProtocol::Unknown);
+        assert_eq!(extract_namespace("/mybucket/mykey", protocol), None);
     }
 
     #[test]
@@ -613,5 +702,178 @@ mod tests {
     #[test]
     fn s3_wrong_domain() {
         assert_eq!(extract_s3_bucket("mybucket.other.com", "localhost"), None);
+    }
+
+    // -- Cross-protocol collision resolution --
+
+    #[test]
+    fn git_query_param_wins_over_nix_prefix() {
+        // /nix/info/refs?service=git-upload-pack is Git, not Nix
+        assert_eq!(
+            detect_protocol("/nix/info/refs", "service=git-upload-pack", &HeaderMap::new()),
+            DetectedProtocol::Git
+        );
+    }
+
+    #[test]
+    fn s3_header_wins_over_git_objects_path() {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        assert_eq!(
+            detect_protocol("/objects/abc123", "", &hdrs),
+            DetectedProtocol::S3
+        );
+    }
+
+    #[test]
+    fn git_objects_without_s3_headers() {
+        assert_eq!(
+            detect_protocol("/objects/abc123", "", &HeaderMap::new()),
+            DetectedProtocol::Git
+        );
+    }
+
+    #[test]
+    fn s3_header_wins_over_nix_nar_prefix() {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        assert_eq!(
+            detect_protocol("/nar/myfile", "", &hdrs),
+            DetectedProtocol::S3
+        );
+    }
+
+    #[test]
+    fn nix_nar_without_s3_headers() {
+        assert_eq!(
+            detect_protocol("/nar/myfile.nar", "", &HeaderMap::new()),
+            DetectedProtocol::Nix
+        );
+    }
+
+    #[test]
+    fn v2_prefix_wins_over_git_head() {
+        assert_eq!(
+            detect_protocol("/v2/HEAD", "", &HeaderMap::new()),
+            DetectedProtocol::Oci
+        );
+    }
+
+    #[test]
+    fn s3_header_wins_over_git_head() {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        assert_eq!(
+            detect_protocol("/myrepo/HEAD", "", &hdrs),
+            DetectedProtocol::S3
+        );
+    }
+
+    #[test]
+    fn git_head_without_s3_headers() {
+        assert_eq!(
+            detect_protocol("/myrepo/HEAD", "", &HeaderMap::new()),
+            DetectedProtocol::Git
+        );
+    }
+
+    #[test]
+    fn git_content_type_wins() {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("content-type", "application/x-git-upload-pack-request".parse().unwrap());
+        assert_eq!(
+            detect_protocol("/myrepo/git-upload-pack", "", &hdrs),
+            DetectedProtocol::Git
+        );
+    }
+
+    #[test]
+    fn nix_cache_info_exact_match() {
+        assert_eq!(
+            detect_protocol("/nix-cache-info", "", &HeaderMap::new()),
+            DetectedProtocol::Nix
+        );
+    }
+
+    #[test]
+    fn nix_narinfo_suffix() {
+        assert_eq!(
+            detect_protocol("/r5sjd57x0r07bwgipryaxqdkx1gglhiy.narinfo", "", &HeaderMap::new()),
+            DetectedProtocol::Nix
+        );
+    }
+
+    #[test]
+    fn nix_prefix_path() {
+        assert_eq!(
+            detect_protocol("/nix/nix-cache-info", "", &HeaderMap::new()),
+            DetectedProtocol::Nix
+        );
+    }
+
+    #[test]
+    fn unknown_path_no_signals() {
+        assert_eq!(
+            detect_protocol("/random/path/here", "", &HeaderMap::new()),
+            DetectedProtocol::Unknown
+        );
+    }
+
+    // -- DetectedOperation --
+
+    #[test]
+    fn git_receive_pack_query_is_write_discovery() {
+        assert_eq!(
+            detect_operation("/_git/myrepo/info/refs", "service=git-receive-pack", &http::Method::GET, DetectedProtocol::Git),
+            DetectedOperation::WriteDiscovery
+        );
+    }
+
+    #[test]
+    fn git_upload_pack_query_is_read() {
+        assert_eq!(
+            detect_operation("/_git/myrepo/info/refs", "service=git-upload-pack", &http::Method::GET, DetectedProtocol::Git),
+            DetectedOperation::Read
+        );
+    }
+
+    #[test]
+    fn git_receive_pack_post_is_write() {
+        assert_eq!(
+            detect_operation("/_git/myrepo/git_receive_pack", "", &http::Method::POST, DetectedProtocol::Git),
+            DetectedOperation::Write
+        );
+    }
+
+    #[test]
+    fn nix_put_is_write() {
+        assert_eq!(
+            detect_operation("/_nix/nar/abc.nar.zst", "", &http::Method::PUT, DetectedProtocol::Nix),
+            DetectedOperation::Write
+        );
+    }
+
+    #[test]
+    fn nix_get_is_read() {
+        assert_eq!(
+            detect_operation("/_nix/nix-cache-info", "", &http::Method::GET, DetectedProtocol::Nix),
+            DetectedOperation::Read
+        );
+    }
+
+    #[test]
+    fn oci_get_is_read() {
+        assert_eq!(
+            detect_operation("/v2/myrepo/manifests/latest", "", &http::Method::GET, DetectedProtocol::Oci),
+            DetectedOperation::Read
+        );
+    }
+
+    #[test]
+    fn oci_put_is_write() {
+        assert_eq!(
+            detect_operation("/v2/myrepo/manifests/latest", "", &http::Method::PUT, DetectedProtocol::Oci),
+            DetectedOperation::Write
+        );
     }
 }

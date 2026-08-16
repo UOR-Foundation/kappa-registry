@@ -581,6 +581,28 @@ pub enum ResolvedNamespace {
     NoNamespace,
 }
 
+/// Operation intent detected from protocol signals by the interceptor.
+/// Stored in request context for the auth layer to consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedOperation {
+    /// Pure read: GET/HEAD that does not precede a write.
+    Read,
+    /// State-modifying operation: PUT/POST/PATCH/DELETE.
+    Write,
+    /// Read that must succeed for a subsequent write to proceed.
+    /// Git: GET /info/refs?service=git-receive-pack
+    /// Treated as Write for authorization (gets AllowCreateNew on
+    /// nonexistent namespaces).
+    WriteDiscovery,
+}
+
+impl DetectedOperation {
+    /// Whether this operation modifies state or precedes a modification.
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::Write | Self::WriteDiscovery)
+    }
+}
+
 /// Errors from namespace resolution in handler code.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum NamespaceError {

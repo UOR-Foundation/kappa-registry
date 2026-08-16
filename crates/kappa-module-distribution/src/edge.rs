@@ -159,10 +159,41 @@ async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Respons
                     // Check if delegator is the namespace owner
                     if let Ok(info) = s2.namespace_info(n.as_str(), None) {
                         if info.owner == delegator {
-                            return Ok(u32::MAX); // owners have unlimited depth
+                            return Ok(u32::MAX);
                         }
                     }
-                    // Find delegator's own delegation depth
+                    // Check if delegator has _root capability (unlimited depth)
+                    if let Ok(root_ns) = s2.namespace_resolve("_root", None) {
+                        let root_query = EdgeQuery {
+                            anchor: delegator.clone(),
+                            direction: Direction::Outbound,
+                            relation: Some(EdgeRelation::Capability),
+                            asserter: Some(delegator.clone()),
+                        };
+                        if let Ok(caps) = s2.edge_query(&root_ns, &root_query) {
+                            if !caps.is_empty() {
+                                return Ok(u32::MAX);
+                            }
+                        }
+                        // Check _root delegation chain
+                        let root_del_query = EdgeQuery {
+                            anchor: delegator.clone(),
+                            direction: Direction::Inbound,
+                            relation: Some(EdgeRelation::Delegation),
+                            asserter: None,
+                        };
+                        if let Ok(del_edges) = s2.edge_query(&root_ns, &root_del_query) {
+                            for e in &del_edges {
+                                if let Some(ref m) = e.metadata {
+                                    if let Ok(parent_scope) = serde_json::from_slice::<DelegationScope>(m) {
+                                        // Has _root delegation — treat as unlimited
+                                        return Ok(u32::MAX.min(parent_scope.delegation_depth.saturating_add(1)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Find delegator's own delegation depth on the target namespace
                     let query = EdgeQuery {
                         anchor: delegator.clone(),
                         direction: Direction::Inbound,
