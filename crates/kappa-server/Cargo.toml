@@ -41,7 +41,7 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
-hickory-resolver = { version = "0.25", features = ["tokio"], optional = true }
+hickory-resolver = { version = "0.25", features = ["tokio"] }
 x509-parser = { version = "0.18", optional = true }
 
 kappa-akd = { path = "../kappa-akd" }
@@ -155,4 +155,4 @@ veilid = ["dep:kappa-transport-veilid"]
 git = ["dep:kappa-module-git", "dep:gix-hash"]
 s3 = ["dep:kappa-module-s3"]
 nix = ["dep:kappa-module-nix"]
-atproto = ["dep:kappa-module-atproto", "dep:hickory-resolver", "dep:x509-parser"]
+atproto = ["dep:kappa-module-atproto", "dep:x509-parser"]

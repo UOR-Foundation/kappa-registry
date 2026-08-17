@@ -302,6 +302,134 @@ fn base64url_encode(data: &[u8]) -> String {
     out
 }
 
+/// Base64url decoding (RFC 4648 section 5, no padding).
+pub fn base64url_decode(input: &str) -> Result<Vec<u8>, SessionError> {
+    let mut out = Vec::new();
+    let mut bits: u32 = 0;
+    let mut nbits: u32 = 0;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => continue, // skip padding
+            _ => return Err(SessionError::InvalidToken),
+        };
+        bits = (bits << 6) | val as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((bits >> nbits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Parse and verify a DPoP proof JWT.
+///
+/// JWT format: {base64url_header}.{base64url_payload}.{base64url_signature}
+/// Header must contain: typ="dpop+jwt", alg="ES256", jwk={EC P-256 key}
+/// Payload contains: jti, htm, htu, iat, ath
+///
+/// Verifies ES256 (P-256 ECDSA) signature over "{header}.{payload}" bytes
+/// using the public key from the header's JWK field.
+///
+/// Returns DpopClaims with the computed JKT (JWK Thumbprint).
+/// Generic over algorithm: supports ES256 (P-256) now, extensible to
+/// ES384 (P-384), ES512 (P-521), EdDSA via the algorithm dispatch.
+pub fn parse_and_verify_dpop_proof(
+    proof_jwt: &str,
+) -> Result<DpopClaims, SessionError> {
+    let parts: Vec<&str> = proof_jwt.split('.').collect();
+    if parts.len() != 3 {
+        return Err(SessionError::InvalidToken);
+    }
+
+    let header_b64 = parts[0];
+    let payload_b64 = parts[1];
+    let signature_b64 = parts[2];
+
+    // Decode header
+    let header_bytes = base64url_decode(header_b64)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|_| SessionError::InvalidToken)?;
+
+    // Verify header fields
+    let typ = header.get("typ").and_then(|v| v.as_str()).unwrap_or("");
+    if typ != "dpop+jwt" {
+        return Err(SessionError::InvalidToken);
+    }
+
+    let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Extract JWK public key
+    let jwk = header.get("jwk").ok_or(SessionError::InvalidToken)?;
+    let kty = jwk.get("kty").and_then(|v| v.as_str()).unwrap_or("");
+    let crv = jwk.get("crv").and_then(|v| v.as_str()).unwrap_or("");
+
+    let (public_key_bytes, verify_algorithm) = match (alg, kty, crv) {
+        ("ES256", "EC", "P-256") => {
+            let x_b64 = jwk.get("x").and_then(|v| v.as_str())
+                .ok_or(SessionError::InvalidToken)?;
+            let y_b64 = jwk.get("y").and_then(|v| v.as_str())
+                .ok_or(SessionError::InvalidToken)?;
+            let x = base64url_decode(x_b64)?;
+            let y = base64url_decode(y_b64)?;
+            if x.len() != 32 || y.len() != 32 {
+                return Err(SessionError::InvalidToken);
+            }
+            // Uncompressed SEC1: 04 || x || y
+            let mut pk = vec![0x04];
+            pk.extend_from_slice(&x);
+            pk.extend_from_slice(&y);
+            (pk, "p256")
+        }
+        _ => return Err(SessionError::InvalidToken),
+    };
+
+    // Verify signature over "{header_b64}.{payload_b64}"
+    let signing_input = format!("{}.{}", header_b64, payload_b64);
+    let signature_bytes = base64url_decode(signature_b64)?;
+
+    let verifier = kappa_core::crypto::verifier_for(verify_algorithm)
+        .map_err(|_| SessionError::InvalidToken)?;
+
+    match verifier.verify(&public_key_bytes, signing_input.as_bytes(), &signature_bytes) {
+        Ok(true) => {}
+        _ => return Err(SessionError::InvalidToken),
+    }
+
+    // Decode payload
+    let payload_bytes = base64url_decode(payload_b64)?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| SessionError::InvalidToken)?;
+
+    let jti = payload.get("jti").and_then(|v| v.as_str())
+        .ok_or(SessionError::InvalidToken)?.to_string();
+    let htm = payload.get("htm").and_then(|v| v.as_str())
+        .ok_or(SessionError::InvalidToken)?.to_string();
+    let htu = payload.get("htu").and_then(|v| v.as_str())
+        .ok_or(SessionError::InvalidToken)?.to_string();
+    let iat = payload.get("iat").and_then(|v| v.as_u64())
+        .ok_or(SessionError::InvalidToken)?;
+    let ath = payload.get("ath").and_then(|v| v.as_str())
+        .unwrap_or("").to_string();
+
+    // Compute JWK Thumbprint from the key in the header
+    let jkt = match (alg, kty, crv) {
+        ("ES256", "EC", "P-256") => {
+            let x_b64 = jwk.get("x").and_then(|v| v.as_str()).unwrap_or("");
+            let y_b64 = jwk.get("y").and_then(|v| v.as_str()).unwrap_or("");
+            jwk_thumbprint_p256(x_b64, y_b64)
+        }
+        _ => return Err(SessionError::InvalidToken),
+    };
+
+    Ok(DpopClaims { jti, htm, htu, iat, ath, jkt })
+}
+
 /// Compute the JWK Thumbprint (RFC 7638) for a P-256 public key.
 ///
 /// The thumbprint is base64url(SHA-256(canonical_jwk)) where the

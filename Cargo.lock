@@ -1555,7 +1555,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4258,7 +4258,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5553,7 +5553,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6510,7 +6510,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 [[package]]
 name = "topcoat"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "futures-util",
  "inventory",
@@ -6539,7 +6539,7 @@ dependencies = [
 [[package]]
 name = "topcoat-asset"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "http",
  "memchr",
@@ -6556,7 +6556,7 @@ dependencies = [
 [[package]]
 name = "topcoat-cookie"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "cookie",
  "getrandom 0.2.17",
@@ -6570,7 +6570,7 @@ dependencies = [
 [[package]]
 name = "topcoat-core"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "anymap3",
  "elsa",
@@ -6584,7 +6584,7 @@ dependencies = [
 [[package]]
 name = "topcoat-core-grammar"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -6595,7 +6595,7 @@ dependencies = [
 [[package]]
 name = "topcoat-core-macro"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -6605,7 +6605,7 @@ dependencies = [
 [[package]]
 name = "topcoat-font"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "heck",
  "inventory",
@@ -6621,7 +6621,7 @@ dependencies = [
 [[package]]
 name = "topcoat-font-grammar"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6633,7 +6633,7 @@ dependencies = [
 [[package]]
 name = "topcoat-font-macro"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -6643,7 +6643,7 @@ dependencies = [
 [[package]]
 name = "topcoat-icon"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "topcoat-core",
  "topcoat-view",
@@ -6653,7 +6653,7 @@ dependencies = [
 [[package]]
 name = "topcoat-icon-grammar"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -6667,7 +6667,7 @@ dependencies = [
 [[package]]
 name = "topcoat-icon-macro"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6678,7 +6678,7 @@ dependencies = [
 [[package]]
 name = "topcoat-mail"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "lettre",
  "thiserror 2.0.20",
@@ -6691,9 +6691,10 @@ dependencies = [
 [[package]]
 name = "topcoat-router"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "bytes",
+ "dashmap 6.2.1",
  "form_urlencoded",
  "futures-core",
  "futures-sink",
@@ -6707,6 +6708,7 @@ dependencies = [
  "matchit",
  "percent-encoding",
  "ref-cast",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -6722,7 +6724,7 @@ dependencies = [
 [[package]]
 name = "topcoat-router-grammar"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -6734,7 +6736,7 @@ dependencies = [
 [[package]]
 name = "topcoat-router-macro"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -6744,7 +6746,7 @@ dependencies = [
 [[package]]
 name = "topcoat-runtime"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "inventory",
  "ref-cast",
@@ -6760,7 +6762,7 @@ dependencies = [
 [[package]]
 name = "topcoat-runtime-grammar"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6775,7 +6777,7 @@ dependencies = [
 [[package]]
 name = "topcoat-runtime-macro"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -6785,7 +6787,7 @@ dependencies = [
 [[package]]
 name = "topcoat-session"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.4.3",
@@ -6801,7 +6803,7 @@ dependencies = [
 [[package]]
 name = "topcoat-view"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -6816,7 +6818,7 @@ dependencies = [
 [[package]]
 name = "topcoat-view-grammar"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -6829,7 +6831,7 @@ dependencies = [
 [[package]]
 name = "topcoat-view-macro"
 version = "0.5.0"
-source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#79717a4cc96efa5ab374bdc786de15797d51f27c"
+source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -7624,15 +7626,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]

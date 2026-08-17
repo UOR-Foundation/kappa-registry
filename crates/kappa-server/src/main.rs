@@ -452,6 +452,18 @@ async fn main() {
         builder = builder.app_context(rl.clone());
     }
 
+    // -- Outbound HTTP client --
+    // Shared reqwest::Client with request ID propagation and per-host
+    // health tracking. Used by resolvers, probe, requestCrawl, federation.
+    let outbound_client = Arc::new(
+        topcoat::router::outbound::OutboundClient::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent(format!("kappa-registry/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+    );
+    builder = builder.app_context(outbound_client.clone());
+
     // -- Identity resolver registry --
     // All protocol-specific identity resolvers registered in one registry.
     // Dispatch by accepts() -- first resolver that recognizes the identifier
@@ -524,6 +536,49 @@ async fn main() {
         builder = builder.app_context(session_store);
         builder = kappa_module_atproto::register(builder);
         tracing::info!("AT Protocol XRPC endpoints enabled");
+    }
+
+    // -- Handle verification background task --
+    // Timer-driven scan of _handles namespace. Filters to Unverified or
+    // Expired handles. Re-verifies via DNS TXT (hickory-resolver async),
+    // WebFinger, or HTTP well-known. Updates HandleRecord liveness on
+    // success/failure. Separate from federation probe.
+    {
+        let handle_store = store.clone();
+        let handle_registry = resolver_registry.clone();
+        let handle_outbound = outbound_client.clone();
+        let handle_verify_interval: u64 = std::env::var("KAPPA_HANDLE_VERIFY_INTERVAL_SECS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(3600);
+        let handle_ttl_ms: u64 = std::env::var("KAPPA_HANDLE_TTL_MS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(24 * 3600 * 1000);
+
+        // hickory-resolver for async DNS TXT lookups (no dig subprocess)
+        let dns_resolver = Arc::new(
+            hickory_resolver::TokioResolver::builder_tokio()
+                .expect("failed to create DNS resolver from system config")
+                .build()
+        );
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(handle_verify_interval));
+            loop {
+                ticker.tick().await;
+                if let Err(e) = verify_stale_handles(
+                    &handle_store,
+                    &handle_registry,
+                    &handle_outbound,
+                    &dns_resolver,
+                    handle_ttl_ms,
+                ).await {
+                    tracing::warn!(error = %e, "handle verification cycle failed");
+                }
+            }
+        });
+        tracing::info!(
+            interval_secs = handle_verify_interval,
+            ttl_ms = handle_ttl_ms,
+            "handle verification background task started"
+        );
     }
 
     // -- Namespace management routes --
@@ -3138,6 +3193,224 @@ async fn main() {
 }
 
 /// Shutdown signal: Ctrl+C or SIGTERM on Unix.
+/// Scan _handles namespace for Unverified or Expired handles, re-verify each.
+///
+/// For each stale handle:
+/// 1. Deserialize HandleRecord from blob
+/// 2. Check liveness: skip Active handles within TTL
+/// 3. Expire Active handles past TTL
+/// 4. Verify via method-specific check (dns_txt, webfinger, http_well_known)
+/// 5. Update HandleRecord blob and tag on success/failure
+async fn verify_stale_handles(
+    store: &Arc<dyn KappaStore>,
+    registry: &Arc<kappa_core::identity::ResolverRegistry>,
+    outbound: &Arc<topcoat::router::outbound::OutboundClient>,
+    dns_resolver: &Arc<hickory_resolver::TokioResolver>,
+    ttl_ms: u64,
+) -> Result<(), String> {
+    let handles_ns = store.namespace_resolve("_handles", None)
+        .map_err(|e| format!("_handles namespace not found: {}", e))?;
+
+    let tags = store.tag_prefix(&handles_ns, "handle:")
+        .map_err(|e| format!("tag_prefix failed: {}", e))?;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    for tag in &tags {
+        let blob = match store.blob_get(&tag.kappa) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let mut record: kappa_core::identity::handle::HandleRecord =
+            match serde_json::from_slice(&blob) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+        // TTL expiration: Active handles past TTL become Expired
+        if record.liveness == kappa_core::identity::handle::HandleLiveness::Active {
+            if let Some(verified_at) = record.verified_at_ms {
+                if now_ms.saturating_sub(verified_at) < ttl_ms {
+                    continue; // still fresh, skip
+                }
+                // Expired
+                record.liveness = kappa_core::identity::handle::HandleLiveness::Expired;
+            }
+        }
+
+        // Only verify Unverified or Expired handles
+        if record.liveness != kappa_core::identity::handle::HandleLiveness::Unverified
+            && record.liveness != kappa_core::identity::handle::HandleLiveness::Expired
+        {
+            continue;
+        }
+
+        // Skip methods that don't need background verification
+        match record.verification_method.as_str() {
+            "key_name" | "commit_sig" => {
+                // key_name: always Active (Nix key names are the identifier)
+                // commit_sig: verified at commit time, not background
+                if record.liveness != kappa_core::identity::handle::HandleLiveness::Active {
+                    record.liveness = kappa_core::identity::handle::HandleLiveness::Active;
+                    record.verified_at_ms = Some(now_ms);
+                    update_handle_record(store, &handles_ns, &tag.name, &record);
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        // Verify via the appropriate method
+        let verified = match record.verification_method.as_str() {
+            "dns_txt" => verify_handle_dns_txt(&record.handle, &record.anchor, dns_resolver, registry).await,
+            "webfinger" => verify_handle_webfinger(&record.handle, &record.anchor, outbound, registry).await,
+            "http_well_known" => verify_handle_http_well_known(&record.handle, &record.anchor, outbound, registry).await,
+            _ => {
+                // Unknown method: try WebFinger as fallback
+                verify_handle_webfinger(&record.handle, &record.anchor, outbound, registry).await
+            }
+        };
+
+        if verified {
+            record.liveness = kappa_core::identity::handle::HandleLiveness::Active;
+            record.verified_at_ms = Some(now_ms);
+        } else {
+            record.liveness = kappa_core::identity::handle::HandleLiveness::Unverified;
+            // Do NOT delete: the claim persists, allowing retry on next cycle
+        }
+
+        update_handle_record(store, &handles_ns, &tag.name, &record);
+    }
+
+    Ok(())
+}
+
+/// Update a HandleRecord blob and tag in the _handles namespace.
+fn update_handle_record(
+    store: &Arc<dyn KappaStore>,
+    handles_ns: &kappa_core::types::NamespaceRef,
+    tag_name: &str,
+    record: &kappa_core::identity::handle::HandleRecord,
+) {
+    if let Ok(record_bytes) = serde_json::to_vec(record) {
+        if let Ok(ingest) = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes) {
+            let _ = store.tag_set(handles_ns, tag_name, &ingest.kappa);
+        }
+    }
+}
+
+/// Verify a handle via DNS TXT record: _atproto.{handle} -> did=did:plc:xyz
+///
+/// Uses hickory-resolver for async DNS TXT lookup. No subprocess spawning.
+/// Works in containers and on systems without dig installed.
+async fn verify_handle_dns_txt(
+    handle: &str,
+    anchor: &str,
+    dns: &Arc<hickory_resolver::TokioResolver>,
+    registry: &Arc<kappa_core::identity::ResolverRegistry>,
+) -> bool {
+    let query_name = format!("_atproto.{}.", handle);
+    let txt_lookup = match dns.txt_lookup(&query_name).await {
+        Ok(lookup) => lookup,
+        Err(_) => return false,
+    };
+
+    // Parse "did=did:plc:xyz" from TXT records
+    let did = txt_lookup.iter()
+        .flat_map(|txt| txt.iter())
+        .find_map(|data| {
+            let s = String::from_utf8_lossy(data);
+            let clean = s.trim().trim_matches('"');
+            clean.strip_prefix("did=").map(|d| d.to_string())
+        });
+
+    let Some(did) = did else { return false; };
+
+    // Resolve DID to anchor via registry
+    match registry.resolve(&did).await {
+        Ok(Some(identity)) => identity.anchor == anchor,
+        _ => false,
+    }
+}
+
+/// Verify a handle via WebFinger: GET https://{handle}/.well-known/webfinger
+async fn verify_handle_webfinger(
+    handle: &str,
+    anchor: &str,
+    outbound: &Arc<topcoat::router::outbound::OutboundClient>,
+    registry: &Arc<kappa_core::identity::ResolverRegistry>,
+) -> bool {
+    let url = format!(
+        "https://{}/.well-known/webfinger?resource=acct:{}",
+        handle, handle
+    );
+
+    // Use a default Cx for outbound calls outside request context
+    let cx = topcoat::context::Cx::default();
+    let resp = match outbound.get(&cx, &url).await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return false,
+    };
+
+    let jrd: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let did = jrd.get("links")
+        .and_then(|links| links.as_array())
+        .and_then(|arr| arr.iter().find_map(|link| {
+            let rel = link.get("rel")?.as_str()?;
+            if rel == "self" {
+                link.get("href").and_then(|h| h.as_str())
+                    .filter(|h| h.starts_with("did:"))
+                    .map(|h| h.to_string())
+            } else { None }
+        }));
+
+    let Some(did) = did else { return false; };
+
+    match registry.resolve(&did).await {
+        Ok(Some(identity)) => identity.anchor == anchor,
+        _ => false,
+    }
+}
+
+/// Verify a handle via HTTP well-known: GET https://{handle}/.well-known/atproto-did
+async fn verify_handle_http_well_known(
+    handle: &str,
+    anchor: &str,
+    outbound: &Arc<topcoat::router::outbound::OutboundClient>,
+    registry: &Arc<kappa_core::identity::ResolverRegistry>,
+) -> bool {
+    let url = format!("https://{}/.well-known/atproto-did", handle);
+
+    let cx = topcoat::context::Cx::default();
+    let resp = match outbound.get(&cx, &url).await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return false,
+    };
+
+    let body = match resp.text().await {
+        Ok(t) => t.trim().to_string(),
+        Err(_) => return false,
+    };
+
+    // Body should be the DID
+    if !body.starts_with("did:") {
+        return false;
+    }
+
+    match registry.resolve(&body).await {
+        Ok(Some(identity)) => identity.anchor == anchor,
+        _ => false,
+    }
+}
+
 /// Probe a single peer via HTTP with real epoch verification.
 ///
 /// GET {peer_url}/v2/_root?signed=true

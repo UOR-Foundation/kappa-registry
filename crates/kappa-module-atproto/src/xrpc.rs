@@ -49,8 +49,11 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
         .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.deleteSession"), delete_session))
         .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.server.getSession"), get_session))
         .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.createAccount"), create_account))
-        // Sync firehose
+        // Sync firehose + crawl
         .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.subscribeRepos"), subscribe_repos))
+        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.sync.requestCrawl"), request_crawl))
+        // Identity
+        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.identity.updateHandle"), update_handle))
 }
 
 fn xrpc_error(cx: &Cx, status: StatusCode, error: &str, message: &str) -> Result<topcoat::router::response::Response, topcoat::Error> {
@@ -970,21 +973,7 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
                                     match event {
                                         Ok(tag_event) => {
                                             seq += 1;
-                                            let action = match tag_event.operation {
-                                                kappa_core::events::TagEventOp::Set => "create",
-                                                kappa_core::events::TagEventOp::Delete => "delete",
-                                                _ => "update",
-                                            };
-                                            let frame = serde_json::json!({
-                                                "$type": "#commit",
-                                                "seq": seq,
-                                                "repo": tag_event.namespace,
-                                                "ops": [{
-                                                    "action": action,
-                                                    "path": tag_event.name,
-                                                    "cid": tag_event.value.as_deref().unwrap_or(""),
-                                                }],
-                                            });
+                                            let frame = firehose_frame(&tag_event, seq);
                                             if socket.send(Message::text(frame.to_string())).await.is_err() {
                                                 return; // client disconnected
                                             }
@@ -1074,6 +1063,207 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
+// -- Frame type dispatch for subscribeRepos -----------------------------------
+
+/// Map a TagEvent to a firehose frame based on namespace and tag name.
+///
+/// Rule table (deterministic, one entry per frame type):
+///   _handles namespace + handle: prefix  -> #handle
+///   any namespace + binding/ prefix      -> #identity
+///   any namespace + succession/ prefix   -> #identity
+///   any namespace + tombstone flag       -> #tombstone
+///   everything else                      -> #commit
+fn firehose_frame(event: &kappa_core::events::TagEvent, seq: u64) -> serde_json::Value {
+    let frame_type = if event.namespace == "_handles" && event.name.starts_with("handle:") {
+        "#handle"
+    } else if event.name.starts_with("binding/") || event.name.starts_with("succession/") {
+        "#identity"
+    } else if event.name == "_tombstone" || event.name.starts_with("_tombstone/") {
+        "#tombstone"
+    } else {
+        "#commit"
+    };
+
+    match frame_type {
+        "#handle" => {
+            // Extract handle from tag name: handle:{protocol}:{handle}
+            let handle = event.name.strip_prefix("handle:")
+                .and_then(|s| s.split_once(':').map(|(_, h)| h))
+                .unwrap_or("");
+            serde_json::json!({
+                "$type": "#handle",
+                "seq": seq,
+                "did": event.namespace,
+                "handle": handle,
+            })
+        }
+        "#identity" => {
+            serde_json::json!({
+                "$type": "#identity",
+                "seq": seq,
+                "did": event.namespace,
+            })
+        }
+        "#tombstone" => {
+            serde_json::json!({
+                "$type": "#tombstone",
+                "seq": seq,
+                "did": event.namespace,
+            })
+        }
+        _ => {
+            let action = match event.operation {
+                kappa_core::events::TagEventOp::Set => "create",
+                kappa_core::events::TagEventOp::Delete => "delete",
+                _ => "update",
+            };
+            serde_json::json!({
+                "$type": "#commit",
+                "seq": seq,
+                "repo": event.namespace,
+                "ops": [{
+                    "action": action,
+                    "path": event.name,
+                    "cid": event.value.as_deref().unwrap_or(""),
+                }],
+            })
+        }
+    }
+}
+
+// -- updateHandle -------------------------------------------------------------
+
+fn update_handle(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let access_token = extract_bearer_token(cx);
+        if access_token.is_empty() {
+            return xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token");
+        }
+
+        // Validate session
+        let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
+        let did = match session_store {
+            Some(store) => match store.validate_token(&access_token) {
+                Some(d) => d,
+                None => return xrpc_error(cx, StatusCode::UNAUTHORIZED, "ExpiredToken", "invalid token"),
+            },
+            None => return xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "no session store"),
+        };
+
+        let request_bytes = {
+            use topcoat::router::to_bytes;
+            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+        };
+        let req: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+
+        let new_handle = req.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+        if new_handle.is_empty() {
+            return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing handle");
+        }
+
+        let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+        let did_owned = did.clone();
+        let handle_owned = new_handle.to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let handles_ns = store.namespace_resolve("_handles", None)?;
+
+            // Find and remove old handle via reverse tag
+            let reverse_key = format!("anchor:{}", did_owned);
+            if let Ok(rev_entry) = store.tag_get(&handles_ns, &reverse_key) {
+                if let Ok(old_keys_blob) = store.blob_get(&rev_entry.kappa) {
+                    let old_keys = String::from_utf8(old_keys_blob).unwrap_or_default();
+                    for old_key in old_keys.split(',') {
+                        if old_key.starts_with("handle:atproto:") {
+                            let _ = store.tag_delete(&handles_ns, old_key);
+                        }
+                    }
+                }
+            }
+
+            // Create new handle record
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let record = kappa_core::identity::handle::HandleRecord {
+                anchor: did_owned.clone(),
+                handle: handle_owned.clone(),
+                protocol: "atproto".to_string(),
+                claimed_at_ms: now_ms,
+                verified_at_ms: None,
+                verification_method: "unverified".to_string(),
+                liveness: kappa_core::identity::handle::HandleLiveness::Unverified,
+            };
+
+            let record_bytes = serde_json::to_vec(&record)
+                .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
+            let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
+
+            let tag_key = format!("handle:atproto:{}", handle_owned);
+            store.tag_set(&handles_ns, &tag_key, &ingest.kappa)?;
+
+            // Update reverse tag
+            let reverse_bytes = tag_key.as_bytes();
+            let reverse_ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, reverse_bytes)?;
+            store.tag_set(&handles_ns, &reverse_key, &reverse_ingest.kappa)?;
+
+            Ok::<(), kappa_core::types::StoreError>(())
+        }).await;
+
+        match result {
+            Ok(Ok(())) => StatusCode::OK.into_response(cx),
+            Ok(Err(e)) => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
+            Err(e) => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
+        }
+    })
+}
+
+// -- requestCrawl -------------------------------------------------------------
+
+fn request_crawl(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let request_bytes = {
+            use topcoat::router::to_bytes;
+            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+        };
+        let req: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+
+        let hostname = req.get("hostname").and_then(|v| v.as_str()).unwrap_or("");
+        if hostname.is_empty() {
+            return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing hostname");
+        }
+
+        // Fire-and-forget: notify the relay via OutboundClient
+        let our_hostname = std::env::var("KAPPA_PDS_HOSTNAME")
+            .unwrap_or_else(|_| "http://localhost:5000".to_string());
+        let relay_url = format!("{}/xrpc/com.atproto.sync.requestCrawl", hostname.trim_end_matches('/'));
+
+        if let Some(outbound) = try_app_context::<Arc<topcoat::router::outbound::OutboundClient>>(cx) {
+            let outbound = outbound.clone();
+            let cx_clone = cx.clone();
+            tokio::spawn(async move {
+                let body = serde_json::json!({ "hostname": our_hostname });
+                match outbound.post_json(&cx_clone, &relay_url, &body).await {
+                    Ok(resp) => {
+                        tracing::debug!(relay = %relay_url, status = %resp.status(), "requestCrawl sent");
+                    }
+                    Err(e) => {
+                        tracing::warn!(relay = %relay_url, error = %e, "requestCrawl failed");
+                    }
+                }
+            });
+        } else {
+            tracing::warn!("OutboundClient not configured, skipping requestCrawl");
+        }
+
+        StatusCode::OK.into_response(cx)
+    })
+}
+
 // -- Helpers ------------------------------------------------------------------
 
 /// Verify the caller's session DID matches the target repo.
@@ -1085,32 +1275,70 @@ fn verify_repo_auth(
     cx: &Cx,
     repo: &str,
 ) -> Result<String, topcoat::router::response::Response> {
-    let token = extract_bearer_token(cx);
-    if token.is_empty() {
+    use topcoat::context::request_context;
+    let parts: &http::request::Parts = request_context(cx);
+    let auth_header = parts.headers.get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if auth_header.is_empty() {
         return Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token")
             .unwrap_or_else(|_| topcoat::router::response::Response::default()));
     }
 
     let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
-    match session_store {
-        Some(store) => {
-            match store.validate_token(&token) {
-                Some(did) => {
-                    // Session DID must match the repo parameter
-                    if did != repo {
-                        return Err(xrpc_error(cx, StatusCode::FORBIDDEN, "Forbidden",
-                            &format!("session DID {} does not match repo {}", did, repo))
-                            .unwrap_or_else(|_| topcoat::router::response::Response::default()));
-                    }
-                    Ok(did)
-                }
-                None => Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "ExpiredToken", "invalid or expired token")
-                    .unwrap_or_else(|_| topcoat::router::response::Response::default())),
-            }
-        }
+    let Some(store) = session_store else {
         // No session store = auth not enforced (unauthenticated mode)
-        None => Ok(repo.to_string()),
+        return Ok(repo.to_string());
+    };
+
+    // DPoP path: Authorization: DPoP {access_token} + DPoP header with proof JWT
+    if let Some(access_token) = auth_header.strip_prefix("DPoP ") {
+        let dpop_proof = parts.headers.get("dpop")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if dpop_proof.is_empty() {
+            return Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "InvalidToken", "DPoP proof header missing")
+                .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+        }
+        // Parse and verify the DPoP proof JWT (ES256 signature verification)
+        let claims = crate::session::parse_and_verify_dpop_proof(dpop_proof)
+            .map_err(|e| xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string())
+                .unwrap_or_else(|_| topcoat::router::response::Response::default()))?;
+
+        // Full 7-step DPoP verification against the session
+        let method = parts.method.as_str();
+        let uri = parts.uri.to_string();
+        let did = store.verify_dpop_request(access_token, &claims, method, &uri)
+            .map_err(|e| xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string())
+                .unwrap_or_else(|_| topcoat::router::response::Response::default()))?;
+
+        if did != repo {
+            return Err(xrpc_error(cx, StatusCode::FORBIDDEN, "Forbidden",
+                &format!("session DID {} does not match repo {}", did, repo))
+                .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+        }
+        return Ok(did);
     }
+
+    // Bearer path: Authorization: Bearer {access_token}
+    if let Some(access_token) = auth_header.strip_prefix("Bearer ") {
+        match store.validate_token(access_token) {
+            Some(did) => {
+                if did != repo {
+                    return Err(xrpc_error(cx, StatusCode::FORBIDDEN, "Forbidden",
+                        &format!("session DID {} does not match repo {}", did, repo))
+                        .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+                }
+                return Ok(did);
+            }
+            None => return Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "ExpiredToken", "invalid or expired token")
+                .unwrap_or_else(|_| topcoat::router::response::Response::default())),
+        }
+    }
+
+    Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "unsupported authorization scheme")
+        .unwrap_or_else(|_| topcoat::router::response::Response::default()))
 }
 
 fn extract_bearer_token(cx: &Cx) -> String {
