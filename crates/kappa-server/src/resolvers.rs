@@ -263,10 +263,11 @@ impl ExternalIdentifierResolver for FulcioResolver {
 pub struct WebFingerResolver {
     client: reqwest::Client,
     registry: Weak<ResolverRegistry>,
+    dns: Arc<hickory_resolver::TokioResolver>,
 }
 
 impl WebFingerResolver {
-    pub fn new(registry: Weak<ResolverRegistry>) -> Self {
+    pub fn new(registry: Weak<ResolverRegistry>, dns: Arc<hickory_resolver::TokioResolver>) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -274,6 +275,7 @@ impl WebFingerResolver {
                 .build()
                 .expect("failed to build reqwest client"),
             registry,
+            dns,
         }
     }
 }
@@ -291,8 +293,10 @@ impl ExternalIdentifierResolver for WebFingerResolver {
         let handle = identifier.strip_prefix('@').unwrap_or(identifier);
 
         // Phase 1: handle -> DID via WebFinger
-        let did = self.resolve_webfinger(handle).await
-            .or_else(|_| self.resolve_dns_txt(handle))?;
+        let did = match self.resolve_webfinger(handle).await {
+            Ok(Some(d)) => Some(d),
+            _ => self.resolve_dns_txt(handle).await?,
+        };
 
         let did = match did {
             Some(d) => d,
@@ -354,23 +358,22 @@ impl WebFingerResolver {
         Ok(did)
     }
 
-    fn resolve_dns_txt(&self, handle: &str) -> Result<Option<String>, String> {
-        let output = std::process::Command::new("dig")
-            .args(["+short", "TXT", &format!("_atproto.{}", handle)])
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
-                let txt = String::from_utf8_lossy(&out.stdout);
-                for line in txt.lines() {
-                    let clean = line.trim().trim_matches('"');
-                    if let Some(did) = clean.strip_prefix("did=") {
-                        return Ok(Some(did.to_string()));
-                    }
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
-        }
+    async fn resolve_dns_txt(&self, handle: &str) -> Result<Option<String>, String> {
+        let query_name = format!("_atproto.{}.", handle);
+        let txt_lookup = match self.dns.txt_lookup(&query_name).await {
+            Ok(lookup) => lookup,
+            Err(_) => return Ok(None),
+        };
+
+        let did = txt_lookup.iter()
+            .flat_map(|txt| txt.iter())
+            .find_map(|data| {
+                let s = String::from_utf8_lossy(data);
+                let clean = s.trim().trim_matches('"');
+                clean.strip_prefix("did=").map(|d| d.to_string())
+            });
+
+        Ok(did)
     }
 }
 
@@ -426,7 +429,7 @@ impl ExternalIdentifierResolver for NixKeyResolver {
 // -- Registry builder ---------------------------------------------------------
 
 /// Build a ResolverRegistry from environment config.
-pub fn build_registry() -> Arc<ResolverRegistry> {
+pub fn build_registry(dns: Arc<hickory_resolver::TokioResolver>) -> Arc<ResolverRegistry> {
     let mut registry = ResolverRegistry::new();
 
     let nix = NixKeyResolver::from_env();
@@ -436,23 +439,22 @@ pub fn build_registry() -> Arc<ResolverRegistry> {
 
     registry.add(Arc::new(PlcResolver::from_env()));
 
-    Arc::new(registry)
-}
+    // WebFingerResolver needs a weak ref back to the registry for DID -> anchor
+    // resolution after handle -> DID via WebFinger/DNS. We build the registry,
+    // wrap it in Arc, then rebuild with the weak ref. The rebuild duplicates
+    // Nix + PLC resolvers but shares the DNS resolver and cache.
+    let inner = Arc::new(registry);
+    let mut full = ResolverRegistry::new();
 
-/// Rebuild registry with WebFinger resolver that holds a weak ref back.
-pub fn registry_with_webfinger(inner: &Arc<ResolverRegistry>) -> Arc<ResolverRegistry> {
-    let mut registry = ResolverRegistry::new();
-
-    let nix = NixKeyResolver::from_env();
-    if !nix.keys.is_empty() {
-        registry.add(Arc::new(nix));
+    let nix2 = NixKeyResolver::from_env();
+    if !nix2.keys.is_empty() {
+        full.add(Arc::new(nix2));
     }
-    registry.add(Arc::new(PlcResolver::from_env()));
+    full.add(Arc::new(PlcResolver::from_env()));
+    let weak = Arc::downgrade(&inner);
+    full.add(Arc::new(WebFingerResolver::new(weak, dns)));
 
-    let weak_registry = Arc::downgrade(inner);
-    registry.add(Arc::new(WebFingerResolver::new(weak_registry)));
-
-    Arc::new(registry)
+    Arc::new(full)
 }
 
 #[cfg(test)]

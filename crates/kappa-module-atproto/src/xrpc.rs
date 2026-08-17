@@ -19,7 +19,6 @@ use topcoat::router::response::IntoResponse;
 use sha2::Digest;
 
 use kappa_core::store::KappaStore;
-use crate::mst::BlockStore as _;
 
 /// Register all AT Protocol XRPC routes.
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
@@ -163,31 +162,45 @@ fn get_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Some(d) => d,
             None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing did parameter"),
         };
+        let since = query_param(cx, "since");
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let result = tokio::task::spawn_blocking(move || {
             let ns = store.namespace_resolve(&did, Some("atproto"))?;
-            // Export the entire repo as a CAR file
             let head = store.tag_get(&ns, "commit/head")?;
-            // Collect all blocks reachable from the commit
             let commit_bytes = store.blob_get(&head.kappa)?;
-            let mut blocks = vec![crate::car::CarBlock {
-                cid: hex::decode(&head.kappa.replace("sha256:", "")).unwrap_or_default(),
-                bytes: commit_bytes,
-            }];
-            // Walk tags for record blobs
-            let tags = store.tag_list(&ns)?;
-            for tag in &tags {
-                if tag.name.starts_with("record/") || tag.name.starts_with("mst/") {
-                    if let Ok(data) = store.blob_get(&tag.kappa) {
-                        blocks.push(crate::car::CarBlock {
-                            cid: hex::decode(&tag.kappa.replace("sha256:", "")).unwrap_or_default(),
-                            bytes: data,
-                        });
+            let commit_cid = crate::cid::cid_for_cbor(&commit_bytes);
+
+            // Build exclusion set from `since` commit if provided
+            let mut visited = std::collections::HashSet::new();
+            if let Some(ref since_rev) = since {
+                // Try to find the since commit via commit/rev/{rev} tag
+                let since_tag = format!("commit/rev/{}", since_rev);
+                if let Ok(since_entry) = store.tag_get(&ns, &since_tag) {
+                    if let Ok(since_commit_bytes) = store.blob_get(&since_entry.kappa) {
+                        if let Some(since_mst_cid) = parse_commit_data_cid(&since_commit_bytes) {
+                            // Walk the since MST to populate exclusion set
+                            walk_mst_cids(&store, &ns, &since_mst_cid, &mut visited);
+                        }
                     }
                 }
             }
-            let root_cid = hex::decode(&head.kappa.replace("sha256:", "")).unwrap_or_default();
-            let car = crate::car::encode_car(Some(&root_cid), &blocks);
+
+            let mut blocks = Vec::new();
+
+            // 1. Commit block
+            if visited.insert(commit_cid) {
+                blocks.push(crate::car::CarBlock {
+                    cid: commit_cid.to_vec(),
+                    bytes: commit_bytes.clone(),
+                });
+            }
+
+            // 2. Parse commit data CID (MST root) and walk
+            if let Some(mst_root_cid) = parse_commit_data_cid(&commit_bytes) {
+                walk_mst_node(&store, &ns, &mst_root_cid, &mut blocks, &mut visited);
+            }
+
+            let car = crate::car::encode_car(Some(&commit_cid), &blocks);
             Ok::<Vec<u8>, kappa_core::types::StoreError>(car)
         }).await;
         match result {
@@ -197,6 +210,203 @@ fn get_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             _ => xrpc_error(cx, StatusCode::NOT_FOUND, "RepoNotFound", "repository not found"),
         }
     })
+}
+
+/// Parse the "data" field CID from a DAG-CBOR encoded commit.
+///
+/// The commit is a CBOR map. We find the "data" key and read its
+/// Tag 42 byte string value, stripping the 0x00 multibase prefix.
+fn parse_commit_data_cid(commit_bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0;
+    if pos >= commit_bytes.len() { return None; }
+    let major = commit_bytes[pos] >> 5;
+    if major != 5 { return None; } // not a map
+    let map_len = (commit_bytes[pos] & 0x1F) as usize;
+    pos += 1;
+
+    for _ in 0..map_len {
+        // Read key (text string)
+        if pos >= commit_bytes.len() { return None; }
+        let key_major = commit_bytes[pos] >> 5;
+        let key_len = (commit_bytes[pos] & 0x1F) as usize;
+        if key_major != 3 { return None; }
+        pos += 1;
+        if pos + key_len > commit_bytes.len() { return None; }
+        let key = std::str::from_utf8(&commit_bytes[pos..pos + key_len]).ok()?;
+        pos += key_len;
+
+        if key == "data" {
+            // Expect Tag 42 (0xD8 0x2A) then byte string
+            if pos + 1 >= commit_bytes.len() { return None; }
+            if commit_bytes[pos] == 0xD8 && commit_bytes[pos + 1] == 42 {
+                pos += 2;
+                if pos >= commit_bytes.len() { return None; }
+                let bs_major = commit_bytes[pos] >> 5;
+                let bs_len = (commit_bytes[pos] & 0x1F) as usize;
+                if bs_major != 2 { return None; }
+                pos += 1;
+                let actual_len = if bs_len < 24 {
+                    bs_len
+                } else if bs_len == 24 {
+                    if pos >= commit_bytes.len() { return None; }
+                    let l = commit_bytes[pos] as usize;
+                    pos += 1;
+                    l
+                } else { return None; };
+                if pos + actual_len > commit_bytes.len() { return None; }
+                let cid_bytes = &commit_bytes[pos..pos + actual_len];
+                // Strip 0x00 identity multibase prefix
+                if !cid_bytes.is_empty() && cid_bytes[0] == 0x00 {
+                    return Some(cid_bytes[1..].to_vec());
+                }
+                return Some(cid_bytes.to_vec());
+            }
+            return None;
+        } else {
+            // Skip value
+            skip_cbor_value(commit_bytes, &mut pos)?;
+        }
+    }
+    None
+}
+
+/// Skip a single CBOR value at the given position.
+fn skip_cbor_value(data: &[u8], pos: &mut usize) -> Option<()> {
+    if *pos >= data.len() { return None; }
+    let major = data[*pos] >> 5;
+    let additional = data[*pos] & 0x1F;
+    *pos += 1;
+    match major {
+        0 | 1 => {
+            if additional >= 24 && additional <= 27 {
+                *pos += 1usize << (additional - 24);
+            }
+        }
+        2 | 3 => {
+            let len = if additional < 24 { additional as usize }
+                else if additional == 24 { let l = *data.get(*pos)? as usize; *pos += 1; l }
+                else { return None; };
+            *pos += len;
+        }
+        4 => {
+            let len = additional as usize;
+            for _ in 0..len { skip_cbor_value(data, pos)?; }
+        }
+        5 => {
+            let len = additional as usize;
+            for _ in 0..len { skip_cbor_value(data, pos)?; skip_cbor_value(data, pos)?; }
+        }
+        6 => {
+            if additional >= 24 && additional <= 27 {
+                *pos += 1usize << (additional - 24);
+            }
+            skip_cbor_value(data, pos)?;
+        }
+        7 => {
+            if additional >= 24 && additional <= 27 {
+                *pos += 1usize << (additional - 24);
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// Walk an MST tree depth-first, collecting CIDs into the visited set.
+/// Does not collect blocks -- used for building exclusion sets.
+fn walk_mst_cids(
+    store: &Arc<dyn KappaStore>,
+    ns: &kappa_core::types::NamespaceRef,
+    node_cid: &[u8],
+    visited: &mut std::collections::HashSet<[u8; 36]>,
+) {
+    if node_cid.len() != 36 { return; }
+    let mut cid_arr = [0u8; 36];
+    cid_arr.copy_from_slice(node_cid);
+    if !visited.insert(cid_arr) { return; }
+
+    let cid_hex = hex::encode(node_cid);
+    let tag_name = format!("mst/{}", cid_hex);
+    let kappa = match store.tag_get(ns, &tag_name) {
+        Ok(e) => e.kappa,
+        Err(_) => return,
+    };
+    let node_bytes = match store.blob_get(&kappa) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    if let Ok((left, entries)) = crate::mst::decode_node(&node_bytes) {
+        if let Some(left_cid) = left {
+            walk_mst_cids(store, ns, &left_cid, visited);
+        }
+        for entry in &entries {
+            visited.insert(entry.value);
+            if let Some(right_cid) = &entry.tree {
+                walk_mst_cids(store, ns, right_cid, visited);
+            }
+        }
+    }
+}
+
+/// Walk an MST tree depth-first, collecting blocks for CAR export.
+fn walk_mst_node(
+    store: &Arc<dyn KappaStore>,
+    ns: &kappa_core::types::NamespaceRef,
+    node_cid: &[u8],
+    blocks: &mut Vec<crate::car::CarBlock>,
+    visited: &mut std::collections::HashSet<[u8; 36]>,
+) {
+    if node_cid.len() != 36 { return; }
+    let mut cid_arr = [0u8; 36];
+    cid_arr.copy_from_slice(node_cid);
+    if !visited.insert(cid_arr) { return; }
+
+    // Look up node blob via CID->kappa bridge tag
+    let cid_hex = hex::encode(node_cid);
+    let tag_name = format!("mst/{}", cid_hex);
+    let kappa = match store.tag_get(ns, &tag_name) {
+        Ok(e) => e.kappa,
+        Err(_) => return,
+    };
+    let node_bytes = match store.blob_get(&kappa) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    blocks.push(crate::car::CarBlock {
+        cid: node_cid.to_vec(),
+        bytes: node_bytes.clone(),
+    });
+
+    // Decode the MST node to find children
+    if let Ok((left, entries)) = crate::mst::decode_node(&node_bytes) {
+        // Walk left subtree
+        if let Some(left_cid) = left {
+            walk_mst_node(store, ns, &left_cid, blocks, visited);
+        }
+
+        // Walk each entry's value (record blob) and right subtree
+        for entry in &entries {
+            // Record blob via CID->kappa bridge tag
+            let value_cid_hex = hex::encode(&entry.value);
+            let blob_tag = format!("blob/{}", value_cid_hex);
+            if let Ok(blob_entry) = store.tag_get(ns, &blob_tag) {
+                if let Ok(blob_data) = store.blob_get(&blob_entry.kappa) {
+                    if visited.insert(entry.value) {
+                        blocks.push(crate::car::CarBlock {
+                            cid: entry.value.to_vec(),
+                            bytes: blob_data,
+                        });
+                    }
+                }
+            }
+
+            // Right subtree
+            if let Some(right_cid) = &entry.tree {
+                walk_mst_node(store, ns, right_cid, blocks, visited);
+            }
+        }
+    }
 }
 
 fn get_blob(cx: &Cx, _body: Body) -> RouteFuture<'_> {
@@ -446,6 +656,11 @@ fn create_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 .map_err(|e| kappa_core::types::StoreError::Rejected(format!("record serialize: {e}")))?;
             let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
 
+            // CID->kappa bridge tag for MST tree walk in getRepo
+            let record_cid = crate::cid::cid_for_cbor(&record_bytes);
+            let blob_cid_hex = hex::encode(record_cid);
+            store.tag_set(&ns, &format!("blob/{}", blob_cid_hex), &ingest.kappa)?;
+
             // Tag: record/{collection}/{rkey} -> record kappa
             let tag_name = format!("record/{}/{}", collection, rkey);
             store.tag_set(&ns, &tag_name, &ingest.kappa)?;
@@ -498,6 +713,11 @@ fn put_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let record_bytes = serde_json::to_vec(record)
                 .map_err(|e| kappa_core::types::StoreError::Rejected(format!("record serialize: {e}")))?;
             let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
+
+            // CID->kappa bridge tag for MST tree walk
+            let record_cid = crate::cid::cid_for_cbor(&record_bytes);
+            let blob_cid_hex = hex::encode(record_cid);
+            store.tag_set(&ns, &format!("blob/{}", blob_cid_hex), &ingest.kappa)?;
 
             let tag_name = format!("record/{}/{}", collection, rkey);
             store.tag_set(&ns, &tag_name, &ingest.kappa)?;
@@ -832,19 +1052,17 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
             // Initialize empty MST root
             let mut mst_store = crate::mst::MemoryBlockStore::new();
             let mst = crate::mst::Mst::new();
-            let mst_root = mst.write_to_store(&mut mst_store);
+            let (mst_root, mst_blocks) = mst.write_to_store(&mut mst_store);
 
-            // Store MST root block
-            let empty_vec = Vec::new();
-            let mst_root_bytes = mst_store.get(&mst_root).unwrap_or(empty_vec);
-            let mst_root_kappa = store.ingest_compute(
-                kappa_core::kappa::Axis::Sha256,
-                &mst_root_bytes,
-            )?.kappa;
-
-            // Tag: CID -> kappa bridge so getRepo can walk the commit tree
-            let mst_cid_hex = hex::encode(mst_root);
-            store.tag_set(&ns, &format!("mst/{}", mst_cid_hex), &mst_root_kappa)?;
+            // Store all MST node blocks and create CID->kappa bridge tags
+            for (block_cid, block_bytes) in &mst_blocks {
+                let ingest = store.ingest_compute(
+                    kappa_core::kappa::Axis::Sha256,
+                    block_bytes,
+                )?;
+                let cid_hex = hex::encode(block_cid);
+                store.tag_set(&ns, &format!("mst/{}", cid_hex), &ingest.kappa)?;
+            }
 
             // Create initial commit
             let tid_gen = crate::tid::TidGenerator::with_clock_id(0);
@@ -922,6 +1140,9 @@ pub struct FirehoseConfig {
     pub mode: FirehoseMode,
     pub max_lag: u64,
     pub heartbeat_interval_ms: u64,
+    /// When true, send JSON text frames instead of DAG-CBOR binary frames.
+    /// For debugging and clients that don't implement DAG-CBOR parsing.
+    pub force_json: bool,
 }
 
 impl Default for FirehoseConfig {
@@ -930,6 +1151,7 @@ impl Default for FirehoseConfig {
             mode: FirehoseMode::Broadcast,
             max_lag: 10000,
             heartbeat_interval_ms: 30000,
+            force_json: false,
         }
     }
 }
@@ -958,6 +1180,7 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
             .on_upgrade(move |mut socket| async move {
                 let mut seq = cursor.unwrap_or(0);
                 let max_lag = config.max_lag;
+                let force_json = config.force_json;
 
                 match (config.mode, &event_sender) {
                     // Broadcast mode: subscribe to the event channel
@@ -973,26 +1196,40 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
                                     match event {
                                         Ok(tag_event) => {
                                             seq += 1;
-                                            let frame = firehose_frame(&tag_event, seq);
-                                            if socket.send(Message::text(frame.to_string())).await.is_err() {
+                                            let msg = if force_json {
+                                                let frame = firehose_frame_json(&tag_event, seq);
+                                                Message::text(frame.to_string())
+                                            } else {
+                                                let frame = firehose_frame_cbor(&tag_event, seq);
+                                                Message::binary(bytes::Bytes::from(frame))
+                                            };
+                                            if socket.send(msg).await.is_err() {
                                                 return; // client disconnected
                                             }
                                         }
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                             if n > max_lag {
-                                                let info = serde_json::json!({
-                                                    "$type": "#info",
-                                                    "name": "OutdatedCursor",
-                                                    "message": format!("lagged {} events, closing", n),
-                                                });
-                                                let _ = socket.send(Message::text(info.to_string())).await;
+                                                let msg = if force_json {
+                                                    let info = serde_json::json!({
+                                                        "$type": "#info",
+                                                        "name": "OutdatedCursor",
+                                                        "message": format!("lagged {} events, closing", n),
+                                                    });
+                                                    Message::text(info.to_string())
+                                                } else {
+                                                    let frame = crate::dag_cbor::frame(
+                                                        crate::dag_cbor::encode_header(-1, "#info"),
+                                                        crate::dag_cbor::encode_info_body("OutdatedCursor", &format!("lagged {} events, closing", n)),
+                                                    );
+                                                    Message::binary(bytes::Bytes::from(frame))
+                                                };
+                                                let _ = socket.send(msg).await;
                                                 return;
                                             }
-                                            // Recoverable lag: continue receiving
                                             seq += n;
                                         }
                                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                            return; // broadcaster dropped
+                                            return;
                                         }
                                     }
                                 }
@@ -1036,23 +1273,41 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
                             while seq < current_seq {
                                 seq += 1;
-                                let event = serde_json::json!({
-                                    "$type": "#info",
-                                    "name": "SequenceAdvance",
-                                    "seq": seq,
-                                });
-                                if socket.send(Message::text(event.to_string())).await.is_err() {
+                                let msg = if force_json {
+                                    let event = serde_json::json!({
+                                        "$type": "#info",
+                                        "name": "SequenceAdvance",
+                                        "seq": seq,
+                                    });
+                                    Message::text(event.to_string())
+                                } else {
+                                    let frame = crate::dag_cbor::frame(
+                                        crate::dag_cbor::encode_header(1, "#info"),
+                                        crate::dag_cbor::encode_info_body("SequenceAdvance", &format!("{}", seq)),
+                                    );
+                                    Message::binary(bytes::Bytes::from(frame))
+                                };
+                                if socket.send(msg).await.is_err() {
                                     return;
                                 }
                             }
 
                             if current_seq.saturating_sub(seq) > max_lag {
-                                let info = serde_json::json!({
-                                    "$type": "#info",
-                                    "name": "OutdatedCursor",
-                                    "message": "cursor too far behind",
-                                });
-                                let _ = socket.send(Message::text(info.to_string())).await;
+                                let msg = if force_json {
+                                    let info = serde_json::json!({
+                                        "$type": "#info",
+                                        "name": "OutdatedCursor",
+                                        "message": "cursor too far behind",
+                                    });
+                                    Message::text(info.to_string())
+                                } else {
+                                    let frame = crate::dag_cbor::frame(
+                                        crate::dag_cbor::encode_header(-1, "#info"),
+                                        crate::dag_cbor::encode_info_body("OutdatedCursor", "cursor too far behind"),
+                                    );
+                                    Message::binary(bytes::Bytes::from(frame))
+                                };
+                                let _ = socket.send(msg).await;
                                 break;
                             }
                         }
@@ -1065,7 +1320,7 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
 // -- Frame type dispatch for subscribeRepos -----------------------------------
 
-/// Map a TagEvent to a firehose frame based on namespace and tag name.
+/// Classify a TagEvent into a firehose frame type.
 ///
 /// Rule table (deterministic, one entry per frame type):
 ///   _handles namespace + handle: prefix  -> #handle
@@ -1073,8 +1328,8 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
 ///   any namespace + succession/ prefix   -> #identity
 ///   any namespace + tombstone flag       -> #tombstone
 ///   everything else                      -> #commit
-fn firehose_frame(event: &kappa_core::events::TagEvent, seq: u64) -> serde_json::Value {
-    let frame_type = if event.namespace == "_handles" && event.name.starts_with("handle:") {
+fn classify_frame(event: &kappa_core::events::TagEvent) -> &'static str {
+    if event.namespace == "_handles" && event.name.starts_with("handle:") {
         "#handle"
     } else if event.name.starts_with("binding/") || event.name.starts_with("succession/") {
         "#identity"
@@ -1082,11 +1337,46 @@ fn firehose_frame(event: &kappa_core::events::TagEvent, seq: u64) -> serde_json:
         "#tombstone"
     } else {
         "#commit"
-    };
+    }
+}
 
+/// Encode a firehose frame as DAG-CBOR binary (spec-correct wire format).
+fn firehose_frame_cbor(event: &kappa_core::events::TagEvent, seq: u64) -> Vec<u8> {
+    let frame_type = classify_frame(event);
+    let header = crate::dag_cbor::encode_header(1, frame_type);
+    let body = match frame_type {
+        "#handle" => {
+            let handle = event.name.strip_prefix("handle:")
+                .and_then(|s| s.split_once(':').map(|(_, h)| h))
+                .unwrap_or("");
+            crate::dag_cbor::encode_handle_body(seq, &event.namespace, handle)
+        }
+        "#identity" => crate::dag_cbor::encode_identity_body(seq, &event.namespace),
+        "#tombstone" => crate::dag_cbor::encode_tombstone_body(seq, &event.namespace),
+        _ => {
+            let action = match event.operation {
+                kappa_core::events::TagEventOp::Set => "create",
+                kappa_core::events::TagEventOp::Delete => "delete",
+                _ => "update",
+            };
+            crate::dag_cbor::encode_commit_body(
+                seq, &event.namespace,
+                &[], // commit CID -- populated when MST-backed commits are real
+                "",  // rev
+                None, // since
+                &[], // blocks CAR -- populated with MST-aware export
+                &[(action, &event.name, None)],
+            )
+        }
+    };
+    crate::dag_cbor::frame(header, body)
+}
+
+/// Encode a firehose frame as JSON (debug/fallback format).
+fn firehose_frame_json(event: &kappa_core::events::TagEvent, seq: u64) -> serde_json::Value {
+    let frame_type = classify_frame(event);
     match frame_type {
         "#handle" => {
-            // Extract handle from tag name: handle:{protocol}:{handle}
             let handle = event.name.strip_prefix("handle:")
                 .and_then(|s| s.split_once(':').map(|(_, h)| h))
                 .unwrap_or("");

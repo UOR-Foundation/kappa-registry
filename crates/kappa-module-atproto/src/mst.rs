@@ -277,15 +277,21 @@ impl Mst {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Serialize the full tree to a block store and return the root CID.
+    /// Serialize the full tree to a block store and return the root CID
+    /// plus all (CID, bytes) pairs stored during serialization.
     ///
     /// This builds the tree structure from scratch every time.
     /// Keys are partitioned into layers based on their leading zeros.
-    pub fn write_to_store(&self, store: &mut dyn BlockStore) -> [u8; 36] {
+    ///
+    /// The returned all_blocks vec contains every MST node block stored,
+    /// enabling the caller to create CID->kappa bridge tags for each.
+    pub fn write_to_store(&self, store: &mut dyn BlockStore) -> ([u8; 36], Vec<([u8; 36], Vec<u8>)>) {
+        let mut all_blocks = Vec::new();
         if self.entries.is_empty() {
-            // Empty tree: single node with no entries and no left pointer
             let node_bytes = encode_node(None, &[]);
-            return store.put(&node_bytes);
+            let cid = store.put(&node_bytes);
+            all_blocks.push((cid, node_bytes));
+            return (cid, all_blocks);
         }
 
         // Collect all keys with their layers
@@ -299,7 +305,8 @@ impl Mst {
         let max_layer = keyed.iter().map(|(_, _, l)| *l).max().unwrap_or(0);
 
         // Build tree recursively
-        build_subtree(&keyed, 0, keyed.len(), max_layer, store)
+        let root = build_subtree(&keyed, 0, keyed.len(), max_layer, store, &mut all_blocks);
+        (root, all_blocks)
     }
 
     /// Compute the diff between this MST and another.
@@ -361,6 +368,7 @@ fn build_subtree(
     end: usize,
     layer: usize,
     store: &mut dyn BlockStore,
+    all_blocks: &mut Vec<([u8; 36], Vec<u8>)>,
 ) -> [u8; 36] {
     let mut node_entries: Vec<MstEntry> = Vec::new();
     let mut left_subtree: Option<[u8; 36]> = None;
@@ -376,7 +384,7 @@ fn build_subtree(
     }
     if i > sub_start {
         if layer > 0 {
-            let sub_cid = build_subtree(keys, sub_start, i, layer - 1, store);
+            let sub_cid = build_subtree(keys, sub_start, i, layer - 1, store, all_blocks);
             left_subtree = Some(sub_cid);
         }
     }
@@ -398,7 +406,7 @@ fn build_subtree(
             }
 
             let right_subtree = if i > sub_start && layer > 0 {
-                Some(build_subtree(keys, sub_start, i, layer - 1, store))
+                Some(build_subtree(keys, sub_start, i, layer - 1, store, all_blocks))
             } else {
                 None
             };
@@ -420,7 +428,9 @@ fn build_subtree(
 
     let left_ref = left_subtree.as_ref().map(|c| c.as_slice());
     let node_bytes = encode_node(left_ref, &node_entries);
-    store.put(&node_bytes)
+    let cid = store.put(&node_bytes);
+    all_blocks.push((cid, node_bytes));
+    cid
 }
 
 /// Count the length of the common prefix between two strings.
@@ -906,20 +916,23 @@ mod tests {
         }
 
         let mut store = MemoryBlockStore::new();
-        let root = mst.write_to_store(&mut store);
+        let (root, all_blocks) = mst.write_to_store(&mut store);
 
         // Root CID should be 36 bytes
         assert_eq!(root.len(), 36);
         // Root block should exist in store
         assert!(store.get(&root).is_some());
+        // All blocks should be non-empty
+        assert!(!all_blocks.is_empty());
     }
 
     #[test]
     fn mst_empty_tree() {
         let mst = Mst::new();
         let mut store = MemoryBlockStore::new();
-        let root = mst.write_to_store(&mut store);
+        let (root, all_blocks) = mst.write_to_store(&mut store);
         assert!(store.get(&root).is_some());
+        assert_eq!(all_blocks.len(), 1); // single empty node
     }
 
     #[test]

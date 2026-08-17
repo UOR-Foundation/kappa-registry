@@ -464,11 +464,18 @@ async fn main() {
     );
     builder = builder.app_context(outbound_client.clone());
 
+    // -- DNS resolver (shared across WebFingerResolver + handle verification) --
+    let dns_resolver = Arc::new(
+        hickory_resolver::TokioResolver::builder_tokio()
+            .expect("failed to create DNS resolver from system config")
+            .build()
+    );
+
     // -- Identity resolver registry --
     // All protocol-specific identity resolvers registered in one registry.
     // Dispatch by accepts() -- first resolver that recognizes the identifier
     // format handles it. Registration order: most specific first.
-    let resolver_registry = resolvers::build_registry();
+    let resolver_registry = resolvers::build_registry(dns_resolver.clone());
     builder = builder.app_context(resolver_registry.clone());
 
     // -- Upload eviction + config --
@@ -552,12 +559,7 @@ async fn main() {
         let handle_ttl_ms: u64 = std::env::var("KAPPA_HANDLE_TTL_MS")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(24 * 3600 * 1000);
 
-        // hickory-resolver for async DNS TXT lookups (no dig subprocess)
-        let dns_resolver = Arc::new(
-            hickory_resolver::TokioResolver::builder_tokio()
-                .expect("failed to create DNS resolver from system config")
-                .build()
-        );
+        let dns_resolver = dns_resolver.clone();
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(handle_verify_interval));
