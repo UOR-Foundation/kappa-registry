@@ -409,6 +409,66 @@ fn walk_mst_node(
     }
 }
 
+/// Rebuild the MST from all record tags, create a new commit, update
+/// commit/head, commit/rev, and commit/rev/{rev} tags.
+///
+/// Called after every record mutation (create, update, delete) to keep
+/// the commit chain consistent with the record state.
+fn rebuild_mst_and_commit(
+    store: &Arc<dyn KappaStore>,
+    ns: &kappa_core::types::NamespaceRef,
+    repo_did: &str,
+) -> Result<String, kappa_core::types::StoreError> {
+    // 1. Load all record tags into an MST
+    let record_tags = store.tag_prefix(ns, "record/")?;
+    let mut mst = crate::mst::Mst::new();
+    for tag in &record_tags {
+        let record_bytes = store.blob_get(&tag.kappa)?;
+        let record_cid = crate::cid::cid_for_cbor(&record_bytes);
+        // MST key = collection/rkey (strip "record/" prefix)
+        let mst_key = tag.name.strip_prefix("record/").unwrap_or(&tag.name);
+        // insert returns Err on duplicate -- skip silently
+        let _ = mst.insert(mst_key, record_cid);
+    }
+
+    // 2. Serialize MST and store all node blocks with CID->kappa bridge tags
+    let mut mst_store = crate::mst::MemoryBlockStore::new();
+    let (mst_root, mst_blocks) = mst.write_to_store(&mut mst_store);
+    for (block_cid, block_bytes) in &mst_blocks {
+        let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, block_bytes)?;
+        let cid_hex = hex::encode(block_cid);
+        store.tag_set(ns, &format!("mst/{}", cid_hex), &ingest.kappa)?;
+    }
+
+    // 3. Get previous commit CID for prev field
+    let prev_commit_cid = store.tag_get(ns, "commit/head").ok().and_then(|entry| {
+        let bytes = store.blob_get(&entry.kappa).ok()?;
+        Some(crate::cid::cid_for_cbor(&bytes).to_vec())
+    });
+
+    // 4. Create new commit
+    let tid_gen = crate::tid::TidGenerator::with_clock_id(0);
+    let rev = tid_gen.next();
+
+    let commit = crate::commit::UnsignedCommit {
+        did: repo_did.to_string(),
+        version: 3,
+        data: mst_root.to_vec(),
+        rev: rev.clone(),
+        prev: prev_commit_cid,
+    };
+    let commit_bytes = commit.to_cbor();
+    let commit_result = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &commit_bytes)?;
+
+    // 5. Update commit tags
+    store.tag_set(ns, "commit/head", &commit_result.kappa)?;
+    store.tag_set(ns, "commit/rev", &rev)?;
+    // Indexed by rev for incremental sync (getRepo ?since=)
+    store.tag_set(ns, &format!("commit/rev/{}", rev), &commit_result.kappa)?;
+
+    Ok(rev)
+}
+
 fn get_blob(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let did = match query_param(cx, "did") {
@@ -665,6 +725,9 @@ fn create_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let tag_name = format!("record/{}/{}", collection, rkey);
             store.tag_set(&ns, &tag_name, &ingest.kappa)?;
 
+            // Rebuild MST and create new commit
+            rebuild_mst_and_commit(&store, &ns, repo)?;
+
             let uri = format!("at://{}/{}/{}", repo, collection, rkey);
             Ok::<(String, String, String), kappa_core::types::StoreError>((uri, ingest.kappa, rkey))
         }).await;
@@ -722,6 +785,9 @@ fn put_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let tag_name = format!("record/{}/{}", collection, rkey);
             store.tag_set(&ns, &tag_name, &ingest.kappa)?;
 
+            // Rebuild MST and create new commit
+            rebuild_mst_and_commit(&store, &ns, repo)?;
+
             let uri = format!("at://{}/{}/{}", repo, collection, rkey);
             Ok::<(String, String), kappa_core::types::StoreError>((uri, ingest.kappa))
         }).await;
@@ -763,6 +829,10 @@ fn delete_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let ns = store.namespace_resolve(repo, Some("atproto"))?;
             let tag_name = format!("record/{}/{}", collection, rkey);
             store.tag_delete(&ns, &tag_name)?;
+
+            // Rebuild MST and create new commit
+            rebuild_mst_and_commit(&store, &ns, repo)?;
+
             Ok::<(), kappa_core::types::StoreError>(())
         }).await;
         match result {
@@ -835,6 +905,12 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
                         let record_bytes = serde_json::to_vec(record)
                             .map_err(|e| kappa_core::types::StoreError::Rejected(format!("record serialize: {e}")))?;
                         let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
+
+                        // CID->kappa bridge tag
+                        let record_cid = crate::cid::cid_for_cbor(&record_bytes);
+                        let blob_cid_hex = hex::encode(record_cid);
+                        store.tag_set(&ns, &format!("blob/{}", blob_cid_hex), &ingest.kappa)?;
+
                         let rkey = if rkey.is_empty() {
                             let gen = crate::tid::TidGenerator::with_clock_id(0);
                             gen.next()
@@ -850,6 +926,12 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
                         let record_bytes = serde_json::to_vec(record)
                             .map_err(|e| kappa_core::types::StoreError::Rejected(format!("record serialize: {e}")))?;
                         let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
+
+                        // CID->kappa bridge tag
+                        let record_cid = crate::cid::cid_for_cbor(&record_bytes);
+                        let blob_cid_hex = hex::encode(record_cid);
+                        store.tag_set(&ns, &format!("blob/{}", blob_cid_hex), &ingest.kappa)?;
+
                         let tag_name = format!("record/{}/{}", collection, rkey);
                         store.tag_set(&ns, &tag_name, &ingest.kappa)?;
                     }
@@ -864,6 +946,10 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     }
                 }
             }
+
+            // Rebuild MST and create new commit after all writes
+            rebuild_mst_and_commit(&store, &ns, repo)?;
+
             Ok::<(), kappa_core::types::StoreError>(())
         }).await;
         match result {
@@ -1083,6 +1169,8 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
             // Tag: commit/head -> commit kappa
             store.tag_set(&ns, "commit/head", &commit_result.kappa)?;
             store.tag_set(&ns, "commit/rev", &rev)?;
+            // Indexed by rev for incremental sync (getRepo ?since=)
+            store.tag_set(&ns, &format!("commit/rev/{}", rev), &commit_result.kappa)?;
 
             Ok::<(String, String), kappa_core::types::StoreError>((did_for_ns, rev))
         }).await;
