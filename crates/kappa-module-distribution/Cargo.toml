@@ -1,0 +1,26 @@
+[package]
+name = "kappa-module-distribution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Kappa-distribution protocol extension handlers."
+
+[lib]
+name = "kappa_module_distribution"
+path = "src/lib.rs"
+
+[dependencies]
+kappa-core = { workspace = true }
+kappa-reconcile = { workspace = true }
+topcoat = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+bytes = "1"

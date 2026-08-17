@@ -1,0 +1,32 @@
+[package]
+name = "kappa-module-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Git smart HTTP protocol module for kappa-registry."
+
+[lib]
+name = "kappa_module_git"
+path = "src/lib.rs"
+
+[dependencies]
+kappa-core = { workspace = true }
+
+gix-object = "0.58"
+gix-pack = { version = "0.68", features = ["streaming-input", "generate"] }
+gix-hash = { version = "0.23", features = ["sha1", "sha256"] }
+gix-features = { version = "0.46", features = ["zlib", "progress"] }
+gix-packetline = { version = "0.21", features = ["blocking-io"] }
+flate2 = "1"
+
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

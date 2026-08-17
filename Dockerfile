@@ -1,17 +1,16 @@
 # kappa-registry conforming /v2/ registry.
 #
 # Build:
-#   cargo build --release --target x86_64-unknown-linux-musl
+#   cargo build --release -p kappa-server
 #   docker build -t kappa-registry .
 #
 # Run:
-#   docker run --rm -p 8080:8080 \
+#   docker run --rm -p 5000:5000 \
 #     -v ./data:/data \
 #     -e KAPPA_STORE_ROOT=/data \
-#     -e KAPPA_LISTEN_ADDR=0.0.0.0:8080 \
+#     -e KAPPA_LISTEN_ADDR=0.0.0.0:5000 \
 #     kappa-registry
 
-ARG RUST_TARGET=x86_64-unknown-linux-musl
 FROM scratch
-COPY target/${RUST_TARGET}/release/kappa-registry /kappa-registry
-ENTRYPOINT ["/kappa-registry"]
+COPY target/release/kappa-server /kappa-server
+ENTRYPOINT ["/kappa-server"]

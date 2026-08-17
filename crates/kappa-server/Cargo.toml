@@ -1,0 +1,158 @@
+[package]
+name = "kappa-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "kappa-registry HTTP server."
+
+[[bin]]
+name = "kappa-server"
+path = "src/main.rs"
+
+[dependencies]
+kappa-core = { workspace = true }
+topcoat = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+governor = { workspace = true }
+http = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+md-5 = "0.10"
+base64-simd = "0.8"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"
+kappa-store-redb = { path = "../kappa-store-redb" }
+uuid = { workspace = true }
+libc = "0.2"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+hickory-resolver = { version = "0.25", features = ["tokio"] }
+x509-parser = { version = "0.18", optional = true }
+
+kappa-akd = { path = "../kappa-akd" }
+kappa-module-oci = { path = "../kappa-module-oci", optional = true }
+kappa-module-identity = { path = "../kappa-module-identity", optional = true }
+kappa-module-distribution = { path = "../kappa-module-distribution", optional = true }
+kappa-transport-veilid = { path = "../kappa-transport-veilid", optional = true }
+kappa-module-git = { path = "../kappa-module-git", optional = true }
+kappa-module-s3 = { path = "../kappa-module-s3", optional = true }
+kappa-module-nix = { path = "../kappa-module-nix", optional = true }
+kappa-module-atproto = { path = "../kappa-module-atproto", optional = true }
+gix-hash = { version = "0.23", features = ["sha1"], optional = true }
+
+[dev-dependencies]
+reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }
+sha3 = { workspace = true }
+rcgen = "0.14"
+tungstenite = "0.30"
+libc = "0.2"
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+getrandom = { workspace = true }
+kappa-core = { workspace = true }
+zstd = "0.13"
+nix-derivation = { git = "https://github.com/cachix/nix-derivation" }
+
+[[test]]
+name = "nix_e2e"
+path = "tests/integration/nix_e2e.rs"
+
+[[test]]
+name = "smoke"
+path = "tests/integration/smoke.rs"
+
+[[test]]
+name = "operational"
+path = "tests/integration/operational.rs"
+
+[[test]]
+name = "persistence"
+path = "tests/integration/persistence.rs"
+
+[[test]]
+name = "streaming"
+path = "tests/integration/streaming.rs"
+
+[[test]]
+name = "auth"
+path = "tests/integration/auth.rs"
+
+[[test]]
+name = "federation"
+path = "tests/integration/federation.rs"
+
+[[test]]
+name = "disk_pressure"
+path = "tests/integration/disk_pressure.rs"
+
+[[test]]
+name = "tls"
+path = "tests/integration/tls.rs"
+
+[[test]]
+name = "akd"
+path = "tests/integration/akd.rs"
+
+[[test]]
+name = "oci_protocol"
+path = "tests/integration/oci_protocol.rs"
+
+[[test]]
+name = "lifecycle"
+path = "tests/integration/lifecycle.rs"
+
+[[test]]
+name = "security"
+path = "tests/integration/security.rs"
+
+[[test]]
+name = "correctness"
+path = "tests/integration/correctness.rs"
+
+[[test]]
+name = "websocket"
+path = "tests/integration/websocket.rs"
+
+[[test]]
+name = "git_e2e"
+path = "tests/integration/git_e2e.rs"
+
+[[test]]
+name = "identity_http"
+path = "tests/integration/identity_http.rs"
+
+[[test]]
+name = "delegation"
+path = "tests/integration/delegation.rs"
+
+[features]
+default = ["oci", "identity-http", "distribution", "git", "s3", "nix"]
+oci = ["dep:kappa-module-oci"]
+identity-http = ["dep:kappa-module-identity"]
+distribution = ["dep:kappa-module-distribution"]
+veilid = ["dep:kappa-transport-veilid"]
+git = ["dep:kappa-module-git", "dep:gix-hash"]
+s3 = ["dep:kappa-module-s3"]
+nix = ["dep:kappa-module-nix"]
+atproto = ["dep:kappa-module-atproto", "dep:x509-parser"]

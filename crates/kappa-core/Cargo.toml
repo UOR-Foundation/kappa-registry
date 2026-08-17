@@ -1,0 +1,50 @@
+[package]
+name = "kappa-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Content-addressed graph database primitives."
+
+[lib]
+name = "kappa_core"
+path = "src/lib.rs"
+
+[dependencies]
+dcbor = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+blake3 = { workspace = true }
+sha1-checked = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
+k256 = { workspace = true }
+signature = { workspace = true }
+frost-core = { workspace = true }
+frost-ed25519 = { workspace = true }
+frost-p256 = { workspace = true }
+frost-secp256k1 = { workspace = true }
+rand_core = { workspace = true }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+getrandom = { workspace = true }
+rekindle-aead = { workspace = true }
+hmac = "0.13"
+subtle = "2"
+md-5 = "0.10"
+crc-fast = "1"
+zeroize = { workspace = true }
+dashmap = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+zstd = "0.13"
+xz2 = "0.1"
+bzip2 = "0.5"
+
+[dev-dependencies]
+tempfile = { workspace = true }

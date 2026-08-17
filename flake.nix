@@ -42,8 +42,7 @@
         {
           default = pkgs.mkShell {
             nativeBuildInputs = with pkgs; [
-              just
-              (rust-bin.stable."1.92.0".minimal.override {
+              (rust-bin.stable."1.95.0".minimal.override {
                 extensions = [
                   "rust-src"
                   "rust-analyzer"
@@ -56,6 +55,8 @@
                 ];
               })
               pkg-config
+              protobuf
+              cmake
               b3sum
               taplo
               shellcheck

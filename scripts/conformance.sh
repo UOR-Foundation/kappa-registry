@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the kappa-conformance binary against a locally started kappa-registry.
+# Run the kappa-conformance binary against a locally started kappa-server.
 # Usage: ./scripts/conformance.sh
 #
 # Prerequisites:
-#   - kappa-registry built:  cargo build --release
+#   - kappa-server built:  cargo build --release -p kappa-server
 #   - kappa-conformance built in ../kappa-distribution: cargo build --release
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFORMANCE_ROOT="$(cd "${REPO_ROOT}/../kappa-distribution" && pwd)"
 
-REGISTRY_BIN="${REPO_ROOT}/target/release/kappa-registry"
+REGISTRY_BIN="${REPO_ROOT}/target/release/kappa-server"
 CONFORMANCE_BIN="${CONFORMANCE_ROOT}/target/release/kappa-conformance"
 
 if [[ ! -x "${REGISTRY_BIN}" ]]; then
     echo "error: registry binary not found at ${REGISTRY_BIN}"
-    echo "run: cargo build --release"
+    echo "run: cargo build --release -p kappa-server"
     exit 1
 fi
 
@@ -50,7 +50,7 @@ KAPPA_RATELIMIT_WRITE_PERIOD_MS=1000 \
 KAPPA_RATELIMIT_WRITE_BURST=400 \
 KAPPA_RATELIMIT_ADMIN_PERIOD_MS=1000 \
 KAPPA_RATELIMIT_ADMIN_BURST=400 \
-RUST_LOG="${RUST_LOG:-kappa_registry=info}" \
+RUST_LOG="${RUST_LOG:-kappa_server=info}" \
     "${REGISTRY_BIN}" &
 REGISTRY_PID=$!
 
