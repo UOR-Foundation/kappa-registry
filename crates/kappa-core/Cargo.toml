@@ -38,6 +38,7 @@ zeroize = { workspace = true }
 dashmap = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

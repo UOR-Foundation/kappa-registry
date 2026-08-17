@@ -383,15 +383,19 @@ struct MockResolver {
     entries: std::collections::HashMap<String, ResolvedIdentity>,
 }
 
+#[async_trait::async_trait]
 impl ExternalIdentifierResolver for MockResolver {
     fn id_type(&self) -> &str { "mock" }
-    fn resolve(&self, identifier: &str) -> Result<Option<ResolvedIdentity>, String> {
+    fn accepts(&self, identifier: &str) -> bool {
+        self.entries.contains_key(identifier)
+    }
+    async fn resolve(&self, identifier: &str) -> Result<Option<ResolvedIdentity>, String> {
         Ok(self.entries.get(identifier).cloned())
     }
 }
 
-#[test]
-fn resolver_trait_resolve_found() {
+#[tokio::test]
+async fn resolver_trait_resolve_found() {
     let mut entries = std::collections::HashMap::new();
     entries.insert("user@example.com".into(), ResolvedIdentity {
         anchor: "sha256:resolved-anchor".into(),
@@ -402,15 +406,15 @@ fn resolver_trait_resolve_found() {
         evidence: None,
     });
     let resolver = MockResolver { entries };
-    let result = resolver.resolve("user@example.com").unwrap();
+    let result = resolver.resolve("user@example.com").await.unwrap();
     assert!(result.is_some());
     assert_eq!(result.unwrap().anchor, "sha256:resolved-anchor");
 }
 
-#[test]
-fn resolver_trait_resolve_not_found() {
+#[tokio::test]
+async fn resolver_trait_resolve_not_found() {
     let resolver = MockResolver { entries: std::collections::HashMap::new() };
-    let result = resolver.resolve("nobody@nowhere.com").unwrap();
+    let result = resolver.resolve("nobody@nowhere.com").await.unwrap();
     assert!(result.is_none());
 }
 
@@ -444,8 +448,8 @@ fn resolver_resolved_identity_fields() {
     assert_eq!(ri.evidence.as_ref().unwrap().len(), 3);
 }
 
-#[test]
-fn resolver_multiple_identifiers() {
+#[tokio::test]
+async fn resolver_multiple_identifiers() {
     let mut entries = std::collections::HashMap::new();
     entries.insert("alice@a.com".into(), ResolvedIdentity {
         anchor: "sha256:alice".into(), public_key: vec![], algorithm: "ed25519".into(),
@@ -456,12 +460,12 @@ fn resolver_multiple_identifiers() {
         service_endpoint: None, handle: "bob".into(), evidence: None,
     });
     let resolver = MockResolver { entries };
-    assert_eq!(resolver.resolve("alice@a.com").unwrap().unwrap().anchor, "sha256:alice");
-    assert_eq!(resolver.resolve("bob@b.com").unwrap().unwrap().anchor, "sha256:bob");
+    assert_eq!(resolver.resolve("alice@a.com").await.unwrap().unwrap().anchor, "sha256:alice");
+    assert_eq!(resolver.resolve("bob@b.com").await.unwrap().unwrap().anchor, "sha256:bob");
 }
 
-#[test]
-fn resolver_same_anchor_different_ids() {
+#[tokio::test]
+async fn resolver_same_anchor_different_ids() {
     let mut entries = std::collections::HashMap::new();
     let anchor = "sha256:shared-anchor";
     entries.insert("email@x.com".into(), ResolvedIdentity {
@@ -473,8 +477,8 @@ fn resolver_same_anchor_different_ids() {
         service_endpoint: None, handle: "github".into(), evidence: None,
     });
     let resolver = MockResolver { entries };
-    let r1 = resolver.resolve("email@x.com").unwrap().unwrap();
-    let r2 = resolver.resolve("github:user").unwrap().unwrap();
+    let r1 = resolver.resolve("email@x.com").await.unwrap().unwrap();
+    let r2 = resolver.resolve("github:user").await.unwrap().unwrap();
     assert_eq!(r1.anchor, r2.anchor);
 }
 
@@ -576,4 +580,413 @@ fn inbound_index_large_batch() {
     }
     let results = store.assertion_index_query_subject("batch-subject").unwrap();
     assert_eq!(results.len(), 100);
+}
+
+// =============================================================================
+// Group 6: Edge Upsert (4 tests)
+// =============================================================================
+
+#[test]
+fn edge_put_exact_duplicate_skipped() {
+    let store = test_store();
+    let ns = NamespaceRef::deterministic("edge-upsert-ns");
+    let edge = Edge {
+        source: "sha256:src".into(),
+        target: "sha256:tgt".into(),
+        relation: EdgeRelation::RefersTo,
+        asserter: "sha256:asserter".into(),
+        value_kappa: None,
+        metadata: None,
+    };
+    store.edge_put(&ns, &edge).unwrap();
+    store.edge_put(&ns, &edge).unwrap(); // duplicate
+    let results = store.edge_query(&ns, &EdgeQuery {
+        anchor: "sha256:src".into(),
+        direction: Direction::Outbound,
+        relation: Some(EdgeRelation::RefersTo),
+        asserter: None,
+    }).unwrap();
+    assert_eq!(results.len(), 1, "duplicate edge should be skipped");
+}
+
+#[test]
+fn edge_put_metadata_update_in_place() {
+    let store = test_store();
+    let ns = NamespaceRef::deterministic("edge-update-ns");
+    let edge1 = Edge {
+        source: "sha256:src".into(),
+        target: "sha256:tgt".into(),
+        relation: EdgeRelation::Owns,
+        asserter: "sha256:a".into(),
+        value_kappa: None,
+        metadata: Some(b"meta-v1".to_vec()),
+    };
+    store.edge_put(&ns, &edge1).unwrap();
+    let edge2 = Edge {
+        source: "sha256:src".into(),
+        target: "sha256:tgt".into(),
+        relation: EdgeRelation::Owns,
+        asserter: "sha256:a".into(),
+        value_kappa: None,
+        metadata: Some(b"meta-v2".to_vec()),
+    };
+    store.edge_put(&ns, &edge2).unwrap();
+    let results = store.edge_query(&ns, &EdgeQuery {
+        anchor: "sha256:src".into(),
+        direction: Direction::Outbound,
+        relation: Some(EdgeRelation::Owns),
+        asserter: None,
+    }).unwrap();
+    assert_eq!(results.len(), 1, "updated edge should replace, not duplicate");
+    assert_eq!(results[0].metadata.as_deref(), Some(b"meta-v2".as_slice()));
+}
+
+#[test]
+fn edge_put_different_asserter_not_duplicate() {
+    let store = test_store();
+    let ns = NamespaceRef::deterministic("diff-asserter-ns");
+    let edge_a = Edge {
+        source: "sha256:src".into(),
+        target: "sha256:tgt".into(),
+        relation: EdgeRelation::Assertion,
+        asserter: "sha256:asserter-a".into(),
+        value_kappa: None,
+        metadata: None,
+    };
+    let edge_b = Edge {
+        source: "sha256:src".into(),
+        target: "sha256:tgt".into(),
+        relation: EdgeRelation::Assertion,
+        asserter: "sha256:asserter-b".into(),
+        value_kappa: None,
+        metadata: None,
+    };
+    store.edge_put(&ns, &edge_a).unwrap();
+    store.edge_put(&ns, &edge_b).unwrap();
+    let results = store.edge_query(&ns, &EdgeQuery {
+        anchor: "sha256:src".into(),
+        direction: Direction::Outbound,
+        relation: Some(EdgeRelation::Assertion),
+        asserter: None,
+    }).unwrap();
+    assert_eq!(results.len(), 2, "different asserters should both exist");
+}
+
+#[test]
+fn edge_put_different_relation_not_duplicate() {
+    let store = test_store();
+    let ns = NamespaceRef::deterministic("diff-rel-ns");
+    let edge_owns = Edge {
+        source: "sha256:src".into(),
+        target: "sha256:tgt".into(),
+        relation: EdgeRelation::Owns,
+        asserter: "sha256:a".into(),
+        value_kappa: None,
+        metadata: None,
+    };
+    let edge_refers = Edge {
+        source: "sha256:src".into(),
+        target: "sha256:tgt".into(),
+        relation: EdgeRelation::RefersTo,
+        asserter: "sha256:a".into(),
+        value_kappa: None,
+        metadata: None,
+    };
+    store.edge_put(&ns, &edge_owns).unwrap();
+    store.edge_put(&ns, &edge_refers).unwrap();
+    let all = store.edge_query(&ns, &EdgeQuery {
+        anchor: "sha256:src".into(),
+        direction: Direction::Outbound,
+        relation: None,
+        asserter: None,
+    }).unwrap();
+    assert_eq!(all.len(), 2, "different relations should both exist");
+}
+
+// =============================================================================
+// Group 7: Watermark on Succession (3 tests)
+// =============================================================================
+
+#[test]
+fn succession_key_compromise_voids_all() {
+    use kappa_core::identity::assertion::IdentityAssertion;
+    use kappa_core::identity::watermark::Watermark;
+    use kappa_core::identity::resolution;
+
+    let assertion = IdentityAssertion {
+        asserter: "sha256:compromised".into(),
+        subject: "sha256:subject".into(),
+        facet: "name".into(),
+        value: b"Alice".to_vec(),
+        basis: "self-asserted".into(),
+        valid_from_ms: 100,
+        valid_until_ms: None,
+        signature: vec![],
+    };
+    // Watermark at 0 = void everything
+    let watermark = Watermark {
+        asserter: "sha256:compromised".into(),
+        invalidate_before_ms: u64::MAX, // void ALL assertions
+        reason: "key-compromise".into(),
+        set_at_ms: 500,
+    };
+    let result = resolution::resolve_all(&[assertion], &[], &[watermark]);
+    assert!(result.valid.is_empty(), "all assertions should be watermarked");
+    assert_eq!(result.watermarked.len(), 1);
+}
+
+#[test]
+fn succession_rotation_voids_before_effective() {
+    use kappa_core::identity::assertion::IdentityAssertion;
+    use kappa_core::identity::watermark::Watermark;
+    use kappa_core::identity::resolution;
+
+    let old_assertion = IdentityAssertion {
+        asserter: "sha256:rotated".into(),
+        subject: "sha256:s".into(),
+        facet: "name".into(),
+        value: b"old-name".to_vec(),
+        basis: "self-asserted".into(),
+        valid_from_ms: 100,
+        valid_until_ms: None,
+        signature: vec![],
+    };
+    let new_assertion = IdentityAssertion {
+        asserter: "sha256:rotated".into(),
+        subject: "sha256:s".into(),
+        facet: "name".into(),
+        value: b"new-name".to_vec(),
+        basis: "self-asserted".into(),
+        valid_from_ms: 500,
+        valid_until_ms: None,
+        signature: vec![],
+    };
+    // Watermark at 300: voids assertions before 300
+    let watermark = Watermark {
+        asserter: "sha256:rotated".into(),
+        invalidate_before_ms: 300,
+        reason: "rotation".into(),
+        set_at_ms: 300,
+    };
+    let result = resolution::resolve_all(
+        &[old_assertion, new_assertion], &[], &[watermark],
+    );
+    assert_eq!(result.valid.len(), 1, "only post-watermark assertion should survive");
+    assert_eq!(result.valid[0].value, b"new-name");
+    assert_eq!(result.watermarked.len(), 1);
+}
+
+#[test]
+fn succession_watermark_only_affects_specific_asserter() {
+    use kappa_core::identity::assertion::IdentityAssertion;
+    use kappa_core::identity::watermark::Watermark;
+    use kappa_core::identity::resolution;
+
+    let assertion_a = IdentityAssertion {
+        asserter: "sha256:alice".into(),
+        subject: "sha256:s".into(),
+        facet: "name".into(),
+        value: b"from-alice".to_vec(),
+        basis: "self-asserted".into(),
+        valid_from_ms: 100,
+        valid_until_ms: None,
+        signature: vec![],
+    };
+    let assertion_b = IdentityAssertion {
+        asserter: "sha256:bob".into(),
+        subject: "sha256:s".into(),
+        facet: "name".into(),
+        value: b"from-bob".to_vec(),
+        basis: "self-asserted".into(),
+        valid_from_ms: 100,
+        valid_until_ms: None,
+        signature: vec![],
+    };
+    // Watermark only on alice
+    let watermark = Watermark {
+        asserter: "sha256:alice".into(),
+        invalidate_before_ms: u64::MAX,
+        reason: "compromise".into(),
+        set_at_ms: 500,
+    };
+    let result = resolution::resolve_all(
+        &[assertion_a, assertion_b], &[], &[watermark],
+    );
+    assert_eq!(result.valid.len(), 1, "only bob's assertion should survive");
+    assert_eq!(result.valid[0].asserter, "sha256:bob");
+}
+
+// =============================================================================
+// Group 8: Identity Binding Lifecycle (3 tests)
+// =============================================================================
+
+#[test]
+fn binding_upsert_updates_verified_at() {
+    let store = test_store();
+    let ns = NamespaceRef::deterministic("upsert-ns");
+    let binding_v1 = IdentityBinding {
+        source: "upsert@test.com".into(),
+        target: "sha256:anchor-upsert".into(),
+        method: "self-asserted".into(),
+        trust_level: 1,
+        verified_at_ms: 100,
+    };
+    store.identity_binding_put(&ns, &binding_v1).unwrap();
+
+    // Update with new verified_at. Since source+target match, this is an upsert.
+    // The current implementation may insert a second entry or deduplicate.
+    // We test that at least the latest value is retrievable.
+    let binding_v2 = IdentityBinding {
+        source: "upsert@test.com".into(),
+        target: "sha256:anchor-upsert".into(),
+        method: "dns-txt".into(),
+        trust_level: 3,
+        verified_at_ms: 500,
+    };
+    store.identity_binding_put(&ns, &binding_v2).unwrap();
+
+    let results = store.identity_binding_get("upsert@test.com").unwrap();
+    // Should have exactly 1 entry (deduplication by source+target)
+    assert_eq!(results.len(), 1, "upsert should replace, not duplicate");
+    assert_eq!(results[0].verified_at_ms, 500);
+    assert_eq!(results[0].trust_level, 3);
+}
+
+#[test]
+fn binding_cross_protocol_same_anchor() {
+    let store = test_store();
+    let ns = NamespaceRef::deterministic("cross-proto-ns");
+    let nix_binding = IdentityBinding {
+        source: "cache.nixos.org-1".into(),
+        target: "sha256:shared-anchor".into(),
+        method: "nix-key".into(),
+        trust_level: 3,
+        verified_at_ms: 100,
+    };
+    let did_binding = IdentityBinding {
+        source: "did:plc:abc123".into(),
+        target: "sha256:shared-anchor".into(),
+        method: "plc-directory".into(),
+        trust_level: 2,
+        verified_at_ms: 200,
+    };
+    store.identity_binding_put(&ns, &nix_binding).unwrap();
+    store.identity_binding_put(&ns, &did_binding).unwrap();
+
+    // Both bindings should be queryable by their sources
+    let nix_results = store.identity_binding_get("cache.nixos.org-1").unwrap();
+    assert_eq!(nix_results.len(), 1);
+    let did_results = store.identity_binding_get("did:plc:abc123").unwrap();
+    assert_eq!(did_results.len(), 1);
+
+    // Both should appear when listing by asserter (shared anchor)
+    let by_asserter = store.identity_binding_list_by_asserter("sha256:shared-anchor").unwrap();
+    assert_eq!(by_asserter.len(), 2);
+}
+
+#[test]
+fn binding_delete_leaves_assertions_intact() {
+    let store = test_store();
+    let ns = NamespaceRef::deterministic("delete-binding-ns");
+
+    // Create an assertion from this anchor
+    let assertion_bytes = b"assertion content";
+    let assertion_kappa = store.ingest_compute(
+        kappa_core::kappa::Axis::Sha256, assertion_bytes,
+    ).unwrap().kappa;
+    store.tag_set(&ns, &format!("assertion/{}", assertion_kappa), &assertion_kappa).unwrap();
+
+    // Create a binding for the same anchor
+    let binding = IdentityBinding {
+        source: "bound@test.com".into(),
+        target: "sha256:anchor-with-assertions".into(),
+        method: "self-asserted".into(),
+        trust_level: 1,
+        verified_at_ms: 0,
+    };
+    store.identity_binding_put(&ns, &binding).unwrap();
+
+    // Delete the binding
+    store.identity_binding_delete(&ns, "bound@test.com", "sha256:anchor-with-assertions").unwrap();
+
+    // The assertion should still exist
+    assert!(store.blob_exists(&assertion_kappa).unwrap(), "assertion blob should survive binding deletion");
+    let tag = store.tag_get(&ns, &format!("assertion/{}", assertion_kappa));
+    assert!(tag.is_ok(), "assertion tag should survive binding deletion");
+}
+
+// =============================================================================
+// Group 9: ResolverRegistry (4 tests)
+// =============================================================================
+
+use kappa_core::identity::resolver::ResolverRegistry;
+
+#[tokio::test]
+async fn registry_dispatch_by_accepts() {
+    let mut registry = ResolverRegistry::new();
+    let mut entries = std::collections::HashMap::new();
+    entries.insert("test-key".into(), ResolvedIdentity {
+        anchor: "sha256:found".into(),
+        public_key: vec![],
+        algorithm: "ed25519".into(),
+        service_endpoint: None,
+        handle: "test-key".into(),
+        evidence: None,
+    });
+    registry.add(Arc::new(MockResolver { entries }));
+
+    let result = registry.resolve("test-key").await.unwrap();
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().anchor, "sha256:found");
+
+    let result = registry.resolve("unknown").await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn registry_empty_returns_none() {
+    let registry = ResolverRegistry::new();
+    let result = registry.resolve("anything").await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn registry_first_accepting_resolver_wins() {
+    let mut registry = ResolverRegistry::new();
+
+    let mut entries1 = std::collections::HashMap::new();
+    entries1.insert("shared".into(), ResolvedIdentity {
+        anchor: "sha256:first-wins".into(),
+        public_key: vec![],
+        algorithm: "ed25519".into(),
+        service_endpoint: None,
+        handle: "shared".into(),
+        evidence: None,
+    });
+    registry.add(Arc::new(MockResolver { entries: entries1 }));
+
+    let mut entries2 = std::collections::HashMap::new();
+    entries2.insert("shared".into(), ResolvedIdentity {
+        anchor: "sha256:second-loses".into(),
+        public_key: vec![],
+        algorithm: "ed25519".into(),
+        service_endpoint: None,
+        handle: "shared".into(),
+        evidence: None,
+    });
+    registry.add(Arc::new(MockResolver { entries: entries2 }));
+
+    let result = registry.resolve("shared").await.unwrap().unwrap();
+    assert_eq!(result.anchor, "sha256:first-wins", "first resolver should win");
+}
+
+#[test]
+fn registry_len_and_is_empty() {
+    let mut registry = ResolverRegistry::new();
+    assert!(registry.is_empty());
+    assert_eq!(registry.len(), 0);
+
+    registry.add(Arc::new(MockResolver { entries: std::collections::HashMap::new() }));
+    assert!(!registry.is_empty());
+    assert_eq!(registry.len(), 1);
 }

@@ -15,6 +15,7 @@ members = [
     "crates/kappa-module-s3",
     "crates/kappa-module-nix",
     "crates/kappa-conformance",
+    "crates/kappa-module-atproto",
 ]
 
 [workspace.package]

@@ -6,6 +6,7 @@ pub mod config;
 pub mod layers;
 pub mod openapi;
 pub mod ratelimit;
+pub mod resolvers;
 pub mod tls;
 
 use std::borrow::Cow;
@@ -451,6 +452,13 @@ async fn main() {
         builder = builder.app_context(rl.clone());
     }
 
+    // -- Identity resolver registry --
+    // All protocol-specific identity resolvers registered in one registry.
+    // Dispatch by accepts() -- first resolver that recognizes the identifier
+    // format handles it. Registration order: most specific first.
+    let resolver_registry = resolvers::build_registry();
+    builder = builder.app_context(resolver_registry.clone());
+
     // -- Upload eviction + config --
     #[cfg(feature = "oci")]
     {
@@ -507,6 +515,13 @@ async fn main() {
         builder = builder.app_context(crdt_manager);
 
         builder = kappa_module_distribution::register(builder);
+    }
+
+    // -- AT Protocol XRPC routes --
+    #[cfg(feature = "atproto")]
+    {
+        builder = kappa_module_atproto::register(builder);
+        tracing::info!("AT Protocol XRPC endpoints enabled");
     }
 
     // -- Namespace management routes --
@@ -973,54 +988,7 @@ async fn main() {
     // -- Nix binary cache routes --
     #[cfg(feature = "nix")]
     {
-        /// Resolves Nix signing key names to identity anchors from static config.
-        /// Simplest ExternalIdentifierResolver: no network, local config lookup.
-        struct NixKeyResolver {
-            keys: Vec<(String, Vec<u8>)>,
-        }
-
-        impl NixKeyResolver {
-            fn from_env() -> Self {
-                let raw = std::env::var("KAPPA_NIX_TRUSTED_KEYS").unwrap_or_default();
-                let keys = raw.split(',')
-                    .filter(|s| !s.is_empty())
-                    .filter_map(|entry| {
-                        let (name, b64) = entry.split_once(':')?;
-                        let pubkey = base64_simd::STANDARD.decode_to_vec(b64.as_bytes()).ok()?;
-                        Some((name.to_string(), pubkey))
-                    })
-                    .collect();
-                Self { keys }
-            }
-        }
-
-        impl kappa_core::identity::resolver::ExternalIdentifierResolver for NixKeyResolver {
-            fn id_type(&self) -> &str { "nix-key" }
-
-            fn resolve(&self, identifier: &str) -> Result<Option<kappa_core::identity::resolver::ResolvedIdentity>, String> {
-                for (name, pubkey) in &self.keys {
-                    if name == identifier {
-                        let anchor = kappa_core::crypto::anchor::anchor_from_key_str("ed25519", pubkey);
-                        return Ok(Some(kappa_core::identity::resolver::ResolvedIdentity {
-                            anchor,
-                            public_key: pubkey.clone(),
-                            algorithm: "ed25519".to_string(),
-                            service_endpoint: None,
-                            handle: name.clone(),
-                            evidence: None,
-                        }));
-                    }
-                }
-                Ok(None)
-            }
-
-            fn cache_ttl_secs(&self) -> u64 {
-                u64::MAX // static config, never expires
-            }
-        }
-
-        let nix_resolver = Arc::new(NixKeyResolver::from_env());
-        builder = builder.app_context(nix_resolver as Arc<dyn kappa_core::identity::resolver::ExternalIdentifierResolver>);
+        // NixKeyResolver is now in resolvers.rs -- registered via ResolverRegistry below
 
         fn nix_cache_info(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             Box::pin(async move {
@@ -1097,7 +1065,7 @@ async fn main() {
                         .map_err(|_| topcoat::router::error::not_found())?
                 };
                 let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                let nix_resolver = try_app_context::<Arc<dyn kappa_core::identity::resolver::ExternalIdentifierResolver>>(cx).cloned();
+                let nix_resolver = try_app_context::<Arc<kappa_core::identity::resolver::ResolverRegistry>>(cx).cloned();
                 let narinfo_bytes = {
                     use topcoat::router::to_bytes;
                     to_bytes(body, 64 * 1024).await
@@ -1193,39 +1161,67 @@ async fn main() {
                         store.edge_put(&nix_ns, &deriver_edge)?;
                     }
 
-                    // Store signatures as blob metadata and create identity bindings
+                    // Store signatures as blob metadata
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+                    let mut sig_key_names: Vec<String> = Vec::new();
                     for (i, sig) in narinfo.signatures.iter().enumerate() {
                         let meta_key = format!("_nix_sig_{}", i);
                         store.blob_put_meta(
                             &narinfo_result.kappa, &meta_key, sig.as_bytes()
                         )?;
-                        // Resolve signing key name to anchor via NixKeyResolver
-                        if let Some(ref resolver) = nix_resolver {
-                            if let Some((key_name, _)) = sig.split_once(':') {
-                                if let Ok(Some(identity)) = resolver.resolve(key_name) {
+                        if let Some((key_name, _)) = sig.split_once(':') {
+                            sig_key_names.push(key_name.to_string());
+                        }
+                    }
+
+                    Ok::<(kappa_core::types::NamespaceRef, String, Vec<String>, u64), kappa_core::types::StoreError>(
+                        (nix_ns, narinfo_result.kappa, sig_key_names, now_ms)
+                    )
+                }).await;
+                // Phase 2: resolve signing keys to anchors (async, outside spawn_blocking)
+                match &result {
+                    Ok(Ok((nix_ns, narinfo_kappa, sig_key_names, now_ms))) => {
+                        if let Some(ref registry) = nix_resolver {
+                            let store2 = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                            for key_name in sig_key_names {
+                                if let Ok(Some(identity)) = registry.resolve(key_name).await {
+                                    // Create identity binding: key name -> anchor
                                     let binding = kappa_core::identity::binding::IdentityBinding {
                                         source: key_name.to_string(),
                                         target: identity.anchor.clone(),
                                         method: "nix-key".to_string(),
                                         trust_level: 3,
-                                        verified_at_ms: now_ms,
+                                        verified_at_ms: *now_ms,
                                     };
-                                    let _ = store.identity_binding_put(&nix_ns, &binding);
+                                    // Create Assertion edge: anchor signed this narinfo
+                                    let assertion_edge = kappa_core::types::Edge {
+                                        source: identity.anchor.clone(),
+                                        target: narinfo_kappa.clone(),
+                                        relation: kappa_core::types::EdgeRelation::Assertion,
+                                        asserter: identity.anchor.clone(),
+                                        value_kappa: None,
+                                        metadata: Some(format!("nix-sig:{}", key_name).into_bytes()),
+                                    };
+                                    let ns = nix_ns.clone();
+                                    let s = store2.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        s.identity_binding_put(&ns, &binding)?;
+                                        s.edge_put(&ns, &assertion_edge)?;
+                                        Ok::<(), kappa_core::types::StoreError>(())
+                                    }).await;
                                 }
                             }
                         }
                     }
-
-                    Ok(())
-                }).await;
-                match result {
-                    Ok(Ok(())) => StatusCode::CREATED.into_response(cx),
+                    _ => {}
+                }
+                match &result {
+                    Ok(Ok(_)) => StatusCode::CREATED.into_response(cx),
                     Ok(Err(kappa_core::types::StoreError::Rejected(msg))) => {
-                        (StatusCode::BAD_REQUEST, msg).into_response(cx)
+                        (StatusCode::BAD_REQUEST, msg.clone()).into_response(cx)
                     }
                     Ok(Err(e)) => {
                         tracing::error!(error = %e, "nix narinfo put failed");

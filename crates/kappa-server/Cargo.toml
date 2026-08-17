@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 
+async-trait = { workspace = true }
 dashmap = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
@@ -39,7 +40,9 @@ libc = "0.2"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+hickory-resolver = { version = "0.25", features = ["tokio"], optional = true }
+x509-parser = { version = "0.18", optional = true }
 
 kappa-akd = { path = "../kappa-akd" }
 kappa-module-oci = { path = "../kappa-module-oci", optional = true }
@@ -49,6 +52,7 @@ kappa-transport-veilid = { path = "../kappa-transport-veilid", optional = true }
 kappa-module-git = { path = "../kappa-module-git", optional = true }
 kappa-module-s3 = { path = "../kappa-module-s3", optional = true }
 kappa-module-nix = { path = "../kappa-module-nix", optional = true }
+kappa-module-atproto = { path = "../kappa-module-atproto", optional = true }
 gix-hash = { version = "0.23", features = ["sha1"], optional = true }
 
 [dev-dependencies]
@@ -151,3 +155,4 @@ veilid = ["dep:kappa-transport-veilid"]
 git = ["dep:kappa-module-git", "dep:gix-hash"]
 s3 = ["dep:kappa-module-s3"]
 nix = ["dep:kappa-module-nix"]
+atproto = ["dep:kappa-module-atproto", "dep:hickory-resolver", "dep:x509-parser"]

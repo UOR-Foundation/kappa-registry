@@ -1101,32 +1101,47 @@ impl KappaStore for PersistentStore {
         let kappa = kappa_core::kappa::kappa_from_value(binding);
         let binding_json = serde_json::to_string(binding)
             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
-        // Read phase: check for duplicate
-        let is_dup = {
+
+        // Append with supersession:
+        // - Same source+target with same metadata: skip (exact duplicate)
+        // - Same source+target with different metadata: remove old, insert new
+        // - Same source, different target: append (supersession, both kept)
+        // - New source: insert
+        //
+        // Read phase: find existing entry with same target
+        let existing_json: Option<String> = {
             let txn = self.db.begin_read().map_err(Self::redb_err)?;
             let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
                 .map_err(Self::redb_err)?;
             table.get(binding.source.as_str())
                 .map_err(Self::redb_err)?
                 .filter_map(|v| v.ok().map(|v| v.value().to_string()))
-                .any(|json_str| {
-                    serde_json::from_str::<serde_json::Value>(&json_str)
+                .find(|json_str| {
+                    serde_json::from_str::<serde_json::Value>(json_str)
                         .ok()
                         .and_then(|v| v["target"].as_str().map(|t| t == binding.target))
                         .unwrap_or(false)
                 })
         };
-        // Write phase: insert if not duplicate
-        if !is_dup {
-            let txn = self.db.begin_write().map_err(Self::redb_err)?;
-            {
-                let mut table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
-                    .map_err(Self::redb_err)?;
-                table.insert(binding.source.as_str(), binding_json.as_str())
+
+        let txn = self.db.begin_write().map_err(Self::redb_err)?;
+        {
+            let mut table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+                .map_err(Self::redb_err)?;
+            if let Some(ref old_json) = existing_json {
+                if old_json == &binding_json {
+                    // Exact duplicate -- skip
+                    return Ok(kappa);
+                }
+                // Same target, different metadata -- remove old, insert new
+                table.remove(binding.source.as_str(), old_json.as_str())
                     .map_err(Self::redb_err)?;
             }
-            txn.commit().map_err(Self::redb_err)?;
+            // Insert (new binding or replacement)
+            table.insert(binding.source.as_str(), binding_json.as_str())
+                .map_err(Self::redb_err)?;
         }
+        txn.commit().map_err(Self::redb_err)?;
         Ok(kappa)
     }
 

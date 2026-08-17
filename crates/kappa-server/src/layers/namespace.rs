@@ -38,6 +38,7 @@ enum DetectedProtocol {
     S3,
     Git,
     Nix,
+    Atproto, // /xrpc/ endpoints
     System,  // /_status, /v2/, /docs, /openapi.json, /identity
     Unknown, // no protocol signal matched — 404
 }
@@ -159,7 +160,12 @@ fn detect_protocol(path: &str, query: &str, hdrs: &topcoat::router::HeaderMap) -
         return DetectedProtocol::System;
     }
 
-    // 5. Nix path signals
+    // 5. AT Protocol XRPC paths
+    if path.starts_with("/xrpc/") {
+        return DetectedProtocol::Atproto;
+    }
+
+    // 6. Nix path signals
     if path == "/nix-cache-info"
         || path.starts_with("/nix/")
         || path.ends_with(".narinfo")
@@ -332,6 +338,7 @@ fn extract_namespace(path: &str, protocol: DetectedProtocol) -> Option<(String, 
         DetectedProtocol::Git => extract_git_namespace(path),
         DetectedProtocol::Nix => Some(("_nix".to_string(), "nix".to_string())),
         DetectedProtocol::S3 => extract_s3_namespace(path),
+        DetectedProtocol::Atproto => None, // XRPC handlers resolve DID namespace internally
         DetectedProtocol::System => None,
         DetectedProtocol::Unknown => None,
     }

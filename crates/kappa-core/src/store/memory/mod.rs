@@ -1016,13 +1016,36 @@ impl KappaStore for InMemoryStore {
         binding: &crate::identity::IdentityBinding,
     ) -> Result<String, StoreError> {
         let kappa = crate::kappa::kappa_from_value(binding);
-        // Check for duplicate (same source + target)
+        // Append with supersession:
+        // - Same source+target, same metadata: skip (exact duplicate)
+        // - Same source+target, different metadata: update in place
+        //   (verified_at, trust_level, method may change on re-verification)
+        // - Same source, different target: append (new binding supersedes
+        //   old but old remains as historical record, sorted by verified_at)
+        // - New source: insert
+        //
+        // This mirrors the assertion/watermark pattern: newer evidence
+        // supersedes older evidence without deleting it. The latest
+        // binding (highest verified_at_ms) is the current authority.
+        // Historical bindings are queryable for audit.
         let mut bindings = self.identity_bindings
             .entry(binding.source.clone())
             .or_default();
-        if !bindings.iter().any(|b| b.source == binding.source && b.target == binding.target) {
+        if let Some(existing) = bindings.iter_mut().find(|b| b.target == binding.target) {
+            // Same source+target: update metadata if anything changed
+            if existing.method != binding.method
+                || existing.trust_level != binding.trust_level
+                || existing.verified_at_ms != binding.verified_at_ms
+            {
+                *existing = binding.clone();
+            }
+            // else exact duplicate, skip
+        } else {
+            // Different target or first binding: append
             bindings.push(binding.clone());
         }
+        // Sort by verified_at_ms descending so latest is first
+        bindings.sort_by(|a, b| b.verified_at_ms.cmp(&a.verified_at_ms));
         Ok(kappa)
     }
 

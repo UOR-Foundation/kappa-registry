@@ -9,6 +9,8 @@ description = "Conformance test suite for kappa-core primitives."
 
 [dev-dependencies]
 kappa-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
 tempfile = { workspace = true }
 dcbor = { workspace = true }
 rand_core = { workspace = true }
