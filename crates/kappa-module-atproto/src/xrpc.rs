@@ -412,6 +412,12 @@ fn create_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
             use topcoat::router::to_bytes;
             to_bytes(body, 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
         };
+        // Pre-parse repo for auth check before spawn_blocking
+        let pre_req: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+        if let Some(repo_val) = pre_req.get("repo").and_then(|r| r.as_str()) {
+            if let Err(resp) = verify_repo_auth(cx, repo_val) { return Ok(resp); }
+        }
         let result = tokio::task::spawn_blocking(move || {
             let req: serde_json::Value = serde_json::from_slice(&request_bytes)
                 .map_err(|e| kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}")))?;
@@ -467,6 +473,11 @@ fn put_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
             use topcoat::router::to_bytes;
             to_bytes(body, 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
         };
+        let pre_req: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+        if let Some(repo_val) = pre_req.get("repo").and_then(|r| r.as_str()) {
+            if let Err(resp) = verify_repo_auth(cx, repo_val) { return Ok(resp); }
+        }
         let result = tokio::task::spawn_blocking(move || {
             let req: serde_json::Value = serde_json::from_slice(&request_bytes)
                 .map_err(|e| kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}")))?;
@@ -511,6 +522,11 @@ fn delete_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
             use topcoat::router::to_bytes;
             to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
         };
+        let pre_req: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+        if let Some(repo_val) = pre_req.get("repo").and_then(|r| r.as_str()) {
+            if let Err(resp) = verify_repo_auth(cx, repo_val) { return Ok(resp); }
+        }
         let result = tokio::task::spawn_blocking(move || {
             let req: serde_json::Value = serde_json::from_slice(&request_bytes)
                 .map_err(|e| kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}")))?;
@@ -568,6 +584,11 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
             use topcoat::router::to_bytes;
             to_bytes(body, 10 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
         };
+        let pre_req: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+        if let Some(repo_val) = pre_req.get("repo").and_then(|r| r.as_str()) {
+            if let Err(resp) = verify_repo_auth(cx, repo_val) { return Ok(resp); }
+        }
         let result = tokio::task::spawn_blocking(move || {
             let req: serde_json::Value = serde_json::from_slice(&request_bytes)
                 .map_err(|e| kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}")))?;
@@ -1054,6 +1075,43 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 // -- Helpers ------------------------------------------------------------------
+
+/// Verify the caller's session DID matches the target repo.
+///
+/// Write endpoints (createRecord, putRecord, deleteRecord, applyWrites)
+/// must verify that the authenticated user owns the repo they're writing to.
+/// Returns Ok(did) if authorized, Err(Response) if not.
+fn verify_repo_auth(
+    cx: &Cx,
+    repo: &str,
+) -> Result<String, topcoat::router::response::Response> {
+    let token = extract_bearer_token(cx);
+    if token.is_empty() {
+        return Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token")
+            .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+    }
+
+    let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
+    match session_store {
+        Some(store) => {
+            match store.validate_token(&token) {
+                Some(did) => {
+                    // Session DID must match the repo parameter
+                    if did != repo {
+                        return Err(xrpc_error(cx, StatusCode::FORBIDDEN, "Forbidden",
+                            &format!("session DID {} does not match repo {}", did, repo))
+                            .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+                    }
+                    Ok(did)
+                }
+                None => Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "ExpiredToken", "invalid or expired token")
+                    .unwrap_or_else(|_| topcoat::router::response::Response::default())),
+            }
+        }
+        // No session store = auth not enforced (unauthenticated mode)
+        None => Ok(repo.to_string()),
+    }
+}
 
 fn extract_bearer_token(cx: &Cx) -> String {
     use topcoat::context::request_context;

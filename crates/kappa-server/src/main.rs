@@ -3048,48 +3048,49 @@ async fn main() {
     });
 
     // -- Federation probe background task --
+    // Uses real epoch verification: GET /v2/_root?signed=true on each peer,
+    // verify Ed25519 signature, detect equivocation via epoch state tracking.
     if !cfg.federation_peers.is_empty() {
         let probe_store = store.clone();
         let probe_identity = node_identity.clone();
         let peers = cfg.federation_peers.clone();
         let probe_interval = cfg.probe_interval_secs;
+        let probe_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build probe HTTP client");
+        // Per-peer epoch state for equivocation detection.
+        // Persists across probe cycles within a process lifetime.
+        let peer_epochs: Arc<dashmap::DashMap<String, (u64, String)>> =
+            Arc::new(dashmap::DashMap::new());
+
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(probe_interval));
             loop {
                 ticker.tick().await;
                 let mut results = Vec::new();
                 for peer_url in &peers {
-                    let result = match reqwest::get(format!("{peer_url}/_status")).await {
-                        Ok(resp) if resp.status().is_success() => {
-                            kappa_core::identity::probe::ProbeResult::Verified(
-                                kappa_core::identity::trust::PeerRecord {
-                                    endpoint: peer_url.to_string(),
-                                    asserter_anchor: peer_url.to_string(),
-                                    last_epoch: 0,
-                                    state_root: String::new(),
-                                }
-                            )
-                        }
-                        _ => kappa_core::identity::probe::ProbeResult::Unreachable(
-                            format!("failed to reach {peer_url}")
-                        ),
-                    };
+                    let result = probe_peer_http(
+                        &probe_client,
+                        peer_url,
+                        &peer_epochs,
+                    ).await;
                     results.push(result);
                 }
                 if let Some(ref ni) = probe_identity {
                     ni.update_from_probes(&results);
-                    // Store trust position as tag in _system namespace
-                    let system_ns = kappa_core::types::NamespaceRef::deterministic("_system");
-                    let position = ni.position();
-                    let key = format!("trust/position/{}", ni.anchor().as_str());
-                    let _ = probe_store.tag_set(&system_ns, &key, position.as_str());
+                    if let Ok(system_ns) = probe_store.namespace_resolve("_system", None) {
+                        let position = ni.position();
+                        let key = format!("trust/position/{}", ni.anchor().as_str());
+                        let _ = probe_store.tag_set(&system_ns, &key, position.as_str());
+                    }
                 }
             }
         });
         tracing::info!(
             peers = cfg.federation_peers.len(),
             interval_secs = cfg.probe_interval_secs,
-            "federation probe task started"
+            "federation probe task started (real epoch verification)"
         );
     }
 
@@ -3134,6 +3135,96 @@ async fn main() {
                 .expect("server error");
         }
     }
+}
+
+/// Shutdown signal: Ctrl+C or SIGTERM on Unix.
+/// Probe a single peer via HTTP with real epoch verification.
+///
+/// GET {peer_url}/v2/_root?signed=true
+/// Parse the signed root response, verify Ed25519 signature,
+/// detect equivocation (same epoch number, different root hash).
+async fn probe_peer_http(
+    client: &reqwest::Client,
+    peer_url: &str,
+    peer_epochs: &dashmap::DashMap<String, (u64, String)>,
+) -> kappa_core::identity::probe::ProbeResult {
+    use kappa_core::identity::probe::ProbeResult;
+    use kappa_core::identity::trust::PeerRecord;
+
+    let url = format!("{}/v2/_root?signed=true", peer_url.trim_end_matches('/'));
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => return ProbeResult::Unreachable(format!("{}: {}", peer_url, e)),
+    };
+
+    if !resp.status().is_success() {
+        return ProbeResult::Unreachable(format!("{}: HTTP {}", peer_url, resp.status()));
+    }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return ProbeResult::Unreachable(format!("{}: parse error: {}", peer_url, e)),
+    };
+
+    // Extract fields from signed root response
+    let root = body.get("root").and_then(|v| v.as_str()).unwrap_or("");
+    let count = body.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let namespace = body.get("namespace").and_then(|v| v.as_str()).unwrap_or("_system");
+    let algorithm = body.get("algorithm").and_then(|v| v.as_str()).unwrap_or("ed25519");
+    let public_key_hex = body.get("public_key").and_then(|v| v.as_str()).unwrap_or("");
+    let signature_hex = body.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+    let timestamp = body.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+
+    if root.is_empty() || public_key_hex.is_empty() || signature_hex.is_empty() {
+        return ProbeResult::Unreachable(format!("{}: incomplete signed root response", peer_url));
+    }
+
+    let public_key = match hex::decode(public_key_hex) {
+        Ok(pk) => pk,
+        Err(_) => return ProbeResult::SignatureInvalid(format!("{}: invalid public_key hex", peer_url)),
+    };
+    let signature = match hex::decode(signature_hex) {
+        Ok(sig) => sig,
+        Err(_) => return ProbeResult::SignatureInvalid(format!("{}: invalid signature hex", peer_url)),
+    };
+
+    // Verify signature over "{namespace}\n{root}\n{timestamp}"
+    let message = format!("{}\n{}\n{}", namespace, root, timestamp);
+    let verifier = match kappa_core::crypto::verifier_for(algorithm) {
+        Ok(v) => v,
+        Err(_) => return ProbeResult::SignatureInvalid(format!("{}: unsupported algorithm {}", peer_url, algorithm)),
+    };
+    match verifier.verify(&public_key, message.as_bytes(), &signature) {
+        Ok(true) => {}
+        Ok(false) => return ProbeResult::SignatureInvalid(format!("{}: signature verification failed", peer_url)),
+        Err(e) => return ProbeResult::SignatureInvalid(format!("{}: {}", peer_url, e)),
+    }
+
+    // Compute anchor from the peer's public key
+    let peer_anchor = kappa_core::crypto::anchor::anchor_from_key_str(algorithm, &public_key);
+
+    // Equivocation detection: same epoch number, different root hash
+    if let Some(prev) = peer_epochs.get(&peer_anchor) {
+        let (prev_epoch, prev_root) = prev.value();
+        if *prev_epoch == count && *prev_root != root {
+            return ProbeResult::Equivocation {
+                peer: peer_anchor,
+                epoch: count,
+                local_root: prev_root.clone(),
+                remote_root: root.to_string(),
+            };
+        }
+    }
+
+    // Store current epoch state for next probe cycle
+    peer_epochs.insert(peer_anchor.clone(), (count, root.to_string()));
+
+    ProbeResult::Verified(PeerRecord {
+        endpoint: peer_url.to_string(),
+        asserter_anchor: peer_anchor,
+        last_epoch: count,
+        state_root: root.to_string(),
+    })
 }
 
 /// Shutdown signal: Ctrl+C or SIGTERM on Unix.
