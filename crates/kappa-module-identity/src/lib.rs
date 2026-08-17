@@ -988,6 +988,188 @@ fn succession_chain_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
+// -- Handle claim -----------------------------------------------------------
+
+fn handle_claim_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = read_body(body).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
+
+        let handle = v["handle"].as_str()
+            .ok_or_else(|| bad_request("missing handle"))?.to_string();
+        let protocol = v["protocol"].as_str().unwrap_or("atproto").to_string();
+        let anchor = v["anchor"].as_str()
+            .ok_or_else(|| bad_request("missing anchor"))?.to_string();
+        let verification_method = v["verification_method"].as_str()
+            .unwrap_or("unverified").to_string();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let record = kappa_core::identity::handle::HandleRecord {
+            anchor: anchor.clone(),
+            handle: handle.clone(),
+            protocol: protocol.clone(),
+            claimed_at_ms: now_ms,
+            verified_at_ms: None,
+            verification_method,
+            liveness: kappa_core::identity::handle::HandleLiveness::Unverified,
+        };
+
+        let s = store(cx).clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let handles_ns = s.namespace_resolve("_handles", None)?;
+            let tag_key = format!("handle:{}:{}", protocol, handle);
+
+            // Check for conflict: existing claim by different anchor
+            if let Ok(existing_entry) = s.tag_get(&handles_ns, &tag_key) {
+                let existing_bytes = s.blob_get(&existing_entry.kappa)?;
+                if let Ok(existing) =
+                    serde_json::from_slice::<kappa_core::identity::handle::HandleRecord>(&existing_bytes)
+                {
+                    if existing.anchor != anchor {
+                        // Grace period: allow reclaim if unverified > 7 days
+                        let grace_ms = 7 * 24 * 3600 * 1000u64;
+                        if existing.liveness != kappa_core::identity::handle::HandleLiveness::Unverified
+                            || now_ms.saturating_sub(existing.claimed_at_ms) < grace_ms
+                        {
+                            return Err(kappa_core::types::StoreError::Conflict(
+                                format!("handle {}:{} already claimed by {}", protocol, handle, existing.anchor)
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Store handle record as blob
+            let record_bytes = serde_json::to_vec(&record)
+                .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
+            let ingest = s.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
+
+            // Forward tag: handle:{protocol}:{handle} -> record kappa
+            s.tag_set(&handles_ns, &tag_key, &ingest.kappa)?;
+
+            // Reverse tag: anchor:{anchor} -> comma-appended handle keys
+            let reverse_key = format!("anchor:{}", anchor);
+            let existing_reverse = s.tag_get(&handles_ns, &reverse_key)
+                .map(|e| e.kappa)
+                .unwrap_or_default();
+            let new_reverse = if existing_reverse.is_empty() {
+                tag_key.clone()
+            } else {
+                format!("{},{}", existing_reverse, tag_key)
+            };
+            // Store reverse as a blob so the tag value is a kappa
+            let reverse_bytes = new_reverse.as_bytes();
+            let reverse_ingest = s.ingest_compute(kappa_core::kappa::Axis::Sha256, reverse_bytes)?;
+            s.tag_set(&handles_ns, &reverse_key, &reverse_ingest.kappa)?;
+
+            Ok::<String, kappa_core::types::StoreError>(ingest.kappa)
+        }).await
+        .map_err(|e| bad_request(e.to_string()))?;
+
+        match result {
+            Ok(kappa) => {
+                let resp = serde_json::json!({"kappa": kappa, "liveness": "unverified"});
+                (StatusCode::CREATED, [("content-type", "application/json")],
+                 serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+            }
+            Err(kappa_core::types::StoreError::Conflict(msg)) => {
+                let resp = serde_json::json!({"error": "conflict", "message": msg});
+                (StatusCode::CONFLICT, [("content-type", "application/json")],
+                 serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+            }
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(cx)
+            }
+        }
+    })
+}
+
+// -- Handle GET -------------------------------------------------------------
+
+fn handle_get_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let protocol = path_param(cx, "protocol");
+        let handle = path_param(cx, "handle");
+        let s = store(cx).clone();
+        let tag_key = format!("handle:{}:{}", protocol, handle);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let handles_ns = s.namespace_resolve("_handles", None)?;
+            let entry = s.tag_get(&handles_ns, &tag_key)?;
+            s.blob_get(&entry.kappa)
+        }).await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        (StatusCode::OK, [("content-type", "application/json")], result).into_response(cx)
+    })
+}
+
+// -- Handle reverse lookup by anchor ----------------------------------------
+
+fn handle_by_anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let anchor = path_param(cx, "anchor");
+        let s = store(cx).clone();
+        let anchor_owned = anchor.to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let handles_ns = s.namespace_resolve("_handles", None)?;
+            let reverse_key = format!("anchor:{}", anchor_owned);
+            let entry = s.tag_get(&handles_ns, &reverse_key)?;
+            let blob = s.blob_get(&entry.kappa)?;
+            let handle_keys = String::from_utf8(blob).unwrap_or_default();
+
+            let mut handles: Vec<serde_json::Value> = Vec::new();
+            for key in handle_keys.split(',') {
+                if let Ok(he) = s.tag_get(&handles_ns, key) {
+                    if let Ok(data) = s.blob_get(&he.kappa) {
+                        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&data) {
+                            handles.push(record);
+                        }
+                    }
+                }
+            }
+            Ok::<Vec<serde_json::Value>, kappa_core::types::StoreError>(handles)
+        }).await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"handles": result});
+        (StatusCode::OK, [("content-type", "application/json")],
+         serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+    })
+}
+
+// -- Handle DELETE ----------------------------------------------------------
+
+fn handle_delete_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let protocol = path_param(cx, "protocol");
+        let handle = path_param(cx, "handle");
+        let s = store(cx).clone();
+        let tag_key = format!("handle:{}:{}", protocol, handle);
+
+        tokio::task::spawn_blocking(move || {
+            let handles_ns = s.namespace_resolve("_handles", None)?;
+            s.tag_delete(&handles_ns, &tag_key)?;
+            Ok::<(), kappa_core::types::StoreError>(())
+        }).await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        StatusCode::NO_CONTENT.into_response(cx)
+    })
+}
+
 /// Register all identity HTTP routes on the router builder.
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder
@@ -1070,5 +1252,26 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
             Method::GET,
             Cow::Borrowed(Path::new("/identity/succession/{anchor}")),
             succession_resolve_handler,
+        ))
+        // Handle registry endpoints
+        .route(RouteFn::new(
+            Method::POST,
+            Cow::Borrowed(Path::new("/identity/handle/claim")),
+            handle_claim_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/anchor/{anchor}/handles")),
+            handle_by_anchor_handler,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            Cow::Borrowed(Path::new("/identity/handle/{protocol}/{handle}")),
+            handle_delete_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/handle/{protocol}/{handle}")),
+            handle_get_handler,
         ))
 }

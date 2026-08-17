@@ -3540,6 +3540,7 @@ dependencies = [
 name = "kappa-module-atproto"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "hex",
  "http",
  "kappa-core",

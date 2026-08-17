@@ -17,3 +17,4 @@ topcoat = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
+bytes = "1"

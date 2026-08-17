@@ -520,6 +520,8 @@ async fn main() {
     // -- AT Protocol XRPC routes --
     #[cfg(feature = "atproto")]
     {
+        let session_store = Arc::new(kappa_module_atproto::session::SessionStore::new());
+        builder = builder.app_context(session_store);
         builder = kappa_module_atproto::register(builder);
         tracing::info!("AT Protocol XRPC endpoints enabled");
     }

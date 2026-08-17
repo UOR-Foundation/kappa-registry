@@ -13,9 +13,13 @@ use topcoat::context::{app_context, try_app_context, Cx};
 use topcoat::router::{
     Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
+use topcoat::router::request::FromRequest;
 use topcoat::router::response::IntoResponse;
 
+use sha2::Digest;
+
 use kappa_core::store::KappaStore;
+use crate::mst::BlockStore as _;
 
 /// Register all AT Protocol XRPC routes.
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
@@ -39,6 +43,14 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
         .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.repo.applyWrites"), apply_writes))
         .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.getRepo"), get_repo))
         .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.getBlob"), get_blob))
+        // Session endpoints
+        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.createSession"), create_session))
+        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.refreshSession"), refresh_session))
+        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.deleteSession"), delete_session))
+        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.server.getSession"), get_session))
+        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.createAccount"), create_account))
+        // Sync firehose
+        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.subscribeRepos"), subscribe_repos))
 }
 
 fn xrpc_error(cx: &Cx, status: StatusCode, error: &str, message: &str) -> Result<topcoat::router::response::Response, topcoat::Error> {
@@ -618,4 +630,437 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
             _ => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "apply writes failed"),
         }
     })
+}
+
+// -- Session endpoints --------------------------------------------------------
+
+fn create_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let request_bytes = {
+            use topcoat::router::to_bytes;
+            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+        };
+        let req: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+
+        let identifier = req.get("identifier").and_then(|v| v.as_str()).unwrap_or("");
+        let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
+
+        if identifier.is_empty() || password.is_empty() {
+            return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing identifier or password");
+        }
+
+        // Extract DPoP JKT from request (or use empty for non-DPoP clients)
+        let dpop_jkt = req.get("dpopJkt").and_then(|v| v.as_str()).unwrap_or("");
+
+        let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
+        match session_store {
+            Some(store) => {
+                match store.create_session(identifier, password, identifier, dpop_jkt) {
+                    Ok(session) => {
+                        let body = serde_json::json!({
+                            "accessJwt": session.access_token,
+                            "refreshJwt": session.refresh_token,
+                            "handle": session.handle,
+                            "did": session.did,
+                            "dpopJkt": session.dpop_jkt,
+                        });
+                        (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                    }
+                    Err(e) => {
+                        let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::UNAUTHORIZED);
+                        xrpc_error(cx, status, e.xrpc_error(), &e.to_string())
+                    }
+                }
+            }
+            None => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "session store not configured"),
+        }
+    })
+}
+
+fn refresh_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        // Refresh token comes from Authorization header
+        let refresh_token = {
+            use topcoat::context::request_context;
+            let parts: &http::request::Parts = request_context(cx);
+            parts.headers.get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or("")
+                .to_string()
+        };
+
+        if refresh_token.is_empty() {
+            return xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing refresh token");
+        }
+
+        let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
+        match session_store {
+            Some(store) => {
+                match store.refresh_session(&refresh_token) {
+                    Ok(session) => {
+                        let body = serde_json::json!({
+                            "accessJwt": session.access_token,
+                            "refreshJwt": session.refresh_token,
+                            "handle": session.handle,
+                            "did": session.did,
+                        });
+                        (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                    }
+                    Err(e) => {
+                        let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::UNAUTHORIZED);
+                        xrpc_error(cx, status, e.xrpc_error(), &e.to_string())
+                    }
+                }
+            }
+            None => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "session store not configured"),
+        }
+    })
+}
+
+fn delete_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let access_token = extract_bearer_token(cx);
+        if access_token.is_empty() {
+            return xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token");
+        }
+
+        let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
+        match session_store {
+            Some(store) => {
+                match store.delete_session(&access_token) {
+                    Ok(()) => StatusCode::OK.into_response(cx),
+                    Err(e) => xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string()),
+                }
+            }
+            None => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "session store not configured"),
+        }
+    })
+}
+
+fn get_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let access_token = extract_bearer_token(cx);
+        if access_token.is_empty() {
+            return xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token");
+        }
+
+        let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
+        match session_store {
+            Some(store) => {
+                match store.get_session(&access_token) {
+                    Ok(session) => {
+                        let body = serde_json::json!({
+                            "handle": session.handle,
+                            "did": session.did,
+                            "active": true,
+                        });
+                        (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                    }
+                    Err(e) => xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string()),
+                }
+            }
+            None => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "session store not configured"),
+        }
+    })
+}
+
+// -- createAccount ------------------------------------------------------------
+
+fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let request_bytes = {
+            use topcoat::router::to_bytes;
+            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+        };
+        let req: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
+
+        let handle = req.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+        let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
+        let did = req.get("did").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        if handle.is_empty() || password.is_empty() {
+            return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing handle or password");
+        }
+
+        let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+        let handle_owned = handle.to_string();
+        let password_owned = password.to_string();
+
+        // Generate DID if not provided
+        let account_did = did.unwrap_or_else(|| {
+            // Generate a deterministic DID from the handle
+            let hash = sha2::Sha256::digest(handle_owned.as_bytes());
+            format!("did:plc:{}", &hex::encode(&hash[..16]))
+        });
+
+        let did_for_ns = account_did.clone();
+        // Create namespace and initial repo state
+        let result = tokio::task::spawn_blocking(move || {
+            // Create namespace for this DID
+            let ns = store.namespace_resolve_or_create(&did_for_ns, &did_for_ns, Some("atproto"))?;
+
+            // Initialize empty MST root
+            let mut mst_store = crate::mst::MemoryBlockStore::new();
+            let mst = crate::mst::Mst::new();
+            let mst_root = mst.write_to_store(&mut mst_store);
+
+            // Store MST root block
+            let empty_vec = Vec::new();
+            let mst_root_bytes = mst_store.get(&mst_root).unwrap_or(empty_vec);
+            let mst_root_kappa = store.ingest_compute(
+                kappa_core::kappa::Axis::Sha256,
+                &mst_root_bytes,
+            )?.kappa;
+
+            // Tag: CID -> kappa bridge so getRepo can walk the commit tree
+            let mst_cid_hex = hex::encode(mst_root);
+            store.tag_set(&ns, &format!("mst/{}", mst_cid_hex), &mst_root_kappa)?;
+
+            // Create initial commit
+            let tid_gen = crate::tid::TidGenerator::with_clock_id(0);
+            let rev = tid_gen.next();
+
+            let commit = crate::commit::UnsignedCommit {
+                did: did_for_ns.clone(),
+                version: 3,
+                data: mst_root.to_vec(),
+                rev: rev.clone(),
+                prev: None,
+            };
+            let commit_bytes = commit.to_cbor();
+            let commit_result = store.ingest_compute(
+                kappa_core::kappa::Axis::Sha256, &commit_bytes,
+            )?;
+
+            // Tag: commit/head -> commit kappa
+            store.tag_set(&ns, "commit/head", &commit_result.kappa)?;
+            store.tag_set(&ns, "commit/rev", &rev)?;
+
+            Ok::<(String, String), kappa_core::types::StoreError>((did_for_ns, rev))
+        }).await;
+
+        match result {
+            Ok(Ok((did, _rev))) => {
+                // Register credentials and create initial session
+                let mut access_jwt = String::new();
+                let mut refresh_jwt = String::new();
+                if let Some(session_store) = try_app_context::<Arc<crate::session::SessionStore>>(cx) {
+                    session_store.register_credentials(&did, &password_owned);
+                    if let Ok(session) = session_store.create_session(&did, &password_owned, &handle_owned, "") {
+                        access_jwt = session.access_token;
+                        refresh_jwt = session.refresh_token;
+                    }
+                }
+
+                let body = serde_json::json!({
+                    "handle": handle_owned,
+                    "did": did,
+                    "accessJwt": access_jwt,
+                    "refreshJwt": refresh_jwt,
+                });
+                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+            }
+            Ok(Err(e)) => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
+            Err(e) => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
+        }
+    })
+}
+
+// -- Helpers ------------------------------------------------------------------
+
+// -- subscribeRepos firehose --------------------------------------------------
+
+/// Firehose delivery mode.
+#[derive(Debug, Clone, Copy)]
+pub enum FirehoseMode {
+    /// Subscribe to broadcast channel. Zero-latency push.
+    /// Requires EventBroadcaster in app context.
+    Broadcast,
+    /// Poll sequence counter at configurable interval.
+    /// Works without EventBroadcaster. Higher latency.
+    Poll { interval_ms: u64 },
+}
+
+impl Default for FirehoseMode {
+    fn default() -> Self {
+        Self::Broadcast
+    }
+}
+
+/// Configurable firehose settings registered in app context.
+pub struct FirehoseConfig {
+    pub mode: FirehoseMode,
+    pub max_lag: u64,
+    pub heartbeat_interval_ms: u64,
+}
+
+impl Default for FirehoseConfig {
+    fn default() -> Self {
+        Self {
+            mode: FirehoseMode::Broadcast,
+            max_lag: 10000,
+            heartbeat_interval_ms: 30000,
+        }
+    }
+}
+
+fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        use topcoat::router::content::websocket::{Message, WebSocketUpgrade};
+
+        let cursor: Option<u64> = query_param(cx, "cursor")
+            .and_then(|s| s.parse().ok());
+
+        let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
+        let config = try_app_context::<Arc<FirehoseConfig>>(cx)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(FirehoseConfig::default()));
+
+        // Broadcast sender registered in app context by kappa-server.
+        // The atproto module subscribes to it for zero-latency push delivery.
+        let event_sender = try_app_context::<
+            Arc<tokio::sync::broadcast::Sender<kappa_core::events::TagEvent>>
+        >(cx).cloned();
+
+        let upgrade = WebSocketUpgrade::from_request(cx, body).await?;
+        upgrade
+            .protocols(["atproto-sync.v1"])
+            .on_upgrade(move |mut socket| async move {
+                let mut seq = cursor.unwrap_or(0);
+                let max_lag = config.max_lag;
+
+                match (config.mode, &event_sender) {
+                    // Broadcast mode: subscribe to the event channel
+                    (FirehoseMode::Broadcast, Some(sender)) => {
+                        let mut rx = sender.subscribe();
+                        let mut heartbeat = tokio::time::interval(
+                            std::time::Duration::from_millis(config.heartbeat_interval_ms),
+                        );
+
+                        loop {
+                            tokio::select! {
+                                event = rx.recv() => {
+                                    match event {
+                                        Ok(tag_event) => {
+                                            seq += 1;
+                                            let action = match tag_event.operation {
+                                                kappa_core::events::TagEventOp::Set => "create",
+                                                kappa_core::events::TagEventOp::Delete => "delete",
+                                                _ => "update",
+                                            };
+                                            let frame = serde_json::json!({
+                                                "$type": "#commit",
+                                                "seq": seq,
+                                                "repo": tag_event.namespace,
+                                                "ops": [{
+                                                    "action": action,
+                                                    "path": tag_event.name,
+                                                    "cid": tag_event.value.as_deref().unwrap_or(""),
+                                                }],
+                                            });
+                                            if socket.send(Message::text(frame.to_string())).await.is_err() {
+                                                return; // client disconnected
+                                            }
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                            if n > max_lag {
+                                                let info = serde_json::json!({
+                                                    "$type": "#info",
+                                                    "name": "OutdatedCursor",
+                                                    "message": format!("lagged {} events, closing", n),
+                                                });
+                                                let _ = socket.send(Message::text(info.to_string())).await;
+                                                return;
+                                            }
+                                            // Recoverable lag: continue receiving
+                                            seq += n;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            return; // broadcaster dropped
+                                        }
+                                    }
+                                }
+                                _ = heartbeat.tick() => {
+                                    if socket.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Poll mode: check sequence counter at interval
+                    _ => {
+                        let poll_ms = match config.mode {
+                            FirehoseMode::Poll { interval_ms } => interval_ms,
+                            _ => 500,
+                        };
+                        let mut interval = tokio::time::interval(
+                            std::time::Duration::from_millis(poll_ms),
+                        );
+                        let system_ns = match store.namespace_resolve("_system", None) {
+                            Ok(ns) => ns,
+                            Err(_) => return,
+                        };
+
+                        loop {
+                            interval.tick().await;
+
+                            let current_seq = match store.sequence_current(&system_ns, "_atproto_seq") {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+
+                            if current_seq <= seq {
+                                if socket.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            while seq < current_seq {
+                                seq += 1;
+                                let event = serde_json::json!({
+                                    "$type": "#info",
+                                    "name": "SequenceAdvance",
+                                    "seq": seq,
+                                });
+                                if socket.send(Message::text(event.to_string())).await.is_err() {
+                                    return;
+                                }
+                            }
+
+                            if current_seq.saturating_sub(seq) > max_lag {
+                                let info = serde_json::json!({
+                                    "$type": "#info",
+                                    "name": "OutdatedCursor",
+                                    "message": "cursor too far behind",
+                                });
+                                let _ = socket.send(Message::text(info.to_string())).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .into_response(cx)
+    })
+}
+
+// -- Helpers ------------------------------------------------------------------
+
+fn extract_bearer_token(cx: &Cx) -> String {
+    use topcoat::context::request_context;
+    let parts: &http::request::Parts = request_context(cx);
+    parts.headers.get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("DPoP ")))
+        .unwrap_or("")
+        .to_string()
 }

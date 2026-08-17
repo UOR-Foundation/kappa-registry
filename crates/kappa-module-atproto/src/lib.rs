@@ -14,6 +14,7 @@ pub mod car;
 pub mod cid;
 pub mod commit;
 pub mod mst;
+pub mod session;
 pub mod tid;
 pub mod xrpc;
 
