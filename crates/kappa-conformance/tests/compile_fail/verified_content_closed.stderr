@@ -1,0 +1,27 @@
+warning: unreachable expression
+ --> tests/compile_fail/verified_content_closed.rs:9:18
+  |
+8 |         label: todo!(),
+  |                ------- any code following this expression is unreachable
+9 |         content: vec![],
+  |                  ^^^^^^ unreachable expression
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `label`, `content` and `_seal` of struct `VerifiedContent` are private
+  --> tests/compile_fail/verified_content_closed.rs:8:9
+   |
+ 7 |     let _v = kappa_core::verified::VerifiedContent {
+   |              ------------------------------------- in this type
+ 8 |         label: todo!(),
+   |         ^^^^^ private field
+ 9 |         content: vec![],
+   |         ^^^^^^^ private field
+10 |         _seal: todo!(),
+   |         ^^^^^ private field
+
+error: type `verified::Seal` is private
+  --> tests/compile_fail/verified_content_closed.rs:10:16
+   |
+10 |         _seal: todo!(),
+   |                ^^^^^^^ private type

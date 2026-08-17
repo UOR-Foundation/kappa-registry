@@ -6,7 +6,6 @@ pub mod manifests;
 pub mod referrers;
 pub mod tags;
 pub mod upload;
-pub mod upload_session;
 
 use std::borrow::Cow;
 
@@ -17,18 +16,16 @@ pub use helpers::MaxBlobSize;
 // Re-export helpers for use by handler modules via crate::
 pub(crate) use helpers::{
     evaluate_filters, oci_error, path_param, query_param, query_params_multi, read_body,
-    registry_anchor, store, store_err, validate_schemas,
+    registry_anchor, resolve_ns_read_async,
+    resolve_ns_write_async, store, store_err, validate_schemas,
 };
 
 /// Register all OCI distribution spec routes on the router builder.
 ///
-/// The caller (kappa-server main.rs) must register these app_context
-/// values before calling register():
-/// - Arc<SessionStore>     (from upload_session)
-/// - UploadTimeout         (from upload)
-/// - BlobRoot              (from upload)
+/// Required app_context values:
 /// - Arc<dyn KappaStore>
 /// - MaxBlobSize
+/// - UploadTimeout
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder
         // Blob metadata query

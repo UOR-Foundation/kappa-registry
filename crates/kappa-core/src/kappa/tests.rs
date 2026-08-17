@@ -453,33 +453,90 @@ mod tests {
         assert!(blob_path_for(root, "sha256:....").is_err());
     }
 
-    // -- Sha1Policy -----------------------------------------------------------
+    // -- Streaming multi-axis computation adversarial tests --------------------
 
     #[test]
-    fn sha1_policy_default_is_allow() {
-        assert_eq!(Sha1Policy::default(), Sha1Policy::Allow);
+    fn streaming_compute_multi_primary_is_first_axis() {
+        let content = b"primary axis selection test";
+        let mut cursor = std::io::Cursor::new(content);
+        let proof = streaming_compute_multi(&["blake3", "sha256"], &mut cursor).unwrap();
+        assert!(proof.kappa().starts_with("blake3:"), "primary should be blake3, got {}", proof.kappa());
     }
 
     #[test]
-    fn sha1_policy_from_str() {
-        assert_eq!(Sha1Policy::parse_str("allow"), Sha1Policy::Allow);
-        assert_eq!(Sha1Policy::parse_str("deny"), Sha1Policy::Deny);
-        assert_eq!(
-            Sha1Policy::parse_str("upgrade"),
-            Sha1Policy::AllowWithSha256Upgrade
-        );
-        assert_eq!(Sha1Policy::parse_str("unknown"), Sha1Policy::Allow);
-        assert_eq!(Sha1Policy::parse_str(""), Sha1Policy::Allow);
+    fn streaming_compute_multi_primary_is_first_axis_reversed() {
+        let content = b"primary axis selection test reversed";
+        let mut cursor = std::io::Cursor::new(content);
+        let proof = streaming_compute_multi(&["sha256", "blake3"], &mut cursor).unwrap();
+        assert!(proof.kappa().starts_with("sha256:"), "primary should be sha256, got {}", proof.kappa());
     }
 
     #[test]
-    fn sha1_policy_roundtrip() {
-        for policy in [
-            Sha1Policy::Allow,
-            Sha1Policy::Deny,
-            Sha1Policy::AllowWithSha256Upgrade,
-        ] {
-            assert_eq!(Sha1Policy::parse_str(policy.as_str()), policy);
+    fn streaming_compute_multi_all_six_axes() {
+        let content = b"all six axes test";
+        let mut cursor = std::io::Cursor::new(content);
+        let proof = streaming_compute_multi(
+            &["sha1", "sha256", "blake3", "sha512", "sha3-256", "keccak256"],
+            &mut cursor,
+        ).unwrap();
+        assert!(proof.kappa().starts_with("sha1:"), "primary should be sha1");
+        assert_eq!(proof.additional().len(), 5, "should have 5 additional axes");
+    }
+
+    #[test]
+    fn streaming_compute_multi_single_axis() {
+        let content = b"single axis test";
+        let mut cursor = std::io::Cursor::new(content);
+        let proof = streaming_compute_multi(&["sha256"], &mut cursor).unwrap();
+        assert!(proof.kappa().starts_with("sha256:"));
+        assert!(proof.additional().is_empty(), "single axis should have no additional");
+    }
+
+    #[test]
+    fn streaming_compute_multi_duplicate_axis() {
+        let content = b"duplicate axis test";
+        let mut cursor = std::io::Cursor::new(content);
+        let proof = streaming_compute_multi(&["sha256", "sha256"], &mut cursor).unwrap();
+        assert!(proof.kappa().starts_with("sha256:"));
+        // Duplicate axis: only one hasher created, results list has one entry
+        // The primary consumes it, additional should be empty
+        assert!(proof.additional().is_empty());
+    }
+
+    #[test]
+    fn streaming_compute_multi_unknown_axis_rejected() {
+        let content = b"unknown axis";
+        let mut cursor = std::io::Cursor::new(content);
+        let result = streaming_compute_multi(&["unknown"], &mut cursor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn streaming_compute_multi_empty_content() {
+        let mut cursor = std::io::Cursor::new(b"");
+        let proof = streaming_compute_multi(&["sha256", "blake3"], &mut cursor).unwrap();
+        let oneshot_sha256 = KappaLabel::sha256(b"");
+        assert_eq!(proof.kappa(), oneshot_sha256.as_str());
+    }
+
+    #[test]
+    fn streaming_compute_multi_large_content() {
+        let content: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
+        let mut cursor = std::io::Cursor::new(&content);
+        let proof = streaming_compute_multi(&["sha256"], &mut cursor).unwrap();
+        let oneshot = KappaLabel::sha256(&content);
+        assert_eq!(proof.kappa(), oneshot.as_str());
+    }
+
+    #[test]
+    fn streaming_compute_kappa_matches_one_shot() {
+        let content = b"streaming vs oneshot comparison";
+        for axis in &["sha1", "sha256", "blake3", "sha512", "sha3-256", "keccak256"] {
+            let mut cursor = std::io::Cursor::new(content);
+            let proof = streaming_compute_kappa(axis, &mut cursor).unwrap();
+            let oneshot = compute_kappa(axis, content).unwrap();
+            assert_eq!(proof.kappa(), oneshot.as_str(), "mismatch for axis {}", axis);
         }
     }
+
 }

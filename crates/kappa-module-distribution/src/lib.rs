@@ -31,9 +31,10 @@ pub mod ws_events;
 
 use std::sync::Arc;
 
-use topcoat::context::{app_context, request_context, try_app_context, Cx};
+use topcoat::context::{app_context, try_app_context, Cx};
 use topcoat::router::error::bad_request;
-use topcoat::router::{to_bytes, Body, Response, RouterBuilder, StatusCode};
+use topcoat::router::response::Response;
+use topcoat::router::{to_bytes, raw_path_params, Body, RouterBuilder, StatusCode};
 
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::store::KappaStore;
@@ -77,20 +78,50 @@ pub(crate) fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
     app_context::<Arc<dyn KappaStore>>(cx)
 }
 
+/// Read resolved namespace from context. Write path: creates on first write.
+pub(crate) async fn resolve_ns_write_async(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
+    use topcoat::context::request_context;
+    use kappa_core::types::ResolvedNamespace;
+    match request_context::<ResolvedNamespace>(cx) {
+        ResolvedNamespace::Exists(ns) => Ok(ns.clone()),
+        ResolvedNamespace::NotFound { name, protocol } => {
+            let s = store(cx).clone();
+            let owner = registry_anchor(cx);
+            let name = name.clone();
+            let protocol = protocol.clone();
+            tokio::task::spawn_blocking(move || {
+                s.namespace_resolve_or_create(&name, &owner, Some(&protocol))
+            })
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)
+        }
+        ResolvedNamespace::NoNamespace => {
+            Err(bad_request("no namespace in request path").into())
+        }
+    }
+}
+
+/// Read resolved namespace from context. Read path: 404 if not found.
+pub(crate) async fn resolve_ns_read_async(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
+    use topcoat::context::request_context;
+    use kappa_core::types::ResolvedNamespace;
+    request_context::<ResolvedNamespace>(cx)
+        .expect_exists()
+        .map_err(|_| topcoat::router::error::not_found().into())
+}
+
 /// Extract a path parameter by name from the matched route.
 pub(crate) fn path_param<'a>(cx: &'a Cx, key: &str) -> &'a str {
-    use topcoat::router::RawPathParams;
-    let params: &RawPathParams = request_context(cx);
-    params
-        .iter()
+    raw_path_params(cx)
         .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+        .map(|(_, v)| v.as_str())
         .unwrap_or("")
 }
 
 /// Extract a query parameter by name.
 pub(crate) fn query_param(cx: &Cx, key: &str) -> Option<String> {
-    let query = topcoat::router::uri(cx).query()?;
+    let query = topcoat::router::request::uri(cx).query()?;
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == key {
@@ -109,8 +140,15 @@ pub(crate) async fn read_body(body: Body) -> topcoat::Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-/// Get the registry's own anchor for edge asserter field.
+/// Get the caller's identity for edge asserter field.
+/// Prefers the authenticated caller's anchor from request context.
+/// Falls back to node anchor for unauthenticated deployments.
 pub(crate) fn registry_anchor(cx: &Cx) -> String {
+    if let Some(caller) = topcoat::context::try_request_context::<kappa_core::types::CallerIdentity>(cx) {
+        if caller.0 != "anonymous" {
+            return caller.0.clone();
+        }
+    }
     match try_app_context::<Arc<NodeIdentity>>(cx) {
         Some(ni) => ni.anchor().as_str().to_string(),
         None => "kappa-distribution".to_string(),

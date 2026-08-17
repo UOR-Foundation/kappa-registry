@@ -1,0 +1,22 @@
+[package]
+name = "kappa-module-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "S3-compatible protocol module for kappa-registry."
+
+[lib]
+name = "kappa_module_s3"
+path = "src/lib.rs"
+
+[dependencies]
+kappa-core = { workspace = true }
+quick-xml = { version = "0.37", features = ["serialize"] }
+base64-simd = "0.8"
+
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

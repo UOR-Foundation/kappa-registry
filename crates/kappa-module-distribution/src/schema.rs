@@ -8,12 +8,13 @@ use std::borrow::Cow;
 
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
+use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
-    Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_core::store::blob_put_computed;
-use kappa_core::types::{Edge, EdgeRelation};
+use kappa_core::types::{Edge, EdgeRelation, NamespaceRef};
 
 use crate::{path_param, read_body, store};
 
@@ -39,32 +40,32 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn register_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let scope = path_param(cx, "scope");
-        register_schema(cx, ns, scope, &bytes).await
+        register_schema(cx, &ns, scope, &bytes).await
     })
 }
 
 fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let scope = path_param(cx, "scope");
-        get(cx, ns, scope).await
+        get(cx, &ns, scope).await
     })
 }
 
 fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
-        list(cx, ns).await
+        let ns = crate::resolve_ns_read_async(cx).await?;
+        list(cx, &ns).await
     })
 }
 
-async fn register_schema(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn register_schema(cx: &Cx, ns: &NamespaceRef, scope: &str, body: &[u8]) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let sc = scope.to_string();
     let content = body.to_vec();
 
@@ -85,7 +86,7 @@ async fn register_schema(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat
     // Store new schema blob and tag
     let kappa = tokio::task::spawn_blocking({
         let s = s.clone();
-        let n = n.clone();
+        let n = ns.clone();
         let sc = sc.clone();
         move || {
             let k = blob_put_computed(&*s, &content)?;
@@ -99,7 +100,7 @@ async fn register_schema(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat
 
     // Store object-type metadata (global + namespace-indexed)
     let k = kappa.clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || {
@@ -123,7 +124,7 @@ async fn register_schema(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat
                 value_kappa: None,
                 metadata: None,
             };
-            let n = ns.to_string();
+            let n = ns.clone();
             let _ = tokio::task::spawn_blocking({
                 let s = s.clone();
                 move || s.edge_put(&n, &edge)
@@ -142,9 +143,9 @@ async fn register_schema(cx: &Cx, ns: &str, scope: &str, body: &[u8]) -> topcoat
         .into_response(cx)
 }
 
-async fn get(cx: &Cx, ns: &str, scope: &str) -> topcoat::Result<Response> {
+async fn get(cx: &Cx, ns: &NamespaceRef, scope: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let sc = scope.to_string();
 
     let (kappa, content) = tokio::task::spawn_blocking(move || {
@@ -169,9 +170,9 @@ async fn get(cx: &Cx, ns: &str, scope: &str) -> topcoat::Result<Response> {
         .into_response(cx)
 }
 
-async fn list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+async fn list(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     let schemas = tokio::task::spawn_blocking(move || s.tag_prefix(&n, "_schema/"))
         .await

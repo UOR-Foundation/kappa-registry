@@ -25,6 +25,7 @@ pub mod merkle;
 pub mod store;
 pub mod transaction;
 pub mod types;
+pub mod verified;
 pub mod version;
 
 pub use canonical::{canonical_bytes, from_canonical};
@@ -34,9 +35,10 @@ pub use crypto::{
 };
 pub use epoch::{EpochRoot, EpochRootFields};
 pub use kappa::{
-    axis_of, blob_path_for, compute_kappa, encrypted_blob_path_for, kappa_from_bytes,
-    kappa_from_value, sha256_raw, split_kappa, verify_kappa, Axis, KappaLabel, LabelError,
-    Sha1Policy,
+    axis_of, blob_path_for, compute_kappa, kappa_from_bytes,
+    kappa_from_value, sha256_raw, split_kappa, streaming_compute_kappa,
+    streaming_compute_multi, verify_kappa, Axis, KappaLabel, LabelError,
 };
 pub use store::KappaStore;
 pub use types::*;
+pub use verified::VerifiedContent;

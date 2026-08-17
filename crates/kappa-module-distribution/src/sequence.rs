@@ -7,9 +7,12 @@ use std::borrow::Cow;
 
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
+use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
-    Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
+
+use kappa_core::types::NamespaceRef;
 
 use crate::{path_param, store};
 
@@ -30,24 +33,24 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn next_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let name = path_param(cx, "name");
-        next(cx, ns, name).await
+        next(cx, &ns, name).await
     })
 }
 
 fn current_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let name = path_param(cx, "name");
-        current(cx, ns, name).await
+        current(cx, &ns, name).await
     })
 }
 
-async fn next(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Response> {
+async fn next(cx: &Cx, ns: &NamespaceRef, name: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let nm = name.to_string();
     let val = tokio::task::spawn_blocking(move || s.sequence_next(&n, &nm))
         .await
@@ -63,9 +66,9 @@ async fn next(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Response> {
         .into_response(cx)
 }
 
-async fn current(cx: &Cx, ns: &str, name: &str) -> topcoat::Result<Response> {
+async fn current(cx: &Cx, ns: &NamespaceRef, name: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let nm = name.to_string();
     let val = tokio::task::spawn_blocking(move || s.sequence_current(&n, &nm))
         .await

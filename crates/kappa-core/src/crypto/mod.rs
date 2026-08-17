@@ -8,6 +8,7 @@ pub mod frost;
 pub mod keystore;
 pub mod kms;
 pub mod prf;
+pub mod sigv4;
 pub mod vrf_trait;
 
 #[derive(Debug, thiserror::Error)]

@@ -91,6 +91,12 @@ pub enum LabelError {
     WrongDigitCount { expected: usize, got: usize },
     #[error("SHA-1 collision detected, content rejected")]
     CollisionDetected,
+    #[error("digest mismatch on axis {axis}: expected {expected}, computed {computed}")]
+    DigestMismatch {
+        expected: String,
+        computed: String,
+        axis: String,
+    },
 }
 
 /// Lookup table for byte-to-hex encoding.

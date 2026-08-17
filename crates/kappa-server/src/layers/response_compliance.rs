@@ -2,19 +2,19 @@
 //! headers are missing from successful blob/manifest responses.
 //! Does NOT modify or reject responses. Safety net for handler bugs.
 
-use topcoat::context::{try_app_context, CxBuilder};
+use topcoat::context::{try_app_context, Cx};
 use topcoat::router::{Body, Method, Next, StatusCode};
 
 use super::request_id::RequestId;
 
 pub fn response_compliance_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
-        let path = topcoat::router::uri(cx).path().to_owned();
-        let method = topcoat::router::method(cx).clone();
+        let path = topcoat::router::request::uri(cx).path().to_owned();
+        let method = topcoat::router::request::method(cx).clone();
         let rid = try_app_context::<RequestId>(cx)
             .map(|r| r.0.clone())
             .unwrap_or_default();

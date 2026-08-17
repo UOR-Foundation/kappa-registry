@@ -7,12 +7,13 @@ use std::borrow::Cow;
 
 use topcoat::context::Cx;
 use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
-    Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_core::kappa::{axis_of, compute_kappa, KappaLabel};
-use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation};
+use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef};
 
 use crate::{path_param, read_body, store};
 
@@ -33,22 +34,22 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn compose_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let op = path_param(cx, "op");
-        compose(cx, ns, op, &bytes).await
+        compose(cx, &ns, op, &bytes).await
     })
 }
 
 fn witness_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let kappa = path_param(cx, "kappa");
-        witness(cx, ns, kappa).await
+        witness(cx, &ns, kappa).await
     })
 }
 
-async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn compose(cx: &Cx, ns: &NamespaceRef, op_token: &str, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let operand_strs: Vec<String> = v["operands"]
@@ -119,7 +120,7 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
     let c = canon.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.blob_put(&ck, &c)
+        move || s.ingest_verified(&ck,&c)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -127,7 +128,7 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
 
     // Store object-type metadata (global + namespace-indexed)
     let ck = composed_kappa.as_str().to_string();
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || {
@@ -148,14 +149,14 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
     let w = witness_data;
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.blob_put(&wk, &w)
+        move || s.ingest_verified(&wk,&w)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
     let wk = witness_kappa.as_str().to_string();
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || {
@@ -181,7 +182,7 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
                 serde_json::to_vec(&serde_json::json!({"operation": op_token})).unwrap_or_default(),
             ),
         };
-        let n = ns.to_string();
+        let n = ns.clone();
         let _ = tokio::task::spawn_blocking({
             let s = s.clone();
             move || s.edge_put(&n, &edge)
@@ -198,7 +199,7 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
         value_kappa: None,
         metadata: None,
     };
-    let n = ns.to_string();
+    let n = ns.clone();
     let _ = tokio::task::spawn_blocking({
         let s = s.clone();
         move || s.edge_put(&n, &witness_edge)
@@ -220,9 +221,9 @@ async fn compose(cx: &Cx, ns: &str, op_token: &str, body: &[u8]) -> topcoat::Res
         .into_response(cx)
 }
 
-async fn witness(cx: &Cx, ns: &str, kappa: &str) -> topcoat::Result<Response> {
+async fn witness(cx: &Cx, ns: &NamespaceRef, kappa: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     let k = kappa.to_string();
 
     let query = EdgeQuery {
@@ -315,7 +316,8 @@ fn canonical_e7(a: &str) -> topcoat::Result<Vec<u8>> {
             best = Some(cand);
         }
     }
-    let result = format!("{}:{}", axis, hex::encode(best.unwrap()));
+    let best = best.expect("PERMS4 is non-empty, loop always sets best");
+    let result = format!("{}:{}", axis, hex::encode(best));
     Ok(result.into_bytes())
 }
 

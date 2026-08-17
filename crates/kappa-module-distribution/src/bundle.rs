@@ -7,11 +7,14 @@ use std::borrow::Cow;
 
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
+use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
-    Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
-use crate::{path_param, read_body, store};
+use kappa_core::types::NamespaceRef;
+
+use crate::{read_body, store};
 
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder
@@ -30,20 +33,20 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn create_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        create(cx, ns, &bytes).await
+        let ns = crate::resolve_ns_write_async(cx).await?;
+        create(cx, &ns, &bytes).await
     })
 }
 
 fn ingest_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        ingest(cx, ns, &bytes).await
+        let ns = crate::resolve_ns_write_async(cx).await?;
+        ingest(cx, &ns, &bytes).await
     })
 }
 
-async fn create(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn create(cx: &Cx, _ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let kappas: Vec<String> = v["kappas"]
@@ -85,7 +88,7 @@ async fn create(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         .into_response(cx)
 }
 
-async fn ingest(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn ingest(cx: &Cx, _ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let s = store(cx).clone();
     let data = body.to_vec();
     let ingested = tokio::task::spawn_blocking(move || {
@@ -94,8 +97,7 @@ async fn ingest(cx: &Cx, _ns: &str, body: &[u8]) -> topcoat::Result<Response> {
             .map_err(|e| kappa_core::StoreError::Rejected(e.to_string()))?;
         let mut kappas = Vec::with_capacity(entries.len());
         for entry in &entries {
-            // Bundle entry already has the kappa -- store at that address
-            s.blob_put(&entry.kappa, &entry.content)?;
+            s.ingest_verified(&entry.kappa,&entry.content)?;
             kappas.push(entry.kappa.clone());
         }
         Ok::<Vec<String>, kappa_core::StoreError>(kappas)

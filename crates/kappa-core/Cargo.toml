@@ -30,11 +30,21 @@ rand_core = { workspace = true }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 getrandom = { workspace = true }
 rekindle-aead = { workspace = true }
+hmac = "0.13"
+subtle = "2"
+md-5 = "0.10"
+crc-fast = "1"
 zeroize = { workspace = true }
 dashmap = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+zstd = "0.13"
+xz2 = "0.1"
+bzip2 = "0.5"
+
+[dev-dependencies]
 tempfile = { workspace = true }

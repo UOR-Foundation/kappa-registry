@@ -2,29 +2,29 @@
 
 use std::sync::Arc;
 
-use topcoat::context::{app_context, request_context, try_app_context, Cx};
+use topcoat::context::{app_context, try_app_context, try_request_context, Cx};
 use topcoat::router::error::bad_request;
-use topcoat::router::{to_bytes, Body, Response, StatusCode};
+use topcoat::router::request::Bytes;
+use topcoat::router::response::Response;
+use topcoat::router::{to_bytes, raw_path_params, Body, StatusCode};
 
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 pub use kappa_core::types::MaxBlobSize;
 
 /// Extract a path parameter by name from the matched route.
 pub fn path_param<'a>(cx: &'a Cx, key: &str) -> &'a str {
-    use topcoat::router::RawPathParams;
-    let params: &RawPathParams = request_context(cx);
-    params
-        .iter()
+    raw_path_params(cx)
         .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+        .map(|(_, v)| v.as_str())
         .unwrap_or("")
 }
 
 /// Extract a query parameter by name.
 pub fn query_param(cx: &Cx, key: &str) -> Option<String> {
-    let query = topcoat::router::uri(cx).query()?;
+    let query = topcoat::router::request::uri(cx).query()?;
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == key {
@@ -37,7 +37,7 @@ pub fn query_param(cx: &Cx, key: &str) -> Option<String> {
 
 /// Extract all values for a repeated query parameter.
 pub fn query_params_multi(cx: &Cx, key: &str) -> Vec<String> {
-    let Some(query) = topcoat::router::uri(cx).query() else {
+    let Some(query) = topcoat::router::request::uri(cx).query() else {
         return Vec::new();
     };
     query
@@ -58,8 +58,50 @@ pub fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
     app_context::<Arc<dyn KappaStore>>(cx)
 }
 
+/// Read resolved namespace from context. Write path: creates on first write.
+pub async fn resolve_ns_write_async(cx: &Cx) -> topcoat::Result<NamespaceRef> {
+    use topcoat::context::request_context;
+    use kappa_core::types::ResolvedNamespace;
+    match request_context::<ResolvedNamespace>(cx) {
+        ResolvedNamespace::Exists(ns) => Ok(ns.clone()),
+        ResolvedNamespace::NotFound { name, protocol } => {
+            let s = store(cx).clone();
+            let owner = registry_anchor(cx);
+            let name = name.clone();
+            let protocol = protocol.clone();
+            tokio::task::spawn_blocking(move || {
+                s.namespace_resolve_or_create(&name, &owner, Some(&protocol))
+            })
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)
+        }
+        ResolvedNamespace::NoNamespace => {
+            Err(bad_request("no namespace in request path").into())
+        }
+    }
+}
+
+/// Read resolved namespace from context. Read path: 404 if not found.
+pub async fn resolve_ns_read_async(cx: &Cx) -> topcoat::Result<NamespaceRef> {
+    use topcoat::context::request_context;
+    use kappa_core::types::ResolvedNamespace;
+    request_context::<ResolvedNamespace>(cx)
+        .expect_exists()
+        .map_err(|_| topcoat::router::error::not_found().into())
+}
+
 /// Get the registry's own anchor for edge asserter field.
 pub fn registry_anchor(cx: &Cx) -> String {
+    // Prefer the authenticated caller's identity from request context.
+    // CallerIdentity is defined in kappa_core::types so protocol modules
+    // and the server can share the type without circular dependencies.
+    if let Some(caller) = try_request_context::<kappa_core::types::CallerIdentity>(cx) {
+        if caller.0 != "anonymous" {
+            return caller.0.clone();
+        }
+    }
+    // Fall back to node anchor for unauthenticated deployments
     match try_app_context::<Arc<NodeIdentity>>(cx) {
         Some(ni) => ni.anchor().to_string(),
         None => "oci-distribution".to_string(),
@@ -99,7 +141,7 @@ pub fn oci_error(
 }
 
 /// Read request body.
-pub async fn read_body(body: Body) -> topcoat::Result<topcoat::router::Bytes> {
+pub async fn read_body(body: Body) -> topcoat::Result<Bytes> {
     to_bytes(body, usize::MAX)
         .await
         .map_err(|e| bad_request(format!("failed to read request body: {e}")).into())
@@ -140,10 +182,10 @@ fn hex_val(b: u8) -> Option<u8> {
 /// Returns Ok(None) if all filters pass, Ok(Some(response)) if rejected.
 pub async fn evaluate_filters(
     s: &Arc<dyn KappaStore>,
-    ns: &str,
+    ns: &NamespaceRef,
     content: &[u8],
 ) -> topcoat::Result<Option<Response>> {
-    let n = ns.to_string();
+    let n = ns.clone();
     let c = content.to_vec();
     let result = tokio::task::spawn_blocking({
         let s = s.clone();
@@ -202,10 +244,10 @@ pub async fn evaluate_filters(
 /// Must be called BEFORE blob_put -- rejected content is never stored.
 pub async fn validate_schemas(
     s: &Arc<dyn KappaStore>,
-    ns: &str,
+    ns: &NamespaceRef,
     content: &[u8],
 ) -> topcoat::Result<Option<Response>> {
-    let n = ns.to_string();
+    let n = ns.clone();
     let c = content.to_vec();
     let result = tokio::task::spawn_blocking({
         let s = s.clone();

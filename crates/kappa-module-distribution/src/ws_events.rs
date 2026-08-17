@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use topcoat::context::{try_app_context, Cx};
-use topcoat::router::FromRequest;
-use topcoat::router::websocket::{Message, WebSocketUpgrade};
+use topcoat::router::request::FromRequest;
+use topcoat::router::content::websocket::{Message, WebSocketUpgrade};
 use topcoat::router::{Body, RouteFuture};
 
 use kappa_core::events::EventLog;

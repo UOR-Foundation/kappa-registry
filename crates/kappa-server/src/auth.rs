@@ -15,7 +15,7 @@ use std::sync::RwLock;
 
 use kappa_core::identity::assertion::IdentityAssertion;
 use kappa_core::store::KappaStore;
-use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, StoreError};
+use kappa_core::types::{DelegationScope, Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef, ResolvedNamespace, StoreError};
 
 use crate::ratelimit::OpClass;
 
@@ -39,98 +39,284 @@ pub fn is_reserved(ns: &str) -> bool {
     RESERVED_PREFIXES.iter().any(|r| ns.starts_with(r))
 }
 
+#[derive(Debug, Clone)]
+pub enum AuthDecision {
+    Allowed,
+    AllowCreateNew,
+    AllowedViaDelegation,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("forbidden: {reason}")]
     Forbidden { reason: String },
+    #[error("not found")]
+    NotFound,
     #[error("store error during auth check: {0}")]
     Store(#[from] StoreError),
 }
 
 /// Authorize an operation on a namespace.
 ///
-/// - Exempt operations always pass (health checks, version).
-/// - Non-reserved namespaces always pass (open by default).
-/// - Reserved namespaces require a capability edge from the namespace
-///   authority granting the asserter the requested op class. This
-///   includes reads -- reserved content is not public.
+/// Takes the already-resolved namespace from the interceptor layer.
+/// The _root authority check resolves _root internally (it's the
+/// authority namespace, not the request namespace).
 ///
-/// Namespace hierarchy: if `ns` contains '/', the authorization check
-/// walks up the hierarchy. A capability edge on "org" grants access to
-/// "org/team" and "org/team/repo". The first match wins. This enables
-/// organization-level capability grants that apply to all sub-namespaces.
+/// Returns AuthDecision::AllowCreateNew when a write targets a
+/// non-reserved namespace that doesn't exist yet (first-writer-claims).
+/// The handler creates the namespace; the auth layer never does.
 pub fn authorize(
     store: &dyn KappaStore,
-    ns: &str,
+    ns: &ResolvedNamespace,
     op: OpClass,
     asserter: &str,
-) -> Result<(), AuthError> {
+) -> Result<AuthDecision, AuthError> {
     if matches!(op, OpClass::Exempt) {
-        return Ok(());
-    }
-    if !is_reserved(ns) {
-        return Ok(());
+        return Ok(AuthDecision::Allowed);
     }
 
-    // Walk namespace hierarchy: "org/team/repo" -> "org/team" -> "org"
-    let mut check_ns = ns;
-    loop {
-        let query = EdgeQuery {
+    // Step 1: _root check (always, regardless of namespace state).
+    // The _root namespace is bootstrapped at server start and always exists.
+    if let Ok(root_ns) = store.namespace_resolve("_root", None) {
+        let admin_query = EdgeQuery {
             anchor: asserter.to_string(),
             direction: Direction::Outbound,
             relation: Some(EdgeRelation::Capability),
             asserter: Some(asserter.to_string()),
         };
-        if let Ok(edges) = store.edge_query(check_ns, &query) {
+        if let Ok(edges) = store.edge_query(&root_ns, &admin_query) {
             if edges.iter().any(|e| cap_permits(e, op)) {
-                return Ok(());
+                return Ok(AuthDecision::Allowed);
             }
         }
-
-        // Walk up to parent namespace
-        match check_ns.rfind('/') {
-            Some(pos) => check_ns = &check_ns[..pos],
-            None => break,
+        // Delegation chain walk on _root
+        if check_delegation(store, &root_ns, op, asserter, 0)? {
+            return Ok(AuthDecision::Allowed);
         }
     }
 
-    // Two-hop role check: asserter -> role (holds-role) -> namespace (capability)
-    // Query edges where the asserter holds a role
-    let role_query = EdgeQuery {
-        anchor: asserter.to_string(),
-        direction: Direction::Outbound,
-        relation: Some(EdgeRelation::Capability),
-        asserter: None,
-    };
-    // Check all namespaces the asserter has edges in for role grants
-    if let Ok(role_edges) = store.edge_query(ns, &role_query) {
-        for role_edge in &role_edges {
-            // The target of a holds-role edge is the role anchor
-            // Check if that role has the capability on this namespace
-            if let Some(ref meta) = role_edge.metadata {
-                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(meta) {
-                    if parsed.get("type").and_then(|v| v.as_str()) == Some("holds-role") {
-                        let role_anchor = &role_edge.target;
-                        let role_cap_query = EdgeQuery {
-                            anchor: role_anchor.clone(),
-                            direction: Direction::Outbound,
-                            relation: Some(EdgeRelation::Capability),
-                            asserter: Some(role_anchor.clone()),
-                        };
-                        if let Ok(role_caps) = store.edge_query(ns, &role_cap_query) {
-                            if role_caps.iter().any(|e| cap_permits(e, op)) {
-                                return Ok(());
+    match ns {
+        ResolvedNamespace::Exists(ns_ref) => {
+            let ns_name = ns_ref.as_str();
+
+            // Step 2: owner check
+            if let Ok(info) = store.namespace_info(ns_name, None) {
+                if info.owner == asserter {
+                    return Ok(AuthDecision::Allowed);
+                }
+            }
+
+            // Step 3: non-reserved unclaimed namespace check
+            if !is_reserved(ns_name) {
+                let any_caps_query = EdgeQuery {
+                    anchor: String::new(),
+                    direction: Direction::Outbound,
+                    relation: Some(EdgeRelation::Capability),
+                    asserter: None,
+                };
+                match store.edge_query(ns_ref, &any_caps_query) {
+                    Ok(caps) if caps.is_empty() => return Ok(AuthDecision::Allowed),
+                    Ok(_) => {}
+                    Err(_) => return Ok(AuthDecision::Allowed),
+                }
+            }
+
+            // Step 4: direct capability check on target namespace
+            let query = EdgeQuery {
+                anchor: asserter.to_string(),
+                direction: Direction::Outbound,
+                relation: Some(EdgeRelation::Capability),
+                asserter: Some(asserter.to_string()),
+            };
+            if let Ok(edges) = store.edge_query(ns_ref, &query) {
+                if edges.iter().any(|e| cap_permits(e, op)) {
+                    return Ok(AuthDecision::Allowed);
+                }
+            }
+
+            // Step 5: namespace hierarchy walk
+            let mut check_ns_str = ns_name;
+            while let Some(pos) = check_ns_str.rfind('/') {
+                check_ns_str = &check_ns_str[..pos];
+                if let Ok(parent_ns) = store.namespace_resolve(check_ns_str, None) {
+                    let parent_query = EdgeQuery {
+                        anchor: asserter.to_string(),
+                        direction: Direction::Outbound,
+                        relation: Some(EdgeRelation::Capability),
+                        asserter: Some(asserter.to_string()),
+                    };
+                    if let Ok(edges) = store.edge_query(&parent_ns, &parent_query) {
+                        if edges.iter().any(|e| cap_permits(e, op)) {
+                            return Ok(AuthDecision::Allowed);
+                        }
+                    }
+                }
+            }
+
+            // Step 6: two-hop role check
+            let role_query = EdgeQuery {
+                anchor: asserter.to_string(),
+                direction: Direction::Outbound,
+                relation: Some(EdgeRelation::Capability),
+                asserter: None,
+            };
+            if let Ok(role_edges) = store.edge_query(ns_ref, &role_query) {
+                for role_edge in &role_edges {
+                    if let Some(ref meta) = role_edge.metadata {
+                        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(meta) {
+                            if parsed.get("type").and_then(|v| v.as_str()) == Some("holds-role") {
+                                let role_anchor = &role_edge.target;
+                                let role_cap_query = EdgeQuery {
+                                    anchor: role_anchor.clone(),
+                                    direction: Direction::Outbound,
+                                    relation: Some(EdgeRelation::Capability),
+                                    asserter: Some(role_anchor.clone()),
+                                };
+                                if let Ok(role_caps) = store.edge_query(ns_ref, &role_cap_query) {
+                                    if role_caps.iter().any(|e| cap_permits(e, op)) {
+                                        return Ok(AuthDecision::Allowed);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+
+            // Step 7: delegation chain walk on target namespace
+            if check_delegation(store, ns_ref, op, asserter, 0)? {
+                return Ok(AuthDecision::AllowedViaDelegation);
+            }
+
+            Err(AuthError::Forbidden {
+                reason: "access denied".to_owned(),
+            })
+        }
+        ResolvedNamespace::NotFound { name, .. } => {
+            if is_reserved(name) {
+                Err(AuthError::Forbidden {
+                    reason: format!("reserved namespace '{}' requires _root authority", name),
+                })
+            } else if op.is_write() {
+                Ok(AuthDecision::AllowCreateNew)
+            } else {
+                Err(AuthError::NotFound)
+            }
+        }
+        ResolvedNamespace::NoNamespace => {
+            Ok(AuthDecision::Allowed)
+        }
+    }
+}
+
+/// Check if `target` is authorized via delegation chain.
+/// Returns `Ok(Some(delegation_depth))` if authorized (the depth from
+/// the edge that authorized `target`), `Ok(None)` if not.
+/// `hop` tracks recursion depth (max 5 hops).
+fn check_delegation(
+    store: &dyn KappaStore,
+    ns: &NamespaceRef,
+    op: OpClass,
+    target: &str,
+    hop: u32,
+) -> Result<bool, AuthError> {
+    check_delegation_inner(store, ns, op, target, hop)
+        .map(|r| r.is_some())
+}
+
+/// Inner delegation check returning the delegation_depth of the
+/// authorizing edge, or None if not authorized.
+fn check_delegation_inner(
+    store: &dyn KappaStore,
+    ns: &NamespaceRef,
+    op: OpClass,
+    target: &str,
+    hop: u32,
+) -> Result<Option<u32>, AuthError> {
+    if hop > 5 {
+        return Ok(None);
+    }
+
+    let op_str = match op {
+        OpClass::Read => "read",
+        OpClass::Write => "write",
+        OpClass::Admin => "admin",
+        OpClass::Exempt => return Ok(Some(u32::MAX)),
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let root_ns = store.namespace_resolve("_root", None)
+        .map_err(|e| AuthError::Store(e))?;
+    let namespaces_to_check = [ns.clone(), root_ns];
+
+    let query = EdgeQuery {
+        anchor: target.to_string(),
+        direction: Direction::Inbound,
+        relation: Some(EdgeRelation::Delegation),
+        asserter: None,
+    };
+
+    for check_ns in &namespaces_to_check {
+        let edges = match store.edge_query(check_ns, &query) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for edge in &edges {
+            let Some(ref meta) = edge.metadata else { continue };
+            let Ok(scope) = serde_json::from_slice::<DelegationScope>(meta) else { continue };
+
+            if !scope.namespaces.is_empty()
+                && !scope.namespaces.iter().any(|n| ns.as_str().starts_with(n.as_str()))
+            {
+                continue;
+            }
+
+            if !scope.operations.iter().any(|o| o == op_str) {
+                continue;
+            }
+
+            if let Some(expires) = scope.expires_at_ms {
+                if now_ms > expires {
+                    continue;
+                }
+            }
+
+            let delegator = &edge.source;
+
+            // Check delegator's direct capability
+            let delegator_query = EdgeQuery {
+                anchor: delegator.clone(),
+                direction: Direction::Outbound,
+                relation: Some(EdgeRelation::Capability),
+                asserter: Some(delegator.clone()),
+            };
+            for cap_ns in &namespaces_to_check {
+                if let Ok(cap_edges) = store.edge_query(cap_ns, &delegator_query) {
+                    if cap_edges.iter().any(|e| cap_permits(e, op)) {
+                        return Ok(Some(scope.delegation_depth));
+                    }
+                }
+            }
+
+            // Delegator has no direct capability. Recurse to check
+            // if the delegator is authorized via its own delegation.
+            if let Some(parent_depth) = check_delegation_inner(store, ns, op, delegator, hop + 1)? {
+                // The parent delegation authorized the delegator with
+                // parent_depth. The delegator can re-delegate only if
+                // parent_depth >= 1.
+                if parent_depth >= 1 {
+                    return Ok(Some(scope.delegation_depth));
+                }
+            }
         }
     }
 
-    Err(AuthError::Forbidden {
-        reason: "no capability edge for this operation on reserved namespace".to_owned(),
-    })
+    Ok(None)
 }
 
 /// Check if a capability edge permits the requested operation class.
@@ -167,13 +353,25 @@ fn cap_permits(edge: &Edge, op: OpClass) -> bool {
 /// Exempt paths (/_status, /v2/, /v2/_health/*) bypass auth.
 /// When auth_required is false or the token list is empty, all
 /// requests pass (permissive default for backward compatibility).
+///
+/// Every token maps to an asserter anchor. The auth layer uses the
+/// anchor as the asserter identity for authorization decisions on
+/// reserved namespaces, delegation chains, and capability checks.
 pub struct BearerAuth {
-    tokens: std::collections::HashSet<String>,
+    /// token -> anchor.
+    tokens: std::collections::HashMap<String, String>,
     required: bool,
 }
 
+/// Result of a successful bearer auth check.
+pub struct AuthIdentity {
+    /// The asserter anchor for this request. "anonymous" if no
+    /// anchor is bound to the token.
+    pub asserter: String,
+}
+
 impl BearerAuth {
-    pub fn new(tokens: Vec<String>, required: bool) -> Self {
+    pub fn new(tokens: Vec<(String, String)>, required: bool) -> Self {
         Self {
             tokens: tokens.into_iter().collect(),
             required,
@@ -181,15 +379,17 @@ impl BearerAuth {
     }
 
     /// Check if a request is authorized.
-    /// Returns Ok(()) if allowed, Err(Response) with 401 if not.
-    #[allow(clippy::result_large_err)] // Response constructed once per 401, not a hot path
+    /// Returns Ok(AuthIdentity) if allowed, Err(Response) with 401 if not.
+    /// The AuthIdentity carries the resolved asserter anchor for downstream
+    /// authorization decisions.
+    #[allow(clippy::result_large_err)]
     pub fn check(
         &self,
         path: &str,
         headers: &topcoat::router::HeaderMap,
-    ) -> Result<(), topcoat::router::Response> {
+    ) -> Result<AuthIdentity, topcoat::router::response::Response> {
         if !self.required || self.tokens.is_empty() {
-            return Ok(());
+            return Ok(AuthIdentity { asserter: "anonymous".to_string() });
         }
         // Exempt paths: health, status, version check
         if path == "/_status"
@@ -197,28 +397,33 @@ impl BearerAuth {
             || path == "/v2"
             || path.starts_with("/v2/_health/")
         {
-            return Ok(());
+            return Ok(AuthIdentity { asserter: "anonymous".to_string() });
         }
         let token = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         match token {
-            Some(t) if self.tokens.contains(t) => Ok(()),
-            _ => {
-                let body = r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
-                let mut resp =
-                    topcoat::router::Response::new(topcoat::router::Body::from(body));
-                *resp.status_mut() = topcoat::router::StatusCode::UNAUTHORIZED;
-                resp.headers_mut().insert(
-                    "www-authenticate",
-                    r#"Bearer realm="kappa-registry""#.parse().unwrap(),
-                );
-                resp.headers_mut()
-                    .insert("content-type", "application/json".parse().unwrap());
-                Err(resp)
+            Some(t) => match self.tokens.get(t) {
+                Some(anchor) => Ok(AuthIdentity { asserter: anchor.clone() }),
+                None => Self::unauthorized(),
             }
+            None => Self::unauthorized(),
         }
+    }
+
+    fn unauthorized<T>() -> Result<T, topcoat::router::response::Response> {
+        let body = r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
+        let mut resp =
+            topcoat::router::response::Response::new(topcoat::router::Body::from(body));
+        *resp.status_mut() = topcoat::router::StatusCode::UNAUTHORIZED;
+        resp.headers_mut().insert(
+            "www-authenticate",
+            r#"Bearer realm="kappa-registry""#.parse().unwrap(),
+        );
+        resp.headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
+        Err(resp)
     }
 }
 

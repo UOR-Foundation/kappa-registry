@@ -1,0 +1,14 @@
+[package]
+name = "kappa-module-nix"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+nix-derivation = { git = "https://github.com/cachix/nix-derivation" }
+thiserror = "2"
+base64 = "0.22"
+zstd = "0.13"
+xz2 = "0.1"
+bzip2 = "0.5"
+sha2 = "0.10"

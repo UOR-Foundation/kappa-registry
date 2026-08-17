@@ -1,19 +1,31 @@
 //! Identity HTTP protocol module for kappa-registry.
 //!
 //! Endpoints:
-//!   GET  /identity/whoami        - node identity and trust position
-//!   POST /identity/assert        - publish an identity assertion
-//!   GET  /identity/resolve/{sub} - resolve assertions about a subject
-//!   POST /identity/revoke        - revoke an assertion
-//!   GET  /identity/absence/{sub}/{facet} - absence proof (requires AKD)
+//!   GET  /identity/whoami                      - node identity and trust position
+//!   POST /identity/assert                      - publish an identity assertion
+//!   GET  /identity/resolve/{sub}               - resolve assertions about a subject
+//!   POST /identity/revoke                      - revoke an assertion
+//!   GET  /identity/absence/{sub}/{facet}       - absence proof (requires AKD)
+//!   POST /identity/watermark                   - set a watermark
+//!   GET  /identity/audit/{start}/{end}         - AKD audit proof
+//!   POST /identity/anchor                      - register an anchor
+//!   POST /identity/binding                     - create an identity binding
+//!   GET  /identity/binding/{source}            - list bindings for identifier
+//!   DELETE /identity/binding                   - delete a binding
+//!   GET  /identity/binding/asserter/{anchor}   - list bindings by asserter
+//!   POST /identity/succession                  - create identity succession
+//!   GET  /identity/succession/{anchor}         - resolve to current anchor
+//!   GET  /identity/succession/{anchor}/chain   - full succession chain
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use topcoat::context::{app_context, request_context, try_app_context, Cx};
+use topcoat::context::{app_context, try_app_context, Cx};
 use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::request::Bytes;
+use topcoat::router::response::IntoResponse;
 use topcoat::router::{
-    to_bytes, Body, IntoResponse, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    to_bytes, raw_path_params, Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_akd::AkdManager;
@@ -22,8 +34,11 @@ use kappa_core::identity::assertion::IdentityAssertion;
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::identity::resolution;
 use kappa_core::identity::revocation::{Revocation, RevocationReason};
+use kappa_core::identity::binding::IdentityBinding;
+use kappa_core::identity::succession::IdentitySuccession;
 use kappa_core::kappa::kappa_from_bytes;
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 /// Asserter filter registered in app_context by the server layer.
 /// The resolve handler reads this and passes it to resolve_all_filtered.
@@ -39,12 +54,9 @@ fn store_err(e: kappa_core::StoreError) -> topcoat::Error {
 }
 
 fn path_param<'a>(cx: &'a Cx, key: &str) -> &'a str {
-    use topcoat::router::RawPathParams;
-    let params: &RawPathParams = request_context(cx);
-    params
-        .iter()
+    raw_path_params(cx)
         .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
+        .map(|(_, v)| v.as_str())
         .unwrap_or("")
 }
 
@@ -52,7 +64,7 @@ fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
     app_context::<Arc<dyn KappaStore>>(cx)
 }
 
-async fn read_body(body: Body) -> topcoat::Result<topcoat::router::Bytes> {
+async fn read_body(body: Body) -> topcoat::Result<Bytes> {
     to_bytes(body, usize::MAX)
         .await
         .map_err(|e| bad_request(format!("failed to read body: {e}")).into())
@@ -182,13 +194,13 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let ab = assertion_bytes;
-            let ns = asserter_ns.clone();
+            let ns = NamespaceRef::deterministic(asserter_ns.as_str());
             let subj = subject.clone();
             let facet = facet_for_edge;
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_assert", ns = %ns, subject = %subj).entered();
                 // 1. Store assertion blob
-                s.blob_put(&k, &ab)?;
+                s.ingest_verified(&k,&ab)?;
                 s.blob_put_meta(&k, "object-type", b"assertion")?;
 
                 // 2. Tag under asserter namespace
@@ -201,10 +213,10 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 s.edge_put(
                     &ns,
                     &kappa_core::types::Edge {
-                        source: ns.clone(),
+                        source: ns.as_str().to_string(),
                         target: subj.clone(),
                         relation: kappa_core::types::EdgeRelation::Assertion,
-                        asserter: ns.clone(),
+                        asserter: ns.as_str().to_string(),
                         value_kappa: Some(k.clone()),
                         metadata: None,
                     },
@@ -215,7 +227,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     &ns,
                     vec![kappa_core::types::EpochMutation {
                         op: kappa_core::types::MutationOp::AssertionPublish,
-                        namespace: ns.clone(),
+                        namespace: ns.as_str().to_string(),
                         tag_name: format!("assertion/{}", k),
                         old_kappa: None,
                         new_kappa: Some(k.clone()),
@@ -267,13 +279,9 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
         // Optional query parameter: at_ms for point-in-time resolution
         let at_ms: Option<u64> = {
-            use topcoat::router::RawPathParams;
-            use topcoat::context::request_context;
-            let params: &RawPathParams = request_context(cx);
-            params
-                .iter()
+            raw_path_params(cx)
                 .find(|(k, _)| *k == "at_ms")
-                .and_then(|(_, v)| v.parse().ok())
+                .and_then(|(_, v)| v.as_str().parse().ok())
         };
 
         // TrustPolicy filter: if registered in app_context, apply it.
@@ -298,12 +306,18 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
             // Revocations and watermarks still need namespace scan
             // (not indexed cross-namespace yet)
-            let namespaces = s.namespace_list()?;
+            let namespaces = s.namespace_list(None)?;
             let mut revocations = Vec::new();
             let mut watermarks = Vec::new();
 
-            for ns in &namespaces {
-                let rev_tags = s.tag_prefix(ns, "revocation/")?;
+            for rec in &namespaces {
+                let alias = rec.aliases.first().map(|s| s.as_str()).unwrap_or(&rec.uuid_hex);
+                let uuid_bytes = hex::decode(&rec.uuid_hex).unwrap_or_default();
+                if uuid_bytes.len() != 16 { continue; }
+                let mut uuid_arr = [0u8; 16];
+                uuid_arr.copy_from_slice(&uuid_bytes);
+                let ns = NamespaceRef::with_name(uuid_arr, alias.to_string());
+                let rev_tags = s.tag_prefix(&ns, "revocation/")?;
                 for tag in &rev_tags {
                     if let Ok(blob) = s.blob_get(&tag.kappa) {
                         if let Ok(r) = canonical::from_canonical::<Revocation>(&blob) {
@@ -312,7 +326,7 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     }
                 }
 
-                let wm_tags = s.tag_prefix(ns, "watermark/")?;
+                let wm_tags = s.tag_prefix(&ns, "watermark/")?;
                 for tag in &wm_tags {
                     if let Ok(blob) = s.blob_get(&tag.kappa) {
                         if let Ok(w) = canonical::from_canonical::<kappa_core::identity::watermark::Watermark>(&blob) {
@@ -415,11 +429,11 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let rb = rev_bytes;
-            let ns = asserter;
+            let ns = NamespaceRef::deterministic(asserter.as_str());
             let rak = revoked_assertion_kappa;
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_revoke", ns = %ns).entered();
-                s.blob_put(&k, &rb)?;
+                s.ingest_verified(&k,&rb)?;
                 s.blob_put_meta(&k, "object-type", b"revocation")?;
                 s.tag_set(&ns, &format!("revocation/{}", k), &k)?;
 
@@ -427,10 +441,10 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 s.edge_put(
                     &ns,
                     &kappa_core::types::Edge {
-                        source: ns.clone(),
+                        source: ns.as_str().to_string(),
                         target: rak.clone(),
                         relation: kappa_core::types::EdgeRelation::Revocation,
-                        asserter: ns.clone(),
+                        asserter: ns.as_str().to_string(),
                         value_kappa: Some(k.clone()),
                         metadata: None,
                     },
@@ -441,7 +455,7 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     &ns,
                     vec![kappa_core::types::EpochMutation {
                         op: kappa_core::types::MutationOp::RevocationPublish,
-                        namespace: ns.clone(),
+                        namespace: ns.as_str().to_string(),
                         tag_name: format!("revocation/{}", k),
                         old_kappa: None,
                         new_kappa: Some(k.clone()),
@@ -564,10 +578,10 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let s = s.clone();
             let k = kappa.clone();
             let wb = wm_bytes;
-            let ns = asserter;
+            let ns = NamespaceRef::deterministic(asserter.as_str());
             move || {
                 let _span = tracing::info_span!("store_mutation", op = "identity_watermark", ns = %ns).entered();
-                s.blob_put(&k, &wb)?;
+                s.ingest_verified(&k,&wb)?;
                 s.blob_put_meta(&k, "object-type", b"watermark")?;
                 s.tag_set(&ns, &format!("watermark/{}", k), &k)?;
 
@@ -578,7 +592,7 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     &ns,
                     vec![kappa_core::types::EpochMutation {
                         op: kappa_core::types::MutationOp::RevocationPublish,
-                        namespace: ns.clone(),
+                        namespace: ns.as_str().to_string(),
                         tag_name: format!("watermark/{}", k),
                         old_kappa: None,
                         new_kappa: Some(k.clone()),
@@ -687,11 +701,12 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 let spec_bytes = serde_json::to_vec(&spec)
                     .map_err(|e| kappa_core::StoreError::Io(std::io::Error::other(e.to_string())))?;
                 let kappa = kappa_from_bytes(&spec_bytes);
-                s.blob_put(&kappa, &spec_bytes)?;
+                s.ingest_verified(&kappa,&spec_bytes)?;
                 s.blob_put_meta(&kappa, "object-type", b"anchor-spec")?;
-                s.tag_set(&a, "anchor/spec", &kappa)?;
+                let ns = NamespaceRef::deterministic(a.as_str());
+                s.tag_set(&ns, "anchor/spec", &kappa)?;
                 if !ep.is_empty() {
-                    s.tag_set(&a, "anchor/endpoint", &kappa)?;
+                    s.tag_set(&ns, "anchor/endpoint", &kappa)?;
                 }
                 Ok::<String, kappa_core::StoreError>(kappa)
             }
@@ -707,6 +722,451 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             serde_json::to_string(&resp).unwrap_or_default(),
         )
             .into_response(cx)
+    })
+}
+
+// -- Binding PUT ------------------------------------------------------------
+
+fn binding_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = read_body(body).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
+
+        let source = v["source"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing source"))?
+            .to_string();
+        let target = v["target"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing target"))?
+            .to_string();
+        let method = v["method"]
+            .as_str()
+            .unwrap_or("self-asserted")
+            .to_string();
+        let trust_level = v["trust_level"].as_u64().unwrap_or(1);
+        let verified_at_ms = v["verified_at_ms"].as_u64().unwrap_or(0);
+
+        let binding = IdentityBinding {
+            source,
+            target: target.clone(),
+            method,
+            trust_level,
+            verified_at_ms,
+        };
+
+        let s = store(cx).clone();
+        let ns = NamespaceRef::deterministic(target.as_str());
+        let result = tokio::task::spawn_blocking(move || {
+            s.identity_binding_put(&ns, &binding)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"kappa": result});
+        (
+            StatusCode::CREATED,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Binding GET by source --------------------------------------------------
+
+fn binding_get_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let source = path_param(cx, "source");
+        let s = store(cx).clone();
+        let src = source.to_string();
+
+        let bindings = tokio::task::spawn_blocking(move || {
+            s.identity_binding_get(&src)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let items: Vec<serde_json::Value> = bindings
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "source": b.source,
+                    "target": b.target,
+                    "method": b.method,
+                    "trust_level": b.trust_level,
+                    "verified_at_ms": b.verified_at_ms,
+                })
+            })
+            .collect();
+
+        let resp = serde_json::json!({"bindings": items});
+        (
+            StatusCode::OK,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Binding DELETE ---------------------------------------------------------
+
+fn binding_delete_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = read_body(body).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
+
+        let source = v["source"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing source"))?
+            .to_string();
+        let target = v["target"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing target"))?
+            .to_string();
+
+        let s = store(cx).clone();
+        let ns = NamespaceRef::deterministic(target.as_str());
+        tokio::task::spawn_blocking(move || {
+            s.identity_binding_delete(&ns, &source, &target)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        StatusCode::NO_CONTENT.into_response(cx)
+    })
+}
+
+// -- Binding list by asserter -----------------------------------------------
+
+fn binding_list_by_asserter_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let anchor = path_param(cx, "anchor");
+        let s = store(cx).clone();
+        let a = anchor.to_string();
+
+        let bindings = tokio::task::spawn_blocking(move || {
+            s.identity_binding_list_by_asserter(&a)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let items: Vec<serde_json::Value> = bindings
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "source": b.source,
+                    "target": b.target,
+                    "method": b.method,
+                    "trust_level": b.trust_level,
+                    "verified_at_ms": b.verified_at_ms,
+                })
+            })
+            .collect();
+
+        let resp = serde_json::json!({"bindings": items});
+        (
+            StatusCode::OK,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Succession PUT ---------------------------------------------------------
+
+fn succession_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = read_body(body).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
+
+        let old_anchor = v["old_anchor"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing old_anchor"))?
+            .to_string();
+        let new_anchor = v["new_anchor"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing new_anchor"))?
+            .to_string();
+        let reason = v["reason"]
+            .as_str()
+            .unwrap_or("rotation")
+            .to_string();
+        let effective_at_ms = v["effective_at_ms"].as_u64().unwrap_or(0);
+        let old_signature_hex = v["old_signature"].as_str().unwrap_or("");
+        let old_signature = hex::decode(old_signature_hex).unwrap_or_default();
+        let new_signature_hex = v["new_signature"].as_str().unwrap_or("");
+        let new_signature = hex::decode(new_signature_hex).unwrap_or_default();
+
+        let succession = IdentitySuccession {
+            old_anchor,
+            new_anchor,
+            reason,
+            effective_at_ms,
+            old_signature,
+            new_signature,
+        };
+
+        let s = store(cx).clone();
+        let result = tokio::task::spawn_blocking(move || {
+            s.identity_succession_put(&succession)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"kappa": result});
+        (
+            StatusCode::CREATED,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Succession resolve -----------------------------------------------------
+
+fn succession_resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let anchor = path_param(cx, "anchor");
+        let s = store(cx).clone();
+        let a = anchor.to_string();
+
+        let current = tokio::task::spawn_blocking(move || {
+            s.identity_succession_resolve(&a)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"current": current});
+        (
+            StatusCode::OK,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Succession chain -------------------------------------------------------
+
+fn succession_chain_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let anchor = path_param(cx, "anchor");
+        let s = store(cx).clone();
+        let a = anchor.to_string();
+
+        let chain = tokio::task::spawn_blocking(move || {
+            s.identity_succession_chain(&a)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"chain": chain});
+        (
+            StatusCode::OK,
+            [("content-type", "application/json".to_string())],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
+    })
+}
+
+// -- Handle claim -----------------------------------------------------------
+
+fn handle_claim_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let bytes = read_body(body).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
+
+        let handle = v["handle"].as_str()
+            .ok_or_else(|| bad_request("missing handle"))?.to_string();
+        let protocol = v["protocol"].as_str().unwrap_or("atproto").to_string();
+        let anchor = v["anchor"].as_str()
+            .ok_or_else(|| bad_request("missing anchor"))?.to_string();
+        let verification_method = v["verification_method"].as_str()
+            .unwrap_or("unverified").to_string();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let record = kappa_core::identity::handle::HandleRecord {
+            anchor: anchor.clone(),
+            handle: handle.clone(),
+            protocol: protocol.clone(),
+            claimed_at_ms: now_ms,
+            verified_at_ms: None,
+            verification_method,
+            liveness: kappa_core::identity::handle::HandleLiveness::Unverified,
+        };
+
+        let s = store(cx).clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let handles_ns = s.namespace_resolve("_handles", None)?;
+            let tag_key = format!("handle:{}:{}", protocol, handle);
+
+            // Check for conflict: existing claim by different anchor
+            if let Ok(existing_entry) = s.tag_get(&handles_ns, &tag_key) {
+                let existing_bytes = s.blob_get(&existing_entry.kappa)?;
+                if let Ok(existing) =
+                    serde_json::from_slice::<kappa_core::identity::handle::HandleRecord>(&existing_bytes)
+                {
+                    if existing.anchor != anchor {
+                        // Grace period: allow reclaim if unverified > 7 days
+                        let grace_ms = 7 * 24 * 3600 * 1000u64;
+                        if existing.liveness != kappa_core::identity::handle::HandleLiveness::Unverified
+                            || now_ms.saturating_sub(existing.claimed_at_ms) < grace_ms
+                        {
+                            return Err(kappa_core::types::StoreError::Conflict(
+                                format!("handle {}:{} already claimed by {}", protocol, handle, existing.anchor)
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Store handle record as blob
+            let record_bytes = serde_json::to_vec(&record)
+                .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
+            let ingest = s.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
+
+            // Forward tag: handle:{protocol}:{handle} -> record kappa
+            s.tag_set(&handles_ns, &tag_key, &ingest.kappa)?;
+
+            // Reverse tag: anchor:{anchor} -> comma-appended handle keys
+            let reverse_key = format!("anchor:{}", anchor);
+            let existing_reverse = s.tag_get(&handles_ns, &reverse_key)
+                .map(|e| e.kappa)
+                .unwrap_or_default();
+            let new_reverse = if existing_reverse.is_empty() {
+                tag_key.clone()
+            } else {
+                format!("{},{}", existing_reverse, tag_key)
+            };
+            // Store reverse as a blob so the tag value is a kappa
+            let reverse_bytes = new_reverse.as_bytes();
+            let reverse_ingest = s.ingest_compute(kappa_core::kappa::Axis::Sha256, reverse_bytes)?;
+            s.tag_set(&handles_ns, &reverse_key, &reverse_ingest.kappa)?;
+
+            Ok::<String, kappa_core::types::StoreError>(ingest.kappa)
+        }).await
+        .map_err(|e| bad_request(e.to_string()))?;
+
+        match result {
+            Ok(kappa) => {
+                let resp = serde_json::json!({"kappa": kappa, "liveness": "unverified"});
+                (StatusCode::CREATED, [("content-type", "application/json")],
+                 serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+            }
+            Err(kappa_core::types::StoreError::Conflict(msg)) => {
+                let resp = serde_json::json!({"error": "conflict", "message": msg});
+                (StatusCode::CONFLICT, [("content-type", "application/json")],
+                 serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+            }
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(cx)
+            }
+        }
+    })
+}
+
+// -- Handle GET -------------------------------------------------------------
+
+fn handle_get_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let protocol = path_param(cx, "protocol");
+        let handle = path_param(cx, "handle");
+        let s = store(cx).clone();
+        let tag_key = format!("handle:{}:{}", protocol, handle);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let handles_ns = s.namespace_resolve("_handles", None)?;
+            let entry = s.tag_get(&handles_ns, &tag_key)?;
+            s.blob_get(&entry.kappa)
+        }).await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        (StatusCode::OK, [("content-type", "application/json")], result).into_response(cx)
+    })
+}
+
+// -- Handle reverse lookup by anchor ----------------------------------------
+
+fn handle_by_anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let anchor = path_param(cx, "anchor");
+        let s = store(cx).clone();
+        let anchor_owned = anchor.to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let handles_ns = s.namespace_resolve("_handles", None)?;
+            let reverse_key = format!("anchor:{}", anchor_owned);
+            let entry = s.tag_get(&handles_ns, &reverse_key)?;
+            let blob = s.blob_get(&entry.kappa)?;
+            let handle_keys = String::from_utf8(blob).unwrap_or_default();
+
+            let mut handles: Vec<serde_json::Value> = Vec::new();
+            for key in handle_keys.split(',') {
+                if let Ok(he) = s.tag_get(&handles_ns, key) {
+                    if let Ok(data) = s.blob_get(&he.kappa) {
+                        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&data) {
+                            handles.push(record);
+                        }
+                    }
+                }
+            }
+            Ok::<Vec<serde_json::Value>, kappa_core::types::StoreError>(handles)
+        }).await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        let resp = serde_json::json!({"handles": result});
+        (StatusCode::OK, [("content-type", "application/json")],
+         serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+    })
+}
+
+// -- Handle DELETE ----------------------------------------------------------
+
+fn handle_delete_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let _ = body;
+        let protocol = path_param(cx, "protocol");
+        let handle = path_param(cx, "handle");
+        let s = store(cx).clone();
+        let tag_key = format!("handle:{}:{}", protocol, handle);
+
+        tokio::task::spawn_blocking(move || {
+            let handles_ns = s.namespace_resolve("_handles", None)?;
+            s.tag_delete(&handles_ns, &tag_key)?;
+            Ok::<(), kappa_core::types::StoreError>(())
+        }).await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(store_err)?;
+
+        StatusCode::NO_CONTENT.into_response(cx)
     })
 }
 
@@ -752,5 +1212,66 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
             Method::POST,
             Cow::Borrowed(Path::new("/identity/anchor")),
             anchor_handler,
+        ))
+        // Identity binding endpoints
+        .route(RouteFn::new(
+            Method::POST,
+            Cow::Borrowed(Path::new("/identity/binding")),
+            binding_put_handler,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            Cow::Borrowed(Path::new("/identity/binding")),
+            binding_delete_handler,
+        ))
+        // binding/asserter/{anchor} must be registered before binding/{source}
+        // because "asserter" is a literal prefix, not a param value
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/binding/asserter/{anchor}")),
+            binding_list_by_asserter_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/binding/{source}")),
+            binding_get_handler,
+        ))
+        // Identity succession endpoints
+        .route(RouteFn::new(
+            Method::POST,
+            Cow::Borrowed(Path::new("/identity/succession")),
+            succession_put_handler,
+        ))
+        // succession/{anchor}/chain must be registered before succession/{anchor}
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/succession/{anchor}/chain")),
+            succession_chain_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/succession/{anchor}")),
+            succession_resolve_handler,
+        ))
+        // Handle registry endpoints
+        .route(RouteFn::new(
+            Method::POST,
+            Cow::Borrowed(Path::new("/identity/handle/claim")),
+            handle_claim_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/anchor/{anchor}/handles")),
+            handle_by_anchor_handler,
+        ))
+        .route(RouteFn::new(
+            Method::DELETE,
+            Cow::Borrowed(Path::new("/identity/handle/{protocol}/{handle}")),
+            handle_delete_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/identity/handle/{protocol}/{handle}")),
+            handle_get_handler,
         ))
 }

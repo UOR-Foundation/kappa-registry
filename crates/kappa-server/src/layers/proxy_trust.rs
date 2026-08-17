@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 
-use topcoat::context::{try_app_context, CxBuilder};
+use topcoat::context::{try_app_context, Cx};
 use topcoat::router::{Body, Next};
 
 #[derive(Clone, Debug)]
@@ -16,13 +16,13 @@ pub struct ProxyTrustConfig {
 }
 
 pub fn proxy_trust_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
         let config = try_app_context::<ProxyTrustConfig>(cx);
-        let hdrs = topcoat::router::headers(cx);
+        let hdrs = topcoat::router::request::headers(cx);
 
         let ip = match config.and_then(|c| c.trusted_header.as_deref()) {
             Some("x-forwarded-for") => hdrs
@@ -60,7 +60,7 @@ pub fn proxy_trust_layer<'a>(
             _ => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         };
 
-        cx.insert(ClientIp(ip));
-        next.run(cx, body).await
+        let cx = cx.with(ClientIp(ip));
+        next.run(&cx, body).await
     })
 }

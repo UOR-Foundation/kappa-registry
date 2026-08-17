@@ -3,14 +3,15 @@
 
 use std::sync::Arc;
 
-use topcoat::context::{try_app_context, CxBuilder};
-use topcoat::router::{Body, Next, Response};
+use topcoat::context::{try_app_context, Cx};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, Next};
 
 use super::proxy_trust::ClientIp;
 use crate::ratelimit::{attach_headers, classify_request, TieredRateLimiter};
 
 pub fn rate_limit_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {
@@ -19,8 +20,8 @@ pub fn rate_limit_layer<'a>(
             let ip = try_app_context::<ClientIp>(cx)
                 .map(|c| c.0)
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-            let uri_path = topcoat::router::uri(cx).path();
-            let method = topcoat::router::method(cx);
+            let uri_path = topcoat::router::request::uri(cx).path();
+            let method = topcoat::router::request::method(cx);
             let op_class = classify_request(method.as_str(), uri_path);
             match limiter.check(ip, op_class) {
                 Ok(snap) => snap,

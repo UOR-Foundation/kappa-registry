@@ -11,10 +11,12 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use topcoat::context::{try_app_context, Cx};
 use topcoat::router::error::bad_request;
-use topcoat::router::{headers, Body, IntoResponse, Response, RouteFuture, StatusCode};
+use topcoat::router::request::headers;
+use topcoat::router::response::{IntoResponse, Response};
+use topcoat::router::{Body, RouteFuture, StatusCode};
 
 use kappa_core::kappa::{kappa_from_bytes, verify_kappa, KappaLabel};
-use kappa_core::types::{Edge, EdgeRelation, EpochMutation, MutationOp};
+use kappa_core::types::{Edge, EdgeRelation, EpochMutation, MutationOp, NamespaceRef};
 
 use crate::blob::{DiskPressure, STREAM_CHUNK_SIZE};
 use crate::{path_param, query_param, query_params_multi, read_body, store};
@@ -22,48 +24,48 @@ use crate::{path_param, query_param, query_params_multi, read_body, store};
 pub fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let reference = path_param(cx, "reference");
         let ct = headers(cx)
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/vnd.oci.image.manifest.v1+json");
-        manifest_put(cx, ns, reference, ct, &bytes).await
+        manifest_put(cx, &ns, reference, ct, &bytes).await
     })
 }
 
 pub fn get_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let reference = path_param(cx, "reference");
-        manifest_get(cx, ns, reference).await
+        manifest_get(cx, &ns, reference).await
     })
 }
 
 pub fn head_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let reference = path_param(cx, "reference");
-        manifest_head(cx, ns, reference).await
+        manifest_head(cx, &ns, reference).await
     })
 }
 
 pub fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let reference = path_param(cx, "reference");
-        manifest_delete(cx, ns, reference).await
+        manifest_delete(cx, &ns, reference).await
     })
 }
 
 pub fn tag_list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
-        tag_list(cx, ns).await
+        let ns = crate::resolve_ns_read_async(cx).await?;
+        tag_list(cx, &ns).await
     })
 }
 
@@ -94,7 +96,7 @@ fn looks_like_bad_digest(reference: &str) -> bool {
 
 async fn manifest_put(
     cx: &Cx,
-    ns: &str,
+    ns: &NamespaceRef,
     reference: &str,
     content_type: &str,
     body: &[u8],
@@ -145,9 +147,6 @@ async fn manifest_put(
         (reference.to_string(), false)
     } else {
         // Reject references that look like digests but fail validation.
-        // A reference with a known algorithm prefix and colon is a malformed
-        // digest, not a tag name. Without this check, "sha256:INVALID" would
-        // be stored as a tag named "sha256:INVALID" instead of rejected.
         if looks_like_bad_digest(reference) {
             return crate::oci_error(
                 StatusCode::BAD_REQUEST,
@@ -164,7 +163,7 @@ async fn manifest_put(
     let content = body.to_vec();
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.blob_put(&k, &content)
+        move || s.ingest_verified(&k,&content)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -186,7 +185,7 @@ async fn manifest_put(
     // Store object-type metadata on the blob (global + namespace-indexed)
     {
         let k = kappa.clone();
-        let n = ns.to_string();
+        let n = ns.clone();
         tokio::task::spawn_blocking({
             let s = s.clone();
             move || {
@@ -205,7 +204,7 @@ async fn manifest_put(
 
     // Bind tag if reference is a tag name
     if is_tag {
-        let n = ns.to_string();
+        let n = ns.clone();
         let r = reference.to_string();
         let k = kappa.clone();
         tokio::task::spawn_blocking({
@@ -217,7 +216,7 @@ async fn manifest_put(
         .map_err(crate::store_err)?;
         tag_mutations.push(EpochMutation {
             op: MutationOp::TagSet,
-            namespace: ns.to_string(),
+            namespace: ns.as_str().to_string(),
             tag_name: reference.to_string(),
             old_kappa: None,
             new_kappa: Some(kappa.clone()),
@@ -226,7 +225,7 @@ async fn manifest_put(
 
     // Multi-tag bind via ?tag= query params (OCI tag parameter extension)
     for extra_tag in &extra_tags {
-        let n = ns.to_string();
+        let n = ns.clone();
         let k = kappa.clone();
         let t = extra_tag.clone();
         tokio::task::spawn_blocking({
@@ -238,7 +237,7 @@ async fn manifest_put(
         .map_err(crate::store_err)?;
         tag_mutations.push(EpochMutation {
             op: MutationOp::TagSet,
-            namespace: ns.to_string(),
+            namespace: ns.as_str().to_string(),
             tag_name: extra_tag.clone(),
             old_kappa: None,
             new_kappa: Some(kappa.clone()),
@@ -247,7 +246,7 @@ async fn manifest_put(
 
     // ONE epoch for all tag mutations in this manifest PUT
     if !tag_mutations.is_empty() {
-        let n = ns.to_string();
+        let n = ns.clone();
         let mutation_count = tag_mutations.len();
         tokio::task::spawn_blocking({
             let s = s.clone();
@@ -273,7 +272,7 @@ async fn manifest_put(
             value_kappa: None,
             metadata: None,
         };
-        let n = ns.to_string();
+        let n = ns.clone();
         let _ = tokio::task::spawn_blocking({
             let s = s.clone();
             move || s.edge_put(&n, &edge)
@@ -292,7 +291,7 @@ async fn manifest_put(
         .insert("docker-content-digest", kappa.parse().unwrap());
     response.headers_mut().insert(
         "location",
-        format!("/v2/{}/manifests/{}", ns, kappa).parse().unwrap(),
+        format!("/v2/{}/manifests/{}", ns.as_str(), kappa).parse().unwrap(),
     );
     response
         .headers_mut()
@@ -314,14 +313,14 @@ async fn manifest_put(
 
 // -- GET ----------------------------------------------------------------------
 
-async fn manifest_get(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Response> {
+async fn manifest_get(cx: &Cx, ns: &NamespaceRef, reference: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
 
     // Resolve reference: digest -> use directly, tag -> tag_get
     let kappa = if is_digest(reference) {
         reference.to_string()
     } else {
-        let n = ns.to_string();
+        let n = ns.clone();
         let r = reference.to_string();
         tokio::task::spawn_blocking({
             let s = s.clone();
@@ -355,7 +354,7 @@ async fn manifest_get(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Res
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
-    let file = tokio::task::spawn_blocking({
+    let reader = tokio::task::spawn_blocking({
         let s = s.clone();
         let k = kappa.clone();
         move || s.blob_open(&k)
@@ -364,8 +363,27 @@ async fn manifest_get(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Res
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(crate::store_err)?;
 
-    let async_file = tokio::fs::File::from_std(file);
-    let stream = tokio_util::io::ReaderStream::with_capacity(async_file, STREAM_CHUNK_SIZE);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut reader = reader;
+        let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body_stream = StreamBody::new(stream.map(|r| r.map(|b| Frame::data(b)).map_err(|e| {
         Box::new(e) as Box<dyn std::error::Error + Send + Sync>
     })));
@@ -383,13 +401,13 @@ async fn manifest_get(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Res
 
 // -- HEAD ---------------------------------------------------------------------
 
-async fn manifest_head(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Response> {
+async fn manifest_head(cx: &Cx, ns: &NamespaceRef, reference: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
 
     let kappa = if is_digest(reference) {
         reference.to_string()
     } else {
-        let n = ns.to_string();
+        let n = ns.clone();
         let r = reference.to_string();
         tokio::task::spawn_blocking({
             let s = s.clone();
@@ -436,12 +454,12 @@ async fn manifest_head(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Re
 
 // -- DELETE -------------------------------------------------------------------
 
-async fn manifest_delete(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<Response> {
+async fn manifest_delete(cx: &Cx, ns: &NamespaceRef, reference: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
 
     if is_digest(reference) {
         // Delete by digest: find all tags pointing to this digest and delete them
-        let n = ns.to_string();
+        let n = ns.clone();
         let digest = reference.to_string();
         let tags = tokio::task::spawn_blocking({
             let s = s.clone();
@@ -466,7 +484,7 @@ async fn manifest_delete(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<
             .iter()
             .map(|t| EpochMutation {
                 op: MutationOp::TagDelete,
-                namespace: ns.to_string(),
+                namespace: ns.as_str().to_string(),
                 tag_name: t.clone(),
                 old_kappa: Some(digest.clone()),
                 new_kappa: None,
@@ -475,7 +493,7 @@ async fn manifest_delete(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<
 
         tokio::task::spawn_blocking({
             let s = s.clone();
-            let n = ns.to_string();
+            let n = ns.clone();
             let d = reference.to_string();
             let tags_owned = tags;
             move || {
@@ -498,7 +516,7 @@ async fn manifest_delete(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<
     }
 
     // Delete by tag name
-    let n = ns.to_string();
+    let n = ns.clone();
     let tag = reference.to_string();
     tokio::task::spawn_blocking({
         let s = s.clone();
@@ -509,7 +527,7 @@ async fn manifest_delete(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<
                 &n,
                 vec![EpochMutation {
                     op: MutationOp::TagDelete,
-                    namespace: n.clone(),
+                    namespace: n.as_str().to_string(),
                     tag_name: tag,
                     old_kappa: None,
                     new_kappa: None,
@@ -527,9 +545,9 @@ async fn manifest_delete(cx: &Cx, ns: &str, reference: &str) -> topcoat::Result<
 
 // -- TAG LIST -----------------------------------------------------------------
 
-async fn tag_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
+async fn tag_list(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     let n_param: Option<usize> = query_param(cx, "n").and_then(|s| s.parse().ok());
     let last_param: Option<String> = query_param(cx, "last");
@@ -538,7 +556,7 @@ async fn tag_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
     let before_param: Option<String> = query_param(cx, "before");
 
     if n_param == Some(0) {
-        let body = serde_json::json!({"name": ns, "tags": []});
+        let body = serde_json::json!({"name": ns.as_str(), "tags": []});
         return (
             StatusCode::OK,
             [("content-type", "application/json".to_string())],
@@ -597,12 +615,12 @@ async fn tag_list(cx: &Cx, ns: &str) -> topcoat::Result<Response> {
         false
     };
 
-    let body = serde_json::json!({"name": ns, "tags": tag_names});
+    let body = serde_json::json!({"name": ns.as_str(), "tags": tag_names});
     let json_body = serde_json::to_string(&body).unwrap_or_default();
 
     if has_more {
         if let Some(last_tag) = tag_names.last() {
-            let link = format!("</v2/{}/tags/list?last={}>; rel=\"next\"", ns, last_tag);
+            let link = format!("</v2/{}/tags/list?last={}>; rel=\"next\"", ns.as_str(), last_tag);
             return (
                 StatusCode::OK,
                 [

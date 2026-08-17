@@ -11,7 +11,11 @@ members = [
     "crates/kappa-akd",
     "crates/kappa-reconcile",
     "crates/kappa-transport-veilid",
+    "crates/kappa-module-git",
+    "crates/kappa-module-s3",
+    "crates/kappa-module-nix",
     "crates/kappa-conformance",
+    "crates/kappa-module-atproto",
 ]
 
 [workspace.package]
@@ -65,7 +69,7 @@ tracing = "0.1"
 http = "1"
 
 # HTTP framework
-topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance", features = ["router", "serve", "tower", "websocket"] }
+topcoat = { git = "https://github.com/usrbinkat/topcoat", branch = "usrbinkat/feat/trailing-slash-tolerance-v2", features = ["router", "serve", "tower", "websocket", "outbound"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }

@@ -212,8 +212,14 @@ pub fn decode(
     let flags = data[5];
     let entry_count = u32::from_be_bytes([data[6], data[7], data[8], data[9]]) as usize;
 
+    // Clamp allocation to prevent remote abort from attacker-controlled
+    // entry_count. Minimum full entry is 1 (type) + 2 (kappa_len) + 45
+    // (shortest kappa) + 8 (content_len) + 0 (empty content) = 56 bytes.
+    let max_entries = payload.len() / 56;
+    let clamped = entry_count.min(max_entries);
+
     let mut pos = 10;
-    let mut entries = Vec::with_capacity(entry_count);
+    let mut entries = Vec::with_capacity(clamped);
     let mut index: HashMap<String, Vec<u8>> = HashMap::new();
     let mut total_bytes: usize = 0;
 

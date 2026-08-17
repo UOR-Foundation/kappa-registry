@@ -7,7 +7,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use crate::store::KappaStore;
-use crate::types::StoreError;
+use crate::types::{NamespaceRef, StoreError};
 
 /// Result of a GC sweep.
 #[derive(Debug, Clone)]
@@ -56,17 +56,23 @@ pub fn compute_reachable(
 /// is retained. Everything else is eligible for collection.
 pub fn build_root_set(store: &dyn KappaStore) -> Result<Vec<String>, StoreError> {
     let mut roots = Vec::new();
-    let namespaces = store.namespace_list()?;
+    let namespaces = store.namespace_list(None)?;
 
-    for ns in &namespaces {
+    for record in &namespaces {
+        let uuid = hex::decode(&record.uuid_hex).unwrap_or_default();
+        if uuid.len() != 16 { continue; }
+        let mut uuid_arr = [0u8; 16];
+        uuid_arr.copy_from_slice(&uuid);
+        let name = record.aliases.first().cloned().unwrap_or_default();
+        let ns_ref = NamespaceRef::with_name(uuid_arr, name);
         // All tagged kappas are roots (live name bindings)
-        let tags = store.tag_list(ns)?;
+        let tags = store.tag_list(&ns_ref)?;
         for tag in &tags {
             roots.push(tag.kappa.clone());
         }
 
         // Walk the epoch chain: current -> prev -> prev -> ...
-        let mut epoch_kappa = store.epoch_current(ns)?;
+        let mut epoch_kappa = store.epoch_current(&ns_ref)?;
         while let Some(ref ek) = epoch_kappa {
             roots.push(ek.clone());
             match store.epoch_get(ek) {
@@ -169,19 +175,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
         let store = InMemoryStore::new(
-            MemoryStoreConfig {
-                blob_root: tmp.path().join("blobs"),
-            },
+            MemoryStoreConfig::new(tmp.path().join("blobs")),
             clock,
         )
         .unwrap();
 
+        let ns = NamespaceRef::deterministic("ns");
         let content = b"content-a";
         let k = kappa_from_bytes(content);
-        store.blob_put(&k, content).unwrap();
-        store.tag_set("ns", "latest", &k).unwrap();
+        store.ingest_verified(&k, content).unwrap();
+        store.tag_set(&ns, "latest", &k).unwrap();
 
-        let epoch_k = store.epoch_advance("ns", vec![]).unwrap();
+        let epoch_k = store.epoch_advance(&ns, vec![]).unwrap();
 
         let roots = build_root_set(&store).unwrap();
         assert!(roots.contains(&k));
@@ -197,21 +202,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
         let store = InMemoryStore::new(
-            MemoryStoreConfig {
-                blob_root: tmp.path().join("blobs"),
-            },
+            MemoryStoreConfig::new(tmp.path().join("blobs")),
             clock,
         )
         .unwrap();
 
+        let ns = NamespaceRef::deterministic("ns");
         let tagged_content = b"tagged-content";
         let tagged_k = kappa_from_bytes(tagged_content);
         let orphan_content = b"orphan-content";
         let orphan_k = kappa_from_bytes(orphan_content);
 
-        store.blob_put(&tagged_k, tagged_content).unwrap();
-        store.blob_put(&orphan_k, orphan_content).unwrap();
-        store.tag_set("ns", "keep", &tagged_k).unwrap();
+        store.ingest_verified(&tagged_k, tagged_content).unwrap();
+        store.ingest_verified(&orphan_k, orphan_content).unwrap();
+        store.tag_set(&ns, "keep", &tagged_k).unwrap();
 
         let result = sweep(&store, &|_| vec![]).unwrap();
         assert!(result.objects_collected >= 1);
@@ -228,13 +232,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
         let store = InMemoryStore::new(
-            MemoryStoreConfig {
-                blob_root: tmp.path().join("blobs"),
-            },
+            MemoryStoreConfig::new(tmp.path().join("blobs")),
             clock,
         )
         .unwrap();
 
+        let ns = NamespaceRef::deterministic("ns");
         let root_content = b"root-content";
         let root_k = kappa_from_bytes(root_content);
         let child_content = b"child-content";
@@ -242,10 +245,10 @@ mod tests {
         let orphan_content = b"orphan-content-edge";
         let orphan_k = kappa_from_bytes(orphan_content);
 
-        store.blob_put(&root_k, root_content).unwrap();
-        store.blob_put(&child_k, child_content).unwrap();
-        store.blob_put(&orphan_k, orphan_content).unwrap();
-        store.tag_set("ns", "entry", &root_k).unwrap();
+        store.ingest_verified(&root_k, root_content).unwrap();
+        store.ingest_verified(&child_k, child_content).unwrap();
+        store.ingest_verified(&orphan_k, orphan_content).unwrap();
+        store.tag_set(&ns, "entry", &root_k).unwrap();
 
         let root_k_clone = root_k.clone();
         let child_k_clone = child_k.clone();

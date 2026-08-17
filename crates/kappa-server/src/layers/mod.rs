@@ -1,11 +1,9 @@
 //! Network data path layers.
-//!
-//! Warning header is a response hook on the Router, not a layer.
-//! See main.rs kappa_warning_header().
 
 pub mod auth;
 pub mod body_limit;
 pub mod cache;
+pub mod namespace;
 pub mod cors;
 pub mod proxy_trust;
 pub mod rate_limit;
@@ -13,7 +11,10 @@ pub mod request_id;
 pub mod request_log;
 pub mod response_compliance;
 pub mod security_headers;
+#[cfg(feature = "s3")]
+pub mod sigv4;
 pub mod timeout;
+pub mod warning;
 
 pub use auth::auth_layer;
 pub use body_limit::{body_limit_layer, MaxApiBodyBytes};
@@ -26,3 +27,4 @@ pub use request_log::request_log_layer;
 pub use response_compliance::response_compliance_layer;
 pub use security_headers::{security_headers_layer, TlsEnabled};
 pub use timeout::{timeout_layer, RequestTimeout};
+pub use warning::warning_layer;

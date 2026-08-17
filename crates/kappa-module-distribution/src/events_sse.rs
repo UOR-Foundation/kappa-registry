@@ -10,13 +10,15 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use topcoat::context::{try_app_context, Cx};
+use topcoat::router::response::Response;
 use topcoat::router::{
-    Body, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_core::events::EventLog;
+use kappa_core::types::NamespaceRef;
 
-use crate::{path_param, query_param};
+use crate::query_param;
 
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder.route(RouteFn::new(
@@ -29,17 +31,17 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn events_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let prefix = query_param(cx, "prefix");
         let since: u64 = query_param(cx, "since")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        events(cx, ns, prefix.as_deref(), since).await
+        events(cx, &ns, prefix.as_deref(), since).await
     })
 }
 
-async fn events(cx: &Cx, ns: &str, prefix: Option<&str>, since: u64) -> topcoat::Result<Response> {
-    let n = ns.to_string();
+async fn events(cx: &Cx, ns: &NamespaceRef, prefix: Option<&str>, since: u64) -> topcoat::Result<Response> {
+    let n = ns.clone();
     let pfx = prefix.map(String::from);
 
     // Access the EventLog from app_context. kappa-server registers
@@ -47,8 +49,9 @@ async fn events(cx: &Cx, ns: &str, prefix: Option<&str>, since: u64) -> topcoat:
     // If no EventLog is registered, fall back to tag-state reconstruction.
     let sse_body = if let Some(event_log) = try_app_context::<Arc<dyn EventLog>>(cx) {
         let log = event_log.clone();
+        let ns_str = ns.as_str().to_string();
         tokio::task::spawn_blocking(move || {
-            let events = log.since_sequence(&n, since);
+            let events = log.since_sequence(&ns_str, since);
             let mut output = String::new();
             for event in &events {
                 if let Some(ref p) = pfx {
@@ -91,7 +94,7 @@ async fn events(cx: &Cx, ns: &str, prefix: Option<&str>, since: u64) -> topcoat:
                 }
                 output.push_str(&format!(
                     "event: tag_set\nid: {}\ndata: {{\"namespace\":\"{}\",\"name\":\"{}\",\"kappa\":\"{}\"}}\n\n",
-                    seq, n, tag.name, tag.kappa
+                    seq, n.as_str(), tag.name, tag.kappa
                 ));
             }
             output

@@ -6,13 +6,14 @@ use std::borrow::Cow;
 
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
+use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
-    Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
-use kappa_core::types::{Direction, EdgeQuery};
+use kappa_core::types::{Direction, EdgeQuery, NamespaceRef};
 
-use crate::{path_param, read_body, store};
+use crate::{read_body, store};
 
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     builder.route(RouteFn::new(
@@ -25,8 +26,8 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn cascade_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        cascade(cx, ns, &bytes).await
+        let ns = crate::resolve_ns_write_async(cx).await?;
+        cascade(cx, &ns, &bytes).await
     })
 }
 
@@ -37,7 +38,7 @@ fn cascade_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 /// then deletes every blob in the reachable set along with its tags
 /// and edges. This is the inverse of GC -- GC retains reachable, cascade
 /// deletes reachable.
-async fn cascade(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn cascade(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let roots: Vec<String> = v["roots"]
@@ -54,7 +55,7 @@ async fn cascade(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
     }
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     let report = tokio::task::spawn_blocking(move || {
         // Compute reachable set from roots

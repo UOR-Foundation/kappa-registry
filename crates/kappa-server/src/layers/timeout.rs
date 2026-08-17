@@ -2,14 +2,15 @@
 
 use std::time::Duration;
 
-use topcoat::context::{try_app_context, CxBuilder};
-use topcoat::router::{Body, Next, Response, StatusCode};
+use topcoat::context::{try_app_context, Cx};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, Next, StatusCode};
 
 #[derive(Clone)]
 pub struct RequestTimeout(pub Duration);
 
 pub fn timeout_layer<'a>(
-    cx: &'a mut CxBuilder,
+    cx: &'a Cx,
     body: Body,
     next: Next<'a>,
 ) -> topcoat::router::LayerFuture<'a> {

@@ -87,8 +87,14 @@ impl EpochRoot {
         self
     }
 
+    /// Storage address of this epoch root: hash(serialized_leaf_bytes).
+    ///
+    /// The Merkle root is a FIELD inside the epoch (self.root_hash),
+    /// not the storage address. The invariant hash(bytes_on_disk) ==
+    /// storage_address requires the kappa to be hash(to_leaf_bytes()).
+    /// The Merkle root is verifiable by recomputing from the leaves.
     pub fn kappa(&self) -> String {
-        kappa_from_bytes(&self.root_hash)
+        kappa_from_bytes(&self.to_leaf_bytes())
     }
 
     /// Serialize the epoch root into a recoverable byte format.

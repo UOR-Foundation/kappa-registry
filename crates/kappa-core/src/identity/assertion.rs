@@ -84,41 +84,43 @@ pub fn assert_double_entry(
     assertion_a: &IdentityAssertion,
     assertion_b: &IdentityAssertion,
 ) -> Result<(String, String), crate::types::StoreError> {
+    use crate::types::NamespaceRef;
+
     let bytes_a = crate::canonical::canonical_bytes(assertion_a);
     let kappa_a = crate::kappa::kappa_from_bytes(&bytes_a);
     let bytes_b = crate::canonical::canonical_bytes(assertion_b);
     let kappa_b = crate::kappa::kappa_from_bytes(&bytes_b);
 
-    let ns_a = &assertion_a.asserter;
-    let ns_b = &assertion_b.asserter;
+    let ns_a = NamespaceRef::deterministic(&assertion_a.asserter);
+    let ns_b = NamespaceRef::deterministic(&assertion_b.asserter);
 
     // Store both blobs
-    store.blob_put(&kappa_a, &bytes_a)?;
-    store.blob_put(&kappa_b, &bytes_b)?;
+    store.ingest_verified(&kappa_a, &bytes_a)?;
+    store.ingest_verified(&kappa_b, &bytes_b)?;
 
     // Tag both under their asserter namespaces
-    store.tag_set(ns_a, &format!("assertion/{}", kappa_a), &kappa_a)?;
-    store.tag_set(ns_b, &format!("assertion/{}", kappa_b), &kappa_b)?;
+    store.tag_set(&ns_a, &format!("assertion/{}", kappa_a), &kappa_a)?;
+    store.tag_set(&ns_b, &format!("assertion/{}", kappa_b), &kappa_b)?;
 
     // Edge: Assertion relation for both
     store.edge_put(
-        ns_a,
+        &ns_a,
         &crate::types::Edge {
-            source: ns_a.clone(),
+            source: assertion_a.asserter.clone(),
             target: assertion_a.subject.clone(),
             relation: crate::types::EdgeRelation::Assertion,
-            asserter: ns_a.clone(),
+            asserter: assertion_a.asserter.clone(),
             value_kappa: Some(kappa_a.clone()),
             metadata: None,
         },
     )?;
     store.edge_put(
-        ns_b,
+        &ns_b,
         &crate::types::Edge {
-            source: ns_b.clone(),
+            source: assertion_b.asserter.clone(),
             target: assertion_b.subject.clone(),
             relation: crate::types::EdgeRelation::Assertion,
-            asserter: ns_b.clone(),
+            asserter: assertion_b.asserter.clone(),
             value_kappa: Some(kappa_b.clone()),
             metadata: None,
         },
@@ -126,18 +128,18 @@ pub fn assert_double_entry(
 
     // ONE epoch advance with BOTH mutations
     store.epoch_advance(
-        ns_a,
+        &ns_a,
         vec![
             crate::types::EpochMutation {
                 op: crate::types::MutationOp::AssertionPublish,
-                namespace: ns_a.clone(),
+                namespace: assertion_a.asserter.clone(),
                 tag_name: format!("assertion/{}", kappa_a),
                 old_kappa: None,
                 new_kappa: Some(kappa_a.clone()),
             },
             crate::types::EpochMutation {
                 op: crate::types::MutationOp::AssertionPublish,
-                namespace: ns_b.clone(),
+                namespace: assertion_b.asserter.clone(),
                 tag_name: format!("assertion/{}", kappa_b),
                 old_kappa: None,
                 new_kappa: Some(kappa_b.clone()),
@@ -203,14 +205,13 @@ mod tests {
         use crate::clock::ntp_lamport::NtpLamportClock;
         use crate::store::memory::{InMemoryStore, MemoryStoreConfig};
         use crate::store::KappaStore;
+        use crate::types::NamespaceRef;
         use std::sync::Arc;
 
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
         let store = InMemoryStore::new(
-            MemoryStoreConfig {
-                blob_root: tmp.path().join("blobs"),
-            },
+            MemoryStoreConfig::new(tmp.path().join("blobs")),
             clock,
         )
         .unwrap();
@@ -244,7 +245,8 @@ mod tests {
         assert!(store.blob_exists(&kb).unwrap());
 
         // Asserter-a namespace has exactly one epoch (the double-entry)
-        let epoch_kappa = store.epoch_current("asserter-a").unwrap();
+        let ns_a = NamespaceRef::deterministic("asserter-a");
+        let epoch_kappa = store.epoch_current(&ns_a).unwrap();
         assert!(epoch_kappa.is_some());
         let epoch = store.epoch_get(epoch_kappa.as_ref().unwrap()).unwrap();
         assert_eq!(epoch.epoch_number, 1, "one epoch, not two");

@@ -22,7 +22,8 @@ use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 
 use http::header::HeaderValue;
-use topcoat::router::{Body, Response, StatusCode};
+use topcoat::router::response::Response;
+use topcoat::router::{Body, StatusCode};
 
 use crate::config::{ClassConfig, RateLimitConfig};
 
@@ -41,6 +42,13 @@ pub enum OpClass {
     Write,
     /// Administrative operations: DELETE, GC, transactions, reconcile, cascade.
     Admin,
+}
+
+impl OpClass {
+    /// Whether this operation class modifies state.
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::Write | Self::Admin)
+    }
 }
 
 /// Result of a rate limit check on a successful (non-rejected) request.

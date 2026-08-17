@@ -26,6 +26,16 @@ impl ServerGuard {
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        // Capture stderr to see any panic messages from the server
+        if let Some(stderr) = self.child.stderr.take() {
+            use std::io::Read;
+            let mut buf = String::new();
+            let mut stderr = stderr;
+            let _ = stderr.read_to_string(&mut buf);
+            if !buf.is_empty() {
+                eprintln!("--- server stderr ---\n{}\n--- end server stderr ---", buf);
+            }
+        }
         let _ = self.child.wait();
     }
 }
@@ -46,7 +56,7 @@ fn start_server() -> (ServerGuard, String) {
         .env("KAPPA_RATELIMIT_ADMIN_PERIOD_MS", "0")
         .env("RUST_LOG", "error")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start kappa-server");
 
@@ -309,6 +319,14 @@ fn test_sequence_next() {
 #[test]
 fn test_namespace_root() {
     let (guard, base) = start_server();
+    // Create namespace first
+    let content = br#"{"schemaVersion":2}"#;
+    client()
+        .put(format!("{}/v2/test/manifests/setup", base))
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(content.to_vec())
+        .send()
+        .unwrap();
     let resp = client()
         .get(format!("{}/v2/test/_root", base))
         .send()
@@ -375,6 +393,13 @@ fn test_gc_sweep() {
 #[test]
 fn test_events_sse() {
     let (guard, base) = start_server();
+    // Create namespace first
+    client()
+        .put(format!("{}/v2/test/manifests/setup", base))
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(br#"{"schemaVersion":2}"#.to_vec())
+        .send()
+        .unwrap();
     let resp = client()
         .get(format!("{}/v2/test/_events", base))
         .send()

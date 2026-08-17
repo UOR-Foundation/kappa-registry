@@ -13,11 +13,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{broadcast, RwLock};
 use topcoat::context::{app_context, Cx};
-use topcoat::router::FromRequest;
+use topcoat::router::request::FromRequest;
 use topcoat::router::{Body, RouteFuture};
-use topcoat::router::websocket::{Message, WebSocketUpgrade};
+use topcoat::router::content::websocket::{Message, WebSocketUpgrade};
 
 use kappa_core::store::KappaStore;
+use kappa_core::types::NamespaceRef;
 
 use crate::path_param;
 
@@ -41,8 +42,8 @@ impl CrdtManager {
         }
     }
 
-    pub async fn join(&self, ns: &str, doc: &str) -> (broadcast::Receiver<Bytes>, Vec<u8>) {
-        let key = format!("{}/{}", ns, doc);
+    pub async fn join(&self, ns: &NamespaceRef, doc: &str) -> (broadcast::Receiver<Bytes>, Vec<u8>) {
+        let key = format!("{}/{}", ns.as_str(), doc);
         let mut rooms = self.rooms.write().await;
         let room = rooms.entry(key.clone()).or_insert_with(|| {
             let state = self.load_state(ns, doc).unwrap_or_default();
@@ -59,8 +60,8 @@ impl CrdtManager {
         (rx, state)
     }
 
-    pub async fn apply_update(&self, ns: &str, doc: &str, update: Bytes) {
-        let key = format!("{}/{}", ns, doc);
+    pub async fn apply_update(&self, ns: &NamespaceRef, doc: &str, update: Bytes) {
+        let key = format!("{}/{}", ns.as_str(), doc);
         let mut rooms = self.rooms.write().await;
         if let Some(room) = rooms.get_mut(&key) {
             room.state.extend_from_slice(&update);
@@ -68,8 +69,8 @@ impl CrdtManager {
         }
     }
 
-    pub async fn leave(&self, ns: &str, doc: &str) {
-        let key = format!("{}/{}", ns, doc);
+    pub async fn leave(&self, ns: &NamespaceRef, doc: &str) {
+        let key = format!("{}/{}", ns.as_str(), doc);
         let mut rooms = self.rooms.write().await;
         let should_remove = rooms
             .get_mut(&key)
@@ -85,16 +86,16 @@ impl CrdtManager {
         }
     }
 
-    fn save_state(&self, ns: &str, doc: &str, state: &[u8]) {
+    fn save_state(&self, ns: &NamespaceRef, doc: &str, state: &[u8]) {
         if state.is_empty() {
             return;
         }
         let kappa = kappa_core::kappa::kappa_from_bytes(state);
-        let _ = self.store.blob_put(&kappa, state);
+        let _ = self.store.ingest_verified(&kappa,state);
         let _ = self.store.tag_set(ns, &format!("_crdt/{}", doc), &kappa);
     }
 
-    fn load_state(&self, ns: &str, doc: &str) -> Option<Vec<u8>> {
+    fn load_state(&self, ns: &NamespaceRef, doc: &str) -> Option<Vec<u8>> {
         let tag = self
             .store
             .tag_get(ns, &format!("_crdt/{}", doc))
@@ -105,7 +106,7 @@ impl CrdtManager {
 
 pub fn ws_crdt_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
-        let ns = path_param(cx, "ns").to_string();
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let doc = path_param(cx, "doc").to_string();
         let crdt = app_context::<Arc<CrdtManager>>(cx).clone();
         let upgrade = WebSocketUpgrade::from_request(cx, body).await?;

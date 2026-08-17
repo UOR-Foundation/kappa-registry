@@ -9,13 +9,14 @@ use std::borrow::Cow;
 
 use topcoat::context::Cx;
 use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
-    Body, IntoResponse, Method, Path, Response, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_core::canonical::canonical_bytes;
 use kappa_core::kappa::kappa_from_bytes;
-use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation};
+use kappa_core::types::{DelegationScope, Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef};
 
 use crate::{path_param, query_param, read_body, store};
 
@@ -46,15 +47,15 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 fn put_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        put(cx, ns, &bytes).await
+        let ns = crate::resolve_ns_write_async(cx).await?;
+        put(cx, &ns, &bytes).await
     })
 }
 
 fn query_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_read_async(cx).await?;
         let anchor = path_param(cx, "edge_key");
         let direction_str = query_param(cx, "direction").unwrap_or_else(|| "outbound".to_string());
         let relation_str = query_param(cx, "relation");
@@ -62,7 +63,7 @@ fn query_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let last = query_param(cx, "last");
         query(
             cx,
-            ns,
+            &ns,
             anchor,
             &direction_str,
             relation_str.as_deref(),
@@ -76,21 +77,21 @@ fn query_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
 fn delete_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let _ = body;
-        let ns = path_param(cx, "ns");
+        let ns = crate::resolve_ns_write_async(cx).await?;
         let edge_kappa = path_param(cx, "edge_key");
-        delete(cx, ns, edge_kappa).await
+        delete(cx, &ns, edge_kappa).await
     })
 }
 
 fn diff_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let bytes = read_body(body).await?;
-        let ns = path_param(cx, "ns");
-        diff(cx, ns, &bytes).await
+        let ns = crate::resolve_ns_read_async(cx).await?;
+        diff(cx, &ns, &bytes).await
     })
 }
 
-async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let source = v["source"]
@@ -108,22 +109,29 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 
     let s = store(cx).clone();
 
-    // Source must exist
-    let src = source.to_string();
-    let exists = tokio::task::spawn_blocking({
-        let s = s.clone();
-        move || s.blob_exists(&src)
-    })
-    .await
-    .map_err(|e| bad_request(e.to_string()))?
-    .map_err(crate::store_err)?;
+    // Source must exist for content edges. Identity edges (Capability,
+    // Delegation, Assertion) reference anchor strings, not blob kappas.
+    let skip_source_check = matches!(
+        relation,
+        EdgeRelation::Capability | EdgeRelation::Delegation | EdgeRelation::Assertion
+    );
+    if !skip_source_check {
+        let src = source.to_string();
+        let exists = tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.blob_exists(&src)
+        })
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(crate::store_err)?;
 
-    if !exists {
-        return crate::error_response(
-            StatusCode::BAD_REQUEST,
-            "EDGE_SOURCE_ABSENT",
-            "source kappa does not exist",
-        );
+        if !exists {
+            return crate::error_response(
+                StatusCode::BAD_REQUEST,
+                "EDGE_SOURCE_ABSENT",
+                "source kappa does not exist",
+            );
+        }
     }
 
     let asserter = crate::registry_anchor(cx);
@@ -138,10 +146,100 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         metadata,
     };
 
+    // Delegation depth enforcement at creation time.
+    // When creating a Delegation edge, verify the delegator has remaining
+    // depth to re-delegate. Owners have unlimited depth.
+    if edge.relation == EdgeRelation::Delegation {
+        if let Some(ref meta) = edge.metadata {
+            if let Ok(scope) = serde_json::from_slice::<DelegationScope>(meta) {
+                let delegator = edge.source.clone();
+                let n = ns.clone();
+                let s2 = s.clone();
+                let depth_result = tokio::task::spawn_blocking(move || {
+                    // Check if delegator is the namespace owner
+                    if let Ok(info) = s2.namespace_info(n.as_str(), None) {
+                        if info.owner == delegator {
+                            return Ok(u32::MAX);
+                        }
+                    }
+                    // Check if delegator has _root capability (unlimited depth)
+                    if let Ok(root_ns) = s2.namespace_resolve("_root", None) {
+                        let root_query = EdgeQuery {
+                            anchor: delegator.clone(),
+                            direction: Direction::Outbound,
+                            relation: Some(EdgeRelation::Capability),
+                            asserter: Some(delegator.clone()),
+                        };
+                        if let Ok(caps) = s2.edge_query(&root_ns, &root_query) {
+                            if !caps.is_empty() {
+                                return Ok(u32::MAX);
+                            }
+                        }
+                        // Check _root delegation chain
+                        let root_del_query = EdgeQuery {
+                            anchor: delegator.clone(),
+                            direction: Direction::Inbound,
+                            relation: Some(EdgeRelation::Delegation),
+                            asserter: None,
+                        };
+                        if let Ok(del_edges) = s2.edge_query(&root_ns, &root_del_query) {
+                            for e in &del_edges {
+                                if let Some(ref m) = e.metadata {
+                                    if let Ok(parent_scope) = serde_json::from_slice::<DelegationScope>(m) {
+                                        // Has _root delegation — treat as unlimited
+                                        return Ok(u32::MAX.min(parent_scope.delegation_depth.saturating_add(1)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Find delegator's own delegation depth on the target namespace
+                    let query = EdgeQuery {
+                        anchor: delegator.clone(),
+                        direction: Direction::Inbound,
+                        relation: Some(EdgeRelation::Delegation),
+                        asserter: None,
+                    };
+                    if let Ok(edges) = s2.edge_query(&n, &query) {
+                        for e in &edges {
+                            if let Some(ref m) = e.metadata {
+                                if let Ok(parent_scope) = serde_json::from_slice::<DelegationScope>(m) {
+                                    return Ok(parent_scope.delegation_depth);
+                                }
+                            }
+                        }
+                    }
+                    Ok::<u32, kappa_core::StoreError>(0)
+                })
+                .await
+                .map_err(|e| bad_request(e.to_string()))?
+                .map_err(crate::store_err)?;
+
+                if depth_result == 0 {
+                    return crate::error_response(
+                        StatusCode::FORBIDDEN,
+                        "DELEGATION_DEPTH_EXCEEDED",
+                        "delegator has depth=0 and cannot re-delegate",
+                    );
+                }
+                if scope.delegation_depth >= depth_result {
+                    return crate::error_response(
+                        StatusCode::FORBIDDEN,
+                        "DELEGATION_DEPTH_EXCEEDED",
+                        &format!(
+                            "new delegation depth {} exceeds delegator remaining depth {}",
+                            scope.delegation_depth, depth_result - 1
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     // Compute the edge kappa for the response (same as store does internally)
     let edge_kappa = kappa_from_bytes(&canonical_bytes(&edge));
 
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || s.edge_put(&n, &edge)
@@ -152,7 +250,7 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 
     // Store object-type metadata (global + namespace-indexed)
     let ek = edge_kappa.clone();
-    let n = ns.to_string();
+    let n = ns.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || {
@@ -176,7 +274,7 @@ async fn put(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
 
 async fn query(
     cx: &Cx,
-    ns: &str,
+    ns: &NamespaceRef,
     anchor: &str,
     direction_str: &str,
     relation_str: Option<&str>,
@@ -187,7 +285,7 @@ async fn query(
     let relation = relation_str.and_then(EdgeRelation::parse);
 
     let s = store(cx).clone();
-    let ns_owned = ns.to_string();
+    let ns_owned = ns.clone();
 
     let mut edges = if is_both {
         let anchor_str = anchor.to_string();
@@ -273,10 +371,10 @@ async fn query(
         .into_response(cx)
 }
 
-async fn delete(cx: &Cx, ns: &str, edge_kappa: &str) -> topcoat::Result<Response> {
+async fn delete(cx: &Cx, ns: &NamespaceRef, edge_kappa: &str) -> topcoat::Result<Response> {
     let s = store(cx).clone();
     let ek = edge_kappa.to_string();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     // Read the edge blob to get (source, target, relation) for the new
     // edge_delete signature. The edge blob is the dCBOR canonical form
@@ -311,7 +409,7 @@ async fn delete(cx: &Cx, ns: &str, edge_kappa: &str) -> topcoat::Result<Response
     StatusCode::ACCEPTED.into_response(cx)
 }
 
-async fn diff(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn diff(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let have: Vec<String> = v["have"]
@@ -332,7 +430,7 @@ async fn diff(cx: &Cx, ns: &str, body: &[u8]) -> topcoat::Result<Response> {
         .unwrap_or_default();
 
     let s = store(cx).clone();
-    let n = ns.to_string();
+    let n = ns.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let mut have_set = std::collections::HashSet::new();

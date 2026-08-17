@@ -15,7 +15,9 @@ use crate::types::StoreError;
 ///     epoch chain blob persistence, SHA3-256/Keccak256 axes.
 /// v5: GC sweep with build_root_set, probe.rs, resolve_all_filtered,
 ///     event log compaction, federation config, membership state,
-///     watermark endpoint, FROST P-256/K-256 end-to-end verified.
+///     watermark endpoint, FROST P-256/K-256 end-to-end verified,
+///     VerifiedContent newtype, blob_get_verified, SigV4 verifier,
+///     DigestMismatch LabelError, bundle decode allocation clamp.
 pub const STORE_FORMAT_VERSION: u32 = 5;
 
 const VERSION_FILE: &str = "format_version";
