@@ -10,9 +10,7 @@ use std::borrow::Cow;
 use topcoat::context::Cx;
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::response::{IntoResponse, Response};
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use kappa_core::canonical::canonical_bytes;
 use kappa_core::kappa::kappa_from_bytes;
@@ -185,9 +183,12 @@ async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Respons
                         if let Ok(del_edges) = s2.edge_query(&root_ns, &root_del_query) {
                             for e in &del_edges {
                                 if let Some(ref m) = e.metadata {
-                                    if let Ok(parent_scope) = serde_json::from_slice::<DelegationScope>(m) {
+                                    if let Ok(parent_scope) =
+                                        serde_json::from_slice::<DelegationScope>(m)
+                                    {
                                         // Has _root delegation — treat as unlimited
-                                        return Ok(u32::MAX.min(parent_scope.delegation_depth.saturating_add(1)));
+                                        return Ok(u32::MAX
+                                            .min(parent_scope.delegation_depth.saturating_add(1)));
                                     }
                                 }
                             }
@@ -203,7 +204,9 @@ async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Respons
                     if let Ok(edges) = s2.edge_query(&n, &query) {
                         for e in &edges {
                             if let Some(ref m) = e.metadata {
-                                if let Ok(parent_scope) = serde_json::from_slice::<DelegationScope>(m) {
+                                if let Ok(parent_scope) =
+                                    serde_json::from_slice::<DelegationScope>(m)
+                                {
                                     return Ok(parent_scope.delegation_depth);
                                 }
                             }
@@ -228,7 +231,8 @@ async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Respons
                         "DELEGATION_DEPTH_EXCEEDED",
                         &format!(
                             "new delegation depth {} exceeds delegator remaining depth {}",
-                            scope.delegation_depth, depth_result - 1
+                            scope.delegation_depth,
+                            depth_result - 1
                         ),
                     );
                 }

@@ -38,7 +38,11 @@ fn relation_index(relation: &EdgeRelation) -> u64 {
     }
 }
 
-pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) -> Result<(), StoreError> {
+pub(super) fn edge_put(
+    store: &InMemoryStore,
+    ns: &NamespaceRef,
+    edge: &Edge,
+) -> Result<(), StoreError> {
     store.ensure_namespace(ns);
 
     let edge_bytes = canonical_bytes(edge);
@@ -70,7 +74,11 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
                         // Same logical edge, different value/metadata: update in place
                         drop(edges);
                         drop(fwd);
-                        store.edges.write().unwrap().insert((uuid, ekh), edge.clone());
+                        store
+                            .edges
+                            .write()
+                            .unwrap()
+                            .insert((uuid, ekh), edge.clone());
                         return Ok(());
                     }
                 }
@@ -101,18 +109,8 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
             .push(edge_kappa.to_string());
     }
 
-    push_index(
-        &store.fwd_index,
-        uuid,
-        item_hash(&edge.source),
-        &edge_kappa,
-    );
-    push_index(
-        &store.rev_index,
-        uuid,
-        item_hash(&edge.target),
-        &edge_kappa,
-    );
+    push_index(&store.fwd_index, uuid, item_hash(&edge.source), &edge_kappa);
+    push_index(&store.rev_index, uuid, item_hash(&edge.target), &edge_kappa);
     push_index(
         &store.rel_index,
         uuid,
@@ -136,7 +134,8 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
     ];
     if inbound_relations.contains(&edge.relation) {
         let key = format!("{}\x00{}", edge.target, edge.relation.as_str());
-        store.assertion_inbound
+        store
+            .assertion_inbound
             .entry(key)
             .or_default()
             .push(edge_kappa.clone());
@@ -239,18 +238,8 @@ pub(super) fn edge_delete(
             }
         }
 
-        remove_from(
-            &store.fwd_index,
-            uuid,
-            item_hash(&edge.source),
-            &edge_kappa,
-        );
-        remove_from(
-            &store.rev_index,
-            uuid,
-            item_hash(&edge.target),
-            &edge_kappa,
-        );
+        remove_from(&store.fwd_index, uuid, item_hash(&edge.source), &edge_kappa);
+        remove_from(&store.rev_index, uuid, item_hash(&edge.target), &edge_kappa);
         remove_from(
             &store.rel_index,
             uuid,

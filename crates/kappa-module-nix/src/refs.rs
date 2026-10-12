@@ -159,10 +159,7 @@ pub fn decompress_and_verify(
 
     // Step 2: Compute NarHash (SHA-256 of entire decompressed NAR byte stream)
     let hash_bytes = Sha256::digest(&decompressed);
-    let computed_hash = format!(
-        "sha256:{}",
-        nix_derivation::nixbase32::encode(&hash_bytes)
-    );
+    let computed_hash = format!("sha256:{}", nix_derivation::nixbase32::encode(&hash_bytes));
     if computed_hash != expected_nar_hash {
         return Err(VerifyError::NarHashMismatch {
             expected: expected_nar_hash.to_string(),

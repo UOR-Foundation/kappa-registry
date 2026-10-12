@@ -355,8 +355,7 @@ mod tests {
         commitment_map.insert(*key_packages[0].identifier(), commits_0);
         commitment_map.insert(*key_packages[1].identifier(), commits_1);
 
-        let signing_package =
-            frost_p256::SigningPackage::new(commitment_map, b"signed message");
+        let signing_package = frost_p256::SigningPackage::new(commitment_map, b"signed message");
 
         let share_0 =
             frost_p256::round2::sign(&signing_package, &nonces_0, &key_packages[0]).unwrap();
@@ -372,7 +371,9 @@ mod tests {
         let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
 
         let verifier = P256SchnorrVerifier;
-        assert!(!verifier.verify(&vk_bytes, b"wrong message", &sig_bytes).unwrap());
+        assert!(!verifier
+            .verify(&vk_bytes, b"wrong message", &sig_bytes)
+            .unwrap());
     }
 
     // -- FROST secp256k1 end-to-end -------------------------------------------
@@ -422,8 +423,7 @@ mod tests {
         share_map.insert(*key_packages[0].identifier(), share_0);
         share_map.insert(*key_packages[1].identifier(), share_1);
 
-        let sig =
-            frost_secp256k1::aggregate(&signing_package, &share_map, &pubkey_pkg).unwrap();
+        let sig = frost_secp256k1::aggregate(&signing_package, &share_map, &pubkey_pkg).unwrap();
         let sig_bytes = sig.serialize().unwrap();
         let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
 
@@ -457,12 +457,13 @@ mod tests {
         share_map.insert(*key_packages[0].identifier(), share_0);
         share_map.insert(*key_packages[1].identifier(), share_1);
 
-        let sig =
-            frost_secp256k1::aggregate(&signing_package, &share_map, &pubkey_pkg).unwrap();
+        let sig = frost_secp256k1::aggregate(&signing_package, &share_map, &pubkey_pkg).unwrap();
         let sig_bytes = sig.serialize().unwrap();
         let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
 
         let verifier = K256SchnorrVerifier;
-        assert!(!verifier.verify(&vk_bytes, b"wrong message", &sig_bytes).unwrap());
+        assert!(!verifier
+            .verify(&vk_bytes, b"wrong message", &sig_bytes)
+            .unwrap());
     }
 }

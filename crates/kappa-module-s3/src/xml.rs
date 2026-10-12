@@ -28,7 +28,15 @@ pub fn encode_list_objects_v2_xml(response: &ListObjectsV2Response) -> Vec<u8> {
     }
     write_text_element(&mut writer, "MaxKeys", &response.max_keys.to_string());
     write_text_element(&mut writer, "KeyCount", &response.key_count.to_string());
-    write_text_element(&mut writer, "IsTruncated", if response.is_truncated { "true" } else { "false" });
+    write_text_element(
+        &mut writer,
+        "IsTruncated",
+        if response.is_truncated {
+            "true"
+        } else {
+            "false"
+        },
+    );
 
     if let Some(ref d) = response.delimiter {
         write_text_element(&mut writer, "Delimiter", d);
@@ -43,24 +51,42 @@ pub fn encode_list_objects_v2_xml(response: &ListObjectsV2Response) -> Vec<u8> {
     let url_encode = response.encoding_type.as_deref() == Some("url");
 
     for entry in &response.contents {
-        writer.write_event(Event::Start(BytesStart::new("Contents"))).unwrap();
-        let key = if url_encode { percent_encode_key(&entry.key) } else { entry.key.clone() };
+        writer
+            .write_event(Event::Start(BytesStart::new("Contents")))
+            .unwrap();
+        let key = if url_encode {
+            percent_encode_key(&entry.key)
+        } else {
+            entry.key.clone()
+        };
         write_text_element(&mut writer, "Key", &key);
         write_text_element(&mut writer, "LastModified", &entry.last_modified);
         write_text_element(&mut writer, "ETag", &entry.etag);
         write_text_element(&mut writer, "Size", &entry.size.to_string());
         write_text_element(&mut writer, "StorageClass", &entry.storage_class);
-        writer.write_event(Event::End(BytesEnd::new("Contents"))).unwrap();
+        writer
+            .write_event(Event::End(BytesEnd::new("Contents")))
+            .unwrap();
     }
 
     for cp in &response.common_prefixes {
-        writer.write_event(Event::Start(BytesStart::new("CommonPrefixes"))).unwrap();
-        let prefix = if url_encode { percent_encode_key(cp) } else { cp.clone() };
+        writer
+            .write_event(Event::Start(BytesStart::new("CommonPrefixes")))
+            .unwrap();
+        let prefix = if url_encode {
+            percent_encode_key(cp)
+        } else {
+            cp.clone()
+        };
         write_text_element(&mut writer, "Prefix", &prefix);
-        writer.write_event(Event::End(BytesEnd::new("CommonPrefixes"))).unwrap();
+        writer
+            .write_event(Event::End(BytesEnd::new("CommonPrefixes")))
+            .unwrap();
     }
 
-    writer.write_event(Event::End(BytesEnd::new("ListBucketResult"))).unwrap();
+    writer
+        .write_event(Event::End(BytesEnd::new("ListBucketResult")))
+        .unwrap();
 
     buf
 }
@@ -70,10 +96,14 @@ pub fn encode_s3_error_xml(code: &str, message: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(XML_DECLARATION.as_bytes());
     let mut writer = Writer::new(&mut buf);
-    writer.write_event(Event::Start(BytesStart::new("Error"))).unwrap();
+    writer
+        .write_event(Event::Start(BytesStart::new("Error")))
+        .unwrap();
     write_text_element(&mut writer, "Code", code);
     write_text_element(&mut writer, "Message", message);
-    writer.write_event(Event::End(BytesEnd::new("Error"))).unwrap();
+    writer
+        .write_event(Event::End(BytesEnd::new("Error")))
+        .unwrap();
     buf
 }
 
@@ -85,20 +115,32 @@ pub fn encode_delete_result_xml(
     let mut buf = Vec::with_capacity(512);
     buf.extend_from_slice(XML_DECLARATION.as_bytes());
     let mut writer = Writer::new(&mut buf);
-    writer.write_event(Event::Start(BytesStart::new("DeleteResult"))).unwrap();
+    writer
+        .write_event(Event::Start(BytesStart::new("DeleteResult")))
+        .unwrap();
     for key in deleted {
-        writer.write_event(Event::Start(BytesStart::new("Deleted"))).unwrap();
+        writer
+            .write_event(Event::Start(BytesStart::new("Deleted")))
+            .unwrap();
         write_text_element(&mut writer, "Key", key);
-        writer.write_event(Event::End(BytesEnd::new("Deleted"))).unwrap();
+        writer
+            .write_event(Event::End(BytesEnd::new("Deleted")))
+            .unwrap();
     }
     for (key, code, message) in errors {
-        writer.write_event(Event::Start(BytesStart::new("Error"))).unwrap();
+        writer
+            .write_event(Event::Start(BytesStart::new("Error")))
+            .unwrap();
         write_text_element(&mut writer, "Key", key);
         write_text_element(&mut writer, "Code", code);
         write_text_element(&mut writer, "Message", message);
-        writer.write_event(Event::End(BytesEnd::new("Error"))).unwrap();
+        writer
+            .write_event(Event::End(BytesEnd::new("Error")))
+            .unwrap();
     }
-    writer.write_event(Event::End(BytesEnd::new("DeleteResult"))).unwrap();
+    writer
+        .write_event(Event::End(BytesEnd::new("DeleteResult")))
+        .unwrap();
     buf
 }
 
@@ -113,7 +155,9 @@ pub fn encode_initiate_multipart_xml(bucket: &str, key: &str, upload_id: &str) -
     write_text_element(&mut writer, "Bucket", bucket);
     write_text_element(&mut writer, "Key", key);
     write_text_element(&mut writer, "UploadId", upload_id);
-    writer.write_event(Event::End(BytesEnd::new("InitiateMultipartUploadResult"))).unwrap();
+    writer
+        .write_event(Event::End(BytesEnd::new("InitiateMultipartUploadResult")))
+        .unwrap();
     buf
 }
 
@@ -128,7 +172,9 @@ pub fn encode_complete_multipart_xml(bucket: &str, key: &str, etag: &str) -> Vec
     write_text_element(&mut writer, "Bucket", bucket);
     write_text_element(&mut writer, "Key", key);
     write_text_element(&mut writer, "ETag", etag);
-    writer.write_event(Event::End(BytesEnd::new("CompleteMultipartUploadResult"))).unwrap();
+    writer
+        .write_event(Event::End(BytesEnd::new("CompleteMultipartUploadResult")))
+        .unwrap();
     buf
 }
 
@@ -146,18 +192,26 @@ pub fn encode_list_parts_xml(parts: &[PartInfo]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
     buf.extend_from_slice(XML_DECLARATION.as_bytes());
     let mut writer = Writer::new(&mut buf);
-    writer.write_event(Event::Start(BytesStart::new("ListPartsResult"))).unwrap();
+    writer
+        .write_event(Event::Start(BytesStart::new("ListPartsResult")))
+        .unwrap();
     for part in parts {
-        writer.write_event(Event::Start(BytesStart::new("Part"))).unwrap();
+        writer
+            .write_event(Event::Start(BytesStart::new("Part")))
+            .unwrap();
         write_text_element(&mut writer, "PartNumber", &part.part_number.to_string());
         write_text_element(&mut writer, "ETag", &part.etag);
         write_text_element(&mut writer, "Size", &part.size.to_string());
         if !part.last_modified.is_empty() {
             write_text_element(&mut writer, "LastModified", &part.last_modified);
         }
-        writer.write_event(Event::End(BytesEnd::new("Part"))).unwrap();
+        writer
+            .write_event(Event::End(BytesEnd::new("Part")))
+            .unwrap();
     }
-    writer.write_event(Event::End(BytesEnd::new("ListPartsResult"))).unwrap();
+    writer
+        .write_event(Event::End(BytesEnd::new("ListPartsResult")))
+        .unwrap();
     buf
 }
 
@@ -166,16 +220,24 @@ pub fn encode_copy_result_xml(etag: &str, last_modified: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(XML_DECLARATION.as_bytes());
     let mut writer = Writer::new(&mut buf);
-    writer.write_event(Event::Start(BytesStart::new("CopyObjectResult"))).unwrap();
+    writer
+        .write_event(Event::Start(BytesStart::new("CopyObjectResult")))
+        .unwrap();
     write_text_element(&mut writer, "ETag", etag);
     write_text_element(&mut writer, "LastModified", last_modified);
-    writer.write_event(Event::End(BytesEnd::new("CopyObjectResult"))).unwrap();
+    writer
+        .write_event(Event::End(BytesEnd::new("CopyObjectResult")))
+        .unwrap();
     buf
 }
 
 fn write_text_element<W: std::io::Write>(writer: &mut Writer<W>, name: &str, value: &str) {
-    writer.write_event(Event::Start(BytesStart::new(name))).unwrap();
-    writer.write_event(Event::Text(BytesText::new(value))).unwrap();
+    writer
+        .write_event(Event::Start(BytesStart::new(name)))
+        .unwrap();
+    writer
+        .write_event(Event::Text(BytesText::new(value)))
+        .unwrap();
     writer.write_event(Event::End(BytesEnd::new(name))).unwrap();
 }
 
@@ -185,8 +247,7 @@ fn percent_encode_key(key: &str) -> String {
     let mut result = String::with_capacity(key.len());
     for byte in key.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'.' | b'_' | b'~' | b'/' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 result.push(byte as char);
             }
             _ => {
@@ -293,8 +354,18 @@ mod tests {
     #[test]
     fn list_parts_xml() {
         let xml = encode_list_parts_xml(&[
-            PartInfo { part_number: 1, etag: "\"aaa\"".into(), size: 1000, last_modified: String::new() },
-            PartInfo { part_number: 2, etag: "\"bbb\"".into(), size: 2000, last_modified: String::new() },
+            PartInfo {
+                part_number: 1,
+                etag: "\"aaa\"".into(),
+                size: 1000,
+                last_modified: String::new(),
+            },
+            PartInfo {
+                part_number: 2,
+                etag: "\"bbb\"".into(),
+                size: 2000,
+                last_modified: String::new(),
+            },
         ]);
         let text = String::from_utf8(xml).unwrap();
         assert!(text.contains("<PartNumber>1</PartNumber>"));

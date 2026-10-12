@@ -97,8 +97,7 @@ pub fn start_server_at_with_env(
     // Cannot use store_root because some tests (store_root_created_if_nonexistent)
     // pass a path that does not yet exist.
     let stderr_path = std::env::temp_dir().join(format!("kappa-server-{}.stderr", port));
-    let stderr_file = std::fs::File::create(&stderr_path)
-        .expect("failed to create stderr log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("failed to create stderr log");
     cmd.stderr(stderr_file);
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -264,7 +263,8 @@ pub fn create_namespace(c: &reqwest::blocking::Client, base: &str, ns: &str) {
     assert!(
         status == 201 || status == 409,
         "create namespace '{}': expected 201 or 409, got {}",
-        ns, status
+        ns,
+        status
     );
 }
 
@@ -355,7 +355,11 @@ pub fn send_chunk(
         let body = resp.text().unwrap_or_default();
         panic!(
             "chunk PATCH failed: {} -- body: {} -- url: {} -- offset: {} -- data_len: {}",
-            status, body, upload_url, offset, data.len()
+            status,
+            body,
+            upload_url,
+            offset,
+            data.len()
         );
     }
     let loc = resp.headers().get("location").unwrap().to_str().unwrap();

@@ -35,8 +35,7 @@ pub struct TableEncryptor {
 impl TableEncryptor {
     /// Create from a 32-byte namespace key (derived from KMS).
     pub fn new(ns_key: &[u8; 32]) -> Result<Self, EncryptionError> {
-        let aes_key =
-            AesGcmKey::new(ns_key).map_err(|_| EncryptionError::KeyInit)?;
+        let aes_key = AesGcmKey::new(ns_key).map_err(|_| EncryptionError::KeyInit)?;
         Ok(Self {
             key: aes_key,
             ns_key_bytes: *ns_key,

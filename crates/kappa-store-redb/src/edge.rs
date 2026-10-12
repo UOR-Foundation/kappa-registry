@@ -20,7 +20,8 @@ impl PersistentStore {
         let edge_bytes = canonical_bytes(edge);
         let edge_kappa = {
             use kappa_core::store::KappaStore;
-            self.ingest_compute(kappa_core::kappa::Axis::Sha256, &edge_bytes)?.kappa
+            self.ingest_compute(kappa_core::kappa::Axis::Sha256, &edge_bytes)?
+                .kappa
         };
 
         let txn = self.db.begin_write().map_err(Self::redb_err)?;
@@ -41,17 +42,24 @@ impl PersistentStore {
                 let fwd_table = txn.open_multimap_table(EDGE_FWD).map_err(Self::redb_err)?;
                 let edges_table = txn.open_table(EDGES).map_err(Self::redb_err)?;
                 let candidate_kappas: Vec<String> = fwd_table
-                    .get(fwd_key.as_str()).map_err(Self::redb_err)?
+                    .get(fwd_key.as_str())
+                    .map_err(Self::redb_err)?
                     .filter_map(|r| r.ok().map(|v| v.value().to_string()))
                     .collect();
                 let mut result = UpsertAction::Insert;
                 for ek in &candidate_kappas {
                     let existing_key = format!("{}\x00{}", ns, ek);
-                    if let Some(val) = edges_table.get(existing_key.as_str()).map_err(Self::redb_err)? {
+                    if let Some(val) = edges_table
+                        .get(existing_key.as_str())
+                        .map_err(Self::redb_err)?
+                    {
                         let raw_bytes = val.value();
                         let decrypted = match &self.table_encryptor {
-                            Some(enc) => enc.decrypt_value(&existing_key, raw_bytes)
-                                .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
+                            Some(enc) => {
+                                enc.decrypt_value(&existing_key, raw_bytes).map_err(|e| {
+                                    StoreError::Io(std::io::Error::other(e.to_string()))
+                                })?
+                            }
                             None => raw_bytes.to_vec(),
                         };
                         if let Ok(existing) = from_canonical::<Edge>(&decrypted) {
@@ -82,13 +90,15 @@ impl PersistentStore {
                 }
                 UpsertAction::Update(existing_key) => {
                     let stored_bytes: Vec<u8> = match &self.table_encryptor {
-                        Some(enc) => enc.encrypt_value(&existing_key, &edge_bytes)
+                        Some(enc) => enc
+                            .encrypt_value(&existing_key, &edge_bytes)
                             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
                         None => edge_bytes.clone(),
                     };
                     {
                         let mut edges = txn.open_table(EDGES).map_err(Self::redb_err)?;
-                        edges.insert(existing_key.as_str(), stored_bytes.as_slice())
+                        edges
+                            .insert(existing_key.as_str(), stored_bytes.as_slice())
                             .map_err(Self::redb_err)?;
                     }
                     txn.commit().map_err(Self::redb_err)?;
@@ -100,7 +110,8 @@ impl PersistentStore {
             // New edge: insert into all tables
             let edge_key = format!("{}\x00{}", ns, edge_kappa);
             let stored_bytes: Vec<u8> = match &self.table_encryptor {
-                Some(enc) => enc.encrypt_value(&edge_key, &edge_bytes)
+                Some(enc) => enc
+                    .encrypt_value(&edge_key, &edge_bytes)
                     .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
                 None => edge_bytes.clone(),
             };
@@ -142,9 +153,11 @@ impl PersistentStore {
             ];
             if inbound_relations.contains(&edge.relation) {
                 let inbound_key = format!("{}\x00{}", edge.target, edge.relation.as_str());
-                let mut inbound = txn.open_multimap_table(ASSERTION_INBOUND)
+                let mut inbound = txn
+                    .open_multimap_table(ASSERTION_INBOUND)
                     .map_err(Self::redb_err)?;
-                inbound.insert(inbound_key.as_str(), edge_kappa.as_str())
+                inbound
+                    .insert(inbound_key.as_str(), edge_kappa.as_str())
                     .map_err(Self::redb_err)?;
             }
         }
@@ -186,7 +199,8 @@ impl PersistentStore {
             if let Some(val) = edges_table.get(edge_key.as_str()).map_err(Self::redb_err)? {
                 let raw_bytes = val.value();
                 let decrypted = match &self.table_encryptor {
-                    Some(enc) => enc.decrypt_value(&edge_key, raw_bytes)
+                    Some(enc) => enc
+                        .decrypt_value(&edge_key, raw_bytes)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
                     None => raw_bytes.to_vec(),
                 };
@@ -220,7 +234,8 @@ impl PersistentStore {
             let edge_bytes = canonical_bytes(edge);
             let edge_kappa = {
                 use kappa_core::store::KappaStore;
-                self.ingest_compute(kappa_core::kappa::Axis::Sha256, &edge_bytes)?.kappa
+                self.ingest_compute(kappa_core::kappa::Axis::Sha256, &edge_bytes)?
+                    .kappa
             };
             prepared.push((edge, edge_bytes, edge_kappa));
         }
@@ -241,7 +256,8 @@ impl PersistentStore {
             for (edge, edge_bytes, edge_kappa) in &prepared {
                 let edge_key = format!("{}\x00{}", ns, edge_kappa);
                 let stored_bytes: Vec<u8> = match &self.table_encryptor {
-                    Some(enc) => enc.encrypt_value(&edge_key, edge_bytes)
+                    Some(enc) => enc
+                        .encrypt_value(&edge_key, edge_bytes)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
                     None => edge_bytes.clone(),
                 };
@@ -298,7 +314,8 @@ impl PersistentStore {
                 if let Some(val) = edges_table.get(edge_key.as_str()).map_err(Self::redb_err)? {
                     let raw_bytes = val.value();
                     let decrypted = match &self.table_encryptor {
-                        Some(enc) => enc.decrypt_value(&edge_key, raw_bytes)
+                        Some(enc) => enc
+                            .decrypt_value(&edge_key, raw_bytes)
                             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
                         None => raw_bytes.to_vec(),
                     };

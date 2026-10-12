@@ -22,8 +22,12 @@ pub fn encode_header(op: i64, frame_type: &str) -> Vec<u8> {
     } else {
         // negative: major type 1, value = -1 - n
         let n = (-1 - op) as u64;
-        if n < 24 { buf.push(0x20 | n as u8); }
-        else { buf.push(0x38); buf.push(n as u8); }
+        if n < 24 {
+            buf.push(0x20 | n as u8);
+        } else {
+            buf.push(0x38);
+            buf.push(n as u8);
+        }
     }
 
     // "t"
@@ -272,8 +276,12 @@ mod tests {
     #[test]
     fn commit_body_has_all_fields() {
         let body = encode_commit_body(
-            42, "did:plc:test", &[0x01; 36], "rev123",
-            Some("prev_rev"), b"car-bytes",
+            42,
+            "did:plc:test",
+            &[0x01; 36],
+            "rev123",
+            Some("prev_rev"),
+            b"car-bytes",
             &[("create", "app.bsky.feed.post/abc", Some(&[0x01; 36]))],
         );
         assert!(!body.is_empty());

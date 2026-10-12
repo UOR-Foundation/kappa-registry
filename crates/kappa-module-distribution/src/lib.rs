@@ -34,7 +34,7 @@ use std::sync::Arc;
 use topcoat::context::{app_context, try_app_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::response::Response;
-use topcoat::router::{to_bytes, raw_path_params, Body, RouterBuilder, StatusCode};
+use topcoat::router::{raw_path_params, to_bytes, Body, RouterBuilder, StatusCode};
 
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::store::KappaStore;
@@ -79,9 +79,11 @@ pub(crate) fn store(cx: &Cx) -> &Arc<dyn KappaStore> {
 }
 
 /// Read resolved namespace from context. Write path: creates on first write.
-pub(crate) async fn resolve_ns_write_async(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
-    use topcoat::context::request_context;
+pub(crate) async fn resolve_ns_write_async(
+    cx: &Cx,
+) -> topcoat::Result<kappa_core::types::NamespaceRef> {
     use kappa_core::types::ResolvedNamespace;
+    use topcoat::context::request_context;
     match request_context::<ResolvedNamespace>(cx) {
         ResolvedNamespace::Exists(ns) => Ok(ns.clone()),
         ResolvedNamespace::NotFound { name, protocol } => {
@@ -96,16 +98,16 @@ pub(crate) async fn resolve_ns_write_async(cx: &Cx) -> topcoat::Result<kappa_cor
             .map_err(|e| bad_request(e.to_string()))?
             .map_err(store_err)
         }
-        ResolvedNamespace::NoNamespace => {
-            Err(bad_request("no namespace in request path").into())
-        }
+        ResolvedNamespace::NoNamespace => Err(bad_request("no namespace in request path").into()),
     }
 }
 
 /// Read resolved namespace from context. Read path: 404 if not found.
-pub(crate) async fn resolve_ns_read_async(cx: &Cx) -> topcoat::Result<kappa_core::types::NamespaceRef> {
-    use topcoat::context::request_context;
+pub(crate) async fn resolve_ns_read_async(
+    cx: &Cx,
+) -> topcoat::Result<kappa_core::types::NamespaceRef> {
     use kappa_core::types::ResolvedNamespace;
+    use topcoat::context::request_context;
     request_context::<ResolvedNamespace>(cx)
         .expect_exists()
         .map_err(|_| topcoat::router::error::not_found().into())
@@ -144,7 +146,9 @@ pub(crate) async fn read_body(body: Body) -> topcoat::Result<Vec<u8>> {
 /// Prefers the authenticated caller's anchor from request context.
 /// Falls back to node anchor for unauthenticated deployments.
 pub(crate) fn registry_anchor(cx: &Cx) -> String {
-    if let Some(caller) = topcoat::context::try_request_context::<kappa_core::types::CallerIdentity>(cx) {
+    if let Some(caller) =
+        topcoat::context::try_request_context::<kappa_core::types::CallerIdentity>(cx)
+    {
         if caller.0 != "anonymous" {
             return caller.0.clone();
         }

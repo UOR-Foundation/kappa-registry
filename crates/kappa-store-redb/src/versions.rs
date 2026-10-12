@@ -50,8 +50,7 @@ impl PersistentStore {
     }
 
     fn serialize_version_entry(entry: &VersionEntry) -> Result<Vec<u8>, StoreError> {
-        serde_json::to_vec(entry)
-            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
+        serde_json::to_vec(entry).map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
     }
 
     fn deserialize_version_entry(bytes: &[u8]) -> Result<VersionEntry, StoreError> {
@@ -153,16 +152,12 @@ impl PersistentStore {
 
         // Scan entries for this key
         let range = match Self::prefix_successor(&prefix) {
-            Some(end) => {
-                table
-                    .range::<&[u8]>(prefix.as_slice()..end.as_slice())
-                    .map_err(Self::redb_err)?
-            }
-            None => {
-                table
-                    .range::<&[u8]>(prefix.as_slice()..)
-                    .map_err(Self::redb_err)?
-            }
+            Some(end) => table
+                .range::<&[u8]>(prefix.as_slice()..end.as_slice())
+                .map_err(Self::redb_err)?,
+            None => table
+                .range::<&[u8]>(prefix.as_slice()..)
+                .map_err(Self::redb_err)?,
         };
 
         match version_id {
@@ -252,16 +247,12 @@ impl PersistentStore {
                     let mut table = txn.open_table(VERSIONS).map_err(Self::redb_err)?;
                     // Find and remove the entry with matching version_id
                     let range = match Self::prefix_successor(&prefix) {
-                        Some(end) => {
-                            table
-                                .range::<&[u8]>(prefix.as_slice()..end.as_slice())
-                                .map_err(Self::redb_err)?
-                        }
-                        None => {
-                            table
-                                .range::<&[u8]>(prefix.as_slice()..)
-                                .map_err(Self::redb_err)?
-                        }
+                        Some(end) => table
+                            .range::<&[u8]>(prefix.as_slice()..end.as_slice())
+                            .map_err(Self::redb_err)?,
+                        None => table
+                            .range::<&[u8]>(prefix.as_slice()..)
+                            .map_err(Self::redb_err)?,
                     };
                     let mut key_to_remove: Option<Vec<u8>> = None;
                     let mut was_delete_marker = false;
@@ -275,9 +266,7 @@ impl PersistentStore {
                         }
                     }
                     if let Some(key_bytes) = key_to_remove {
-                        table
-                            .remove(key_bytes.as_slice())
-                            .map_err(Self::redb_err)?;
+                        table.remove(key_bytes.as_slice()).map_err(Self::redb_err)?;
                     }
                     drop(table);
                     txn.commit().map_err(Self::redb_err)?;
@@ -306,16 +295,12 @@ impl PersistentStore {
         let table = txn.open_table(VERSIONS).map_err(Self::redb_err)?;
 
         let range = match Self::prefix_successor(&prefix) {
-            Some(end) => {
-                table
-                    .range::<&[u8]>(prefix.as_slice()..end.as_slice())
-                    .map_err(Self::redb_err)?
-            }
-            None => {
-                table
-                    .range::<&[u8]>(prefix.as_slice()..)
-                    .map_err(Self::redb_err)?
-            }
+            Some(end) => table
+                .range::<&[u8]>(prefix.as_slice()..end.as_slice())
+                .map_err(Self::redb_err)?,
+            None => table
+                .range::<&[u8]>(prefix.as_slice()..)
+                .map_err(Self::redb_err)?,
         };
 
         let mut entries = Vec::new();
@@ -337,16 +322,12 @@ impl PersistentStore {
         {
             let mut table = txn.open_table(VERSIONS).map_err(Self::redb_err)?;
             let range = match Self::prefix_successor(&prefix) {
-                Some(end) => {
-                    table
-                        .range::<&[u8]>(prefix.as_slice()..end.as_slice())
-                        .map_err(Self::redb_err)?
-                }
-                None => {
-                    table
-                        .range::<&[u8]>(prefix.as_slice()..)
-                        .map_err(Self::redb_err)?
-                }
+                Some(end) => table
+                    .range::<&[u8]>(prefix.as_slice()..end.as_slice())
+                    .map_err(Self::redb_err)?,
+                None => table
+                    .range::<&[u8]>(prefix.as_slice()..)
+                    .map_err(Self::redb_err)?,
             };
             let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
             for item in range {
@@ -357,9 +338,7 @@ impl PersistentStore {
                 }
             }
             for key_bytes in keys_to_remove {
-                table
-                    .remove(key_bytes.as_slice())
-                    .map_err(Self::redb_err)?;
+                table.remove(key_bytes.as_slice()).map_err(Self::redb_err)?;
             }
         }
         txn.commit().map_err(Self::redb_err)?;

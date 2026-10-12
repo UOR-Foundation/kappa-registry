@@ -10,11 +10,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use topcoat::context::{app_context, try_app_context, Cx};
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
 use topcoat::router::request::FromRequest;
 use topcoat::router::response::IntoResponse;
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use sha2::Digest;
 
@@ -28,39 +26,137 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
 
     builder
         // Server
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.server.describeServer"), describe_server))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.getLatestCommit"), get_latest_commit))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.listRepos"), list_repos))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.identity.resolveHandle"), resolve_handle))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.repo.describeRepo"), describe_repo))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.repo.getRecord"), get_record))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.repo.listRecords"), list_records))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.repo.createRecord"), create_record))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.repo.putRecord"), put_record))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.repo.deleteRecord"), delete_record))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.repo.uploadBlob"), upload_blob))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.repo.applyWrites"), apply_writes))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.getRepo"), get_repo))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.getBlob"), get_blob))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.server.describeServer"),
+            describe_server,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.sync.getLatestCommit"),
+            get_latest_commit,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.sync.listRepos"),
+            list_repos,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.identity.resolveHandle"),
+            resolve_handle,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.repo.describeRepo"),
+            describe_repo,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.repo.getRecord"),
+            get_record,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.repo.listRecords"),
+            list_records,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.repo.createRecord"),
+            create_record,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.repo.putRecord"),
+            put_record,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.repo.deleteRecord"),
+            delete_record,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.repo.uploadBlob"),
+            upload_blob,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.repo.applyWrites"),
+            apply_writes,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.sync.getRepo"),
+            get_repo,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.sync.getBlob"),
+            get_blob,
+        ))
         // Session endpoints
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.createSession"), create_session))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.refreshSession"), refresh_session))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.deleteSession"), delete_session))
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.server.getSession"), get_session))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.server.createAccount"), create_account))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.server.createSession"),
+            create_session,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.server.refreshSession"),
+            refresh_session,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.server.deleteSession"),
+            delete_session,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.server.getSession"),
+            get_session,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.server.createAccount"),
+            create_account,
+        ))
         // Sync firehose + crawl
-        .route(RouteFn::new(Method::GET, p("/xrpc/com.atproto.sync.subscribeRepos"), subscribe_repos))
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.sync.requestCrawl"), request_crawl))
+        .route(RouteFn::new(
+            Method::GET,
+            p("/xrpc/com.atproto.sync.subscribeRepos"),
+            subscribe_repos,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.sync.requestCrawl"),
+            request_crawl,
+        ))
         // Identity
-        .route(RouteFn::new(Method::POST, p("/xrpc/com.atproto.identity.updateHandle"), update_handle))
+        .route(RouteFn::new(
+            Method::POST,
+            p("/xrpc/com.atproto.identity.updateHandle"),
+            update_handle,
+        ))
 }
 
-fn xrpc_error(cx: &Cx, status: StatusCode, error: &str, message: &str) -> Result<topcoat::router::response::Response, topcoat::Error> {
+fn xrpc_error(
+    cx: &Cx,
+    status: StatusCode,
+    error: &str,
+    message: &str,
+) -> Result<topcoat::router::response::Response, topcoat::Error> {
     let body = serde_json::json!({
         "error": error,
         "message": message,
     });
-    (status, [("content-type", "application/json")], body.to_string()).into_response(cx)
+    (
+        status,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+        .into_response(cx)
 }
 
 /// Extract a query parameter from the request URI.
@@ -70,7 +166,11 @@ fn query_param(cx: &Cx, key: &str) -> Option<String> {
     parts.uri.query().and_then(|q| {
         q.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            if k == key { Some(v.to_string()) } else { None }
+            if k == key {
+                Some(v.to_string())
+            } else {
+                None
+            }
         })
     })
 }
@@ -86,7 +186,12 @@ fn describe_server(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             "did": "did:web:kappa-registry",
             "links": {}
         });
-        (StatusCode::OK, [("content-type", "application/json")], response.to_string()).into_response(cx)
+        (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            response.to_string(),
+        )
+            .into_response(cx)
     })
 }
 
@@ -96,7 +201,14 @@ fn get_latest_commit(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let did = match query_param(cx, "did") {
             Some(d) => d,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing did parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing did parameter",
+                )
+            }
         };
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -105,13 +217,24 @@ fn get_latest_commit(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             let rev_entry = store.tag_get(&ns, "commit/rev");
             let rev = rev_entry.map(|e| e.kappa).unwrap_or_default();
             Ok::<(String, String), kappa_core::types::StoreError>((entry.kappa, rev))
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok((cid, rev))) => {
                 let body = serde_json::json!({ "cid": cid, "rev": rev });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
-            _ => xrpc_error(cx, StatusCode::NOT_FOUND, "RepoNotFound", "repository not found"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::NOT_FOUND,
+                "RepoNotFound",
+                "repository not found",
+            ),
         }
     })
 }
@@ -125,7 +248,8 @@ fn list_repos(cx: &Cx, _body: Body) -> RouteFuture<'_> {
         let cursor = query_param(cx, "cursor");
         let result = tokio::task::spawn_blocking(move || {
             let records = store.namespace_list(Some("atproto"))?;
-            let repos: Vec<serde_json::Value> = records.iter()
+            let repos: Vec<serde_json::Value> = records
+                .iter()
                 .filter(|r| !r.tombstoned)
                 .skip_while(|r| {
                     if let Some(ref c) = cursor {
@@ -145,13 +269,24 @@ fn list_repos(cx: &Cx, _body: Body) -> RouteFuture<'_> {
                 })
                 .collect();
             Ok::<Vec<serde_json::Value>, kappa_core::types::StoreError>(repos)
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(repos)) => {
                 let body = serde_json::json!({ "repos": repos });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
-            _ => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "list repos failed"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "list repos failed",
+            ),
         }
     })
 }
@@ -160,7 +295,14 @@ fn get_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let did = match query_param(cx, "did") {
             Some(d) => d,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing did parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing did parameter",
+                )
+            }
         };
         let since = query_param(cx, "since");
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
@@ -202,12 +344,21 @@ fn get_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
 
             let car = crate::car::encode_car(Some(&commit_cid), &blocks);
             Ok::<Vec<u8>, kappa_core::types::StoreError>(car)
-        }).await;
+        })
+        .await;
         match result {
-            Ok(Ok(car)) => {
-                (StatusCode::OK, [("content-type", "application/vnd.ipld.car")], car).into_response(cx)
-            }
-            _ => xrpc_error(cx, StatusCode::NOT_FOUND, "RepoNotFound", "repository not found"),
+            Ok(Ok(car)) => (
+                StatusCode::OK,
+                [("content-type", "application/vnd.ipld.car")],
+                car,
+            )
+                .into_response(cx),
+            _ => xrpc_error(
+                cx,
+                StatusCode::NOT_FOUND,
+                "RepoNotFound",
+                "repository not found",
+            ),
         }
     })
 }
@@ -218,42 +369,64 @@ fn get_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
 /// Tag 42 byte string value, stripping the 0x00 multibase prefix.
 fn parse_commit_data_cid(commit_bytes: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 0;
-    if pos >= commit_bytes.len() { return None; }
+    if pos >= commit_bytes.len() {
+        return None;
+    }
     let major = commit_bytes[pos] >> 5;
-    if major != 5 { return None; } // not a map
+    if major != 5 {
+        return None;
+    } // not a map
     let map_len = (commit_bytes[pos] & 0x1F) as usize;
     pos += 1;
 
     for _ in 0..map_len {
         // Read key (text string)
-        if pos >= commit_bytes.len() { return None; }
+        if pos >= commit_bytes.len() {
+            return None;
+        }
         let key_major = commit_bytes[pos] >> 5;
         let key_len = (commit_bytes[pos] & 0x1F) as usize;
-        if key_major != 3 { return None; }
+        if key_major != 3 {
+            return None;
+        }
         pos += 1;
-        if pos + key_len > commit_bytes.len() { return None; }
+        if pos + key_len > commit_bytes.len() {
+            return None;
+        }
         let key = std::str::from_utf8(&commit_bytes[pos..pos + key_len]).ok()?;
         pos += key_len;
 
         if key == "data" {
             // Expect Tag 42 (0xD8 0x2A) then byte string
-            if pos + 1 >= commit_bytes.len() { return None; }
+            if pos + 1 >= commit_bytes.len() {
+                return None;
+            }
             if commit_bytes[pos] == 0xD8 && commit_bytes[pos + 1] == 42 {
                 pos += 2;
-                if pos >= commit_bytes.len() { return None; }
+                if pos >= commit_bytes.len() {
+                    return None;
+                }
                 let bs_major = commit_bytes[pos] >> 5;
                 let bs_len = (commit_bytes[pos] & 0x1F) as usize;
-                if bs_major != 2 { return None; }
+                if bs_major != 2 {
+                    return None;
+                }
                 pos += 1;
                 let actual_len = if bs_len < 24 {
                     bs_len
                 } else if bs_len == 24 {
-                    if pos >= commit_bytes.len() { return None; }
+                    if pos >= commit_bytes.len() {
+                        return None;
+                    }
                     let l = commit_bytes[pos] as usize;
                     pos += 1;
                     l
-                } else { return None; };
-                if pos + actual_len > commit_bytes.len() { return None; }
+                } else {
+                    return None;
+                };
+                if pos + actual_len > commit_bytes.len() {
+                    return None;
+                }
                 let cid_bytes = &commit_bytes[pos..pos + actual_len];
                 // Strip 0x00 identity multibase prefix
                 if !cid_bytes.is_empty() && cid_bytes[0] == 0x00 {
@@ -272,7 +445,9 @@ fn parse_commit_data_cid(commit_bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Skip a single CBOR value at the given position.
 fn skip_cbor_value(data: &[u8], pos: &mut usize) -> Option<()> {
-    if *pos >= data.len() { return None; }
+    if *pos >= data.len() {
+        return None;
+    }
     let major = data[*pos] >> 5;
     let additional = data[*pos] & 0x1F;
     *pos += 1;
@@ -283,18 +458,29 @@ fn skip_cbor_value(data: &[u8], pos: &mut usize) -> Option<()> {
             }
         }
         2 | 3 => {
-            let len = if additional < 24 { additional as usize }
-                else if additional == 24 { let l = *data.get(*pos)? as usize; *pos += 1; l }
-                else { return None; };
+            let len = if additional < 24 {
+                additional as usize
+            } else if additional == 24 {
+                let l = *data.get(*pos)? as usize;
+                *pos += 1;
+                l
+            } else {
+                return None;
+            };
             *pos += len;
         }
         4 => {
             let len = additional as usize;
-            for _ in 0..len { skip_cbor_value(data, pos)?; }
+            for _ in 0..len {
+                skip_cbor_value(data, pos)?;
+            }
         }
         5 => {
             let len = additional as usize;
-            for _ in 0..len { skip_cbor_value(data, pos)?; skip_cbor_value(data, pos)?; }
+            for _ in 0..len {
+                skip_cbor_value(data, pos)?;
+                skip_cbor_value(data, pos)?;
+            }
         }
         6 => {
             if additional >= 24 && additional <= 27 {
@@ -320,10 +506,14 @@ fn walk_mst_cids(
     node_cid: &[u8],
     visited: &mut std::collections::HashSet<[u8; 36]>,
 ) {
-    if node_cid.len() != 36 { return; }
+    if node_cid.len() != 36 {
+        return;
+    }
     let mut cid_arr = [0u8; 36];
     cid_arr.copy_from_slice(node_cid);
-    if !visited.insert(cid_arr) { return; }
+    if !visited.insert(cid_arr) {
+        return;
+    }
 
     let cid_hex = hex::encode(node_cid);
     let tag_name = format!("mst/{}", cid_hex);
@@ -357,10 +547,14 @@ fn walk_mst_node(
     blocks: &mut Vec<crate::car::CarBlock>,
     visited: &mut std::collections::HashSet<[u8; 36]>,
 ) {
-    if node_cid.len() != 36 { return; }
+    if node_cid.len() != 36 {
+        return;
+    }
     let mut cid_arr = [0u8; 36];
     cid_arr.copy_from_slice(node_cid);
-    if !visited.insert(cid_arr) { return; }
+    if !visited.insert(cid_arr) {
+        return;
+    }
 
     // Look up node blob via CID->kappa bridge tag
     let cid_hex = hex::encode(node_cid);
@@ -473,11 +667,25 @@ fn get_blob(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let did = match query_param(cx, "did") {
             Some(d) => d,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing did parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing did parameter",
+                )
+            }
         };
         let cid_param = match query_param(cx, "cid") {
             Some(c) => c,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing cid parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing cid parameter",
+                )
+            }
         };
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -486,11 +694,15 @@ fn get_blob(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             let tag_name = format!("blob/{}", cid_param);
             let entry = store.tag_get(&ns, &tag_name)?;
             store.blob_get(&entry.kappa)
-        }).await;
+        })
+        .await;
         match result {
-            Ok(Ok(data)) => {
-                (StatusCode::OK, [("content-type", "application/octet-stream")], data).into_response(cx)
-            }
+            Ok(Ok(data)) => (
+                StatusCode::OK,
+                [("content-type", "application/octet-stream")],
+                data,
+            )
+                .into_response(cx),
             _ => StatusCode::NOT_FOUND.into_response(cx),
         }
     })
@@ -502,7 +714,14 @@ fn resolve_handle(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let handle = match query_param(cx, "handle") {
             Some(h) => h,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing handle parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing handle parameter",
+                )
+            }
         };
         // Use the ResolverRegistry to resolve the handle to a DID
         let registry = try_app_context::<Arc<kappa_core::identity::ResolverRegistry>>(cx).cloned();
@@ -515,7 +734,12 @@ fn resolve_handle(cx: &Cx, _body: Body) -> RouteFuture<'_> {
                     // Otherwise return the anchor as a placeholder.
                     let did = identity.handle.clone();
                     let body = serde_json::json!({ "did": did });
-                    return (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx);
+                    return (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        body.to_string(),
+                    )
+                        .into_response(cx);
                 }
                 _ => {}
             }
@@ -527,15 +751,26 @@ fn resolve_handle(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             let tag_name = format!("handle:atproto:{}", handle);
             let entry = store.tag_get(&handles_ns, &tag_name)?;
             store.blob_get(&entry.kappa)
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(data)) => {
                 let record: serde_json::Value = serde_json::from_slice(&data).unwrap_or_default();
                 let did = record.get("anchor").and_then(|a| a.as_str()).unwrap_or("");
                 let body = serde_json::json!({ "did": did });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
-            _ => xrpc_error(cx, StatusCode::NOT_FOUND, "HandleNotFound", "handle not found"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::NOT_FOUND,
+                "HandleNotFound",
+                "handle not found",
+            ),
         }
     })
 }
@@ -546,7 +781,14 @@ fn describe_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let repo = match query_param(cx, "repo") {
             Some(r) => r,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing repo parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing repo parameter",
+                )
+            }
         };
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let repo_owned = repo.clone();
@@ -556,7 +798,8 @@ fn describe_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             let info = store.namespace_info(ns_name, Some("atproto"))?;
             // List collections by scanning tag prefixes
             let tags = store.tag_list(&ns)?;
-            let mut collections: Vec<String> = tags.iter()
+            let mut collections: Vec<String> = tags
+                .iter()
                 .filter_map(|t| {
                     let key = t.name.strip_prefix("record/")?;
                     let collection = key.split('/').next()?;
@@ -565,8 +808,11 @@ fn describe_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
                 .collect();
             collections.sort();
             collections.dedup();
-            Ok::<(kappa_core::store::NamespaceRecord, Vec<String>), kappa_core::types::StoreError>((info, collections))
-        }).await;
+            Ok::<(kappa_core::store::NamespaceRecord, Vec<String>), kappa_core::types::StoreError>(
+                (info, collections),
+            )
+        })
+        .await;
         match result {
             Ok(Ok((info, collections))) => {
                 let did = info.aliases.first().map(|a| a.as_str()).unwrap_or(&repo);
@@ -577,9 +823,19 @@ fn describe_repo(cx: &Cx, _body: Body) -> RouteFuture<'_> {
                     "collections": collections,
                     "handleIsCorrect": true,
                 });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
-            _ => xrpc_error(cx, StatusCode::NOT_FOUND, "RepoNotFound", "repository not found"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::NOT_FOUND,
+                "RepoNotFound",
+                "repository not found",
+            ),
         }
     })
 }
@@ -588,15 +844,36 @@ fn get_record(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let repo = match query_param(cx, "repo") {
             Some(r) => r,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing repo parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing repo parameter",
+                )
+            }
         };
         let collection = match query_param(cx, "collection") {
             Some(c) => c,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing collection parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing collection parameter",
+                )
+            }
         };
         let rkey = match query_param(cx, "rkey") {
             Some(r) => r,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing rkey parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing rkey parameter",
+                )
+            }
         };
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -604,10 +881,13 @@ fn get_record(cx: &Cx, _body: Body) -> RouteFuture<'_> {
             let tag_name = format!("record/{}/{}", collection, rkey);
             let entry = store.tag_get(&ns, &tag_name)?;
             let data = store.blob_get(&entry.kappa)?;
-            Ok::<(String, Vec<u8>, String), kappa_core::types::StoreError>(
-                (entry.kappa, data, format!("at://{}/{}/{}", repo, collection, rkey))
-            )
-        }).await;
+            Ok::<(String, Vec<u8>, String), kappa_core::types::StoreError>((
+                entry.kappa,
+                data,
+                format!("at://{}/{}/{}", repo, collection, rkey),
+            ))
+        })
+        .await;
         match result {
             Ok(Ok((cid, data, uri))) => {
                 let value: serde_json::Value = serde_json::from_slice(&data).unwrap_or_default();
@@ -616,9 +896,19 @@ fn get_record(cx: &Cx, _body: Body) -> RouteFuture<'_> {
                     "cid": cid,
                     "value": value,
                 });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
-            _ => xrpc_error(cx, StatusCode::NOT_FOUND, "RecordNotFound", "record not found"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::NOT_FOUND,
+                "RecordNotFound",
+                "record not found",
+            ),
         }
     })
 }
@@ -627,11 +917,25 @@ fn list_records(cx: &Cx, _body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let repo = match query_param(cx, "repo") {
             Some(r) => r,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing repo parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing repo parameter",
+                )
+            }
         };
         let collection = match query_param(cx, "collection") {
             Some(c) => c,
-            None => return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing collection parameter"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "missing collection parameter",
+                )
+            }
         };
         let limit: usize = query_param(cx, "limit")
             .and_then(|s| s.parse().ok())
@@ -653,7 +957,9 @@ fn list_records(cx: &Cx, _body: Body) -> RouteFuture<'_> {
                     }
                     continue;
                 }
-                if records.len() >= limit { break; }
+                if records.len() >= limit {
+                    break;
+                }
                 let rkey = tag.name.strip_prefix(&prefix).unwrap_or(&tag.name);
                 let uri = format!("at://{}/{}/{}", repo, collection, rkey);
                 let value: serde_json::Value = match store.blob_get(&tag.kappa) {
@@ -667,13 +973,24 @@ fn list_records(cx: &Cx, _body: Body) -> RouteFuture<'_> {
                 }));
             }
             Ok::<Vec<serde_json::Value>, kappa_core::types::StoreError>(records)
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(records)) => {
                 let body = serde_json::json!({ "records": records });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
-            _ => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "list records failed"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "list records failed",
+            ),
         }
     })
 }
@@ -683,28 +1000,43 @@ fn create_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let request_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 1024 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         // Pre-parse repo for auth check before spawn_blocking
         let pre_req: serde_json::Value = serde_json::from_slice(&request_bytes)
             .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
         if let Some(repo_val) = pre_req.get("repo").and_then(|r| r.as_str()) {
-            if let Err(resp) = verify_repo_auth(cx, repo_val) { return Ok(resp); }
+            if let Err(resp) = verify_repo_auth(cx, repo_val) {
+                return Ok(resp);
+            }
         }
         let result = tokio::task::spawn_blocking(move || {
-            let req: serde_json::Value = serde_json::from_slice(&request_bytes)
-                .map_err(|e| kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}")))?;
-            let repo = req.get("repo").and_then(|r| r.as_str())
+            let req: serde_json::Value = serde_json::from_slice(&request_bytes).map_err(|e| {
+                kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}"))
+            })?;
+            let repo = req
+                .get("repo")
+                .and_then(|r| r.as_str())
                 .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing repo".into()))?;
-            let collection = req.get("collection").and_then(|c| c.as_str())
-                .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing collection".into()))?;
-            let record = req.get("record")
+            let collection = req
+                .get("collection")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| {
+                    kappa_core::types::StoreError::Rejected("missing collection".into())
+                })?;
+            let record = req
+                .get("record")
                 .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing record".into()))?;
 
             let ns = store.namespace_resolve_or_create(repo, repo, Some("atproto"))?;
 
             // Generate rkey (TID)
-            let rkey = req.get("rkey").and_then(|r| r.as_str())
+            let rkey = req
+                .get("rkey")
+                .and_then(|r| r.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
                     let gen = crate::tid::TidGenerator::with_clock_id(0);
@@ -712,8 +1044,9 @@ fn create_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 });
 
             // Store record as blob
-            let record_bytes = serde_json::to_vec(record)
-                .map_err(|e| kappa_core::types::StoreError::Rejected(format!("record serialize: {e}")))?;
+            let record_bytes = serde_json::to_vec(record).map_err(|e| {
+                kappa_core::types::StoreError::Rejected(format!("record serialize: {e}"))
+            })?;
             let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
 
             // CID->kappa bridge tag for MST tree walk in getRepo
@@ -730,19 +1063,30 @@ fn create_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
             let uri = format!("at://{}/{}/{}", repo, collection, rkey);
             Ok::<(String, String, String), kappa_core::types::StoreError>((uri, ingest.kappa, rkey))
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok((uri, cid, _rkey))) => {
                 let body = serde_json::json!({
                     "uri": uri,
                     "cid": cid,
                 });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
             Ok(Err(kappa_core::types::StoreError::Rejected(msg))) => {
                 xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", &msg)
             }
-            _ => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "create record failed"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "create record failed",
+            ),
         }
     })
 }
@@ -752,29 +1096,45 @@ fn put_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let request_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 1024 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         let pre_req: serde_json::Value = serde_json::from_slice(&request_bytes)
             .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
         if let Some(repo_val) = pre_req.get("repo").and_then(|r| r.as_str()) {
-            if let Err(resp) = verify_repo_auth(cx, repo_val) { return Ok(resp); }
+            if let Err(resp) = verify_repo_auth(cx, repo_val) {
+                return Ok(resp);
+            }
         }
         let result = tokio::task::spawn_blocking(move || {
-            let req: serde_json::Value = serde_json::from_slice(&request_bytes)
-                .map_err(|e| kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}")))?;
-            let repo = req.get("repo").and_then(|r| r.as_str())
+            let req: serde_json::Value = serde_json::from_slice(&request_bytes).map_err(|e| {
+                kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}"))
+            })?;
+            let repo = req
+                .get("repo")
+                .and_then(|r| r.as_str())
                 .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing repo".into()))?;
-            let collection = req.get("collection").and_then(|c| c.as_str())
-                .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing collection".into()))?;
-            let rkey = req.get("rkey").and_then(|r| r.as_str())
+            let collection = req
+                .get("collection")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| {
+                    kappa_core::types::StoreError::Rejected("missing collection".into())
+                })?;
+            let rkey = req
+                .get("rkey")
+                .and_then(|r| r.as_str())
                 .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing rkey".into()))?;
-            let record = req.get("record")
+            let record = req
+                .get("record")
                 .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing record".into()))?;
 
             let ns = store.namespace_resolve_or_create(repo, repo, Some("atproto"))?;
 
-            let record_bytes = serde_json::to_vec(record)
-                .map_err(|e| kappa_core::types::StoreError::Rejected(format!("record serialize: {e}")))?;
+            let record_bytes = serde_json::to_vec(record).map_err(|e| {
+                kappa_core::types::StoreError::Rejected(format!("record serialize: {e}"))
+            })?;
             let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
 
             // CID->kappa bridge tag for MST tree walk
@@ -790,16 +1150,27 @@ fn put_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
             let uri = format!("at://{}/{}/{}", repo, collection, rkey);
             Ok::<(String, String), kappa_core::types::StoreError>((uri, ingest.kappa))
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok((uri, cid))) => {
                 let body = serde_json::json!({ "uri": uri, "cid": cid });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
             Ok(Err(kappa_core::types::StoreError::Rejected(msg))) => {
                 xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", &msg)
             }
-            _ => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "put record failed"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "put record failed",
+            ),
         }
     })
 }
@@ -809,21 +1180,35 @@ fn delete_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let request_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 64 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         let pre_req: serde_json::Value = serde_json::from_slice(&request_bytes)
             .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
         if let Some(repo_val) = pre_req.get("repo").and_then(|r| r.as_str()) {
-            if let Err(resp) = verify_repo_auth(cx, repo_val) { return Ok(resp); }
+            if let Err(resp) = verify_repo_auth(cx, repo_val) {
+                return Ok(resp);
+            }
         }
         let result = tokio::task::spawn_blocking(move || {
-            let req: serde_json::Value = serde_json::from_slice(&request_bytes)
-                .map_err(|e| kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}")))?;
-            let repo = req.get("repo").and_then(|r| r.as_str())
+            let req: serde_json::Value = serde_json::from_slice(&request_bytes).map_err(|e| {
+                kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}"))
+            })?;
+            let repo = req
+                .get("repo")
+                .and_then(|r| r.as_str())
                 .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing repo".into()))?;
-            let collection = req.get("collection").and_then(|c| c.as_str())
-                .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing collection".into()))?;
-            let rkey = req.get("rkey").and_then(|r| r.as_str())
+            let collection = req
+                .get("collection")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| {
+                    kappa_core::types::StoreError::Rejected("missing collection".into())
+                })?;
+            let rkey = req
+                .get("rkey")
+                .and_then(|r| r.as_str())
                 .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing rkey".into()))?;
 
             let ns = store.namespace_resolve(repo, Some("atproto"))?;
@@ -834,10 +1219,16 @@ fn delete_record(cx: &Cx, body: Body) -> RouteFuture<'_> {
             rebuild_mst_and_commit(&store, &ns, repo)?;
 
             Ok::<(), kappa_core::types::StoreError>(())
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(())) => StatusCode::OK.into_response(cx),
-            _ => xrpc_error(cx, StatusCode::NOT_FOUND, "RecordNotFound", "record not found"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::NOT_FOUND,
+                "RecordNotFound",
+                "record not found",
+            ),
         }
     })
 }
@@ -847,12 +1238,16 @@ fn upload_blob(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let blob_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 10 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 10 * 1024 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         let result = tokio::task::spawn_blocking(move || {
             let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &blob_bytes)?;
             Ok::<(String, usize), kappa_core::types::StoreError>((ingest.kappa, blob_bytes.len()))
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok((cid, size))) => {
                 let body = serde_json::json!({
@@ -863,9 +1258,19 @@ fn upload_blob(cx: &Cx, body: Body) -> RouteFuture<'_> {
                         "size": size,
                     }
                 });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
-            _ => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "upload blob failed"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "upload blob failed",
+            ),
         }
     })
 }
@@ -875,36 +1280,62 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let request_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 10 * 1024 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 10 * 1024 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         let pre_req: serde_json::Value = serde_json::from_slice(&request_bytes)
             .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
         if let Some(repo_val) = pre_req.get("repo").and_then(|r| r.as_str()) {
-            if let Err(resp) = verify_repo_auth(cx, repo_val) { return Ok(resp); }
+            if let Err(resp) = verify_repo_auth(cx, repo_val) {
+                return Ok(resp);
+            }
         }
         let result = tokio::task::spawn_blocking(move || {
-            let req: serde_json::Value = serde_json::from_slice(&request_bytes)
-                .map_err(|e| kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}")))?;
-            let repo = req.get("repo").and_then(|r| r.as_str())
+            let req: serde_json::Value = serde_json::from_slice(&request_bytes).map_err(|e| {
+                kappa_core::types::StoreError::Rejected(format!("invalid JSON: {e}"))
+            })?;
+            let repo = req
+                .get("repo")
+                .and_then(|r| r.as_str())
                 .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing repo".into()))?;
-            let writes = req.get("writes").and_then(|w| w.as_array())
-                .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing writes array".into()))?;
+            let writes = req
+                .get("writes")
+                .and_then(|w| w.as_array())
+                .ok_or_else(|| {
+                    kappa_core::types::StoreError::Rejected("missing writes array".into())
+                })?;
 
             let ns = store.namespace_resolve_or_create(repo, repo, Some("atproto"))?;
 
             for write in writes {
-                let action = write.get("$type").or(write.get("action"))
-                    .and_then(|a| a.as_str()).unwrap_or("");
-                let collection = write.get("collection").and_then(|c| c.as_str()).unwrap_or("");
+                let action = write
+                    .get("$type")
+                    .or(write.get("action"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                let collection = write
+                    .get("collection")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
                 let rkey = write.get("rkey").and_then(|r| r.as_str()).unwrap_or("");
 
                 match action {
                     "com.atproto.repo.applyWrites#create" | "create" => {
-                        let record = write.get("value").or(write.get("record"))
-                            .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing record in create".into()))?;
-                        let record_bytes = serde_json::to_vec(record)
-                            .map_err(|e| kappa_core::types::StoreError::Rejected(format!("record serialize: {e}")))?;
-                        let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
+                        let record =
+                            write.get("value").or(write.get("record")).ok_or_else(|| {
+                                kappa_core::types::StoreError::Rejected(
+                                    "missing record in create".into(),
+                                )
+                            })?;
+                        let record_bytes = serde_json::to_vec(record).map_err(|e| {
+                            kappa_core::types::StoreError::Rejected(format!(
+                                "record serialize: {e}"
+                            ))
+                        })?;
+                        let ingest =
+                            store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
 
                         // CID->kappa bridge tag
                         let record_cid = crate::cid::cid_for_cbor(&record_bytes);
@@ -921,11 +1352,19 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
                         store.tag_set(&ns, &tag_name, &ingest.kappa)?;
                     }
                     "com.atproto.repo.applyWrites#update" | "update" => {
-                        let record = write.get("value").or(write.get("record"))
-                            .ok_or_else(|| kappa_core::types::StoreError::Rejected("missing record in update".into()))?;
-                        let record_bytes = serde_json::to_vec(record)
-                            .map_err(|e| kappa_core::types::StoreError::Rejected(format!("record serialize: {e}")))?;
-                        let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
+                        let record =
+                            write.get("value").or(write.get("record")).ok_or_else(|| {
+                                kappa_core::types::StoreError::Rejected(
+                                    "missing record in update".into(),
+                                )
+                            })?;
+                        let record_bytes = serde_json::to_vec(record).map_err(|e| {
+                            kappa_core::types::StoreError::Rejected(format!(
+                                "record serialize: {e}"
+                            ))
+                        })?;
+                        let ingest =
+                            store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
 
                         // CID->kappa bridge tag
                         let record_cid = crate::cid::cid_for_cbor(&record_bytes);
@@ -940,9 +1379,10 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
                         let _ = store.tag_delete(&ns, &tag_name);
                     }
                     _ => {
-                        return Err(kappa_core::types::StoreError::Rejected(
-                            format!("unknown write action: {}", action)
-                        ));
+                        return Err(kappa_core::types::StoreError::Rejected(format!(
+                            "unknown write action: {}",
+                            action
+                        )));
                     }
                 }
             }
@@ -951,13 +1391,19 @@ fn apply_writes(cx: &Cx, body: Body) -> RouteFuture<'_> {
             rebuild_mst_and_commit(&store, &ns, repo)?;
 
             Ok::<(), kappa_core::types::StoreError>(())
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(())) => StatusCode::OK.into_response(cx),
             Ok(Err(kappa_core::types::StoreError::Rejected(msg))) => {
                 xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", &msg)
             }
-            _ => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "apply writes failed"),
+            _ => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "apply writes failed",
+            ),
         }
     })
 }
@@ -968,7 +1414,10 @@ fn create_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let request_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 64 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         let req: serde_json::Value = serde_json::from_slice(&request_bytes)
             .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
@@ -977,7 +1426,12 @@ fn create_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
 
         if identifier.is_empty() || password.is_empty() {
-            return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing identifier or password");
+            return xrpc_error(
+                cx,
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "missing identifier or password",
+            );
         }
 
         // Extract DPoP JKT from request (or use empty for non-DPoP clients)
@@ -985,25 +1439,34 @@ fn create_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
         let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
         match session_store {
-            Some(store) => {
-                match store.create_session(identifier, password, identifier, dpop_jkt) {
-                    Ok(session) => {
-                        let body = serde_json::json!({
-                            "accessJwt": session.access_token,
-                            "refreshJwt": session.refresh_token,
-                            "handle": session.handle,
-                            "did": session.did,
-                            "dpopJkt": session.dpop_jkt,
-                        });
-                        (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
-                    }
-                    Err(e) => {
-                        let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::UNAUTHORIZED);
-                        xrpc_error(cx, status, e.xrpc_error(), &e.to_string())
-                    }
+            Some(store) => match store.create_session(identifier, password, identifier, dpop_jkt) {
+                Ok(session) => {
+                    let body = serde_json::json!({
+                        "accessJwt": session.access_token,
+                        "refreshJwt": session.refresh_token,
+                        "handle": session.handle,
+                        "did": session.did,
+                        "dpopJkt": session.dpop_jkt,
+                    });
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        body.to_string(),
+                    )
+                        .into_response(cx)
                 }
-            }
-            None => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "session store not configured"),
+                Err(e) => {
+                    let status =
+                        StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::UNAUTHORIZED);
+                    xrpc_error(cx, status, e.xrpc_error(), &e.to_string())
+                }
+            },
+            None => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "session store not configured",
+            ),
         }
     })
 }
@@ -1015,7 +1478,9 @@ fn refresh_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let refresh_token = {
             use topcoat::context::request_context;
             let parts: &http::request::Parts = request_context(cx);
-            parts.headers.get("authorization")
+            parts
+                .headers
+                .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .unwrap_or("")
@@ -1023,29 +1488,43 @@ fn refresh_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
         };
 
         if refresh_token.is_empty() {
-            return xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing refresh token");
+            return xrpc_error(
+                cx,
+                StatusCode::UNAUTHORIZED,
+                "AuthenticationRequired",
+                "missing refresh token",
+            );
         }
 
         let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
         match session_store {
-            Some(store) => {
-                match store.refresh_session(&refresh_token) {
-                    Ok(session) => {
-                        let body = serde_json::json!({
-                            "accessJwt": session.access_token,
-                            "refreshJwt": session.refresh_token,
-                            "handle": session.handle,
-                            "did": session.did,
-                        });
-                        (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
-                    }
-                    Err(e) => {
-                        let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::UNAUTHORIZED);
-                        xrpc_error(cx, status, e.xrpc_error(), &e.to_string())
-                    }
+            Some(store) => match store.refresh_session(&refresh_token) {
+                Ok(session) => {
+                    let body = serde_json::json!({
+                        "accessJwt": session.access_token,
+                        "refreshJwt": session.refresh_token,
+                        "handle": session.handle,
+                        "did": session.did,
+                    });
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        body.to_string(),
+                    )
+                        .into_response(cx)
                 }
-            }
-            None => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "session store not configured"),
+                Err(e) => {
+                    let status =
+                        StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::UNAUTHORIZED);
+                    xrpc_error(cx, status, e.xrpc_error(), &e.to_string())
+                }
+            },
+            None => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "session store not configured",
+            ),
         }
     })
 }
@@ -1055,18 +1534,26 @@ fn delete_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let _ = body;
         let access_token = extract_bearer_token(cx);
         if access_token.is_empty() {
-            return xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token");
+            return xrpc_error(
+                cx,
+                StatusCode::UNAUTHORIZED,
+                "AuthenticationRequired",
+                "missing access token",
+            );
         }
 
         let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
         match session_store {
-            Some(store) => {
-                match store.delete_session(&access_token) {
-                    Ok(()) => StatusCode::OK.into_response(cx),
-                    Err(e) => xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string()),
-                }
-            }
-            None => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "session store not configured"),
+            Some(store) => match store.delete_session(&access_token) {
+                Ok(()) => StatusCode::OK.into_response(cx),
+                Err(e) => xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string()),
+            },
+            None => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "session store not configured",
+            ),
         }
     })
 }
@@ -1076,25 +1563,38 @@ fn get_session(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let _ = body;
         let access_token = extract_bearer_token(cx);
         if access_token.is_empty() {
-            return xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token");
+            return xrpc_error(
+                cx,
+                StatusCode::UNAUTHORIZED,
+                "AuthenticationRequired",
+                "missing access token",
+            );
         }
 
         let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
         match session_store {
-            Some(store) => {
-                match store.get_session(&access_token) {
-                    Ok(session) => {
-                        let body = serde_json::json!({
-                            "handle": session.handle,
-                            "did": session.did,
-                            "active": true,
-                        });
-                        (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
-                    }
-                    Err(e) => xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string()),
+            Some(store) => match store.get_session(&access_token) {
+                Ok(session) => {
+                    let body = serde_json::json!({
+                        "handle": session.handle,
+                        "did": session.did,
+                        "active": true,
+                    });
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        body.to_string(),
+                    )
+                        .into_response(cx)
                 }
-            }
-            None => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "session store not configured"),
+                Err(e) => xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string()),
+            },
+            None => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "session store not configured",
+            ),
         }
     })
 }
@@ -1105,17 +1605,28 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let request_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 64 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         let req: serde_json::Value = serde_json::from_slice(&request_bytes)
             .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
 
         let handle = req.get("handle").and_then(|v| v.as_str()).unwrap_or("");
         let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
-        let did = req.get("did").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let did = req
+            .get("did")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         if handle.is_empty() || password.is_empty() {
-            return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing handle or password");
+            return xrpc_error(
+                cx,
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "missing handle or password",
+            );
         }
 
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
@@ -1133,7 +1644,8 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
         // Create namespace and initial repo state
         let result = tokio::task::spawn_blocking(move || {
             // Create namespace for this DID
-            let ns = store.namespace_resolve_or_create(&did_for_ns, &did_for_ns, Some("atproto"))?;
+            let ns =
+                store.namespace_resolve_or_create(&did_for_ns, &did_for_ns, Some("atproto"))?;
 
             // Initialize empty MST root
             let mut mst_store = crate::mst::MemoryBlockStore::new();
@@ -1142,10 +1654,7 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
             // Store all MST node blocks and create CID->kappa bridge tags
             for (block_cid, block_bytes) in &mst_blocks {
-                let ingest = store.ingest_compute(
-                    kappa_core::kappa::Axis::Sha256,
-                    block_bytes,
-                )?;
+                let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, block_bytes)?;
                 let cid_hex = hex::encode(block_cid);
                 store.tag_set(&ns, &format!("mst/{}", cid_hex), &ingest.kappa)?;
             }
@@ -1162,9 +1671,8 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 prev: None,
             };
             let commit_bytes = commit.to_cbor();
-            let commit_result = store.ingest_compute(
-                kappa_core::kappa::Axis::Sha256, &commit_bytes,
-            )?;
+            let commit_result =
+                store.ingest_compute(kappa_core::kappa::Axis::Sha256, &commit_bytes)?;
 
             // Tag: commit/head -> commit kappa
             store.tag_set(&ns, "commit/head", &commit_result.kappa)?;
@@ -1173,16 +1681,21 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
             store.tag_set(&ns, &format!("commit/rev/{}", rev), &commit_result.kappa)?;
 
             Ok::<(String, String), kappa_core::types::StoreError>((did_for_ns, rev))
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok((did, _rev))) => {
                 // Register credentials and create initial session
                 let mut access_jwt = String::new();
                 let mut refresh_jwt = String::new();
-                if let Some(session_store) = try_app_context::<Arc<crate::session::SessionStore>>(cx) {
+                if let Some(session_store) =
+                    try_app_context::<Arc<crate::session::SessionStore>>(cx)
+                {
                     session_store.register_credentials(&did, &password_owned);
-                    if let Ok(session) = session_store.create_session(&did, &password_owned, &handle_owned, "") {
+                    if let Ok(session) =
+                        session_store.create_session(&did, &password_owned, &handle_owned, "")
+                    {
                         access_jwt = session.access_token;
                         refresh_jwt = session.refresh_token;
                     }
@@ -1194,10 +1707,25 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
                     "accessJwt": access_jwt,
                     "refreshJwt": refresh_jwt,
                 });
-                (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response(cx)
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx)
             }
-            Ok(Err(e)) => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
-            Err(e) => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
+            Ok(Err(e)) => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                &e.to_string(),
+            ),
+            Err(e) => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                &e.to_string(),
+            ),
         }
     })
 }
@@ -1248,8 +1776,7 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         use topcoat::router::content::websocket::{Message, WebSocketUpgrade};
 
-        let cursor: Option<u64> = query_param(cx, "cursor")
-            .and_then(|s| s.parse().ok());
+        let cursor: Option<u64> = query_param(cx, "cursor").and_then(|s| s.parse().ok());
 
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
         let config = try_app_context::<Arc<FirehoseConfig>>(cx)
@@ -1259,8 +1786,9 @@ fn subscribe_repos(cx: &Cx, body: Body) -> RouteFuture<'_> {
         // Broadcast sender registered in app context by kappa-server.
         // The atproto module subscribes to it for zero-latency push delivery.
         let event_sender = try_app_context::<
-            Arc<tokio::sync::broadcast::Sender<kappa_core::events::TagEvent>>
-        >(cx).cloned();
+            Arc<tokio::sync::broadcast::Sender<kappa_core::events::TagEvent>>,
+        >(cx)
+        .cloned();
 
         let upgrade = WebSocketUpgrade::from_request(cx, body).await?;
         upgrade
@@ -1434,7 +1962,9 @@ fn firehose_frame_cbor(event: &kappa_core::events::TagEvent, seq: u64) -> Vec<u8
     let header = crate::dag_cbor::encode_header(1, frame_type);
     let body = match frame_type {
         "#handle" => {
-            let handle = event.name.strip_prefix("handle:")
+            let handle = event
+                .name
+                .strip_prefix("handle:")
                 .and_then(|s| s.split_once(':').map(|(_, h)| h))
                 .unwrap_or("");
             crate::dag_cbor::encode_handle_body(seq, &event.namespace, handle)
@@ -1448,11 +1978,12 @@ fn firehose_frame_cbor(event: &kappa_core::events::TagEvent, seq: u64) -> Vec<u8
                 _ => "update",
             };
             crate::dag_cbor::encode_commit_body(
-                seq, &event.namespace,
-                &[], // commit CID -- populated when MST-backed commits are real
-                "",  // rev
+                seq,
+                &event.namespace,
+                &[],  // commit CID -- populated when MST-backed commits are real
+                "",   // rev
                 None, // since
-                &[], // blocks CAR -- populated with MST-aware export
+                &[],  // blocks CAR -- populated with MST-aware export
                 &[(action, &event.name, None)],
             )
         }
@@ -1465,7 +1996,9 @@ fn firehose_frame_json(event: &kappa_core::events::TagEvent, seq: u64) -> serde_
     let frame_type = classify_frame(event);
     match frame_type {
         "#handle" => {
-            let handle = event.name.strip_prefix("handle:")
+            let handle = event
+                .name
+                .strip_prefix("handle:")
                 .and_then(|s| s.split_once(':').map(|(_, h)| h))
                 .unwrap_or("");
             serde_json::json!({
@@ -1515,7 +2048,12 @@ fn update_handle(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let access_token = extract_bearer_token(cx);
         if access_token.is_empty() {
-            return xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token");
+            return xrpc_error(
+                cx,
+                StatusCode::UNAUTHORIZED,
+                "AuthenticationRequired",
+                "missing access token",
+            );
         }
 
         // Validate session
@@ -1523,21 +2061,43 @@ fn update_handle(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let did = match session_store {
             Some(store) => match store.validate_token(&access_token) {
                 Some(d) => d,
-                None => return xrpc_error(cx, StatusCode::UNAUTHORIZED, "ExpiredToken", "invalid token"),
+                None => {
+                    return xrpc_error(
+                        cx,
+                        StatusCode::UNAUTHORIZED,
+                        "ExpiredToken",
+                        "invalid token",
+                    )
+                }
             },
-            None => return xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "no session store"),
+            None => {
+                return xrpc_error(
+                    cx,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "no session store",
+                )
+            }
         };
 
         let request_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 64 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         let req: serde_json::Value = serde_json::from_slice(&request_bytes)
             .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
 
         let new_handle = req.get("handle").and_then(|v| v.as_str()).unwrap_or("");
         if new_handle.is_empty() {
-            return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing handle");
+            return xrpc_error(
+                cx,
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "missing handle",
+            );
         }
 
         let store = app_context::<Arc<dyn KappaStore>>(cx).clone();
@@ -1576,8 +2136,9 @@ fn update_handle(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 liveness: kappa_core::identity::handle::HandleLiveness::Unverified,
             };
 
-            let record_bytes = serde_json::to_vec(&record)
-                .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
+            let record_bytes = serde_json::to_vec(&record).map_err(|e| {
+                kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string()))
+            })?;
             let ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
 
             let tag_key = format!("handle:atproto:{}", handle_owned);
@@ -1585,16 +2146,28 @@ fn update_handle(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
             // Update reverse tag
             let reverse_bytes = tag_key.as_bytes();
-            let reverse_ingest = store.ingest_compute(kappa_core::kappa::Axis::Sha256, reverse_bytes)?;
+            let reverse_ingest =
+                store.ingest_compute(kappa_core::kappa::Axis::Sha256, reverse_bytes)?;
             store.tag_set(&handles_ns, &reverse_key, &reverse_ingest.kappa)?;
 
             Ok::<(), kappa_core::types::StoreError>(())
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(())) => StatusCode::OK.into_response(cx),
-            Ok(Err(e)) => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
-            Err(e) => xrpc_error(cx, StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
+            Ok(Err(e)) => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                &e.to_string(),
+            ),
+            Err(e) => xrpc_error(
+                cx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                &e.to_string(),
+            ),
         }
     })
 }
@@ -1605,22 +2178,35 @@ fn request_crawl(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         let request_bytes = {
             use topcoat::router::to_bytes;
-            to_bytes(body, 64 * 1024).await.map(|b| b.to_vec()).unwrap_or_default()
+            to_bytes(body, 64 * 1024)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         let req: serde_json::Value = serde_json::from_slice(&request_bytes)
             .map_err(|e| topcoat::router::error::bad_request(format!("invalid JSON: {e}")))?;
 
         let hostname = req.get("hostname").and_then(|v| v.as_str()).unwrap_or("");
         if hostname.is_empty() {
-            return xrpc_error(cx, StatusCode::BAD_REQUEST, "InvalidRequest", "missing hostname");
+            return xrpc_error(
+                cx,
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "missing hostname",
+            );
         }
 
         // Fire-and-forget: notify the relay via OutboundClient
         let our_hostname = std::env::var("KAPPA_PDS_HOSTNAME")
             .unwrap_or_else(|_| "http://localhost:5000".to_string());
-        let relay_url = format!("{}/xrpc/com.atproto.sync.requestCrawl", hostname.trim_end_matches('/'));
+        let relay_url = format!(
+            "{}/xrpc/com.atproto.sync.requestCrawl",
+            hostname.trim_end_matches('/')
+        );
 
-        if let Some(outbound) = try_app_context::<Arc<topcoat::router::outbound::OutboundClient>>(cx) {
+        if let Some(outbound) =
+            try_app_context::<Arc<topcoat::router::outbound::OutboundClient>>(cx)
+        {
             let outbound = outbound.clone();
             let cx_clone = cx.clone();
             tokio::spawn(async move {
@@ -1649,19 +2235,23 @@ fn request_crawl(cx: &Cx, body: Body) -> RouteFuture<'_> {
 /// Write endpoints (createRecord, putRecord, deleteRecord, applyWrites)
 /// must verify that the authenticated user owns the repo they're writing to.
 /// Returns Ok(did) if authorized, Err(Response) if not.
-fn verify_repo_auth(
-    cx: &Cx,
-    repo: &str,
-) -> Result<String, topcoat::router::response::Response> {
+fn verify_repo_auth(cx: &Cx, repo: &str) -> Result<String, topcoat::router::response::Response> {
     use topcoat::context::request_context;
     let parts: &http::request::Parts = request_context(cx);
-    let auth_header = parts.headers.get("authorization")
+    let auth_header = parts
+        .headers
+        .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
     if auth_header.is_empty() {
-        return Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "missing access token")
-            .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+        return Err(xrpc_error(
+            cx,
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "missing access token",
+        )
+        .unwrap_or_else(|_| topcoat::router::response::Response::default()));
     }
 
     let session_store = try_app_context::<Arc<crate::session::SessionStore>>(cx);
@@ -1672,29 +2262,44 @@ fn verify_repo_auth(
 
     // DPoP path: Authorization: DPoP {access_token} + DPoP header with proof JWT
     if let Some(access_token) = auth_header.strip_prefix("DPoP ") {
-        let dpop_proof = parts.headers.get("dpop")
+        let dpop_proof = parts
+            .headers
+            .get("dpop")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if dpop_proof.is_empty() {
-            return Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "InvalidToken", "DPoP proof header missing")
-                .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+            return Err(xrpc_error(
+                cx,
+                StatusCode::UNAUTHORIZED,
+                "InvalidToken",
+                "DPoP proof header missing",
+            )
+            .unwrap_or_else(|_| topcoat::router::response::Response::default()));
         }
         // Parse and verify the DPoP proof JWT (ES256 signature verification)
-        let claims = crate::session::parse_and_verify_dpop_proof(dpop_proof)
-            .map_err(|e| xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string())
-                .unwrap_or_else(|_| topcoat::router::response::Response::default()))?;
+        let claims = crate::session::parse_and_verify_dpop_proof(dpop_proof).map_err(|e| {
+            xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string())
+                .unwrap_or_else(|_| topcoat::router::response::Response::default())
+        })?;
 
         // Full 7-step DPoP verification against the session
         let method = parts.method.as_str();
         let uri = parts.uri.to_string();
-        let did = store.verify_dpop_request(access_token, &claims, method, &uri)
-            .map_err(|e| xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string())
-                .unwrap_or_else(|_| topcoat::router::response::Response::default()))?;
+        let did = store
+            .verify_dpop_request(access_token, &claims, method, &uri)
+            .map_err(|e| {
+                xrpc_error(cx, StatusCode::UNAUTHORIZED, e.xrpc_error(), &e.to_string())
+                    .unwrap_or_else(|_| topcoat::router::response::Response::default())
+            })?;
 
         if did != repo {
-            return Err(xrpc_error(cx, StatusCode::FORBIDDEN, "Forbidden",
-                &format!("session DID {} does not match repo {}", did, repo))
-                .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+            return Err(xrpc_error(
+                cx,
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+                &format!("session DID {} does not match repo {}", did, repo),
+            )
+            .unwrap_or_else(|_| topcoat::router::response::Response::default()));
         }
         return Ok(did);
     }
@@ -1704,27 +2309,48 @@ fn verify_repo_auth(
         match store.validate_token(access_token) {
             Some(did) => {
                 if did != repo {
-                    return Err(xrpc_error(cx, StatusCode::FORBIDDEN, "Forbidden",
-                        &format!("session DID {} does not match repo {}", did, repo))
-                        .unwrap_or_else(|_| topcoat::router::response::Response::default()));
+                    return Err(xrpc_error(
+                        cx,
+                        StatusCode::FORBIDDEN,
+                        "Forbidden",
+                        &format!("session DID {} does not match repo {}", did, repo),
+                    )
+                    .unwrap_or_else(|_| topcoat::router::response::Response::default()));
                 }
                 return Ok(did);
             }
-            None => return Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "ExpiredToken", "invalid or expired token")
-                .unwrap_or_else(|_| topcoat::router::response::Response::default())),
+            None => {
+                return Err(xrpc_error(
+                    cx,
+                    StatusCode::UNAUTHORIZED,
+                    "ExpiredToken",
+                    "invalid or expired token",
+                )
+                .unwrap_or_else(|_| topcoat::router::response::Response::default()))
+            }
         }
     }
 
-    Err(xrpc_error(cx, StatusCode::UNAUTHORIZED, "AuthenticationRequired", "unsupported authorization scheme")
-        .unwrap_or_else(|_| topcoat::router::response::Response::default()))
+    Err(xrpc_error(
+        cx,
+        StatusCode::UNAUTHORIZED,
+        "AuthenticationRequired",
+        "unsupported authorization scheme",
+    )
+    .unwrap_or_else(|_| topcoat::router::response::Response::default()))
 }
 
 fn extract_bearer_token(cx: &Cx) -> String {
     use topcoat::context::request_context;
     let parts: &http::request::Parts = request_context(cx);
-    parts.headers.get("authorization")
+    parts
+        .headers
+        .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("DPoP ")))
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("DPoP "))
+        })
         .unwrap_or("")
         .to_string()
 }

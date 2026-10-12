@@ -11,9 +11,7 @@ use std::sync::Arc;
 
 use topcoat::context::{try_app_context, Cx};
 use topcoat::router::response::Response;
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use kappa_core::events::EventLog;
 use kappa_core::types::NamespaceRef;
@@ -40,7 +38,12 @@ fn events_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
-async fn events(cx: &Cx, ns: &NamespaceRef, prefix: Option<&str>, since: u64) -> topcoat::Result<Response> {
+async fn events(
+    cx: &Cx,
+    ns: &NamespaceRef,
+    prefix: Option<&str>,
+    since: u64,
+) -> topcoat::Result<Response> {
     let n = ns.clone();
     let pfx = prefix.map(String::from);
 

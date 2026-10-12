@@ -15,7 +15,10 @@ use std::sync::RwLock;
 
 use kappa_core::identity::assertion::IdentityAssertion;
 use kappa_core::store::KappaStore;
-use kappa_core::types::{DelegationScope, Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef, ResolvedNamespace, StoreError};
+use kappa_core::types::{
+    DelegationScope, Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef, ResolvedNamespace,
+    StoreError,
+};
 
 use crate::ratelimit::OpClass;
 
@@ -203,9 +206,7 @@ pub fn authorize(
                 Err(AuthError::NotFound)
             }
         }
-        ResolvedNamespace::NoNamespace => {
-            Ok(AuthDecision::Allowed)
-        }
+        ResolvedNamespace::NoNamespace => Ok(AuthDecision::Allowed),
     }
 }
 
@@ -220,8 +221,7 @@ fn check_delegation(
     target: &str,
     hop: u32,
 ) -> Result<bool, AuthError> {
-    check_delegation_inner(store, ns, op, target, hop)
-        .map(|r| r.is_some())
+    check_delegation_inner(store, ns, op, target, hop).map(|r| r.is_some())
 }
 
 /// Inner delegation check returning the delegation_depth of the
@@ -249,7 +249,8 @@ fn check_delegation_inner(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let root_ns = store.namespace_resolve("_root", None)
+    let root_ns = store
+        .namespace_resolve("_root", None)
         .map_err(|e| AuthError::Store(e))?;
     let namespaces_to_check = [ns.clone(), root_ns];
 
@@ -267,11 +268,18 @@ fn check_delegation_inner(
         };
 
         for edge in &edges {
-            let Some(ref meta) = edge.metadata else { continue };
-            let Ok(scope) = serde_json::from_slice::<DelegationScope>(meta) else { continue };
+            let Some(ref meta) = edge.metadata else {
+                continue;
+            };
+            let Ok(scope) = serde_json::from_slice::<DelegationScope>(meta) else {
+                continue;
+            };
 
             if !scope.namespaces.is_empty()
-                && !scope.namespaces.iter().any(|n| ns.as_str().starts_with(n.as_str()))
+                && !scope
+                    .namespaces
+                    .iter()
+                    .any(|n| ns.as_str().starts_with(n.as_str()))
             {
                 continue;
             }
@@ -389,15 +397,16 @@ impl BearerAuth {
         headers: &topcoat::router::HeaderMap,
     ) -> Result<AuthIdentity, topcoat::router::response::Response> {
         if !self.required || self.tokens.is_empty() {
-            return Ok(AuthIdentity { asserter: "anonymous".to_string() });
+            return Ok(AuthIdentity {
+                asserter: "anonymous".to_string(),
+            });
         }
         // Exempt paths: health, status, version check
-        if path == "/_status"
-            || path == "/v2/"
-            || path == "/v2"
-            || path.starts_with("/v2/_health/")
+        if path == "/_status" || path == "/v2/" || path == "/v2" || path.starts_with("/v2/_health/")
         {
-            return Ok(AuthIdentity { asserter: "anonymous".to_string() });
+            return Ok(AuthIdentity {
+                asserter: "anonymous".to_string(),
+            });
         }
         let token = headers
             .get("authorization")
@@ -405,17 +414,18 @@ impl BearerAuth {
             .and_then(|v| v.strip_prefix("Bearer "));
         match token {
             Some(t) => match self.tokens.get(t) {
-                Some(anchor) => Ok(AuthIdentity { asserter: anchor.clone() }),
+                Some(anchor) => Ok(AuthIdentity {
+                    asserter: anchor.clone(),
+                }),
                 None => Self::unauthorized(),
-            }
+            },
             None => Self::unauthorized(),
         }
     }
 
     fn unauthorized<T>() -> Result<T, topcoat::router::response::Response> {
         let body = r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
-        let mut resp =
-            topcoat::router::response::Response::new(topcoat::router::Body::from(body));
+        let mut resp = topcoat::router::response::Response::new(topcoat::router::Body::from(body));
         *resp.status_mut() = topcoat::router::StatusCode::UNAUTHORIZED;
         resp.headers_mut().insert(
             "www-authenticate",

@@ -42,13 +42,15 @@ pub fn update_ref(
                 kappa: new_oid.to_string(),
                 expected_version: Some(0),
             }];
-            store.tag_set_batch(namespace, &updates).map_err(|e| match e {
-                StoreError::Conflict(_) => RefError::UpdateRejected {
-                    expected: "(none)".into(),
-                    actual: "(exists)".into(),
-                },
-                other => RefError::Store(other),
-            })
+            store
+                .tag_set_batch(namespace, &updates)
+                .map_err(|e| match e {
+                    StoreError::Conflict(_) => RefError::UpdateRejected {
+                        expected: "(none)".into(),
+                        actual: "(exists)".into(),
+                    },
+                    other => RefError::Store(other),
+                })
         }
         Some(expected) => {
             // Atomic CAS via tag_set_batch with expected_version.
@@ -85,13 +87,15 @@ pub fn update_ref(
                 kappa: new_oid.to_string(),
                 expected_version: Some(current.version),
             }];
-            store.tag_set_batch(namespace, &updates).map_err(|e| match e {
-                StoreError::Conflict(_) => RefError::UpdateRejected {
-                    expected: expected.to_string(),
-                    actual: "(concurrent modification)".into(),
-                },
-                other => RefError::Store(other),
-            })
+            store
+                .tag_set_batch(namespace, &updates)
+                .map_err(|e| match e {
+                    StoreError::Conflict(_) => RefError::UpdateRejected {
+                        expected: expected.to_string(),
+                        actual: "(concurrent modification)".into(),
+                    },
+                    other => RefError::Store(other),
+                })
         }
     }
 }
@@ -144,10 +148,7 @@ pub fn list_refs(
     prefix: &str,
 ) -> Result<Vec<(String, String)>, RefError> {
     let tags = store.tag_prefix(namespace, prefix)?;
-    Ok(tags
-        .into_iter()
-        .map(|t| (t.name, t.kappa))
-        .collect())
+    Ok(tags.into_iter().map(|t| (t.name, t.kappa)).collect())
 }
 
 /// Delete a ref.
@@ -170,11 +171,8 @@ mod tests {
     fn test_store() -> (Arc<InMemoryStore>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        )
-        .unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
         (Arc::new(store), tmp)
     }
 
@@ -192,7 +190,14 @@ mod tests {
         let (store, _tmp) = test_store();
         let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
-        update_ref(&*store, &ns, "refs/heads/main", "sha1:bbb", Some("sha1:aaa")).unwrap();
+        update_ref(
+            &*store,
+            &ns,
+            "refs/heads/main",
+            "sha1:bbb",
+            Some("sha1:aaa"),
+        )
+        .unwrap();
         let resolved = resolve_ref(&*store, &ns, "refs/heads/main").unwrap();
         assert_eq!(resolved, Some("sha1:bbb".into()));
     }
@@ -202,7 +207,13 @@ mod tests {
         let (store, _tmp) = test_store();
         let ns = NamespaceRef::deterministic("repo");
         update_ref(&*store, &ns, "refs/heads/main", "sha1:aaa", None).unwrap();
-        let result = update_ref(&*store, &ns, "refs/heads/main", "sha1:bbb", Some("sha1:wrong"));
+        let result = update_ref(
+            &*store,
+            &ns,
+            "refs/heads/main",
+            "sha1:bbb",
+            Some("sha1:wrong"),
+        );
         assert!(matches!(result, Err(RefError::UpdateRejected { .. })));
     }
 

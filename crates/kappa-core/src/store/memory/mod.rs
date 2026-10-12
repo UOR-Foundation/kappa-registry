@@ -108,14 +108,21 @@ impl InMemoryStore {
         let uuid = *ns.uuid();
         if !self.ns_records.contains_key(&uuid) {
             let name = ns.display_name().unwrap_or("").to_string();
-            self.ns_records.insert(uuid, crate::store::NamespaceRecord {
-                uuid_hex: ns.uuid_hex(),
-                owner: String::new(),
-                created_at_ms: 0,
-                protocol: None,
-                aliases: if name.is_empty() { vec![] } else { vec![name.clone()] },
-                tombstoned: false,
-            });
+            self.ns_records.insert(
+                uuid,
+                crate::store::NamespaceRecord {
+                    uuid_hex: ns.uuid_hex(),
+                    owner: String::new(),
+                    created_at_ms: 0,
+                    protocol: None,
+                    aliases: if name.is_empty() {
+                        vec![]
+                    } else {
+                        vec![name.clone()]
+                    },
+                    tombstoned: false,
+                },
+            );
             if !name.is_empty() {
                 self.ns_aliases.insert(name, uuid);
             }
@@ -136,7 +143,10 @@ impl InMemoryStore {
 }
 
 impl KappaStore for InMemoryStore {
-    fn blob_put_verified(&self, verified: &crate::verified::VerifiedContent) -> Result<bool, StoreError> {
+    fn blob_put_verified(
+        &self,
+        verified: &crate::verified::VerifiedContent,
+    ) -> Result<bool, StoreError> {
         let kappa = verified.kappa();
         let content = verified.content();
         tracing::debug!(kappa = kappa, size = content.len(), "blob_put_verified");
@@ -280,7 +290,13 @@ impl KappaStore for InMemoryStore {
 
     // -- Namespace-scoped metadata --------------------------------------------
 
-    fn meta_set(&self, ns: &NamespaceRef, kappa: &str, key: &str, value: &str) -> Result<(), StoreError> {
+    fn meta_set(
+        &self,
+        ns: &NamespaceRef,
+        kappa: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), StoreError> {
         tracing::debug!(ns = %ns, kappa = kappa, key = key, value = value, "meta_set");
         self.ensure_namespace(ns);
         let idx_key = (*ns.uuid(), item_hash(key), item_hash(value));
@@ -291,7 +307,12 @@ impl KappaStore for InMemoryStore {
         Ok(())
     }
 
-    fn meta_query(&self, ns: &NamespaceRef, key: &str, value: &str) -> Result<Vec<String>, StoreError> {
+    fn meta_query(
+        &self,
+        ns: &NamespaceRef,
+        key: &str,
+        value: &str,
+    ) -> Result<Vec<String>, StoreError> {
         tracing::trace!(ns = %ns, key = key, value = value, "meta_query");
         let uuid = *ns.uuid();
         if value.is_empty() {
@@ -467,7 +488,11 @@ impl KappaStore for InMemoryStore {
 
     // -- Epoch ----------------------------------------------------------------
 
-    fn epoch_advance(&self, ns: &NamespaceRef, mutations: Vec<EpochMutation>) -> Result<String, StoreError> {
+    fn epoch_advance(
+        &self,
+        ns: &NamespaceRef,
+        mutations: Vec<EpochMutation>,
+    ) -> Result<String, StoreError> {
         tracing::debug!(ns = %ns, mutation_count = mutations.len(), "epoch_advance");
         self.ensure_namespace(ns);
         let uuid = *ns.uuid();
@@ -522,13 +547,7 @@ impl KappaStore for InMemoryStore {
         tracing::trace!(ns = %ns, "epoch_current");
         let uuid = *ns.uuid();
         // Check in-memory cache first
-        if let Some(k) = self
-            .current_epochs
-            .read()
-            .unwrap()
-            .get(&uuid)
-            .cloned()
-        {
+        if let Some(k) = self.current_epochs.read().unwrap().get(&uuid).cloned() {
             return Ok(Some(k));
         }
         // Fall back to persisted tag (post-restart recovery)
@@ -572,7 +591,10 @@ impl KappaStore for InMemoryStore {
     ) -> Result<NamespaceRef, StoreError> {
         let alias_key = alias_key(name, protocol);
         if self.ns_aliases.contains_key(&alias_key) {
-            return Err(StoreError::Conflict(format!("namespace alias already exists: {}", alias_key)));
+            return Err(StoreError::Conflict(format!(
+                "namespace alias already exists: {}",
+                alias_key
+            )));
         }
         let ns = NamespaceRef::generate(name);
         let uuid = *ns.uuid();
@@ -581,14 +603,17 @@ impl KappaStore for InMemoryStore {
             .unwrap_or_default()
             .as_millis() as u64;
         self.ns_aliases.insert(alias_key, uuid);
-        self.ns_records.insert(uuid, crate::store::NamespaceRecord {
-            uuid_hex: ns.uuid_hex(),
-            owner: owner.to_string(),
-            created_at_ms: now_ms,
-            protocol: protocol.map(|s| s.to_string()),
-            aliases: vec![name.to_string()],
-            tombstoned: false,
-        });
+        self.ns_records.insert(
+            uuid,
+            crate::store::NamespaceRecord {
+                uuid_hex: ns.uuid_hex(),
+                owner: owner.to_string(),
+                created_at_ms: now_ms,
+                protocol: protocol.map(|s| s.to_string()),
+                aliases: vec![name.to_string()],
+                tombstoned: false,
+            },
+        );
         Ok(ns)
     }
 
@@ -598,7 +623,9 @@ impl KappaStore for InMemoryStore {
         protocol: Option<&str>,
     ) -> Result<NamespaceRef, StoreError> {
         let key = alias_key(name, protocol);
-        let uuid = self.ns_aliases.get(&key)
+        let uuid = self
+            .ns_aliases
+            .get(&key)
             .map(|r| *r.value())
             .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", key)))?;
         Ok(NamespaceRef::with_name(uuid, name.to_string()))
@@ -612,13 +639,11 @@ impl KappaStore for InMemoryStore {
     ) -> Result<NamespaceRef, StoreError> {
         match self.namespace_resolve(name, protocol) {
             Ok(ns) => Ok(ns),
-            Err(StoreError::NotFound(_)) => {
-                match self.namespace_create(name, owner, protocol) {
-                    Ok(ns) => Ok(ns),
-                    Err(StoreError::Conflict(_)) => self.namespace_resolve(name, protocol),
-                    Err(e) => Err(e),
-                }
-            }
+            Err(StoreError::NotFound(_)) => match self.namespace_create(name, owner, protocol) {
+                Ok(ns) => Ok(ns),
+                Err(StoreError::Conflict(_)) => self.namespace_resolve(name, protocol),
+                Err(e) => Err(e),
+            },
             Err(e) => Err(e),
         }
     }
@@ -628,7 +653,9 @@ impl KappaStore for InMemoryStore {
         protocol: Option<&str>,
     ) -> Result<Vec<crate::store::NamespaceRecord>, StoreError> {
         tracing::trace!("namespace_list");
-        let mut result: Vec<crate::store::NamespaceRecord> = self.ns_records.iter()
+        let mut result: Vec<crate::store::NamespaceRecord> = self
+            .ns_records
+            .iter()
             .map(|r| r.value().clone())
             .filter(|r| {
                 if let Some(p) = protocol {
@@ -642,11 +669,7 @@ impl KappaStore for InMemoryStore {
         Ok(result)
     }
 
-    fn namespace_exists(
-        &self,
-        name: &str,
-        protocol: Option<&str>,
-    ) -> Result<bool, StoreError> {
+    fn namespace_exists(&self, name: &str, protocol: Option<&str>) -> Result<bool, StoreError> {
         let key = alias_key(name, protocol);
         Ok(self.ns_aliases.contains_key(&key))
     }
@@ -660,16 +683,22 @@ impl KappaStore for InMemoryStore {
     ) -> Result<(), StoreError> {
         let old_key = alias_key(old_name, protocol);
         let new_key = alias_key(new_name, protocol);
-        let uuid = self.ns_aliases.get(&old_key)
+        let uuid = self
+            .ns_aliases
+            .get(&old_key)
             .map(|r| *r.value())
             .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", old_key)))?;
         if self.ns_aliases.contains_key(&new_key) {
-            return Err(StoreError::Conflict(format!("target alias already exists: {}", new_key)));
+            return Err(StoreError::Conflict(format!(
+                "target alias already exists: {}",
+                new_key
+            )));
         }
         if let Some(mut record) = self.ns_records.get_mut(&uuid) {
             if record.owner != actor {
                 return Err(StoreError::Rejected(format!(
-                    "only owner {} can rename, actor is {}", record.owner, actor
+                    "only owner {} can rename, actor is {}",
+                    record.owner, actor
                 )));
             }
             record.aliases.retain(|a| a != old_name);
@@ -689,13 +718,18 @@ impl KappaStore for InMemoryStore {
     ) -> Result<(), StoreError> {
         let key = alias_key(alias, protocol);
         if self.ns_aliases.contains_key(&key) {
-            return Err(StoreError::Conflict(format!("alias already exists: {}", key)));
+            return Err(StoreError::Conflict(format!(
+                "alias already exists: {}",
+                key
+            )));
         }
-        let mut record = self.ns_records.get_mut(uuid)
-            .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+        let mut record = self.ns_records.get_mut(uuid).ok_or_else(|| {
+            StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+        })?;
         if record.owner != actor {
             return Err(StoreError::Rejected(format!(
-                "only owner {} can add alias, actor is {}", record.owner, actor
+                "only owner {} can add alias, actor is {}",
+                record.owner, actor
             )));
         }
         if !record.aliases.contains(&alias.to_string()) {
@@ -712,13 +746,15 @@ impl KappaStore for InMemoryStore {
         new_owner: &str,
         actor: &str,
     ) -> Result<(), StoreError> {
-        let mut record = self.ns_records.get_mut(uuid)
-            .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+        let mut record = self.ns_records.get_mut(uuid).ok_or_else(|| {
+            StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+        })?;
         if record.owner != actor {
             let resolved = self.identity_succession_resolve(&record.owner)?;
             if resolved != actor {
                 return Err(StoreError::Rejected(format!(
-                    "only owner {} (or successor) can transfer, actor is {}", record.owner, actor
+                    "only owner {} (or successor) can transfer, actor is {}",
+                    record.owner, actor
                 )));
             }
         }
@@ -732,10 +768,13 @@ impl KappaStore for InMemoryStore {
         protocol: Option<&str>,
     ) -> Result<crate::store::NamespaceRecord, StoreError> {
         let key = alias_key(name, protocol);
-        let uuid = self.ns_aliases.get(&key)
+        let uuid = self
+            .ns_aliases
+            .get(&key)
             .map(|r| *r.value())
             .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", key)))?;
-        self.ns_records.get(&uuid)
+        self.ns_records
+            .get(&uuid)
             .map(|r| r.value().clone())
             .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))
     }
@@ -747,15 +786,19 @@ impl KappaStore for InMemoryStore {
         protocol: Option<&str>,
     ) -> Result<(), StoreError> {
         let key = alias_key(name, protocol);
-        let uuid = self.ns_aliases.get(&key)
+        let uuid = self
+            .ns_aliases
+            .get(&key)
             .map(|r| *r.value())
             .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", key)))?;
         {
-            let record = self.ns_records.get(&uuid)
-                .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+            let record = self.ns_records.get(&uuid).ok_or_else(|| {
+                StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+            })?;
             if record.owner != actor {
                 return Err(StoreError::Rejected(format!(
-                    "only owner {} can delete, actor is {}", record.owner, actor
+                    "only owner {} can delete, actor is {}",
+                    record.owner, actor
                 )));
             }
         }
@@ -778,13 +821,16 @@ impl KappaStore for InMemoryStore {
     fn upload_begin(&self, namespace: &NamespaceRef, max_size: u64) -> Result<String, StoreError> {
         let id = uuid::Uuid::new_v4().to_string();
         let mut uploads = self.uploads.lock().unwrap();
-        uploads.insert(id.clone(), UploadSession {
-            namespace: namespace.to_string(),
-            data: Vec::new(),
-            max_size,
-            created_at: std::time::Instant::now(),
-            part_digests: Vec::new(),
-        });
+        uploads.insert(
+            id.clone(),
+            UploadSession {
+                namespace: namespace.to_string(),
+                data: Vec::new(),
+                max_size,
+                created_at: std::time::Instant::now(),
+                part_digests: Vec::new(),
+            },
+        );
         Ok(id)
     }
 
@@ -800,16 +846,21 @@ impl KappaStore for InMemoryStore {
             if let Some(session) = uploads.get(upload_id) {
                 if session.created_at.elapsed() > std::time::Duration::from_secs(timeout) {
                     uploads.remove(upload_id);
-                    return Err(StoreError::NotFound(format!("upload {} expired", upload_id)));
+                    return Err(StoreError::NotFound(format!(
+                        "upload {} expired",
+                        upload_id
+                    )));
                 }
             }
         }
-        let session = uploads.get_mut(upload_id)
+        let session = uploads
+            .get_mut(upload_id)
             .ok_or_else(|| StoreError::NotFound(format!("upload {}", upload_id)))?;
         if offset != session.data.len() as u64 {
             return Err(StoreError::Conflict(format!(
                 "out-of-order: expected offset {}, got {}",
-                session.data.len(), offset
+                session.data.len(),
+                offset
             )));
         }
         let new_len = session.data.len() + data.len();
@@ -825,7 +876,9 @@ impl KappaStore for InMemoryStore {
         let mut md5_bytes = [0u8; 16];
         md5_bytes.copy_from_slice(&md5_hash);
         let part_number = session.part_digests.len() as u32 + 1;
-        session.part_digests.push((part_number, md5_bytes, data.len() as u64));
+        session
+            .part_digests
+            .push((part_number, md5_bytes, data.len() as u64));
 
         session.data.extend_from_slice(data);
         Ok(session.data.len() as u64)
@@ -838,11 +891,15 @@ impl KappaStore for InMemoryStore {
     ) -> Result<crate::store::IngestResult, StoreError> {
         let content = {
             let mut uploads = self.uploads.lock().unwrap();
-            let session = uploads.remove(upload_id)
+            let session = uploads
+                .remove(upload_id)
                 .ok_or_else(|| StoreError::NotFound(format!("upload {}", upload_id)))?;
             if let Some(timeout) = self.upload_timeout_secs {
                 if session.created_at.elapsed() > std::time::Duration::from_secs(timeout) {
-                    return Err(StoreError::NotFound(format!("upload {} expired", upload_id)));
+                    return Err(StoreError::NotFound(format!(
+                        "upload {} expired",
+                        upload_id
+                    )));
                 }
             }
             session.data
@@ -867,7 +924,8 @@ impl KappaStore for InMemoryStore {
             if proof.kappa() != claimed {
                 return Err(StoreError::Rejected(format!(
                     "digest mismatch: expected {}, computed {}",
-                    claimed, proof.kappa()
+                    claimed,
+                    proof.kappa()
                 )));
             }
         }
@@ -913,9 +971,11 @@ impl KappaStore for InMemoryStore {
     fn upload_part_info(&self, upload_id: &str) -> Vec<(u32, String, u64)> {
         let uploads = self.uploads.lock().unwrap();
         match uploads.get(upload_id) {
-            Some(session) => session.part_digests.iter().map(|(pn, md5, size)| {
-                (*pn, format!("\"{}\"", hex::encode(md5)), *size)
-            }).collect(),
+            Some(session) => session
+                .part_digests
+                .iter()
+                .map(|(pn, md5, size)| (*pn, format!("\"{}\"", hex::encode(md5)), *size))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -923,7 +983,8 @@ impl KappaStore for InMemoryStore {
     fn upload_evict_expired(&self, timeout_secs: u64) -> usize {
         let mut uploads = self.uploads.lock().unwrap();
         let before = uploads.len();
-        uploads.retain(|_, s| s.created_at.elapsed() <= std::time::Duration::from_secs(timeout_secs));
+        uploads
+            .retain(|_, s| s.created_at.elapsed() <= std::time::Duration::from_secs(timeout_secs));
         before - uploads.len()
     }
 
@@ -950,7 +1011,12 @@ impl KappaStore for InMemoryStore {
         // Store compression record
         self.compression_records.insert(
             uncompressed_hash.to_string(),
-            (kappa.clone(), compression.to_string(), compressed_content.to_vec(), uncompressed_size),
+            (
+                kappa.clone(),
+                compression.to_string(),
+                compressed_content.to_vec(),
+                uncompressed_size,
+            ),
         );
         Ok(crate::store::IngestResult::new(kappa, true))
     }
@@ -959,7 +1025,9 @@ impl KappaStore for InMemoryStore {
         &self,
         uncompressed_hash: &str,
     ) -> Result<Box<dyn crate::store::BlobReader>, StoreError> {
-        let entry = self.compression_records.get(uncompressed_hash)
+        let entry = self
+            .compression_records
+            .get(uncompressed_hash)
             .ok_or_else(|| StoreError::NotFound(uncompressed_hash.to_string()))?;
         let compressed_bytes = entry.value().2.clone();
         Ok(Box::new(std::io::Cursor::new(compressed_bytes)))
@@ -969,7 +1037,9 @@ impl KappaStore for InMemoryStore {
         &self,
         uncompressed_hash: &str,
     ) -> Result<Box<dyn crate::store::BlobReader>, StoreError> {
-        let entry = self.compression_records.get(uncompressed_hash)
+        let entry = self
+            .compression_records
+            .get(uncompressed_hash)
             .ok_or_else(|| StoreError::NotFound(uncompressed_hash.to_string()))?;
         let (_, ref algo, ref compressed, _) = *entry.value();
         let decompressed = decompress_bytes(compressed, algo)?;
@@ -992,10 +1062,7 @@ impl KappaStore for InMemoryStore {
         Ok(())
     }
 
-    fn assertion_index_query_subject(
-        &self,
-        subject: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    fn assertion_index_query_subject(&self, subject: &str) -> Result<Vec<String>, StoreError> {
         let prefix = format!("{}\x00", subject);
         let mut results = Vec::new();
         for entry in self.assertion_inbound.iter() {
@@ -1028,7 +1095,8 @@ impl KappaStore for InMemoryStore {
         // supersedes older evidence without deleting it. The latest
         // binding (highest verified_at_ms) is the current authority.
         // Historical bindings are queryable for audit.
-        let mut bindings = self.identity_bindings
+        let mut bindings = self
+            .identity_bindings
             .entry(binding.source.clone())
             .or_default();
         if let Some(existing) = bindings.iter_mut().find(|b| b.target == binding.target) {
@@ -1100,10 +1168,8 @@ impl KappaStore for InMemoryStore {
             return Err(StoreError::Rejected("cannot succeed to self".into()));
         }
         let kappa = crate::kappa::kappa_from_value(succession);
-        self.identity_successions.insert(
-            succession.old_anchor.clone(),
-            succession.new_anchor.clone(),
-        );
+        self.identity_successions
+            .insert(succession.old_anchor.clone(), succession.new_anchor.clone());
 
         // Create watermark voiding old anchor's assertions.
         // KeyCompromise: void everything (timestamp 0).
@@ -1132,10 +1198,7 @@ impl KappaStore for InMemoryStore {
         Ok(kappa)
     }
 
-    fn identity_succession_resolve(
-        &self,
-        anchor: &str,
-    ) -> Result<String, StoreError> {
+    fn identity_succession_resolve(&self, anchor: &str) -> Result<String, StoreError> {
         let mut current = anchor.to_string();
         let mut visited = std::collections::HashSet::new();
         visited.insert(current.clone());
@@ -1150,7 +1213,7 @@ impl KappaStore for InMemoryStore {
                     }
                     if visited.len() >= 10 {
                         return Err(StoreError::Rejected(
-                            "succession chain exceeds 10 hops".into()
+                            "succession chain exceeds 10 hops".into(),
                         ));
                     }
                     visited.insert(next_val.clone());
@@ -1161,10 +1224,7 @@ impl KappaStore for InMemoryStore {
         }
     }
 
-    fn identity_succession_chain(
-        &self,
-        anchor: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    fn identity_succession_chain(&self, anchor: &str) -> Result<Vec<String>, StoreError> {
         let mut chain = vec![anchor.to_string()];
         let mut current = anchor.to_string();
         let mut visited = std::collections::HashSet::new();
@@ -1180,7 +1240,7 @@ impl KappaStore for InMemoryStore {
                     }
                     if visited.len() >= 10 {
                         return Err(StoreError::Rejected(
-                            "succession chain exceeds 10 hops".into()
+                            "succession chain exceeds 10 hops".into(),
                         ));
                     }
                     visited.insert(next_val.clone());
@@ -1209,7 +1269,8 @@ fn decompress_bytes(data: &[u8], algorithm: &str) -> Result<Vec<u8>, StoreError>
             use std::io::Read;
             let mut decoder = xz2::read::XzDecoder::new(data);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out)
+            decoder
+                .read_to_end(&mut out)
                 .map_err(|e| StoreError::Io(std::io::Error::other(format!("xz: {e}"))))?;
             Ok(out)
         }
@@ -1217,10 +1278,13 @@ fn decompress_bytes(data: &[u8], algorithm: &str) -> Result<Vec<u8>, StoreError>
             use std::io::Read;
             let mut decoder = bzip2::read::BzDecoder::new(data);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out)
+            decoder
+                .read_to_end(&mut out)
                 .map_err(|e| StoreError::Io(std::io::Error::other(format!("bzip2: {e}"))))?;
             Ok(out)
         }
-        other => Err(StoreError::Rejected(format!("unsupported compression: {other}"))),
+        other => Err(StoreError::Rejected(format!(
+            "unsupported compression: {other}"
+        ))),
     }
 }

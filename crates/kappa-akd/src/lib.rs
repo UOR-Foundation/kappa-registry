@@ -126,8 +126,11 @@ impl AkdStoreAdapter {
             kappa_core::StoreError::Rejected(format!("checkpoint serialize: {}", e))
         })?;
         let kappa = kappa_core::store::blob_put_computed(&*self.store, &bytes)?;
-        self.store
-            .tag_set(&NamespaceRef::deterministic(self.namespace.as_str()), "_akd/checkpoint", &kappa)?;
+        self.store.tag_set(
+            &NamespaceRef::deterministic(self.namespace.as_str()),
+            "_akd/checkpoint",
+            &kappa,
+        )?;
         Ok(())
     }
 
@@ -136,7 +139,10 @@ impl AkdStoreAdapter {
         store: Arc<dyn KappaStore>,
         namespace: String,
     ) -> Result<Self, kappa_core::StoreError> {
-        let entry = store.tag_get(&NamespaceRef::deterministic(namespace.as_str()), "_akd/checkpoint")?;
+        let entry = store.tag_get(
+            &NamespaceRef::deterministic(namespace.as_str()),
+            "_akd/checkpoint",
+        )?;
         let bytes = store.blob_get(&entry.kappa)?;
         let checkpoint: AkdCheckpoint = postcard::from_bytes(&bytes).map_err(|e| {
             kappa_core::StoreError::Rejected(format!("checkpoint deserialize: {}", e))
@@ -392,7 +398,10 @@ impl AkdManager {
     ///
     /// Attempts to recover from a checkpoint first. If no checkpoint exists,
     /// creates a new empty directory.
-    pub async fn new(store: Arc<dyn KappaStore>, namespace: String) -> Result<Self, AkdManagerError> {
+    pub async fn new(
+        store: Arc<dyn KappaStore>,
+        namespace: String,
+    ) -> Result<Self, AkdManagerError> {
         let adapter = match AkdStoreAdapter::recover(store.clone(), namespace.clone()) {
             Ok(a) => {
                 tracing::info!("AKD directory recovered from checkpoint");
@@ -411,12 +420,8 @@ impl AkdManager {
 
         let storage = StorageManager::new_no_cache(adapter);
         let vrf = HardCodedAkdVRF {};
-        let directory = Directory::<Config, _, _>::new(
-            storage,
-            vrf,
-            AzksParallelismConfig::default(),
-        )
-        .await?;
+        let directory =
+            Directory::<Config, _, _>::new(storage, vrf, AzksParallelismConfig::default()).await?;
 
         Ok(Self {
             directory: Mutex::new(directory),

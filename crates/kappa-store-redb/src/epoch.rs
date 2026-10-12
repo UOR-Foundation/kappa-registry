@@ -61,10 +61,12 @@ impl PersistentStore {
                     let raw = v.value();
                     let decrypted = match &self.table_encryptor {
                         Some(enc) => {
-                            let bytes = hex::decode(raw)
-                                .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
-                            let pt = enc.decrypt_value(ns, &bytes)
-                                .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+                            let bytes = hex::decode(raw).map_err(|e| {
+                                StoreError::Io(std::io::Error::other(e.to_string()))
+                            })?;
+                            let pt = enc.decrypt_value(ns, &bytes).map_err(|e| {
+                                StoreError::Io(std::io::Error::other(e.to_string()))
+                            })?;
                             String::from_utf8(pt)
                                 .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?
                         }
@@ -100,7 +102,8 @@ impl PersistentStore {
             // Update current pointer in redb (encrypt if enabled)
             let stored_kappa = match &self.table_encryptor {
                 Some(enc) => {
-                    let encrypted = enc.encrypt_value(ns, kappa.as_bytes())
+                    let encrypted = enc
+                        .encrypt_value(ns, kappa.as_bytes())
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                     hex::encode(&encrypted)
                 }
@@ -131,7 +134,8 @@ impl PersistentStore {
                     Some(enc) => {
                         let bytes = hex::decode(raw)
                             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
-                        let pt = enc.decrypt_value(ns, &bytes)
+                        let pt = enc
+                            .decrypt_value(ns, &bytes)
                             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                         String::from_utf8(pt)
                             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?

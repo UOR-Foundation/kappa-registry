@@ -90,9 +90,7 @@ pub fn probe_peer(
     let response = match transport.fetch_epoch_root(endpoint, namespace) {
         Ok(r) => r,
         Err(ProbeError::Transport(msg)) => return ProbeResult::Unreachable(msg),
-        Err(ProbeError::Verification(e)) => {
-            return ProbeResult::SignatureInvalid(e.to_string())
-        }
+        Err(ProbeError::Verification(e)) => return ProbeResult::SignatureInvalid(e.to_string()),
     };
 
     // Verify signature
@@ -122,9 +120,7 @@ pub fn probe_peer(
 
     // Check equivocation: same epoch, different root
     if let Some(local) = local_epoch {
-        if local.epoch_number == response.epoch_number
-            && local.kappa() != response.root_kappa
-        {
+        if local.epoch_number == response.epoch_number && local.kappa() != response.root_kappa {
             return ProbeResult::Equivocation {
                 peer: response.anchor,
                 epoch: response.epoch_number,
@@ -158,27 +154,19 @@ mod tests {
         ) -> Result<PeerEpochResponse, ProbeError> {
             match &self.response {
                 Ok(r) => Ok(r.clone()),
-                Err(ProbeError::Transport(msg)) => {
-                    Err(ProbeError::Transport(msg.clone()))
-                }
-                Err(ProbeError::Verification(e)) => {
-                    Err(ProbeError::Verification(CryptoError::SigningFailed(
-                        e.to_string(),
-                    )))
-                }
+                Err(ProbeError::Transport(msg)) => Err(ProbeError::Transport(msg.clone())),
+                Err(ProbeError::Verification(e)) => Err(ProbeError::Verification(
+                    CryptoError::SigningFailed(e.to_string()),
+                )),
             }
         }
     }
 
-    fn signed_response(
-        namespace: &str,
-        epoch: u64,
-        root_kappa: &str,
-    ) -> PeerEpochResponse {
+    fn signed_response(namespace: &str, epoch: u64, root_kappa: &str) -> PeerEpochResponse {
         use crate::crypto::Signer;
-        let signer = crate::crypto::ed25519::Ed25519Signer::generate(
-            &mut rand_core::UnwrapErr(getrandom::SysRng),
-        );
+        let signer = crate::crypto::ed25519::Ed25519Signer::generate(&mut rand_core::UnwrapErr(
+            getrandom::SysRng,
+        ));
         let message = format!("{}\n{}\n{}", namespace, root_kappa, epoch);
         let signature = signer.sign(message.as_bytes()).unwrap();
         PeerEpochResponse {
@@ -194,9 +182,7 @@ mod tests {
     #[test]
     fn probe_verified() {
         let resp = signed_response("ns", 5, "sha256:root-5");
-        let transport = MockTransport {
-            response: Ok(resp),
-        };
+        let transport = MockTransport { response: Ok(resp) };
         let result = probe_peer(&transport, "http://peer:8080", "ns", None);
         match result {
             ProbeResult::Verified(pr) => {
@@ -220,9 +206,7 @@ mod tests {
     fn probe_invalid_signature() {
         let mut resp = signed_response("ns", 5, "sha256:root-5");
         resp.signature = vec![0u8; 64]; // corrupt
-        let transport = MockTransport {
-            response: Ok(resp),
-        };
+        let transport = MockTransport { response: Ok(resp) };
         let result = probe_peer(&transport, "http://peer:8080", "ns", None);
         assert!(matches!(result, ProbeResult::SignatureInvalid(_)));
     }
@@ -230,9 +214,7 @@ mod tests {
     #[test]
     fn probe_equivocation() {
         let resp = signed_response("ns", 5, "sha256:remote-root");
-        let transport = MockTransport {
-            response: Ok(resp),
-        };
+        let transport = MockTransport { response: Ok(resp) };
 
         let local = crate::epoch::EpochRoot::build(crate::epoch::EpochRootFields {
             namespace: "ns".into(),
@@ -244,8 +226,7 @@ mod tests {
             signer_anchor: "local".into(),
         });
         // local.kappa() != "sha256:remote-root", same epoch 5
-        let result =
-            probe_peer(&transport, "http://peer:8080", "ns", Some(&local));
+        let result = probe_peer(&transport, "http://peer:8080", "ns", Some(&local));
         match result {
             ProbeResult::Equivocation {
                 peer,
@@ -266,9 +247,7 @@ mod tests {
     fn probe_unsupported_algorithm() {
         let mut resp = signed_response("ns", 5, "sha256:root");
         resp.algorithm = "rsa-4096".into();
-        let transport = MockTransport {
-            response: Ok(resp),
-        };
+        let transport = MockTransport { response: Ok(resp) };
         let result = probe_peer(&transport, "http://peer:8080", "ns", None);
         assert!(matches!(result, ProbeResult::SignatureInvalid(_)));
     }

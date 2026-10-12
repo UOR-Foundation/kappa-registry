@@ -85,7 +85,11 @@ fn binding_delete_removes() -> Result<(), String> {
     assert_eq!(resp.status(), 200);
     let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     let bindings = json["bindings"].as_array().unwrap();
-    assert!(bindings.is_empty(), "expected empty after delete, got {:?}", bindings);
+    assert!(
+        bindings.is_empty(),
+        "expected empty after delete, got {:?}",
+        bindings
+    );
     Ok(())
 }
 
@@ -117,7 +121,12 @@ fn binding_list_by_asserter() -> Result<(), String> {
     assert_eq!(resp.status(), 200);
     let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     let bindings = json["bindings"].as_array().unwrap();
-    assert_eq!(bindings.len(), 3, "expected 3 bindings, got {}", bindings.len());
+    assert_eq!(
+        bindings.len(),
+        3,
+        "expected 3 bindings, got {}",
+        bindings.len()
+    );
     Ok(())
 }
 
@@ -146,7 +155,12 @@ fn binding_duplicate_idempotent() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     let bindings = json["bindings"].as_array().unwrap();
-    assert_eq!(bindings.len(), 1, "duplicate should be idempotent, got {}", bindings.len());
+    assert_eq!(
+        bindings.len(),
+        1,
+        "duplicate should be idempotent, got {}",
+        bindings.len()
+    );
     Ok(())
 }
 
@@ -169,7 +183,12 @@ fn succession_put_resolve() -> Result<(), String> {
         .body(serde_json::to_string(&body).unwrap())
         .send()
         .map_err(|e| e.to_string())?;
-    assert_eq!(resp.status(), 201, "succession PUT failed: {}", resp.text().unwrap_or_default());
+    assert_eq!(
+        resp.status(),
+        201,
+        "succession PUT failed: {}",
+        resp.text().unwrap_or_default()
+    );
 
     let resp = c
         .get(format!("{}/identity/succession/sha256:old-key", base))
@@ -221,7 +240,10 @@ fn succession_chain_3_deep() -> Result<(), String> {
 
     // Chain from A = [A, B, C]
     let resp = c
-        .get(format!("{}/identity/succession/sha256:anchor-a/chain", base))
+        .get(format!(
+            "{}/identity/succession/sha256:anchor-a/chain",
+            base
+        ))
         .send()
         .map_err(|e| e.to_string())?;
     assert_eq!(resp.status(), 200);

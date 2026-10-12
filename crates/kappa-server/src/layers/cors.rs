@@ -15,11 +15,7 @@ const EXPOSE_HEADERS: &str = "Docker-Content-Digest, WWW-Authenticate, Link, \
     OCI-Chunk-Min-Length, OCI-Subject, OCI-Tag, Warning, ETag, X-Request-Id, \
     Accept-Ranges, X-Kappa-Label, X-Kappa-Axis";
 
-pub fn cors_layer<'a>(
-    cx: &'a Cx,
-    body: Body,
-    next: Next<'a>,
-) -> topcoat::router::LayerFuture<'a> {
+pub fn cors_layer<'a>(cx: &'a Cx, body: Body, next: Next<'a>) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
         let method = topcoat::router::request::method(cx).clone();
         let origin = topcoat::router::request::headers(cx).get("origin").cloned();

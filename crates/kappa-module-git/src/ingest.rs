@@ -77,7 +77,10 @@ pub fn ingest_pack<R: BufRead>(
             | gix_pack::data::entry::Header::Tree
             | gix_pack::data::entry::Header::Blob
             | gix_pack::data::entry::Header::Tag => {
-                let kind = entry.header.as_kind().ok_or(IngestError::UnknownEntryType)?;
+                let kind = entry
+                    .header
+                    .as_kind()
+                    .ok_or(IngestError::UnknownEntryType)?;
                 let compressed = entry
                     .compressed
                     .as_ref()
@@ -90,7 +93,12 @@ pub fn ingest_pack<R: BufRead>(
                     // Decompress in 64 KiB chunks. Never hold the full
                     // object in memory.
                     let kappa = ingest_streaming(
-                        store, namespace, kind, compressed, decompressed_size, object_hash,
+                        store,
+                        namespace,
+                        kind,
+                        compressed,
+                        decompressed_size,
+                        object_hash,
                     )?;
                     ingested += 1;
                     offset_to_kappa.insert(entry_pack_offset, kappa);
@@ -100,14 +108,21 @@ pub fn ingest_pack<R: BufRead>(
                     let kappa = compute_git_kappa(object_hash, kind, &decompressed)?;
                     let envelope_bytes = envelope::wrap(kind, &decompressed);
                     let result = store.ingest_verified(&kappa, &envelope_bytes)?;
-                    if result.newly_stored { ingested += 1; } else { deduplicated += 1; }
+                    if result.newly_stored {
+                        ingested += 1;
+                    } else {
+                        deduplicated += 1;
+                    }
                     offset_to_kappa.insert(entry_pack_offset, kappa);
                 }
             }
 
             gix_pack::data::entry::Header::RefDelta { base_id } => {
                 let kappa = resolve_delta(
-                    store, &entry, &envelope::oid_to_kappa(&base_id)?, object_hash,
+                    store,
+                    &entry,
+                    &envelope::oid_to_kappa(&base_id)?,
+                    object_hash,
                 )?;
                 if store.blob_exists(&kappa).unwrap_or(false) {
                     deduplicated += 1;
@@ -118,18 +133,24 @@ pub fn ingest_pack<R: BufRead>(
             }
 
             gix_pack::data::entry::Header::OfsDelta { base_distance } => {
-                let base_offset = entry_pack_offset
-                    .checked_sub(base_distance)
-                    .ok_or_else(|| IngestError::Delta(format!(
-                        "OFS_DELTA base_distance {} exceeds pack_offset {}",
-                        base_distance, entry_pack_offset
-                    )))?;
+                let base_offset =
+                    entry_pack_offset
+                        .checked_sub(base_distance)
+                        .ok_or_else(|| {
+                            IngestError::Delta(format!(
+                                "OFS_DELTA base_distance {} exceeds pack_offset {}",
+                                base_distance, entry_pack_offset
+                            ))
+                        })?;
 
-                let base_kappa = offset_to_kappa.get(&base_offset)
-                    .ok_or_else(|| IngestError::Delta(format!(
-                        "OFS_DELTA base at offset {} not in offset map",
-                        base_offset
-                    )))?
+                let base_kappa = offset_to_kappa
+                    .get(&base_offset)
+                    .ok_or_else(|| {
+                        IngestError::Delta(format!(
+                            "OFS_DELTA base at offset {} not in offset map",
+                            base_offset
+                        ))
+                    })?
                     .clone();
 
                 let kappa = resolve_delta(store, &entry, &base_kappa, object_hash)?;
@@ -195,7 +216,9 @@ fn ingest_streaming(
 
     loop {
         let n = decoder.read(&mut chunk_buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         total_decompressed += n;
 
         git_hasher.update(&chunk_buf[..n]);
@@ -213,7 +236,8 @@ fn ingest_streaming(
     }
 
     // Compute the Git object ID
-    let oid = git_hasher.try_finalize()
+    let oid = git_hasher
+        .try_finalize()
         .map_err(|e| IngestError::Pack(format!("hash finalize: {e}")))?;
     let kappa = envelope::oid_to_kappa(&oid)?;
 
@@ -240,7 +264,8 @@ fn resolve_delta(
     let delta_data = decompress_entry(compressed, entry.decompressed_size as usize)?;
 
     // Resolve base from store
-    let base_envelope = store.blob_get(base_kappa)
+    let base_envelope = store
+        .blob_get(base_kappa)
         .map_err(|e| IngestError::Delta(format!("base {} not found: {e}", base_kappa)))?;
     let (base_kind, base_content) = envelope::unwrap(&base_envelope)?;
 
@@ -274,7 +299,8 @@ fn decompress_entry(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>, 
     if decompressed.len() != expected_size {
         return Err(IngestError::Pack(format!(
             "decompressed size mismatch: got {}, expected {}",
-            decompressed.len(), expected_size
+            decompressed.len(),
+            expected_size
         )));
     }
     Ok(decompressed)
@@ -292,7 +318,8 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, IngestError> {
     if base_size as usize != base.len() {
         return Err(IngestError::Delta(format!(
             "base size mismatch: delta says {}, actual {}",
-            base_size, base.len()
+            base_size,
+            base.len()
         )));
     }
 
@@ -311,23 +338,35 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, IngestError> {
             let mut size: u64 = 0;
             for (bit, shift) in [(0x01u8, 0u32), (0x02, 8), (0x04, 16), (0x08, 24)] {
                 if cmd & bit != 0 {
-                    offset |= (*delta.get(pos).ok_or_else(|| IngestError::Delta("truncated copy".into()))? as u64) << shift;
+                    offset |= (*delta
+                        .get(pos)
+                        .ok_or_else(|| IngestError::Delta("truncated copy".into()))?
+                        as u64)
+                        << shift;
                     pos += 1;
                 }
             }
             for (bit, shift) in [(0x10u8, 0u32), (0x20, 8), (0x40, 16)] {
                 if cmd & bit != 0 {
-                    size |= (*delta.get(pos).ok_or_else(|| IngestError::Delta("truncated copy".into()))? as u64) << shift;
+                    size |= (*delta
+                        .get(pos)
+                        .ok_or_else(|| IngestError::Delta("truncated copy".into()))?
+                        as u64)
+                        << shift;
                     pos += 1;
                 }
             }
-            if size == 0 { size = 0x10000; }
+            if size == 0 {
+                size = 0x10000;
+            }
             let offset = offset as usize;
             let size = size as usize;
             if offset + size > base.len() {
                 return Err(IngestError::Delta(format!(
                     "copy out of bounds: offset={}, size={}, base_len={}",
-                    offset, size, base.len()
+                    offset,
+                    size,
+                    base.len()
                 )));
             }
             result.extend_from_slice(&base[offset..offset + size]);
@@ -344,7 +383,8 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, IngestError> {
     if result.len() != result_size as usize {
         return Err(IngestError::Delta(format!(
             "result size mismatch: got {}, expected {}",
-            result.len(), result_size
+            result.len(),
+            result_size
         )));
     }
 
@@ -401,9 +441,7 @@ impl RabinIndex {
 
         for &candidate_offset in candidates {
             // Verify the window matches (FNV can collide)
-            if &base[candidate_offset..candidate_offset + RABIN_WINDOW]
-                != &target[..RABIN_WINDOW]
-            {
+            if &base[candidate_offset..candidate_offset + RABIN_WINDOW] != &target[..RABIN_WINDOW] {
                 continue;
             }
             // Extend the match forward
@@ -474,7 +512,9 @@ pub fn compute_delta(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn flush_insert(instructions: &mut Vec<u8>, buf: &mut Vec<u8>) {
-    if buf.is_empty() { return; }
+    if buf.is_empty() {
+        return;
+    }
     // INSERT instructions: cmd byte = count (1-127), followed by literal bytes
     for chunk in buf.chunks(127) {
         instructions.push(chunk.len() as u8);
@@ -519,7 +559,9 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
             byte |= 0x80;
         }
         out.push(byte);
-        if value == 0 { break; }
+        if value == 0 {
+            break;
+        }
     }
 }
 
@@ -655,7 +697,10 @@ mod tests {
         let base = b"the quick brown fox jumps over the lazy dog and more text to exceed the window size threshold";
         let target = b"the quick brown cat jumps over the lazy dog and more text to exceed the window size threshold";
         let delta = compute_delta(base, target).unwrap();
-        assert!(delta.len() < target.len(), "delta should be smaller than target");
+        assert!(
+            delta.len() < target.len(),
+            "delta should be smaller than target"
+        );
         let reconstructed = apply_delta(base, &delta).unwrap();
         assert_eq!(reconstructed, target);
     }
@@ -664,7 +709,11 @@ mod tests {
     fn compute_delta_identical_is_tiny() {
         let content = b"identical content repeated many times for testing delta compression algorithms and roundtrip verification";
         let delta = compute_delta(content, content).unwrap();
-        assert!(delta.len() < 30, "delta of identical content should be tiny, got {}", delta.len());
+        assert!(
+            delta.len() < 30,
+            "delta of identical content should be tiny, got {}",
+            delta.len()
+        );
         let reconstructed = apply_delta(content, &delta).unwrap();
         assert_eq!(reconstructed, content);
     }
@@ -677,7 +726,10 @@ mod tests {
         // Either None (no benefit) or roundtrip produces the original
         if let Some(delta) = result {
             let reconstructed = apply_delta(&base, &delta).unwrap();
-            assert_eq!(reconstructed, target, "delta roundtrip must reproduce target");
+            assert_eq!(
+                reconstructed, target,
+                "delta roundtrip must reproduce target"
+            );
         }
     }
 
@@ -687,7 +739,11 @@ mod tests {
         let mut target = base.clone();
         target[5000] = 0xFF;
         let delta = compute_delta(&base, &target).unwrap();
-        assert!(delta.len() < 500, "delta for one-byte change in 10KB should be small, got {}", delta.len());
+        assert!(
+            delta.len() < 500,
+            "delta for one-byte change in 10KB should be small, got {}",
+            delta.len()
+        );
         let reconstructed = apply_delta(&base, &delta).unwrap();
         assert_eq!(reconstructed, target);
     }
@@ -701,7 +757,8 @@ mod tests {
 
     #[test]
     fn compute_delta_append_only() {
-        let base = b"base content that is long enough to have rabin windows computed over it for matching";
+        let base =
+            b"base content that is long enough to have rabin windows computed over it for matching";
         let mut target = base.to_vec();
         target.extend_from_slice(b" and then some appended content at the end");
         let delta = compute_delta(base, &target).unwrap();
@@ -737,7 +794,10 @@ mod tests {
         for &b in &encoded[..encoded.len() - 1] {
             assert!(b & 0x80 != 0, "continuation bytes must have MSB set");
         }
-        assert!(encoded[encoded.len() - 1] & 0x80 == 0, "last byte must not have MSB set");
+        assert!(
+            encoded[encoded.len() - 1] & 0x80 == 0,
+            "last byte must not have MSB set"
+        );
     }
 
     // -- write_varint roundtrip -----------------------------------------------

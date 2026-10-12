@@ -23,12 +23,7 @@ use kappa_core::types::{DetectedOperation, ResolvedNamespace};
 use crate::auth::{authorize, AuthDecision, AuthError, BearerAuth};
 use crate::ratelimit::{classify_request, OpClass};
 
-
-pub fn auth_layer<'a>(
-    cx: &'a Cx,
-    body: Body,
-    next: Next<'a>,
-) -> topcoat::router::LayerFuture<'a> {
+pub fn auth_layer<'a>(cx: &'a Cx, body: Body, next: Next<'a>) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
         let path = topcoat::router::request::uri(cx).path().to_string();
         let method = topcoat::router::request::method(cx).to_string();
@@ -80,9 +75,8 @@ pub fn auth_layer<'a>(
                     return Ok(response);
                 }
                 Ok(Err(AuthError::Forbidden { reason })) => {
-                    let body_str = format!(
-                        r#"{{"errors":[{{"code":"DENIED","message":"{reason}"}}]}}"#
-                    );
+                    let body_str =
+                        format!(r#"{{"errors":[{{"code":"DENIED","message":"{reason}"}}]}}"#);
                     let mut response = Response::new(Body::from(body_str));
                     *response.status_mut() = StatusCode::FORBIDDEN;
                     response

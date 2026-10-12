@@ -13,9 +13,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{broadcast, RwLock};
 use topcoat::context::{app_context, Cx};
+use topcoat::router::content::websocket::{Message, WebSocketUpgrade};
 use topcoat::router::request::FromRequest;
 use topcoat::router::{Body, RouteFuture};
-use topcoat::router::content::websocket::{Message, WebSocketUpgrade};
 
 use kappa_core::store::KappaStore;
 use kappa_core::types::NamespaceRef;
@@ -42,7 +42,11 @@ impl CrdtManager {
         }
     }
 
-    pub async fn join(&self, ns: &NamespaceRef, doc: &str) -> (broadcast::Receiver<Bytes>, Vec<u8>) {
+    pub async fn join(
+        &self,
+        ns: &NamespaceRef,
+        doc: &str,
+    ) -> (broadcast::Receiver<Bytes>, Vec<u8>) {
         let key = format!("{}/{}", ns.as_str(), doc);
         let mut rooms = self.rooms.write().await;
         let room = rooms.entry(key.clone()).or_insert_with(|| {
@@ -91,15 +95,12 @@ impl CrdtManager {
             return;
         }
         let kappa = kappa_core::kappa::kappa_from_bytes(state);
-        let _ = self.store.ingest_verified(&kappa,state);
+        let _ = self.store.ingest_verified(&kappa, state);
         let _ = self.store.tag_set(ns, &format!("_crdt/{}", doc), &kappa);
     }
 
     fn load_state(&self, ns: &NamespaceRef, doc: &str) -> Option<Vec<u8>> {
-        let tag = self
-            .store
-            .tag_get(ns, &format!("_crdt/{}", doc))
-            .ok()?;
+        let tag = self.store.tag_get(ns, &format!("_crdt/{}", doc)).ok()?;
         self.store.blob_get(&tag.kappa).ok()
     }
 }

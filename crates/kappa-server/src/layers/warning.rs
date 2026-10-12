@@ -24,10 +24,14 @@ pub fn warning_layer<'a>(
             use topcoat::context::request_context;
             let parts: &http::request::Parts = request_context(cx);
             let path = parts.uri.path();
-            path.starts_with("/v2/") || path == "/v2" || path.starts_with("/v2?")
+            path.starts_with("/v2/")
+                || path == "/v2"
+                || path.starts_with("/v2?")
                 || path.starts_with("/identity/")
-                || path == "/_status" || path.starts_with("/_status/")
-                || path == "/openapi.json" || path == "/docs"
+                || path == "/_status"
+                || path.starts_with("/_status/")
+                || path == "/openapi.json"
+                || path == "/docs"
         };
 
         if !is_oci {

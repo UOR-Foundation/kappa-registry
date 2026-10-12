@@ -210,11 +210,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        )
-        .unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
 
         let a = IdentityAssertion {
             asserter: "asserter-a".into(),

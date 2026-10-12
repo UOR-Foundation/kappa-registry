@@ -4,11 +4,7 @@
 use topcoat::context::Cx;
 use topcoat::router::{Body, Next, StatusCode};
 
-pub fn cache_layer<'a>(
-    cx: &'a Cx,
-    body: Body,
-    next: Next<'a>,
-) -> topcoat::router::LayerFuture<'a> {
+pub fn cache_layer<'a>(cx: &'a Cx, body: Body, next: Next<'a>) -> topcoat::router::LayerFuture<'a> {
     Box::pin(async move {
         let if_none_match = topcoat::router::request::headers(cx)
             .get("if-none-match")
@@ -72,17 +68,9 @@ fn is_blob_path(path: &str) -> bool {
 }
 
 fn is_manifest_by_digest(path: &str) -> bool {
-    path.contains("/manifests/")
-        && path
-            .rsplit('/')
-            .next()
-            .is_some_and(|s| s.contains(':'))
+    path.contains("/manifests/") && path.rsplit('/').next().is_some_and(|s| s.contains(':'))
 }
 
 fn is_manifest_by_tag(path: &str) -> bool {
-    path.contains("/manifests/")
-        && path
-            .rsplit('/')
-            .next()
-            .is_some_and(|s| !s.contains(':'))
+    path.contains("/manifests/") && path.rsplit('/').next().is_some_and(|s| !s.contains(':'))
 }

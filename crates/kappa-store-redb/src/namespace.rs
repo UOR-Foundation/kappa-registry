@@ -13,12 +13,15 @@ impl PersistentStore {
 
     pub(crate) fn decode_seq_value(&self, db_key: &str, raw: &[u8]) -> Result<u64, StoreError> {
         let bytes = match &self.table_encryptor {
-            Some(enc) => enc.decrypt_value(db_key, raw)
+            Some(enc) => enc
+                .decrypt_value(db_key, raw)
                 .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
             None => raw.to_vec(),
         };
         if bytes.len() != 8 {
-            return Err(StoreError::Io(std::io::Error::other("sequence value not 8 bytes")));
+            return Err(StoreError::Io(std::io::Error::other(
+                "sequence value not 8 bytes",
+            )));
         }
         Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
     }
@@ -26,17 +29,14 @@ impl PersistentStore {
     pub(crate) fn encode_seq_value(&self, db_key: &str, value: u64) -> Result<Vec<u8>, StoreError> {
         let bytes = value.to_be_bytes();
         match &self.table_encryptor {
-            Some(enc) => enc.encrypt_value(db_key, &bytes)
+            Some(enc) => enc
+                .encrypt_value(db_key, &bytes)
                 .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string()))),
             None => Ok(bytes.to_vec()),
         }
     }
 
-    pub(crate) fn sequence_next_impl(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> Result<u64, StoreError> {
+    pub(crate) fn sequence_next_impl(&self, ns: &str, name: &str) -> Result<u64, StoreError> {
         let db_key = format!("{}\x00{}", ns, name);
         let txn = self.db.begin_write().map_err(Self::redb_err)?;
         let value;
@@ -60,11 +60,7 @@ impl PersistentStore {
         Ok(value)
     }
 
-    pub(crate) fn sequence_current_impl(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> Result<u64, StoreError> {
+    pub(crate) fn sequence_current_impl(&self, ns: &str, name: &str) -> Result<u64, StoreError> {
         let db_key = format!("{}\x00{}", ns, name);
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
         let table = txn.open_table(SEQUENCES).map_err(Self::redb_err)?;
@@ -96,8 +92,7 @@ impl PersistentStore {
     }
 
     fn encode_record(record: &NamespaceRecord) -> Result<Vec<u8>, StoreError> {
-        serde_json::to_vec(record)
-            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
+        serde_json::to_vec(record).map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
     }
 
     // -- namespace_create -----------------------------------------------------
@@ -113,23 +108,40 @@ impl PersistentStore {
         {
             // Collision detection: check alias does not exist
             let alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
-            if alias_table.get(key.as_str()).map_err(Self::redb_err)?.is_some() {
-                return Err(StoreError::Conflict(format!("namespace alias already exists: {}", key)));
+            if alias_table
+                .get(key.as_str())
+                .map_err(Self::redb_err)?
+                .is_some()
+            {
+                return Err(StoreError::Conflict(format!(
+                    "namespace alias already exists: {}",
+                    key
+                )));
             }
             // Cross-protocol collision detection
             if protocol.is_some() {
                 let global_key = name.to_string();
-                if alias_table.get(global_key.as_str()).map_err(Self::redb_err)?.is_some() {
+                if alias_table
+                    .get(global_key.as_str())
+                    .map_err(Self::redb_err)?
+                    .is_some()
+                {
                     return Err(StoreError::Conflict(format!(
-                        "namespace alias collides with global alias: {}", name
+                        "namespace alias collides with global alias: {}",
+                        name
                     )));
                 }
             } else {
                 for proto in &["oci", "s3", "git", "nix"] {
                     let scoped = format!("{}:{}", proto, name);
-                    if alias_table.get(scoped.as_str()).map_err(Self::redb_err)?.is_some() {
+                    if alias_table
+                        .get(scoped.as_str())
+                        .map_err(Self::redb_err)?
+                        .is_some()
+                    {
                         return Err(StoreError::Conflict(format!(
-                            "namespace alias collides with {}-scoped alias: {}", proto, name
+                            "namespace alias collides with {}-scoped alias: {}",
+                            proto, name
                         )));
                     }
                 }
@@ -150,11 +162,15 @@ impl PersistentStore {
             let record_json = Self::encode_record(&record)?;
 
             let mut alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
-            alias_table.insert(key.as_str(), uuid.as_slice()).map_err(Self::redb_err)?;
+            alias_table
+                .insert(key.as_str(), uuid.as_slice())
+                .map_err(Self::redb_err)?;
             drop(alias_table);
 
             let mut record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            record_table.insert(uuid.as_slice(), record_json.as_slice()).map_err(Self::redb_err)?;
+            record_table
+                .insert(uuid.as_slice(), record_json.as_slice())
+                .map_err(Self::redb_err)?;
             drop(record_table);
 
             // Alias history
@@ -171,7 +187,9 @@ impl PersistentStore {
             hist_key.extend_from_slice(&uuid);
             hist_key.extend_from_slice(&now.to_be_bytes());
             let mut hist_table = txn.open_table(ALIAS_HISTORY).map_err(Self::redb_err)?;
-            hist_table.insert(hist_key.as_slice(), event_json.as_slice()).map_err(Self::redb_err)?;
+            hist_table
+                .insert(hist_key.as_slice(), event_json.as_slice())
+                .map_err(Self::redb_err)?;
             drop(hist_table);
 
             txn.commit().map_err(Self::redb_err)?;
@@ -193,11 +211,16 @@ impl PersistentStore {
             Some(val) => {
                 let bytes = val.value();
                 if bytes.len() != 16 {
-                    return Err(StoreError::Io(std::io::Error::other("alias UUID not 16 bytes")));
+                    return Err(StoreError::Io(std::io::Error::other(
+                        "alias UUID not 16 bytes",
+                    )));
                 }
                 let mut uuid = [0u8; 16];
                 uuid.copy_from_slice(bytes);
-                Ok(kappa_core::types::NamespaceRef::with_name(uuid, name.to_string()))
+                Ok(kappa_core::types::NamespaceRef::with_name(
+                    uuid,
+                    name.to_string(),
+                ))
             }
             None => Err(StoreError::NotFound(format!("namespace alias: {}", key))),
         }
@@ -219,42 +242,62 @@ impl PersistentStore {
         {
             // Resolve old alias
             let alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
-            let val = alias_table.get(old_key.as_str()).map_err(Self::redb_err)?
+            let val = alias_table
+                .get(old_key.as_str())
+                .map_err(Self::redb_err)?
                 .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", old_key)))?;
             let mut uuid = [0u8; 16];
             uuid.copy_from_slice(val.value());
             drop(val);
             // Check new doesn't exist
-            if alias_table.get(new_key.as_str()).map_err(Self::redb_err)?.is_some() {
-                return Err(StoreError::Conflict(format!("target alias already exists: {}", new_key)));
+            if alias_table
+                .get(new_key.as_str())
+                .map_err(Self::redb_err)?
+                .is_some()
+            {
+                return Err(StoreError::Conflict(format!(
+                    "target alias already exists: {}",
+                    new_key
+                )));
             }
             drop(alias_table);
 
             // Verify owner
             let record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            let rec_val = record_table.get(uuid.as_slice()).map_err(Self::redb_err)?
-                .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+            let rec_val = record_table
+                .get(uuid.as_slice())
+                .map_err(Self::redb_err)?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+                })?;
             let mut record = Self::parse_record(rec_val.value())?;
             drop(rec_val);
             drop(record_table);
 
             if record.owner != actor {
                 return Err(StoreError::Rejected(format!(
-                    "only owner {} can rename, actor is {}", record.owner, actor
+                    "only owner {} can rename, actor is {}",
+                    record.owner, actor
                 )));
             }
 
             // Perform rename
             let mut alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
-            alias_table.remove(old_key.as_str()).map_err(Self::redb_err)?;
-            alias_table.insert(new_key.as_str(), uuid.as_slice()).map_err(Self::redb_err)?;
+            alias_table
+                .remove(old_key.as_str())
+                .map_err(Self::redb_err)?;
+            alias_table
+                .insert(new_key.as_str(), uuid.as_slice())
+                .map_err(Self::redb_err)?;
             drop(alias_table);
 
             record.aliases.retain(|a| a != old_name);
             record.aliases.push(new_name.to_string());
             let record_json = Self::encode_record(&record)?;
             let mut record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            record_table.insert(uuid.as_slice(), record_json.as_slice()).map_err(Self::redb_err)?;
+            record_table
+                .insert(uuid.as_slice(), record_json.as_slice())
+                .map_err(Self::redb_err)?;
             drop(record_table);
 
             let now = Self::now_ms();
@@ -271,7 +314,9 @@ impl PersistentStore {
             hist_key.extend_from_slice(&uuid);
             hist_key.extend_from_slice(&now.to_be_bytes());
             let mut hist_table = txn.open_table(ALIAS_HISTORY).map_err(Self::redb_err)?;
-            hist_table.insert(hist_key.as_slice(), event_json.as_slice()).map_err(Self::redb_err)?;
+            hist_table
+                .insert(hist_key.as_slice(), event_json.as_slice())
+                .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
         Ok(())
@@ -292,28 +337,42 @@ impl PersistentStore {
         {
             // Verify owner
             let record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            let rec_val = record_table.get(uuid.as_slice()).map_err(Self::redb_err)?
-                .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+            let rec_val = record_table
+                .get(uuid.as_slice())
+                .map_err(Self::redb_err)?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+                })?;
             let mut record = Self::parse_record(rec_val.value())?;
             drop(rec_val);
             drop(record_table);
 
             if record.owner != actor {
                 return Err(StoreError::Rejected(format!(
-                    "only owner {} can add alias, actor is {}", record.owner, actor
+                    "only owner {} can add alias, actor is {}",
+                    record.owner, actor
                 )));
             }
 
             // Check alias doesn't exist
             let alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
-            if alias_table.get(key.as_str()).map_err(Self::redb_err)?.is_some() {
-                return Err(StoreError::Conflict(format!("alias already exists: {}", key)));
+            if alias_table
+                .get(key.as_str())
+                .map_err(Self::redb_err)?
+                .is_some()
+            {
+                return Err(StoreError::Conflict(format!(
+                    "alias already exists: {}",
+                    key
+                )));
             }
             drop(alias_table);
 
             // Insert alias
             let mut alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
-            alias_table.insert(key.as_str(), uuid.as_slice()).map_err(Self::redb_err)?;
+            alias_table
+                .insert(key.as_str(), uuid.as_slice())
+                .map_err(Self::redb_err)?;
             drop(alias_table);
 
             if !record.aliases.contains(&alias.to_string()) {
@@ -321,7 +380,9 @@ impl PersistentStore {
             }
             let record_json = Self::encode_record(&record)?;
             let mut record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            record_table.insert(uuid.as_slice(), record_json.as_slice()).map_err(Self::redb_err)?;
+            record_table
+                .insert(uuid.as_slice(), record_json.as_slice())
+                .map_err(Self::redb_err)?;
             drop(record_table);
 
             let now = Self::now_ms();
@@ -338,7 +399,9 @@ impl PersistentStore {
             hist_key.extend_from_slice(uuid);
             hist_key.extend_from_slice(&now.to_be_bytes());
             let mut hist_table = txn.open_table(ALIAS_HISTORY).map_err(Self::redb_err)?;
-            hist_table.insert(hist_key.as_slice(), event_json.as_slice()).map_err(Self::redb_err)?;
+            hist_table
+                .insert(hist_key.as_slice(), event_json.as_slice())
+                .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
         Ok(())
@@ -356,8 +419,12 @@ impl PersistentStore {
         let old_owner = {
             let txn = self.db.begin_read().map_err(Self::redb_err)?;
             let record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            let rec_val = record_table.get(uuid.as_slice()).map_err(Self::redb_err)?
-                .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+            let rec_val = record_table
+                .get(uuid.as_slice())
+                .map_err(Self::redb_err)?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+                })?;
             let record = Self::parse_record(rec_val.value())?;
             if record.owner != actor {
                 // Check succession chain
@@ -365,7 +432,8 @@ impl PersistentStore {
                 let resolved = self.identity_succession_resolve(&record.owner)?;
                 if resolved != actor {
                     return Err(StoreError::Rejected(format!(
-                        "only owner {} (or successor) can transfer, actor is {}", record.owner, actor
+                        "only owner {} (or successor) can transfer, actor is {}",
+                        record.owner, actor
                     )));
                 }
             }
@@ -375,8 +443,12 @@ impl PersistentStore {
         let txn = self.db.begin_write().map_err(Self::redb_err)?;
         {
             let record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            let rec_val = record_table.get(uuid.as_slice()).map_err(Self::redb_err)?
-                .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+            let rec_val = record_table
+                .get(uuid.as_slice())
+                .map_err(Self::redb_err)?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+                })?;
             let mut record = Self::parse_record(rec_val.value())?;
             drop(rec_val);
             drop(record_table);
@@ -384,7 +456,9 @@ impl PersistentStore {
             record.owner = new_owner.to_string();
             let record_json = Self::encode_record(&record)?;
             let mut record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            record_table.insert(uuid.as_slice(), record_json.as_slice()).map_err(Self::redb_err)?;
+            record_table
+                .insert(uuid.as_slice(), record_json.as_slice())
+                .map_err(Self::redb_err)?;
             drop(record_table);
 
             let now = Self::now_ms();
@@ -401,7 +475,9 @@ impl PersistentStore {
             hist_key.extend_from_slice(uuid);
             hist_key.extend_from_slice(&now.to_be_bytes());
             let mut hist_table = txn.open_table(ALIAS_HISTORY).map_err(Self::redb_err)?;
-            hist_table.insert(hist_key.as_slice(), event_json.as_slice()).map_err(Self::redb_err)?;
+            hist_table
+                .insert(hist_key.as_slice(), event_json.as_slice())
+                .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
         Ok(())
@@ -417,15 +493,21 @@ impl PersistentStore {
         let key = Self::alias_key(name, protocol);
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
         let alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
-        let val = alias_table.get(key.as_str()).map_err(Self::redb_err)?
+        let val = alias_table
+            .get(key.as_str())
+            .map_err(Self::redb_err)?
             .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", key)))?;
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(val.value());
         drop(val);
         drop(alias_table);
         let record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-        let rec_val = record_table.get(uuid.as_slice()).map_err(Self::redb_err)?
-            .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+        let rec_val = record_table
+            .get(uuid.as_slice())
+            .map_err(Self::redb_err)?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+            })?;
         Self::parse_record(rec_val.value())
     }
 
@@ -441,9 +523,13 @@ impl PersistentStore {
         for item in record_table.iter().map_err(Self::redb_err)? {
             let (_, v) = item.map_err(Self::redb_err)?;
             if let Ok(rec) = Self::parse_record(v.value()) {
-                if rec.tombstoned { continue; }
+                if rec.tombstoned {
+                    continue;
+                }
                 if let Some(p) = protocol {
-                    if rec.protocol.as_deref() != Some(p) { continue; }
+                    if rec.protocol.as_deref() != Some(p) {
+                        continue;
+                    }
                 }
                 records.push(rec);
             }
@@ -479,7 +565,9 @@ impl PersistentStore {
         {
             // Resolve UUID
             let alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
-            let val = alias_table.get(key.as_str()).map_err(Self::redb_err)?
+            let val = alias_table
+                .get(key.as_str())
+                .map_err(Self::redb_err)?
                 .ok_or_else(|| StoreError::NotFound(format!("namespace alias: {}", key)))?;
             let mut uuid = [0u8; 16];
             uuid.copy_from_slice(val.value());
@@ -488,15 +576,20 @@ impl PersistentStore {
 
             // Verify owner
             let record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            let rec_val = record_table.get(uuid.as_slice()).map_err(Self::redb_err)?
-                .ok_or_else(|| StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid))))?;
+            let rec_val = record_table
+                .get(uuid.as_slice())
+                .map_err(Self::redb_err)?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!("namespace record: {}", hex::encode(uuid)))
+                })?;
             let mut record = Self::parse_record(rec_val.value())?;
             drop(rec_val);
             drop(record_table);
 
             if record.owner != actor {
                 return Err(StoreError::Rejected(format!(
-                    "only owner {} can delete, actor is {}", record.owner, actor
+                    "only owner {} can delete, actor is {}",
+                    record.owner, actor
                 )));
             }
 
@@ -504,10 +597,14 @@ impl PersistentStore {
             let mut alias_table = txn.open_table(NAMESPACE_ALIASES).map_err(Self::redb_err)?;
             for alias_name in &record.aliases {
                 let global_key = alias_name.to_string();
-                alias_table.remove(global_key.as_str()).map_err(Self::redb_err)?;
+                alias_table
+                    .remove(global_key.as_str())
+                    .map_err(Self::redb_err)?;
                 if let Some(ref proto) = record.protocol {
                     let scoped_key = format!("{}:{}", proto, alias_name);
-                    alias_table.remove(scoped_key.as_str()).map_err(Self::redb_err)?;
+                    alias_table
+                        .remove(scoped_key.as_str())
+                        .map_err(Self::redb_err)?;
                 }
             }
             drop(alias_table);
@@ -516,7 +613,9 @@ impl PersistentStore {
             record.tombstoned = true;
             let record_json = Self::encode_record(&record)?;
             let mut record_table = txn.open_table(NAMESPACE_RECORDS).map_err(Self::redb_err)?;
-            record_table.insert(uuid.as_slice(), record_json.as_slice()).map_err(Self::redb_err)?;
+            record_table
+                .insert(uuid.as_slice(), record_json.as_slice())
+                .map_err(Self::redb_err)?;
             drop(record_table);
 
             let now = Self::now_ms();
@@ -533,7 +632,9 @@ impl PersistentStore {
             hist_key.extend_from_slice(&uuid);
             hist_key.extend_from_slice(&now.to_be_bytes());
             let mut hist_table = txn.open_table(ALIAS_HISTORY).map_err(Self::redb_err)?;
-            hist_table.insert(hist_key.as_slice(), event_json.as_slice()).map_err(Self::redb_err)?;
+            hist_table
+                .insert(hist_key.as_slice(), event_json.as_slice())
+                .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
         Ok(())

@@ -163,7 +163,7 @@ pub(crate) async fn put(
         let s = s.clone();
         let d = d.clone();
         let c = c.clone();
-        move || s.ingest_verified(&d,&c)
+        move || s.ingest_verified(&d, &c)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -191,7 +191,7 @@ pub(crate) async fn put(
         let c = c.clone();
         tokio::task::spawn_blocking({
             let s = s.clone();
-            move || s.ingest_verified(&also_k,&c)
+            move || s.ingest_verified(&also_k, &c)
         })
         .await
         .map_err(|e| bad_request(e.to_string()))?
@@ -208,7 +208,10 @@ pub(crate) async fn put(
     (
         status,
         [
-            ("location", format!("/v2/{}/blobs/{}", ns.as_str(), client_digest)),
+            (
+                "location",
+                format!("/v2/{}/blobs/{}", ns.as_str(), client_digest),
+            ),
             ("docker-content-digest", client_digest.to_string()),
             ("x-kappa-label", client_digest.to_string()),
             ("x-kappa-axis", axis.to_string()),
@@ -317,7 +320,10 @@ async fn get(cx: &Cx, _ns: &NamespaceRef, kappa: &str) -> topcoat::Result<Respon
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx.blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                    if tx
+                        .blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
                         break; // receiver dropped
                     }
                 }
@@ -329,9 +335,10 @@ async fn get(cx: &Cx, _ns: &NamespaceRef, kappa: &str) -> topcoat::Result<Respon
         }
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body_stream = StreamBody::new(stream.map(|r| r.map(|b| Frame::data(b)).map_err(|e| {
-        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-    })));
+    let body_stream = StreamBody::new(stream.map(|r| {
+        r.map(|b| Frame::data(b))
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }));
     let body = Body::new(body_stream);
 
     let mut response = Response::new(body);

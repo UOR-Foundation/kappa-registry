@@ -25,9 +25,7 @@ pub enum SignError {
 
 /// Parse a Nix key string "name:base64data" into (name, raw_bytes).
 pub fn parse_nix_key(key_str: &str) -> Result<(String, Vec<u8>), SignError> {
-    let (name, encoded) = key_str
-        .split_once(':')
-        .ok_or(SignError::InvalidKeyFormat)?;
+    let (name, encoded) = key_str.split_once(':').ok_or(SignError::InvalidKeyFormat)?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
     Ok((name.to_string(), bytes))
 }

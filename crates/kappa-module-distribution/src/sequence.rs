@@ -8,9 +8,7 @@ use std::borrow::Cow;
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
 use topcoat::router::response::{IntoResponse, Response};
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use kappa_core::types::NamespaceRef;
 

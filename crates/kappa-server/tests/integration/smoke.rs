@@ -553,7 +553,12 @@ fn test_openapi_json() {
         .send()
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(ct.contains("application/json"), "content-type: {}", ct);
     let body: serde_json::Value = resp.json().unwrap();
     assert_eq!(body["openapi"], "3.1.0");
@@ -564,12 +569,14 @@ fn test_openapi_json() {
 #[test]
 fn test_docs_scalar() {
     let (guard, base) = start_server();
-    let resp = client()
-        .get(format!("{}/docs", base))
-        .send()
-        .unwrap();
+    let resp = client().get(format!("{}/docs", base)).send().unwrap();
     assert_eq!(resp.status(), 200);
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(ct.contains("text/html"), "content-type: {}", ct);
     let body = resp.text().unwrap();
     assert!(body.contains("api-reference"), "missing Scalar script tag");
