@@ -11,7 +11,7 @@
 extern crate blake3;
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 
@@ -792,7 +792,7 @@ fn streaming_download_manifest_streams() {
         let mut m = br#"{"schemaVersion":2,"config":{"digest":"sha256:aaaa","data":""#.to_vec();
         // Pad with spaces to reach target size
         let padding_needed = manifest_size - m.len() - 3; // 3 for closing '"}}'
-        m.extend(std::iter::repeat(b' ').take(padding_needed));
+        m.extend(std::iter::repeat_n(b' ', padding_needed));
         m.extend(br#""}}"#);
         m
     };

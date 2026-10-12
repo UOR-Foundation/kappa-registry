@@ -193,7 +193,7 @@ impl PersistentStore {
             drop(hist_table);
 
             txn.commit().map_err(Self::redb_err)?;
-            return Ok(ns);
+            Ok(ns)
         }
     }
 

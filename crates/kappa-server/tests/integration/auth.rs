@@ -11,7 +11,7 @@
 //! of 401 until the bearer auth middleware exists.
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 

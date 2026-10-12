@@ -441,7 +441,7 @@ impl RabinIndex {
 
         for &candidate_offset in candidates {
             // Verify the window matches (FNV can collide)
-            if &base[candidate_offset..candidate_offset + RABIN_WINDOW] != &target[..RABIN_WINDOW] {
+            if base[candidate_offset..candidate_offset + RABIN_WINDOW] != target[..RABIN_WINDOW] {
                 continue;
             }
             // Extend the match forward
@@ -637,38 +637,21 @@ mod tests {
     #[test]
     fn apply_delta_copy_only() {
         let base = b"hello world";
-        let mut delta = Vec::new();
-        delta.push(base.len() as u8);
-        delta.push(5);
-        delta.push(0x80 | 0x01 | 0x10);
-        delta.push(0);
-        delta.push(5);
+        let delta = vec![base.len() as u8, 5, 0x80 | 0x01 | 0x10, 0, 5];
         assert_eq!(apply_delta(base, &delta).unwrap(), b"hello");
     }
 
     #[test]
     fn apply_delta_copy_from_middle() {
         let base = b"hello world";
-        let mut delta = Vec::new();
-        delta.push(base.len() as u8);
-        delta.push(5);
-        delta.push(0x80 | 0x01 | 0x10);
-        delta.push(6);
-        delta.push(5);
+        let delta = vec![base.len() as u8, 5, 0x80 | 0x01 | 0x10, 6, 5];
         assert_eq!(apply_delta(base, &delta).unwrap(), b"world");
     }
 
     #[test]
     fn apply_delta_mixed() {
         let base = b"hello world";
-        let mut delta = Vec::new();
-        delta.push(base.len() as u8);
-        delta.push(6);
-        delta.push(0x80 | 0x01 | 0x10);
-        delta.push(0);
-        delta.push(5);
-        delta.push(1);
-        delta.push(b'!');
+        let delta = vec![base.len() as u8, 6, 0x80 | 0x01 | 0x10, 0, 5, 1, b'!'];
         assert_eq!(apply_delta(base, &delta).unwrap(), b"hello!");
     }
 
@@ -681,12 +664,7 @@ mod tests {
     #[test]
     fn apply_delta_rejects_oob_copy() {
         let base = b"short";
-        let mut delta = Vec::new();
-        delta.push(base.len() as u8);
-        delta.push(10);
-        delta.push(0x80 | 0x01 | 0x10);
-        delta.push(0);
-        delta.push(10);
+        let delta = vec![base.len() as u8, 10, 0x80 | 0x01 | 0x10, 0, 10];
         assert!(apply_delta(base, &delta).is_err());
     }
 

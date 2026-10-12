@@ -11,6 +11,7 @@
 //!    - Git: /{ns}/info/refs -> /_git/{ns}/info/refs
 //!    - Nix: /nix-cache-info, /*.narinfo, /nar/* -> /_nix/*
 //!    - S3 vhost: bucket.domain/key -> /{bucket}/key
+//!
 //!    Rewrites return `Err(rewrite(...))` causing the router to re-dispatch.
 //!
 //! 3. Namespace resolution: extracts namespace name and protocol from
@@ -58,20 +59,19 @@ pub fn namespace_layer<'a>(
 
         // Phase 1: URI rewriting for protocols that need internal route prefixes
         match protocol {
-            DetectedProtocol::Git => {
+            DetectedProtocol::Git
                 // Rewrite /{ns}/info/refs -> /_git/{ns}/info/refs
                 // Rewrite /{ns}/git-upload-pack -> /_git/{ns}/git_upload_pack
                 // Rewrite /{ns}/git-receive-pack -> /_git/{ns}/git_receive_pack
                 // Rewrite /{ns}/info/lfs/objects/batch -> /_git/{ns}/info/lfs/objects/batch
-                if !path.starts_with("/_git/") {
+                if !path.starts_with("/_git/") => {
                     if let Some(rewritten) = rewrite_git_to_internal(&path, query) {
                         return Err(rewrite(&rewritten, body).into());
                     }
                 }
-            }
-            DetectedProtocol::Nix => {
+            DetectedProtocol::Nix
                 // Rewrite Nix paths to /_nix/ internal prefix
-                if !path.starts_with("/_nix/") {
+                if !path.starts_with("/_nix/") => {
                     if let Some(rewritten) = rewrite_nix_to_internal(&path) {
                         let pq = match request_uri.query() {
                             Some(q) => format!("{rewritten}?{q}"),
@@ -80,7 +80,6 @@ pub fn namespace_layer<'a>(
                         return Err(rewrite(&pq, body).into());
                     }
                 }
-            }
             DetectedProtocol::S3 => {
                 // S3 vhost rewrite: bucket.domain/key -> /{bucket}/key
                 if let Some(base_domain) = try_app_context::<S3BaseDomain>(cx) {

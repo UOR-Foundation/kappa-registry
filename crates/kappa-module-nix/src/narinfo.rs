@@ -82,7 +82,7 @@ impl NarInfo {
                 &line[colon_pos + 2..]
             } else if line.len() > colon_pos + 1 {
                 // "Key: " with nothing after space, or "Key:X" (no space)
-                &line[colon_pos + 1..].trim_start()
+                line[colon_pos + 1..].trim_start()
             } else {
                 ""
             };

@@ -5,7 +5,7 @@
 //! keypairs and real anchors computed via anchor_from_key_str.
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 

@@ -151,7 +151,7 @@ impl PersistentStore {
         let table = txn.open_table(VERSIONS).map_err(Self::redb_err)?;
 
         // Scan entries for this key
-        let range = match Self::prefix_successor(&prefix) {
+        let mut range = match Self::prefix_successor(&prefix) {
             Some(end) => table
                 .range::<&[u8]>(prefix.as_slice()..end.as_slice())
                 .map_err(Self::redb_err)?,
@@ -177,7 +177,7 @@ impl PersistentStore {
             }
             None => {
                 // Find latest non-delete-marker
-                for item in range {
+                if let Some(item) = range.next() {
                     let (_, v) = item.map_err(Self::redb_err)?;
                     let entry = Self::deserialize_version_entry(v.value())?;
                     if entry.is_delete_marker {

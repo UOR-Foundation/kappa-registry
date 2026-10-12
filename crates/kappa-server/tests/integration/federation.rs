@@ -8,7 +8,7 @@
 //! - Multi-axis blob integrity (sha256, sha512, blake3)
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 

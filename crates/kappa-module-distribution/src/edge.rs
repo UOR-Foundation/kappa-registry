@@ -187,8 +187,7 @@ async fn put(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Respons
                                         serde_json::from_slice::<DelegationScope>(m)
                                     {
                                         // Has _root delegation — treat as unlimited
-                                        return Ok(u32::MAX
-                                            .min(parent_scope.delegation_depth.saturating_add(1)));
+                                        return Ok(parent_scope.delegation_depth.saturating_add(1));
                                     }
                                 }
                             }

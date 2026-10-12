@@ -1,6 +1,7 @@
 //! Tests for the kappa module.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::kappa::*;
 

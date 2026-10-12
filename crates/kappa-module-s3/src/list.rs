@@ -134,7 +134,7 @@ pub fn list_objects_v2(
             .ok()
             .and_then(|b| String::from_utf8(b).ok())
             .and_then(|ms_str| ms_str.parse::<u64>().ok())
-            .map(|ms| kappa_core::clock::epoch_ms_to_iso8601(ms))
+            .map(kappa_core::clock::epoch_ms_to_iso8601)
             .unwrap_or_else(|| "2026-01-01T00:00:00.000Z".to_string());
         let etag = store
             .blob_get_meta(&tag.kappa, "_s3_etag")

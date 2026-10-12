@@ -58,10 +58,10 @@ pub fn scan_references(data: &[u8], candidates: &[&str]) -> Vec<String> {
         if !is_nixbase32_byte(window[STORE_PATH_HASH_LEN - 1]) {
             continue;
         }
-        if let Ok(window_str) = std::str::from_utf8(window) {
-            if candidate_set.contains(window_str) {
-                found.insert(window_str.to_string());
-            }
+        if let Ok(window_str) = std::str::from_utf8(window)
+            && candidate_set.contains(window_str)
+        {
+            found.insert(window_str.to_string());
         }
     }
     let mut result: Vec<String> = found.into_iter().collect();

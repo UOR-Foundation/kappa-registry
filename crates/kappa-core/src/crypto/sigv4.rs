@@ -355,6 +355,7 @@ pub fn compute_chunk_signature(
     compute_signature(signing_key, &sts)
 }
 
+#[allow(clippy::too_many_arguments)] // one parameter per SigV4 signing input
 pub fn verify_chunk_signature(
     signing_key: &[u8],
     datetime: &str,
@@ -423,6 +424,7 @@ pub fn compute_trailer_signature(
     compute_signature(signing_key, &sts)
 }
 
+#[allow(clippy::too_many_arguments)] // one parameter per SigV4 signing input
 pub fn verify_trailer_signature(
     signing_key: &[u8],
     datetime: &str,
@@ -519,6 +521,7 @@ pub struct ChunkStreamParser<R: std::io::Read> {
 }
 
 impl<R: std::io::Read> ChunkStreamParser<R> {
+    #[allow(clippy::too_many_arguments)] // one parameter per SigV4 signing input
     pub fn new(
         reader: R,
         signing_key: Zeroizing<Vec<u8>>,

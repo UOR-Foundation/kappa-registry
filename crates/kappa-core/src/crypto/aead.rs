@@ -125,7 +125,7 @@ impl BlobEncryptor {
         let frame_count = if plaintext.is_empty() {
             1
         } else {
-            (plaintext.len() + FRAME_SIZE - 1) / FRAME_SIZE
+            plaintext.len().div_ceil(FRAME_SIZE)
         };
 
         let mut disk_bytes = Vec::with_capacity(frame_count * FRAME_DISK_SIZE);
@@ -646,8 +646,8 @@ mod tests {
         assert_eq!(dec_stream, plaintext);
 
         // Same frame count
-        let mem_frames = (mem_result.disk_bytes.len() + FRAME_DISK_SIZE - 1) / FRAME_DISK_SIZE;
-        let stream_frames = (ct_buf.len() + FRAME_DISK_SIZE - 1) / FRAME_DISK_SIZE;
+        let mem_frames = mem_result.disk_bytes.len().div_ceil(FRAME_DISK_SIZE);
+        let stream_frames = ct_buf.len().div_ceil(FRAME_DISK_SIZE);
         assert_eq!(mem_frames, stream_frames);
 
         // Range read across frame boundary on streaming-encrypted output

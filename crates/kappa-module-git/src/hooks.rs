@@ -214,9 +214,7 @@ fn load_hook(
     let entry = store
         .tag_get(namespace, &tag_name)
         .map_err(|_| HookError::NotFound(hook_name.to_string()))?;
-    store
-        .blob_get(&entry.kappa)
-        .map_err(|e| HookError::Store(e))
+    store.blob_get(&entry.kappa).map_err(HookError::Store)
 }
 
 /// Store a hook script in the namespace.

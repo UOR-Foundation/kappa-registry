@@ -251,7 +251,7 @@ fn check_delegation_inner(
 
     let root_ns = store
         .namespace_resolve("_root", None)
-        .map_err(|e| AuthError::Store(e))?;
+        .map_err(AuthError::Store)?;
     let namespaces_to_check = [ns.clone(), root_ns];
 
     let query = EdgeQuery {
@@ -423,6 +423,7 @@ impl BearerAuth {
         }
     }
 
+    #[allow(clippy::result_large_err)] // the Err is the HTTP response to send
     fn unauthorized<T>() -> Result<T, topcoat::router::response::Response> {
         let body = r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
         let mut resp = topcoat::router::response::Response::new(topcoat::router::Body::from(body));

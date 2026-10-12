@@ -33,6 +33,9 @@ impl MemoryStoreConfig {
     }
 }
 
+/// Edge index: (namespace uuid, key hash) -> edge kappas.
+pub(crate) type EdgeIndex = RwLock<HashMap<([u8; 16], u64), Vec<String>>>;
+
 pub struct InMemoryStore {
     blob_root: PathBuf,
     clock: Arc<dyn Clock>,
@@ -42,10 +45,10 @@ pub struct InMemoryStore {
     /// Namespace-scoped metadata index: (ns_uuid, key_hash, value_hash) -> Vec<kappa>
     ns_meta: DashMap<([u8; 16], u64, u64), Vec<String>>,
     pub(crate) edges: RwLock<HashMap<([u8; 16], u64), Edge>>,
-    pub(crate) fwd_index: RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
-    pub(crate) rev_index: RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
-    pub(crate) rel_index: RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
-    pub(crate) asr_index: RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
+    pub(crate) fwd_index: EdgeIndex,
+    pub(crate) rev_index: EdgeIndex,
+    pub(crate) rel_index: EdgeIndex,
+    pub(crate) asr_index: EdgeIndex,
     sequences: Mutex<HashMap<([u8; 16], u64), u64>>,
     epoch_roots: RwLock<HashMap<String, EpochRoot>>,
     current_epochs: RwLock<HashMap<[u8; 16], String>>,
@@ -1113,7 +1116,7 @@ impl KappaStore for InMemoryStore {
             bindings.push(binding.clone());
         }
         // Sort by verified_at_ms descending so latest is first
-        bindings.sort_by(|a, b| b.verified_at_ms.cmp(&a.verified_at_ms));
+        bindings.sort_by_key(|b| std::cmp::Reverse(b.verified_at_ms));
         Ok(kappa)
     }
 

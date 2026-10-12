@@ -4,15 +4,12 @@
 //! forward (by source), reverse (by target), by relation, by asserter.
 //! Indexes are maintained on put/delete and rebuilt from blobs on recovery.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
-
 use crate::canonical::canonical_bytes;
 use crate::kappa::kappa_from_bytes;
 use crate::store::KappaStore;
 use crate::types::*;
 
-use super::InMemoryStore;
+use super::{EdgeIndex, InMemoryStore};
 
 /// Map EdgeRelation to its permanent CBOR discriminant for index keys.
 /// Exhaustive match -- adding a variant without handling it is a compile error.
@@ -95,12 +92,7 @@ pub(super) fn edge_put(
             .insert((uuid, ek_hash), edge.clone());
     }
 
-    fn push_index(
-        index: &RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
-        uuid: [u8; 16],
-        key_hash: u64,
-        edge_kappa: &str,
-    ) {
+    fn push_index(index: &EdgeIndex, uuid: [u8; 16], key_hash: u64, edge_kappa: &str) {
         index
             .write()
             .unwrap()
@@ -227,12 +219,7 @@ pub(super) fn edge_delete(
     let edge = store.edges.write().unwrap().remove(&(uuid, ek_hash));
 
     if let Some(edge) = edge {
-        fn remove_from(
-            index: &RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
-            uuid: [u8; 16],
-            key_hash: u64,
-            kappa: &str,
-        ) {
+        fn remove_from(index: &EdgeIndex, uuid: [u8; 16], key_hash: u64, kappa: &str) {
             if let Some(vec) = index.write().unwrap().get_mut(&(uuid, key_hash)) {
                 vec.retain(|k| k != kappa);
             }

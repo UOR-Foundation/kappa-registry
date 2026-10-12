@@ -340,13 +340,12 @@ fn skip_cbor_value(data: &[u8], pos: &mut usize) -> Result<(), CarError> {
     *pos += 1;
 
     match major {
-        0 | 1 => {
+        0 | 1
             // unsigned/negative integer
-            if additional >= 24 && additional <= 27 {
+            if (24..=27).contains(&additional) => {
                 let extra = 1 << (additional - 24);
                 *pos += extra;
             }
-        }
         2 | 3 => {
             // byte string / text string
             let len = if additional < 24 {

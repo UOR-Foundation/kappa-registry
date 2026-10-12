@@ -452,10 +452,8 @@ fn skip_cbor_value(data: &[u8], pos: &mut usize) -> Option<()> {
     let additional = data[*pos] & 0x1F;
     *pos += 1;
     match major {
-        0 | 1 => {
-            if additional >= 24 && additional <= 27 {
-                *pos += 1usize << (additional - 24);
-            }
+        0 | 1 if (24..=27).contains(&additional) => {
+            *pos += 1usize << (additional - 24);
         }
         2 | 3 => {
             let len = if additional < 24 {
@@ -483,15 +481,13 @@ fn skip_cbor_value(data: &[u8], pos: &mut usize) -> Option<()> {
             }
         }
         6 => {
-            if additional >= 24 && additional <= 27 {
+            if (24..=27).contains(&additional) {
                 *pos += 1usize << (additional - 24);
             }
             skip_cbor_value(data, pos)?;
         }
-        7 => {
-            if additional >= 24 && additional <= 27 {
-                *pos += 1usize << (additional - 24);
-            }
+        7 if (24..=27).contains(&additional) => {
+            *pos += 1usize << (additional - 24);
         }
         _ => {}
     }
@@ -582,7 +578,7 @@ fn walk_mst_node(
         // Walk each entry's value (record blob) and right subtree
         for entry in &entries {
             // Record blob via CID->kappa bridge tag
-            let value_cid_hex = hex::encode(&entry.value);
+            let value_cid_hex = hex::encode(entry.value.as_slice());
             let blob_tag = format!("blob/{}", value_cid_hex);
             if let Ok(blob_entry) = store.tag_get(ns, &blob_tag) {
                 if let Ok(blob_data) = store.blob_get(&blob_entry.kappa) {
@@ -726,22 +722,19 @@ fn resolve_handle(cx: &Cx, _body: Body) -> RouteFuture<'_> {
         // Use the ResolverRegistry to resolve the handle to a DID
         let registry = try_app_context::<Arc<kappa_core::identity::ResolverRegistry>>(cx).cloned();
         if let Some(reg) = registry {
-            match reg.resolve(&handle).await {
-                Ok(Some(identity)) => {
-                    // The anchor resolves but we need the DID, not the anchor.
-                    // For atproto, the handle maps to a DID via WebFinger.
-                    // If the resolver returned evidence (the DID document), extract the DID.
-                    // Otherwise return the anchor as a placeholder.
-                    let did = identity.handle.clone();
-                    let body = serde_json::json!({ "did": did });
-                    return (
-                        StatusCode::OK,
-                        [("content-type", "application/json")],
-                        body.to_string(),
-                    )
-                        .into_response(cx);
-                }
-                _ => {}
+            if let Ok(Some(identity)) = reg.resolve(&handle).await {
+                // The anchor resolves but we need the DID, not the anchor.
+                // For atproto, the handle maps to a DID via WebFinger.
+                // If the resolver returned evidence (the DID document), extract the DID.
+                // Otherwise return the anchor as a placeholder.
+                let did = identity.handle.clone();
+                let body = serde_json::json!({ "did": did });
+                return (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(cx);
             }
         }
         // Fallback: check handle tags in _handles namespace
@@ -1735,20 +1728,15 @@ fn create_account(cx: &Cx, body: Body) -> RouteFuture<'_> {
 // -- subscribeRepos firehose --------------------------------------------------
 
 /// Firehose delivery mode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum FirehoseMode {
     /// Subscribe to broadcast channel. Zero-latency push.
     /// Requires EventBroadcaster in app context.
+    #[default]
     Broadcast,
     /// Poll sequence counter at configurable interval.
     /// Works without EventBroadcaster. Higher latency.
     Poll { interval_ms: u64 },
-}
-
-impl Default for FirehoseMode {
-    fn default() -> Self {
-        Self::Broadcast
-    }
 }
 
 /// Configurable firehose settings registered in app context.
@@ -2235,6 +2223,7 @@ fn request_crawl(cx: &Cx, body: Body) -> RouteFuture<'_> {
 /// Write endpoints (createRecord, putRecord, deleteRecord, applyWrites)
 /// must verify that the authenticated user owns the repo they're writing to.
 /// Returns Ok(did) if authorized, Err(Response) if not.
+#[allow(clippy::result_large_err)] // the Err is the HTTP response to send
 fn verify_repo_auth(cx: &Cx, repo: &str) -> Result<String, topcoat::router::response::Response> {
     use topcoat::context::request_context;
     let parts: &http::request::Parts = request_context(cx);

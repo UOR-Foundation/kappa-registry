@@ -11,7 +11,7 @@
 //! Requires `git` on PATH (provided by the Nix devshell).
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 

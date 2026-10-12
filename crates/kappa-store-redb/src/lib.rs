@@ -354,7 +354,7 @@ fn compute_composite_etag(parts: &[PartDigests]) -> Option<String> {
     }
     let mut hasher = md5::Md5::new();
     for part in parts {
-        Md5Digest::update(&mut hasher, &part.md5);
+        Md5Digest::update(&mut hasher, part.md5.as_slice());
     }
     let combined = hasher.finalize();
     Some(format!("\"{}-{}\"", hex::encode(combined), parts.len()))
@@ -723,6 +723,7 @@ impl KappaStore for PersistentStore {
                 std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
+                    .truncate(false)
                     .mode(0o600)
                     .open(&staging_path)
                     .map_err(StoreError::Io)?;
@@ -732,6 +733,7 @@ impl KappaStore for PersistentStore {
                 std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
+                    .truncate(false)
                     .open(&staging_path)
                     .map_err(StoreError::Io)?;
             }

@@ -336,7 +336,7 @@ async fn get(cx: &Cx, _ns: &NamespaceRef, kappa: &str) -> topcoat::Result<Respon
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body_stream = StreamBody::new(stream.map(|r| {
-        r.map(|b| Frame::data(b))
+        r.map(Frame::data)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }));
     let body = Body::new(body_stream);

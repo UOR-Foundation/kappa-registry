@@ -2,7 +2,7 @@
 //! These verify behavior beyond the smoke test "returns 200" level.
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 

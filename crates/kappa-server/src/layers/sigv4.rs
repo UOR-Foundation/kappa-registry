@@ -29,6 +29,7 @@ pub struct S3Region(pub String);
 /// Run SigV4 verification on the request. Returns Ok(None) if the request
 /// has no SigV4 auth (non-S3 request, pass through). Returns Ok(Some(principal))
 /// on successful verification. Returns Err(Response) on auth failure.
+#[allow(clippy::result_large_err)] // the Err is the HTTP response to send
 pub fn verify_request(
     cx: &Cx,
     _body_bytes: Option<&[u8]>,

@@ -1419,44 +1419,39 @@ async fn main() {
                 })
                 .await;
                 // Phase 2: resolve signing keys to anchors (async, outside spawn_blocking)
-                match &result {
-                    Ok(Ok((nix_ns, narinfo_kappa, sig_key_names, now_ms))) => {
-                        if let Some(ref registry) = nix_resolver {
-                            let store2 = app_context::<Arc<dyn KappaStore>>(cx).clone();
-                            for key_name in sig_key_names {
-                                if let Ok(Some(identity)) = registry.resolve(key_name).await {
-                                    // Create identity binding: key name -> anchor
-                                    let binding = kappa_core::identity::binding::IdentityBinding {
-                                        source: key_name.to_string(),
-                                        target: identity.anchor.clone(),
-                                        method: "nix-key".to_string(),
-                                        trust_level: 3,
-                                        verified_at_ms: *now_ms,
-                                    };
-                                    // Create Assertion edge: anchor signed this narinfo
-                                    let assertion_edge = kappa_core::types::Edge {
-                                        source: identity.anchor.clone(),
-                                        target: narinfo_kappa.clone(),
-                                        relation: kappa_core::types::EdgeRelation::Assertion,
-                                        asserter: identity.anchor.clone(),
-                                        value_kappa: None,
-                                        metadata: Some(
-                                            format!("nix-sig:{}", key_name).into_bytes(),
-                                        ),
-                                    };
-                                    let ns = nix_ns.clone();
-                                    let s = store2.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        s.identity_binding_put(&ns, &binding)?;
-                                        s.edge_put(&ns, &assertion_edge)?;
-                                        Ok::<(), kappa_core::types::StoreError>(())
-                                    })
-                                    .await;
-                                }
+                if let Ok(Ok((nix_ns, narinfo_kappa, sig_key_names, now_ms))) = &result {
+                    if let Some(ref registry) = nix_resolver {
+                        let store2 = app_context::<Arc<dyn KappaStore>>(cx).clone();
+                        for key_name in sig_key_names {
+                            if let Ok(Some(identity)) = registry.resolve(key_name).await {
+                                // Create identity binding: key name -> anchor
+                                let binding = kappa_core::identity::binding::IdentityBinding {
+                                    source: key_name.to_string(),
+                                    target: identity.anchor.clone(),
+                                    method: "nix-key".to_string(),
+                                    trust_level: 3,
+                                    verified_at_ms: *now_ms,
+                                };
+                                // Create Assertion edge: anchor signed this narinfo
+                                let assertion_edge = kappa_core::types::Edge {
+                                    source: identity.anchor.clone(),
+                                    target: narinfo_kappa.clone(),
+                                    relation: kappa_core::types::EdgeRelation::Assertion,
+                                    asserter: identity.anchor.clone(),
+                                    value_kappa: None,
+                                    metadata: Some(format!("nix-sig:{}", key_name).into_bytes()),
+                                };
+                                let ns = nix_ns.clone();
+                                let s = store2.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    s.identity_binding_put(&ns, &binding)?;
+                                    s.edge_put(&ns, &assertion_edge)?;
+                                    Ok::<(), kappa_core::types::StoreError>(())
+                                })
+                                .await;
                             }
                         }
                     }
-                    _ => {}
                 }
                 match &result {
                     Ok(Ok(_)) => StatusCode::CREATED.into_response(cx),
@@ -1754,10 +1749,7 @@ async fn main() {
             // Synchronous policy check -- policy blobs are small
             let policy_json = {
                 match store.tag_get(&b, "_config/policy") {
-                    Ok(entry) => match store.blob_get(&entry.kappa) {
-                        Ok(bytes) => Some(bytes),
-                        Err(_) => None,
-                    },
+                    Ok(entry) => store.blob_get(&entry.kappa).ok(),
                     Err(_) => None,
                 }
             };
@@ -2069,7 +2061,7 @@ async fn main() {
                 if let Some(ref expected_md5_b64) = content_md5_header {
                     use md5::Digest;
                     let computed = md5::Md5::digest(&content);
-                    let computed_b64 = base64_simd::STANDARD.encode_to_string(&computed);
+                    let computed_b64 = base64_simd::STANDARD.encode_to_string(computed);
                     if computed_b64 != *expected_md5_b64 {
                         let err = kappa_module_s3::encode_s3_error_xml(
                             "BadDigest",

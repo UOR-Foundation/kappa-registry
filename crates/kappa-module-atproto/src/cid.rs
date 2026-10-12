@@ -40,7 +40,7 @@ pub fn cid_for_cbor(data: &[u8]) -> [u8; 36] {
 /// display and logging. The binary form (36 bytes) is used in CBOR
 /// and CAR files.
 pub fn cid_to_string(cid: &[u8]) -> String {
-    let mut s = String::with_capacity(1 + (cid.len() * 8 + 4) / 5);
+    let mut s = String::with_capacity(1 + (cid.len() * 8).div_ceil(5));
     s.push('b');
     s.push_str(&base32_lower_encode(cid));
     s

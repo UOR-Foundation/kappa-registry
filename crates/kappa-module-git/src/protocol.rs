@@ -575,7 +575,7 @@ pub fn handle_upload_pack<R: Read, W: Write>(
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let progress_ref = progress_messages.clone();
     let progress_cb = move |written: u32, total: u32| {
-        let pct = if total > 0 { written * 100 / total } else { 0 };
+        let pct = (written * 100).checked_div(total).unwrap_or(0);
         let msg = format!("Compressing objects: {}% ({}/{})\r", pct, written, total);
         progress_ref.lock().unwrap().push(msg);
     };
@@ -914,10 +914,10 @@ fn compute_need_set(
         if let Some(ref filter) = opts.filter {
             match filter {
                 FilterSpec::BlobNone if kind == gix_object::Kind::Blob => continue,
-                FilterSpec::BlobLimit(limit) if kind == gix_object::Kind::Blob => {
-                    if _content.len() as u64 > *limit {
-                        continue;
-                    }
+                FilterSpec::BlobLimit(limit)
+                    if kind == gix_object::Kind::Blob && _content.len() as u64 > *limit =>
+                {
+                    continue;
                 }
                 _ => {}
             }

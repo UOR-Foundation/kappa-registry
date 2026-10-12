@@ -158,7 +158,7 @@ fn read_envelope_header(reader: &mut dyn Read) -> Result<(gix_object::Kind, u64)
         .find(' ')
         .ok_or_else(|| PackGenError::Io(io::Error::other("no space in envelope header")))?;
 
-    let kind = gix_object::Kind::from_bytes(header_str[..space_pos].as_bytes())
+    let kind = gix_object::Kind::from_bytes(&header_str.as_bytes()[..space_pos])
         .map_err(|e| PackGenError::Io(io::Error::other(e.to_string())))?;
     let size: u64 = header_str[space_pos + 1..]
         .parse()
@@ -296,8 +296,7 @@ pub fn generate_pack_sorted<W: Write>(
         kappa_to_offset.insert(obj.kappa.clone(), entry_offset);
 
         let envelope = store.blob_get(&obj.kappa)?;
-        let (kind, content) =
-            crate::envelope::unwrap(&envelope).map_err(|e| PackGenError::Envelope(e))?;
+        let (kind, content) = crate::envelope::unwrap(&envelope).map_err(PackGenError::Envelope)?;
         let content = content.to_vec();
 
         // Try delta against window objects of same type
