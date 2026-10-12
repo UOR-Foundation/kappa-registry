@@ -37,6 +37,10 @@ jobs:
       - name: Test (workspace)
         run: cargo test --workspace
 
+      - name: Install musl C toolchain
+        # aws-lc-sys compiles C for the musl target and needs musl-gcc.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build release (musl)
         run: cargo build --release --target x86_64-unknown-linux-musl
 
