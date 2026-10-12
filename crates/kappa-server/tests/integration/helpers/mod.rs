@@ -85,6 +85,15 @@ pub fn start_server_at_with_env(
     port: u16,
     extra_env: &[(&str, &str)],
 ) -> ServerGuard {
+    try_start_server_at_with_env(store_root, port, extra_env).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Start a server; Err if it exits during startup or never becomes ready.
+fn try_start_server_at_with_env(
+    store_root: &std::path::Path,
+    port: u16,
+    extra_env: &[(&str, &str)],
+) -> Result<ServerGuard, String> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kappa-server"));
     cmd.env("KAPPA_LISTEN_ADDR", format!("127.0.0.1:{}", port))
         .env("KAPPA_STORE_ROOT", store_root.to_str().unwrap())
@@ -115,17 +124,29 @@ pub fn start_server_at_with_env(
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
+    let mut guard = guard;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(100));
-        if c.get(format!("{}/_status", base)).send().is_ok() {
-            return guard;
+        // pick_port releases the port before the server binds it, so under
+        // parallel tests another server can take it. Our server then exits
+        // and /_status answers from someone else's. Ready means our child
+        // is still running and the port answers.
+        if let Ok(Some(status)) = guard.child.try_wait() {
+            let stderr_content = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            return Err(format!(
+                "kappa-server exited during startup ({status})\nserver stderr:\n{stderr_content}"
+            ));
+        }
+        if c.get(format!("{}/_status", base)).send().is_ok()
+            && matches!(guard.child.try_wait(), Ok(None))
+        {
+            return Ok(guard);
         }
     }
     let stderr_content = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-    panic!(
-        "kappa-server did not become ready within 5 seconds\nserver stderr:\n{}",
-        stderr_content
-    );
+    Err(format!(
+        "kappa-server did not become ready within 5 seconds\nserver stderr:\n{stderr_content}"
+    ))
 }
 
 /// Start a server with a fresh TempDir and optional extra env vars.
@@ -133,11 +154,19 @@ pub fn start_server_at_with_env(
 pub fn start_server_with_env(
     extra_env: &[(&str, &str)],
 ) -> (ServerGuard, String, tempfile::TempDir) {
-    let port = pick_port();
-    let tmp = tempfile::tempdir().unwrap();
-    let guard = start_server_at_with_env(tmp.path(), port, extra_env);
-    let base = guard.base();
-    (guard, base, tmp)
+    let mut last_err = String::new();
+    for _ in 0..3 {
+        let port = pick_port();
+        let tmp = tempfile::tempdir().unwrap();
+        match try_start_server_at_with_env(tmp.path(), port, extra_env) {
+            Ok(guard) => {
+                let base = guard.base();
+                return (guard, base, tmp);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    panic!("{last_err}");
 }
 
 /// Start a server with defaults. Returns guard, base URL, and TempDir.

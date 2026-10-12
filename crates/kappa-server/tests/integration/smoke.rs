@@ -46,36 +46,46 @@ fn pick_port() -> u16 {
 }
 
 fn start_server() -> (ServerGuard, String) {
-    let port = pick_port();
-    let tmp = tempfile::tempdir().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_kappa-server"))
-        .env("KAPPA_LISTEN_ADDR", format!("127.0.0.1:{}", port))
-        .env("KAPPA_STORE_ROOT", tmp.path().to_str().unwrap())
-        .env("KAPPA_RATELIMIT_READ_PERIOD_MS", "0")
-        .env("KAPPA_RATELIMIT_WRITE_PERIOD_MS", "0")
-        .env("KAPPA_RATELIMIT_ADMIN_PERIOD_MS", "0")
-        .env("RUST_LOG", "error")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to start kappa-server");
+    // pick_port releases the port before the server binds it, so under
+    // parallel tests another server can take it. Ours then exits and
+    // /_status answers from someone else's. Ready means our child is still
+    // running and the port answers; otherwise retry on a fresh port.
+    for _attempt in 0..3 {
+        let port = pick_port();
+        let tmp = tempfile::tempdir().unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_kappa-server"))
+            .env("KAPPA_LISTEN_ADDR", format!("127.0.0.1:{}", port))
+            .env("KAPPA_STORE_ROOT", tmp.path().to_str().unwrap())
+            .env("KAPPA_RATELIMIT_READ_PERIOD_MS", "0")
+            .env("KAPPA_RATELIMIT_WRITE_PERIOD_MS", "0")
+            .env("KAPPA_RATELIMIT_ADMIN_PERIOD_MS", "0")
+            .env("RUST_LOG", "error")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start kappa-server");
 
-    let base = format!("http://127.0.0.1:{}", port);
-    let guard = ServerGuard { child, tmp };
+        let base = format!("http://127.0.0.1:{}", port);
+        let mut guard = ServerGuard { child, tmp };
 
-    // Poll readiness -- guard ensures cleanup on panic
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(100));
-        if client.get(format!("{}/_status", base)).send().is_ok() {
-            return (guard, base);
+        // Poll readiness -- guard ensures cleanup on panic
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if !matches!(guard.child.try_wait(), Ok(None)) {
+                break;
+            }
+            if client.get(format!("{}/_status", base)).send().is_ok()
+                && matches!(guard.child.try_wait(), Ok(None))
+            {
+                return (guard, base);
+            }
         }
     }
-    // guard drops here, kills child, cleans tmp
-    panic!("kappa-server did not become ready within 5 seconds");
+    panic!("kappa-server did not become ready (3 attempts)");
 }
 
 fn client() -> reqwest::blocking::Client {
