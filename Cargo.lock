@@ -920,7 +920,7 @@ version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
 dependencies = [
- "heck",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 3.0.3",
@@ -1230,65 +1230,6 @@ checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
 dependencies = [
  "cmov",
  "subtle",
-]
-
-[[package]]
-name = "cucumber"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cd12917efc3a8b069a4975ef3cb2f2d835d42d04b3814d90838488f9dd9bf69"
-dependencies = [
- "anyhow",
- "clap",
- "console",
- "cucumber-codegen",
- "cucumber-expressions",
- "derive_more",
- "drain_filter_polyfill",
- "either",
- "futures",
- "gherkin",
- "globwalk",
- "humantime",
- "inventory",
- "itertools",
- "lazy-regex",
- "linked-hash-map",
- "once_cell",
- "pin-project",
- "regex",
- "sealed",
- "smart-default",
-]
-
-[[package]]
-name = "cucumber-codegen"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e19cd9e8e7cfd79fbf844eb6a7334117973c01f6bad35571262b00891e60f1c"
-dependencies = [
- "cucumber-expressions",
- "inflections",
- "itertools",
- "proc-macro2",
- "quote",
- "regex",
- "syn 2.0.119",
- "synthez",
-]
-
-[[package]]
-name = "cucumber-expressions"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d794fed319eea24246fb5f57632f7ae38d61195817b7eb659455aa5bdd7c1810"
-dependencies = [
- "derive_more",
- "either",
- "nom",
- "nom_locate",
- "regex",
- "regex-syntax 0.7.5",
 ]
 
 [[package]]
@@ -1828,7 +1769,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
 dependencies = [
- "heck",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1933,7 +1874,7 @@ checksum = "476de73bddf2ef8490aa4ee8f1cf40b430bf1d56c48c22080e5186952cd580e6"
 dependencies = [
  "bit-set",
  "regex-automata",
- "regex-syntax 0.8.11",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -3027,12 +2968,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "humantime"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3259,23 +3194,6 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
- "serde",
- "serde_core",
-]
-
-[[package]]
-name = "inflections"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a257582fdcde896fd96463bf2d40eefea0580021c0712a0e2b028b60b47a837a"
-
-[[package]]
-name = "inventory"
-version = "0.3.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
-dependencies = [
- "rustversion",
 ]
 
 [[package]]
@@ -4912,7 +4830,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck",
+ "heck 0.4.1",
  "itertools",
  "log",
  "multimap",
@@ -5359,7 +5277,7 @@ dependencies = [
  "aho-corasick",
  "memchr",
  "regex-automata",
- "regex-syntax 0.8.11",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -5370,14 +5288,8 @@ checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-syntax 0.8.11",
+ "regex-syntax",
 ]
-
-[[package]]
-name = "regex-syntax"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbb5fb1acd8a1a18b3dd5be62d25485eb770e05afb408a9627d14d451bae12da"
 
 [[package]]
 name = "regex-syntax"
@@ -5792,18 +5704,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "sealed"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4a8caec23b7800fb97971a1c6ae365b6239aaeddfb934d6265f8505e795699d"
-dependencies = [
- "heck 0.4.1",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6162,23 +6062,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
-name = "smart-default"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0eb01866308440fc64d6c44d9e86c5cc17adfe33c4d6eed55da9145044d0ffc1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "smawk"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
-
-[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6283,7 +6166,7 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
 dependencies = [
- "heck",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6334,39 +6217,6 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "synthez"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d2c2202510a1e186e63e596d9318c91a8cbe85cd1a56a7be0c333e5f59ec8d"
-dependencies = [
- "syn 2.0.119",
- "synthez-codegen",
- "synthez-core",
-]
-
-[[package]]
-name = "synthez-codegen"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f724aa6d44b7162f3158a57bccd871a77b39a4aef737e01bcdff41f4772c7746"
-dependencies = [
- "syn 2.0.119",
- "synthez-core",
-]
-
-[[package]]
-name = "synthez-core"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78bfa6ec52465e2425fd43ce5bbbe0f0b623964f7c63feb6b10980e816c654ea"
-dependencies = [
- "proc-macro2",
- "quote",
- "sealed",
  "syn 2.0.119",
 ]
 
@@ -6763,7 +6613,7 @@ name = "topcoat-font"
 version = "0.5.0"
 source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
- "heck",
+ "heck 0.5.0",
  "inventory",
  "serde",
  "serde_json",
@@ -6811,7 +6661,7 @@ name = "topcoat-icon-grammar"
 version = "0.5.0"
 source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
- "heck",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "serde_json",
@@ -6854,7 +6704,7 @@ dependencies = [
  "form_urlencoded",
  "futures-core",
  "futures-sink",
- "heck",
+ "heck 0.5.0",
  "http",
  "http-body",
  "http-body-util",
@@ -6882,7 +6732,7 @@ name = "topcoat-router-grammar"
 version = "0.5.0"
 source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
- "heck",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6976,7 +6826,7 @@ name = "topcoat-view-grammar"
 version = "0.5.0"
 source = "git+https://github.com/usrbinkat/topcoat?branch=usrbinkat%2Ffeat%2Ftrailing-slash-tolerance-v2#bf923d6ade1b4a1f0b2a40d37537169a96186dd9"
 dependencies = [
- "heck",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
