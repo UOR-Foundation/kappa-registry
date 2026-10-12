@@ -23,6 +23,18 @@ pub struct Revocation {
     pub signature: Vec<u8>,
 }
 
+impl Revocation {
+    /// The canonical bytes that are signed: this revocation with the
+    /// signature cleared. The server derives `asserter` from the signing
+    /// key, so the signer signs with `asserter` empty, as for assertions.
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        crate::canonical::canonical_bytes(&Revocation {
+            signature: Vec::new(),
+            ..self.clone()
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CBORCodable)]
 pub enum RevocationReason {
     #[cbor(n = 0)]

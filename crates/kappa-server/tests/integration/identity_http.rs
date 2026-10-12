@@ -165,24 +165,63 @@ fn binding_duplicate_idempotent() -> Result<(), String> {
 }
 
 // -- Succession tests ---------------------------------------------------------
+//
+// A succession must be signed by both keys: the old anchor approves, the
+// new anchor accepts. Anchors here are real Ed25519 anchors.
+
+fn key(seed: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+}
+
+fn anchor(k: &ed25519_dalek::SigningKey) -> String {
+    kappa_core::crypto::anchor::anchor_from_key_str("ed25519", &k.verifying_key().to_bytes())
+}
+
+/// POST a succession from `old` to `new`, signed by `old_signer` and `new_signer`.
+fn post_succession(
+    c: &reqwest::blocking::Client,
+    base: &str,
+    old: &ed25519_dalek::SigningKey,
+    new: &ed25519_dalek::SigningKey,
+    old_signer: &ed25519_dalek::SigningKey,
+    new_signer: &ed25519_dalek::SigningKey,
+    reason: &str,
+) -> Result<reqwest::blocking::Response, String> {
+    use ed25519_dalek::Signer;
+    let succession = kappa_core::identity::succession::IdentitySuccession {
+        old_anchor: anchor(old),
+        new_anchor: anchor(new),
+        reason: reason.to_string(),
+        effective_at_ms: 5000,
+        old_signature: Vec::new(),
+        new_signature: Vec::new(),
+    };
+    let message = succession.signable_bytes();
+    let body = serde_json::json!({
+        "old_anchor": succession.old_anchor,
+        "new_anchor": succession.new_anchor,
+        "reason": reason,
+        "effective_at_ms": 5000,
+        "algorithm": "ed25519",
+        "old_public_key": hex::encode(old_signer.verifying_key().to_bytes()),
+        "new_public_key": hex::encode(new_signer.verifying_key().to_bytes()),
+        "old_signature": hex::encode(old_signer.sign(&message).to_bytes()),
+        "new_signature": hex::encode(new_signer.sign(&message).to_bytes()),
+    });
+    c.post(format!("{}/identity/succession", base))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).unwrap())
+        .send()
+        .map_err(|e| e.to_string())
+}
 
 #[test]
 fn succession_put_resolve() -> Result<(), String> {
     let (_guard, base, _tmp) = start_server();
     let c = client();
+    let (old, new) = (key(1), key(2));
 
-    let body = serde_json::json!({
-        "old_anchor": "sha256:old-key",
-        "new_anchor": "sha256:new-key",
-        "reason": "rotation",
-        "effective_at_ms": 5000,
-    });
-    let resp = c
-        .post(format!("{}/identity/succession", base))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).unwrap())
-        .send()
-        .map_err(|e| e.to_string())?;
+    let resp = post_succession(&c, &base, &old, &new, &old, &new, "rotation")?;
     assert_eq!(
         resp.status(),
         201,
@@ -191,12 +230,12 @@ fn succession_put_resolve() -> Result<(), String> {
     );
 
     let resp = c
-        .get(format!("{}/identity/succession/sha256:old-key", base))
+        .get(format!("{}/identity/succession/{}", base, anchor(&old)))
         .send()
         .map_err(|e| e.to_string())?;
     assert_eq!(resp.status(), 200);
     let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    assert_eq!(json["current"], "sha256:new-key");
+    assert_eq!(json["current"], anchor(&new));
     Ok(())
 }
 
@@ -204,55 +243,35 @@ fn succession_put_resolve() -> Result<(), String> {
 fn succession_chain_3_deep() -> Result<(), String> {
     let (_guard, base, _tmp) = start_server();
     let c = client();
+    let (a, b, cc) = (key(1), key(2), key(3));
 
-    // A -> B
-    let body = serde_json::json!({
-        "old_anchor": "sha256:anchor-a",
-        "new_anchor": "sha256:anchor-b",
-        "reason": "rotation",
-    });
-    c.post(format!("{}/identity/succession", base))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).unwrap())
-        .send()
-        .map_err(|e| e.to_string())?;
-
-    // B -> C
-    let body = serde_json::json!({
-        "old_anchor": "sha256:anchor-b",
-        "new_anchor": "sha256:anchor-c",
-        "reason": "upgrade",
-    });
-    c.post(format!("{}/identity/succession", base))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).unwrap())
-        .send()
-        .map_err(|e| e.to_string())?;
+    // A -> B, B -> C
+    let resp = post_succession(&c, &base, &a, &b, &a, &b, "rotation")?;
+    assert_eq!(resp.status(), 201);
+    let resp = post_succession(&c, &base, &b, &cc, &b, &cc, "upgrade")?;
+    assert_eq!(resp.status(), 201);
 
     // Resolve A -> C
     let resp = c
-        .get(format!("{}/identity/succession/sha256:anchor-a", base))
+        .get(format!("{}/identity/succession/{}", base, anchor(&a)))
         .send()
         .map_err(|e| e.to_string())?;
     assert_eq!(resp.status(), 200);
     let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    assert_eq!(json["current"], "sha256:anchor-c");
+    assert_eq!(json["current"], anchor(&cc));
 
     // Chain from A = [A, B, C]
     let resp = c
-        .get(format!(
-            "{}/identity/succession/sha256:anchor-a/chain",
-            base
-        ))
+        .get(format!("{}/identity/succession/{}/chain", base, anchor(&a)))
         .send()
         .map_err(|e| e.to_string())?;
     assert_eq!(resp.status(), 200);
     let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     let chain = json["chain"].as_array().unwrap();
     assert_eq!(chain.len(), 3, "expected 3-element chain, got {:?}", chain);
-    assert_eq!(chain[0], "sha256:anchor-a");
-    assert_eq!(chain[1], "sha256:anchor-b");
-    assert_eq!(chain[2], "sha256:anchor-c");
+    assert_eq!(chain[0], anchor(&a));
+    assert_eq!(chain[1], anchor(&b));
+    assert_eq!(chain[2], anchor(&cc));
     Ok(())
 }
 
@@ -260,10 +279,21 @@ fn succession_chain_3_deep() -> Result<(), String> {
 fn succession_self_rejected() -> Result<(), String> {
     let (_guard, base, _tmp) = start_server();
     let c = client();
+    let same = key(1);
+
+    let resp = post_succession(&c, &base, &same, &same, &same, &same, "rotation")?;
+    assert_eq!(resp.status(), 400, "self-succession should be rejected");
+    Ok(())
+}
+
+#[test]
+fn succession_unsigned_rejected() -> Result<(), String> {
+    let (_guard, base, _tmp) = start_server();
+    let c = client();
 
     let body = serde_json::json!({
-        "old_anchor": "sha256:same",
-        "new_anchor": "sha256:same",
+        "old_anchor": anchor(&key(1)),
+        "new_anchor": anchor(&key(2)),
         "reason": "rotation",
     });
     let resp = c
@@ -272,6 +302,41 @@ fn succession_self_rejected() -> Result<(), String> {
         .body(serde_json::to_string(&body).unwrap())
         .send()
         .map_err(|e| e.to_string())?;
-    assert_eq!(resp.status(), 400, "self-succession should be rejected");
+    assert_eq!(resp.status(), 400, "unsigned succession must be rejected");
+    Ok(())
+}
+
+#[test]
+fn succession_without_old_key_rejected() -> Result<(), String> {
+    // An attacker claims a victim's anchor by signing both sides itself.
+    let (_guard, base, _tmp) = start_server();
+    let c = client();
+    let (victim, attacker) = (key(1), key(9));
+
+    let resp = post_succession(
+        &c,
+        &base,
+        &victim,
+        &attacker,
+        &attacker,
+        &attacker,
+        "compromise",
+    )?;
+    assert_eq!(
+        resp.status(),
+        400,
+        "succession not signed by the old key must be rejected"
+    );
+
+    let resp = c
+        .get(format!("{}/identity/succession/{}", base, anchor(&victim)))
+        .send()
+        .map_err(|e| e.to_string())?;
+    let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    assert_ne!(
+        json["current"],
+        anchor(&attacker),
+        "victim anchor must not resolve to the attacker"
+    );
     Ok(())
 }

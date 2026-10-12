@@ -156,3 +156,7 @@ git = ["dep:kappa-module-git", "dep:gix-hash"]
 s3 = ["dep:kappa-module-s3"]
 nix = ["dep:kappa-module-nix"]
 atproto = ["dep:kappa-module-atproto", "dep:x509-parser"]
+
+[[test]]
+name = "authority"
+path = "tests/integration/authority.rs"

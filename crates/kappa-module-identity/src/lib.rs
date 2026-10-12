@@ -70,6 +70,34 @@ async fn read_body(body: Body) -> topcoat::Result<Bytes> {
         .map_err(|e| bad_request(format!("failed to read body: {e}")).into())
 }
 
+/// Verify a hex `signature_field` over `message` with the hex public key in
+/// `key_field` and return the signer's anchor. Every identity write that
+/// speaks for an anchor must be signed by that anchor's key.
+fn verified_signer(
+    v: &serde_json::Value,
+    key_field: &str,
+    signature_field: &str,
+    message: &[u8],
+) -> Result<(String, Vec<u8>), String> {
+    let algorithm = v["algorithm"].as_str().ok_or("missing algorithm")?;
+    let public_key = v[key_field]
+        .as_str()
+        .ok_or_else(|| format!("missing {key_field}"))
+        .and_then(|h| hex::decode(h).map_err(|_| format!("invalid {key_field} hex")))?;
+    let signature = v[signature_field]
+        .as_str()
+        .ok_or_else(|| format!("missing {signature_field}"))
+        .and_then(|h| hex::decode(h).map_err(|_| format!("invalid {signature_field} hex")))?;
+    let anchor = kappa_core::crypto::anchor::asserter_from_signature(
+        algorithm,
+        &public_key,
+        message,
+        &signature,
+    )
+    .map_err(|e| format!("signature verification failed: {e}"))?;
+    Ok((anchor.as_str().to_string(), signature))
+}
+
 // -- Whoami -----------------------------------------------------------------
 
 fn whoami_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
@@ -302,25 +330,20 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 }
             }
 
-            // Revocations and watermarks still need namespace scan
-            // (not indexed cross-namespace yet)
-            let namespaces = s.namespace_list(None)?;
+            // Revocations and watermarks live in each asserter's
+            // deterministic namespace (see revoke/watermark handlers).
+            // Those namespaces have no namespace record, so a
+            // namespace_list scan never reaches them; read them directly.
+            // Only an asserter's own revocations and watermarks can void
+            // its assertions, so these are the only namespaces that matter.
+            let mut asserters: Vec<&str> = assertions.iter().map(|a| a.asserter.as_str()).collect();
+            asserters.sort_unstable();
+            asserters.dedup();
             let mut revocations = Vec::new();
             let mut watermarks = Vec::new();
 
-            for rec in &namespaces {
-                let alias = rec
-                    .aliases
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or(&rec.uuid_hex);
-                let uuid_bytes = hex::decode(&rec.uuid_hex).unwrap_or_default();
-                if uuid_bytes.len() != 16 {
-                    continue;
-                }
-                let mut uuid_arr = [0u8; 16];
-                uuid_arr.copy_from_slice(&uuid_bytes);
-                let ns = NamespaceRef::with_name(uuid_arr, alias.to_string());
+            for asserter in asserters {
+                let ns = NamespaceRef::deterministic(asserter);
                 let rev_tags = s.tag_prefix(&ns, "revocation/")?;
                 for tag in &rev_tags {
                     if let Ok(blob) = s.blob_get(&tag.kappa) {
@@ -397,10 +420,6 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let v: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
 
-        let asserter = v["asserter"]
-            .as_str()
-            .ok_or_else(|| bad_request("missing asserter"))?
-            .to_string();
         let assertion_kappa = v["assertion_kappa"]
             .as_str()
             .ok_or_else(|| bad_request("missing assertion_kappa"))?
@@ -414,16 +433,25 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             _ => RevocationReason::Superseded,
         };
         let revoked_at_ms = v["revoked_at_ms"].as_u64().unwrap_or(0);
-        let signature_hex = v["signature"].as_str().unwrap_or("");
-        let signature = hex::decode(signature_hex).unwrap_or_default();
 
-        let revocation = Revocation {
-            asserter: asserter.clone(),
+        // Only the asserter's own key can revoke its assertions. The
+        // asserter is derived from the signing key, never taken from the
+        // request; a stated asserter must match it.
+        let mut revocation = Revocation {
+            asserter: String::new(),
             assertion_kappa,
             reason,
             revoked_at_ms,
-            signature,
+            signature: Vec::new(),
         };
+        let (asserter, signature) =
+            verified_signer(&v, "public_key", "signature", &revocation.signable_bytes())
+                .map_err(bad_request)?;
+        if v["asserter"].as_str().is_some_and(|a| a != asserter) {
+            return Err(bad_request("asserter does not match signing key").into());
+        }
+        revocation.asserter = asserter.clone();
+        revocation.signature = signature;
 
         let s = store(cx).clone();
         let rev_bytes = canonical::canonical_bytes(&revocation);
@@ -557,22 +585,34 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let v: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
 
-        let asserter = v["asserter"]
-            .as_str()
-            .ok_or_else(|| bad_request("missing asserter"))?
-            .to_string();
         let invalidate_before_ms = v["invalidate_before_ms"]
             .as_u64()
             .ok_or_else(|| bad_request("missing invalidate_before_ms"))?;
         let reason = v["reason"].as_str().unwrap_or("unspecified").to_string();
         let set_at_ms = v["set_at_ms"].as_u64().unwrap_or(0);
 
-        let watermark = kappa_core::identity::watermark::Watermark {
-            asserter: asserter.clone(),
+        // A watermark voids every earlier assertion of its asserter, so
+        // only the asserter's own key may set one. The signature covers
+        // the watermark with `asserter` empty; the asserter is derived
+        // from the key. Watermark has no signature field in its permanent
+        // CBOR layout, so the signature is checked here, at ingest.
+        let mut watermark = kappa_core::identity::watermark::Watermark {
+            asserter: String::new(),
             invalidate_before_ms,
             reason,
             set_at_ms,
         };
+        let (asserter, _) = verified_signer(
+            &v,
+            "public_key",
+            "signature",
+            &canonical::canonical_bytes(&watermark),
+        )
+        .map_err(bad_request)?;
+        if v["asserter"].as_str().is_some_and(|a| a != asserter) {
+            return Err(bad_request("asserter does not match signing key").into());
+        }
+        watermark.asserter = asserter.clone();
 
         let s = store(cx).clone();
         let wm_bytes = canonical::canonical_bytes(&watermark);
@@ -897,19 +937,32 @@ fn succession_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             .to_string();
         let reason = v["reason"].as_str().unwrap_or("rotation").to_string();
         let effective_at_ms = v["effective_at_ms"].as_u64().unwrap_or(0);
-        let old_signature_hex = v["old_signature"].as_str().unwrap_or("");
-        let old_signature = hex::decode(old_signature_hex).unwrap_or_default();
-        let new_signature_hex = v["new_signature"].as_str().unwrap_or("");
-        let new_signature = hex::decode(new_signature_hex).unwrap_or_default();
 
-        let succession = IdentitySuccession {
+        // A succession hands an anchor's identity to a new anchor, so both
+        // keys must sign it: the old key approves, the new key accepts.
+        let mut succession = IdentitySuccession {
             old_anchor,
             new_anchor,
             reason,
             effective_at_ms,
-            old_signature,
-            new_signature,
+            old_signature: Vec::new(),
+            new_signature: Vec::new(),
         };
+        let message = succession.signable_bytes();
+        let (old_signer, old_signature) =
+            verified_signer(&v, "old_public_key", "old_signature", &message)
+                .map_err(bad_request)?;
+        let (new_signer, new_signature) =
+            verified_signer(&v, "new_public_key", "new_signature", &message)
+                .map_err(bad_request)?;
+        if old_signer != succession.old_anchor {
+            return Err(bad_request("old_signature is not from old_anchor").into());
+        }
+        if new_signer != succession.new_anchor {
+            return Err(bad_request("new_signature is not from new_anchor").into());
+        }
+        succession.old_signature = old_signature;
+        succession.new_signature = new_signature;
 
         let s = store(cx).clone();
         let result = tokio::task::spawn_blocking(move || s.identity_succession_put(&succession))
