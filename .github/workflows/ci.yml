@@ -28,6 +28,12 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Install system dependencies
+        # protoc: rekindle-ratchet (via the veilid transport) compiles .proto
+        # files in its build script. musl-tools: aws-lc-sys compiles C for
+        # the musl release target and needs musl-gcc.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
+
       - name: Format check
         run: cargo fmt --check
 
@@ -36,10 +42,6 @@ jobs:
 
       - name: Test (workspace)
         run: cargo test --workspace
-
-      - name: Install musl C toolchain
-        # aws-lc-sys compiles C for the musl target and needs musl-gcc.
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build release (musl)
         run: cargo build --release --target x86_64-unknown-linux-musl
