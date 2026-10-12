@@ -749,6 +749,33 @@ pub fn handle_receive_pack<R: Read, W: Write>(
         store.tag_set_batch(namespace, &batch_updates)
     };
 
+    // A repository created by a push has no HEAD. A bare repository's HEAD
+    // names its default branch, and without one clients clone with nothing
+    // checked out ("remote HEAD refers to nonexistent ref"). Point HEAD at
+    // the pushed branch, preferring main. The push itself has succeeded, so
+    // a failure here is logged, not reported as a ref failure.
+    if batch_result.is_ok()
+        && matches!(
+            store.tag_get(namespace, "HEAD"),
+            Err(kappa_core::StoreError::NotFound(_))
+        )
+    {
+        let mut branches = batch_updates
+            .iter()
+            .map(|u| u.name.as_str())
+            .filter(|name| name.starts_with("refs/heads/"));
+        let default = batch_updates
+            .iter()
+            .map(|u| u.name.as_str())
+            .find(|name| *name == "refs/heads/main")
+            .or_else(|| branches.next());
+        if let Some(default) = default {
+            if let Err(e) = refs::set_symbolic_ref(store, namespace, "HEAD", default) {
+                tracing::warn!(error = %e, branch = default, "failed to set HEAD for new repository");
+            }
+        }
+    }
+
     let mut delete_errors: Vec<(String, String)> = Vec::new();
     for ref_name in &deletes {
         if let Err(e) = refs::delete_ref(store, namespace, ref_name) {
