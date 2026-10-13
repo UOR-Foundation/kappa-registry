@@ -11,6 +11,12 @@ description = "Content-addressed graph database primitives."
 name = "kappa_core"
 path = "src/lib.rs"
 
+[features]
+default = ["encryption"]
+# AES-256-GCM at rest, on aws-lc through rekindle-aead. Off: no key can be
+# constructed, encryption paths fail closed, and aws-lc is not linked.
+encryption = ["dep:rekindle-aead"]
+
 [dependencies]
 dcbor = { workspace = true }
 sha2 = { workspace = true }
@@ -29,7 +35,7 @@ frost-secp256k1 = { workspace = true }
 rand_core = { workspace = true }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 getrandom = { workspace = true }
-rekindle-aead = { workspace = true }
+rekindle-aead = { workspace = true, optional = true }
 hmac = "0.13"
 subtle = "2"
 md-5 = "0.10"

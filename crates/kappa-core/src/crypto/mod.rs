@@ -1,6 +1,7 @@
 //! Cryptographic signing, verification, and threshold co-signing.
 
 pub mod aead;
+pub mod aead_backend;
 pub mod anchor;
 pub mod ecdsa;
 pub mod ed25519;

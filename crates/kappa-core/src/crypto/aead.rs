@@ -16,8 +16,9 @@
 use super::kms::KeyManagementService;
 use super::CryptoError;
 
-use rekindle_aead::aes_gcm::AesGcmKey;
-use rekindle_aead::BulkAead;
+use super::aead_backend::AesGcmKey;
+#[cfg(feature = "encryption")]
+use super::aead_backend::BulkAead;
 
 /// Frame size for framed AEAD: 65536 bytes (64KB).
 /// Matches STREAM_CHUNK_SIZE in the download path.
@@ -323,7 +324,7 @@ impl BlobEncryptor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::*;
     use crate::crypto::kms::FileKms;

@@ -20,8 +20,9 @@
 //! and filter in memory. This is O(n) per namespace but acceptable for
 //! single-node deployments with thousands to millions of tags.
 
-use rekindle_aead::aes_gcm::AesGcmKey;
-use rekindle_aead::BulkAead;
+use kappa_core::crypto::aead_backend::AesGcmKey;
+#[cfg(feature = "encryption")]
+use kappa_core::crypto::aead_backend::BulkAead;
 
 /// Encrypted table key/value operations.
 ///
@@ -142,7 +143,7 @@ impl std::fmt::Display for EncryptionError {
 
 impl std::error::Error for EncryptionError {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::*;
 
