@@ -101,7 +101,8 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
                 return report;
             }
         };
-        let namespaces: Vec<String> = ns_records.iter()
+        let namespaces: Vec<String> = ns_records
+            .iter()
             .flat_map(|r| r.aliases.first().cloned())
             .collect();
 
@@ -128,7 +129,9 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
                 let remote: EpochRootResponse = match postcard::from_bytes(&remote_bytes[1..]) {
                     Ok(r) => r,
                     Err(e) => {
-                        report.errors.push((peer.id.clone(), format!("decode: {e}")));
+                        report
+                            .errors
+                            .push((peer.id.clone(), format!("decode: {e}")));
                         continue;
                     }
                 };
@@ -167,10 +170,13 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
                     continue;
                 }
 
-                let pull_resp: DiffPullResponse = match postcard::from_bytes(&pull_resp_bytes[1..]) {
+                let pull_resp: DiffPullResponse = match postcard::from_bytes(&pull_resp_bytes[1..])
+                {
                     Ok(r) => r,
                     Err(e) => {
-                        report.errors.push((peer.id.clone(), format!("decode pull: {e}")));
+                        report
+                            .errors
+                            .push((peer.id.clone(), format!("decode pull: {e}")));
                         continue;
                     }
                 };
@@ -231,8 +237,7 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
     ) -> tokio::task::JoinHandle<()> {
         let interval_secs = self.interval_secs;
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -262,10 +267,7 @@ impl<T: PeerTransport + 'static, M: MembershipView + 'static> ReconcileLoop<T, M
 /// Called from the kappa-server dispatch loop when an AppCall arrives
 /// with a recognized protocol byte. Returns the response bytes to
 /// send back via app_call_reply.
-pub fn handle_reconcile_request(
-    store: &dyn KappaStore,
-    request: &[u8],
-) -> Result<Vec<u8>, String> {
+pub fn handle_reconcile_request(store: &dyn KappaStore, request: &[u8]) -> Result<Vec<u8>, String> {
     if request.is_empty() {
         return Err("empty request".into());
     }
@@ -278,14 +280,19 @@ pub fn handle_reconcile_request(
                 .map_err(|e| format!("invalid namespace utf8: {e}"))?;
             let namespace = match store.namespace_resolve(namespace_str, None) {
                 Ok(r) => r,
-                Err(_) => return Ok({
-                    let resp = EpochRootResponse { epoch_number: 0, root_kappa: String::new() };
-                    let mut resp_bytes = vec![PROTO_EPOCH_ROOT_RESP];
-                    resp_bytes.extend_from_slice(
-                        &postcard::to_stdvec(&resp).map_err(|e| format!("encode: {e}"))?,
-                    );
-                    resp_bytes
-                }),
+                Err(_) => {
+                    return Ok({
+                        let resp = EpochRootResponse {
+                            epoch_number: 0,
+                            root_kappa: String::new(),
+                        };
+                        let mut resp_bytes = vec![PROTO_EPOCH_ROOT_RESP];
+                        resp_bytes.extend_from_slice(
+                            &postcard::to_stdvec(&resp).map_err(|e| format!("encode: {e}"))?,
+                        );
+                        resp_bytes
+                    })
+                }
             };
 
             let (epoch_number, root_kappa) = match store.epoch_current(&namespace) {
@@ -309,10 +316,11 @@ pub fn handle_reconcile_request(
         }
 
         PROTO_DIFF_PULL_REQ => {
-            let req: DiffPullRequest = postcard::from_bytes(&request[1..])
-                .map_err(|e| format!("decode: {e}"))?;
+            let req: DiffPullRequest =
+                postcard::from_bytes(&request[1..]).map_err(|e| format!("decode: {e}"))?;
 
-            let req_ns = store.namespace_resolve(req.namespace.as_str(), None)
+            let req_ns = store
+                .namespace_resolve(req.namespace.as_str(), None)
                 .map_err(|e| format!("namespace resolve: {e}"))?;
             let tags = if req.tag_names.is_empty() {
                 store

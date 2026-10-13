@@ -76,7 +76,8 @@ impl FrameDecryptingReader {
         self.file.read_exact(&mut self.read_buf)?;
 
         // Decrypt via BlobEncryptor::decrypt_frame
-        let plaintext = self.encryptor
+        let plaintext = self
+            .encryptor
             .decrypt_frame(&self.sigma, &self.base_nonce, frame_index, &self.read_buf)
             .map_err(|e| io::Error::other(format!("frame {} decrypt: {e}", frame_index)))?;
 

@@ -14,7 +14,7 @@
 //! The Nix devshell is hermetic -- openssl CLI may not be available.
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 

@@ -31,9 +31,7 @@ fn trust_position_standalone() {
 
 #[test]
 fn trust_position_federated() {
-    let federated = TrustPosition::Federated {
-        verified_peers: 3,
-    };
+    let federated = TrustPosition::Federated { verified_peers: 3 };
     assert_eq!(federated.as_str(), "federated");
     assert!(!federated.is_faulted());
 }
@@ -115,13 +113,17 @@ fn probe_result_equivocation() {
 #[test]
 fn trust_position_degraded_reasons_distinct() {
     let d1 = TrustPosition::Degraded {
-        reason: DegradeReason::SignatureInvalid, reachable: 1, verified: 0,
+        reason: DegradeReason::SignatureInvalid,
+        reachable: 1,
+        verified: 0,
     };
     let d2 = TrustPosition::Degraded {
-        reason: DegradeReason::Equivocation, reachable: 1, verified: 0,
+        reason: DegradeReason::Equivocation,
+        reachable: 1,
+        verified: 0,
     };
     assert_ne!(d1.as_str(), ""); // both say "degraded"
-    // But the reasons are different
+                                 // But the reasons are different
     match (&d1, &d2) {
         (
             TrustPosition::Degraded { reason: r1, .. },
@@ -133,9 +135,7 @@ fn trust_position_degraded_reasons_distinct() {
 
 #[test]
 fn trust_position_federated_peer_count() {
-    let f = TrustPosition::Federated {
-        verified_peers: 5,
-    };
+    let f = TrustPosition::Federated { verified_peers: 5 };
     if let TrustPosition::Federated { verified_peers } = f {
         assert_eq!(verified_peers, 5);
     } else {
@@ -267,7 +267,13 @@ fn watermark_multiple_for_same_asserter() {
 // Group 8: Resolution Pipeline (14 tests)
 // =============================================================================
 
-fn make_assertion(asserter: &str, subject: &str, facet: &str, from: u64, until: Option<u64>) -> IdentityAssertion {
+fn make_assertion(
+    asserter: &str,
+    subject: &str,
+    facet: &str,
+    from: u64,
+    until: Option<u64>,
+) -> IdentityAssertion {
     IdentityAssertion {
         asserter: asserter.into(),
         subject: subject.into(),
@@ -363,10 +369,8 @@ fn resolve_all_filtered_by_asserter() {
         make_assertion("trusted", "s", "f1", 100, None),
         make_assertion("untrusted", "s", "f2", 200, None),
     ];
-    let result = resolution::resolve_all_filtered(
-        &assertions, &[], &[],
-        Some(&|a: &str| a == "trusted"),
-    );
+    let result =
+        resolution::resolve_all_filtered(&assertions, &[], &[], Some(&|a: &str| a == "trusted"));
     assert_eq!(result.valid.len(), 1);
     assert_eq!(result.valid[0].asserter, "trusted");
 }
@@ -393,12 +397,18 @@ fn resolve_multiple_revocations_same_assertion() {
     let assertion = make_assertion("a", "s", "f", 100, None);
     let kappa = kappa_core::kappa::kappa_from_bytes(&canonical_bytes(&assertion));
     let rev1 = Revocation {
-        asserter: "a".into(), assertion_kappa: kappa.clone(),
-        reason: RevocationReason::Superseded, revoked_at_ms: 200, signature: vec![],
+        asserter: "a".into(),
+        assertion_kappa: kappa.clone(),
+        reason: RevocationReason::Superseded,
+        revoked_at_ms: 200,
+        signature: vec![],
     };
     let rev2 = Revocation {
-        asserter: "a".into(), assertion_kappa: kappa,
-        reason: RevocationReason::KeyCompromise, revoked_at_ms: 300, signature: vec![],
+        asserter: "a".into(),
+        assertion_kappa: kappa,
+        reason: RevocationReason::KeyCompromise,
+        revoked_at_ms: 300,
+        signature: vec![],
     };
     let result = resolution::resolve_at(&[assertion], &[rev1, rev2], &[], 150);
     assert_eq!(result.valid.len(), 0);
@@ -411,7 +421,9 @@ fn resolve_revocation_wrong_asserter_does_not_affect() {
     let revocation = Revocation {
         asserter: "bob".into(), // wrong asserter
         assertion_kappa: kappa,
-        reason: RevocationReason::Superseded, revoked_at_ms: 200, signature: vec![],
+        reason: RevocationReason::Superseded,
+        revoked_at_ms: 200,
+        signature: vec![],
     };
     let result = resolution::resolve_at(&[assertion], &[revocation], &[], 150);
     // The current implementation matches by kappa, not by asserter.
@@ -429,23 +441,28 @@ fn resolve_watermark_wrong_asserter_does_not_affect() {
         set_at_ms: 201,
     };
     let result = resolution::resolve_at(&[assertion], &[], &[watermark], 150);
-    assert_eq!(result.valid.len(), 1, "bob's watermark should not affect alice's assertion");
+    assert_eq!(
+        result.valid.len(),
+        1,
+        "bob's watermark should not affect alice's assertion"
+    );
 }
 
 #[test]
 fn resolve_combined_filters() {
     let assertions = vec![
-        make_assertion("a", "s", "expired", 100, Some(150)),  // expired
-        make_assertion("a", "s", "valid", 100, None),          // valid
-        make_assertion("b", "s", "untrusted", 100, None),      // filtered by asserter
+        make_assertion("a", "s", "expired", 100, Some(150)), // expired
+        make_assertion("a", "s", "valid", 100, None),        // valid
+        make_assertion("b", "s", "untrusted", 100, None),    // filtered by asserter
     ];
     let watermark = Watermark {
-        asserter: "a".into(), invalidate_before_ms: 50, reason: "r".into(), set_at_ms: 51,
+        asserter: "a".into(),
+        invalidate_before_ms: 50,
+        reason: "r".into(),
+        set_at_ms: 51,
     };
-    let result = resolution::resolve_all_filtered(
-        &assertions, &[], &[watermark],
-        Some(&|a: &str| a == "a"),
-    );
+    let result =
+        resolution::resolve_all_filtered(&assertions, &[], &[watermark], Some(&|a: &str| a == "a"));
     assert_eq!(result.valid.len(), 1);
     assert_eq!(result.valid[0].facet, "valid");
 }
@@ -460,7 +477,10 @@ fn federation_config_default() {
     assert!(matches!(config.mode, FederationMode::Disabled));
     assert!(config.peers.is_empty());
     assert_eq!(config.sync_interval_secs, 300);
-    assert!(matches!(config.conflict_resolution, ConflictResolution::Reject));
+    assert!(matches!(
+        config.conflict_resolution,
+        ConflictResolution::Reject
+    ));
 }
 
 #[test]
@@ -502,7 +522,11 @@ fn federation_mode_disabled() {
 
 #[test]
 fn conflict_resolution_variants() {
-    for cr in [ConflictResolution::Reject, ConflictResolution::AcceptAll, ConflictResolution::VersionWins] {
+    for cr in [
+        ConflictResolution::Reject,
+        ConflictResolution::AcceptAll,
+        ConflictResolution::VersionWins,
+    ] {
         let bytes = canonical_bytes(&cr);
         let decoded: ConflictResolution = from_canonical(&bytes).unwrap();
         assert_eq!(decoded, cr);
@@ -651,15 +675,21 @@ fn membership_cbor_roundtrip() {
 fn membership_mixed_roles() {
     let mut state = MembershipState::default();
     state.add_member(MemberRecord {
-        anchor: "sha256:v1".into(), endpoint: "e".into(), joined_at_ms: 0,
+        anchor: "sha256:v1".into(),
+        endpoint: "e".into(),
+        joined_at_ms: 0,
         role: kappa_core::membership::MemberRole::Voter,
     });
     state.add_member(MemberRecord {
-        anchor: "sha256:l1".into(), endpoint: "e".into(), joined_at_ms: 0,
+        anchor: "sha256:l1".into(),
+        endpoint: "e".into(),
+        joined_at_ms: 0,
         role: kappa_core::membership::MemberRole::Learner,
     });
     state.add_member(MemberRecord {
-        anchor: "sha256:v2".into(), endpoint: "e".into(), joined_at_ms: 0,
+        anchor: "sha256:v2".into(),
+        endpoint: "e".into(),
+        joined_at_ms: 0,
         role: kappa_core::membership::MemberRole::Voter,
     });
     assert_eq!(state.members.len(), 3);

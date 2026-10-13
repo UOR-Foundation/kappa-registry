@@ -210,7 +210,8 @@ async fn tag_create(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<
 
     let nm = name.to_string();
     tokio::task::spawn_blocking(move || {
-        let _span = tracing::info_span!("store_mutation", op = "tag_create", ns = %n, tag = %nm).entered();
+        let _span =
+            tracing::info_span!("store_mutation", op = "tag_create", ns = %n, tag = %nm).entered();
         s.tag_set(&n, &nm, &k)?;
         s.epoch_advance(
             &n,
@@ -257,7 +258,8 @@ async fn tag_delete_by_query(cx: &Cx, ns: &NamespaceRef, name: &str) -> topcoat:
     let n = ns.clone();
     let nm = name.to_string();
     tokio::task::spawn_blocking(move || {
-        let _span = tracing::info_span!("store_mutation", op = "tag_delete", ns = %n, tag = %nm).entered();
+        let _span =
+            tracing::info_span!("store_mutation", op = "tag_delete", ns = %n, tag = %nm).entered();
         s.tag_delete(&n, &nm)?;
         s.epoch_advance(
             &n,
@@ -441,7 +443,9 @@ async fn tag_put(
         let result = tokio::task::spawn_blocking({
             let s = s.clone();
             move || {
-                let _span = tracing::info_span!("store_mutation", op = "tag_set_cas", ns = %n, tag = %nm).entered();
+                let _span =
+                    tracing::info_span!("store_mutation", op = "tag_set_cas", ns = %n, tag = %nm)
+                        .entered();
                 match s.tag_get(&n, &nm) {
                     Ok(entry) => {
                         if entry.kappa == ek {
@@ -552,7 +556,8 @@ async fn tag_put(
     tokio::task::spawn_blocking({
         let s = s.clone();
         move || {
-            let _span = tracing::info_span!("store_mutation", op = "tag_set", ns = %n, tag = %nm).entered();
+            let _span =
+                tracing::info_span!("store_mutation", op = "tag_set", ns = %n, tag = %nm).entered();
             s.tag_set(&n, &nm, &k)?;
             s.epoch_advance(
                 &n,

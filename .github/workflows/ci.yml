@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.92.0
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
           targets: x86_64-unknown-linux-musl
@@ -27,6 +27,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+
+      - name: Install system dependencies
+        # protoc: rekindle-ratchet (via the veilid transport) compiles .proto
+        # files in its build script. musl-tools: aws-lc-sys compiles C for
+        # the musl release target and needs musl-gcc.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
 
       - name: Format check
         run: cargo fmt --check
@@ -44,4 +50,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kappa-registry-x86_64-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/kappa-registry
+          path: target/x86_64-unknown-linux-musl/release/kappa-server

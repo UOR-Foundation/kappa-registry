@@ -50,16 +50,10 @@ pub struct EncryptedBlob {
 
 impl BlobEncryptor {
     /// Create an encryptor for a namespace using a KMS-derived key.
-    pub fn new(
-        kms: &dyn KeyManagementService,
-        namespace: &str,
-    ) -> Result<Self, CryptoError> {
+    pub fn new(kms: &dyn KeyManagementService, namespace: &str) -> Result<Self, CryptoError> {
         let derived = kms.derive_subject_key(namespace, "_blob_encryption")?;
-        let key_bytes: [u8; 32] = derived
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKey)?;
-        let aes_key = AesGcmKey::new(&key_bytes)
-            .map_err(|_| CryptoError::InvalidKey)?;
+        let key_bytes: [u8; 32] = derived.try_into().map_err(|_| CryptoError::InvalidKey)?;
+        let aes_key = AesGcmKey::new(&key_bytes).map_err(|_| CryptoError::InvalidKey)?;
         Ok(Self {
             key: aes_key,
             raw_key_bytes: key_bytes,
@@ -71,8 +65,7 @@ impl BlobEncryptor {
     /// AesGcmKey wraps LessSafeKey which is not Clone, so we expand a
     /// new key schedule from the stored raw bytes.
     pub fn clone_for_reader(&self) -> Result<Self, CryptoError> {
-        let aes_key = AesGcmKey::new(&self.raw_key_bytes)
-            .map_err(|_| CryptoError::InvalidKey)?;
+        let aes_key = AesGcmKey::new(&self.raw_key_bytes).map_err(|_| CryptoError::InvalidKey)?;
         Ok(Self {
             key: aes_key,
             raw_key_bytes: self.raw_key_bytes,
@@ -118,24 +111,21 @@ impl BlobEncryptor {
         let mut plaintext = vec![0u8; ciphertext.len()];
         self.key
             .open_detached(&nonce, sigma.as_bytes(), ciphertext, &tag, &mut plaintext)
-            .map_err(|e| CryptoError::SigningFailed(format!("frame {} decrypt: {e}", frame_index)))?;
+            .map_err(|e| {
+                CryptoError::SigningFailed(format!("frame {} decrypt: {e}", frame_index))
+            })?;
         Ok(plaintext)
     }
 
     /// Encrypt a blob in fixed-size frames.
-    pub fn encrypt(
-        &self,
-        sigma: &str,
-        plaintext: &[u8],
-    ) -> Result<EncryptedBlob, CryptoError> {
+    pub fn encrypt(&self, sigma: &str, plaintext: &[u8]) -> Result<EncryptedBlob, CryptoError> {
         let mut base_nonce = [0u8; 8];
-        getrandom::fill(&mut base_nonce)
-            .map_err(|e| CryptoError::KeyGeneration(e.to_string()))?;
+        getrandom::fill(&mut base_nonce).map_err(|e| CryptoError::KeyGeneration(e.to_string()))?;
 
         let frame_count = if plaintext.is_empty() {
             1
         } else {
-            (plaintext.len() + FRAME_SIZE - 1) / FRAME_SIZE
+            plaintext.len().div_ceil(FRAME_SIZE)
         };
 
         let mut disk_bytes = Vec::with_capacity(frame_count * FRAME_DISK_SIZE);
@@ -180,8 +170,7 @@ impl BlobEncryptor {
         writer: &mut dyn std::io::Write,
     ) -> Result<(/*base_nonce*/ [u8; 8], /*plaintext_size*/ u64), CryptoError> {
         let mut base_nonce = [0u8; 8];
-        getrandom::fill(&mut base_nonce)
-            .map_err(|e| CryptoError::KeyGeneration(e.to_string()))?;
+        getrandom::fill(&mut base_nonce).map_err(|e| CryptoError::KeyGeneration(e.to_string()))?;
 
         let aad = sigma.as_bytes();
         let mut frame_index: u32 = 0;
@@ -211,12 +200,16 @@ impl BlobEncryptor {
             let mut tag = [0u8; 16];
             self.key
                 .seal_detached(&nonce, aad, frame_plaintext, &mut frame_ct, &mut tag)
-                .map_err(|e| CryptoError::SigningFailed(format!("frame {frame_index} seal: {e}")))?;
+                .map_err(|e| {
+                    CryptoError::SigningFailed(format!("frame {frame_index} seal: {e}"))
+                })?;
 
             // Write [tag:16][ciphertext] to output
-            writer.write_all(&tag)
+            writer
+                .write_all(&tag)
                 .map_err(|e| CryptoError::SigningFailed(format!("write tag: {e}")))?;
-            writer.write_all(&frame_ct)
+            writer
+                .write_all(&frame_ct)
                 .map_err(|e| CryptoError::SigningFailed(format!("write ct: {e}")))?;
 
             plaintext_size += frame_len as u64;
@@ -257,7 +250,10 @@ impl BlobEncryptor {
             }
 
             let frame_pt = self.decrypt_frame(
-                sigma, base_nonce, frame_index, &disk_bytes[pos..pos + frame_disk_len],
+                sigma,
+                base_nonce,
+                frame_index,
+                &disk_bytes[pos..pos + frame_disk_len],
             )?;
             plaintext.extend_from_slice(&frame_pt);
             pos += frame_disk_len;
@@ -267,7 +263,8 @@ impl BlobEncryptor {
         if plaintext.len() != plaintext_size as usize {
             return Err(CryptoError::SigningFailed(format!(
                 "decrypted {} bytes but expected {}",
-                plaintext.len(), plaintext_size
+                plaintext.len(),
+                plaintext_size
             )));
         }
         Ok(plaintext)
@@ -303,12 +300,17 @@ impl BlobEncryptor {
             if disk_offset + frame_disk_len > disk_bytes.len() {
                 return Err(CryptoError::SigningFailed(format!(
                     "frame {} beyond disk (offset={}, len={}, total={})",
-                    fi, disk_offset, frame_disk_len, disk_bytes.len()
+                    fi,
+                    disk_offset,
+                    frame_disk_len,
+                    disk_bytes.len()
                 )));
             }
 
             let frame_pt = self.decrypt_frame(
-                sigma, base_nonce, fi,
+                sigma,
+                base_nonce,
+                fi,
                 &disk_bytes[disk_offset..disk_offset + frame_disk_len],
             )?;
             decrypted_frames.extend_from_slice(&frame_pt);
@@ -340,7 +342,14 @@ mod tests {
         let sigma = "sha256:aabbccdd";
         let encrypted = enc.encrypt(sigma, plaintext).unwrap();
         assert_eq!(encrypted.disk_bytes.len(), 16 + plaintext.len());
-        let pt = enc.decrypt_all(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size).unwrap();
+        let pt = enc
+            .decrypt_all(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+            )
+            .unwrap();
         assert_eq!(pt, plaintext);
     }
 
@@ -349,12 +358,20 @@ mod tests {
         let (kms, _dir) = test_kms();
         let enc = BlobEncryptor::new(&kms, "test-ns").unwrap();
         let plaintext: Vec<u8> = (0..FRAME_SIZE * 2 + FRAME_SIZE / 2)
-            .map(|i| (i % 251) as u8).collect();
+            .map(|i| (i % 251) as u8)
+            .collect();
         let sigma = "sha256:multiframe";
         let encrypted = enc.encrypt(sigma, &plaintext).unwrap();
         let expected_disk = 2 * FRAME_DISK_SIZE + 16 + FRAME_SIZE / 2;
         assert_eq!(encrypted.disk_bytes.len(), expected_disk);
-        let pt = enc.decrypt_all(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size).unwrap();
+        let pt = enc
+            .decrypt_all(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+            )
+            .unwrap();
         assert_eq!(pt, plaintext);
     }
 
@@ -363,7 +380,14 @@ mod tests {
         let (kms, _dir) = test_kms();
         let enc = BlobEncryptor::new(&kms, "test-ns").unwrap();
         let encrypted = enc.encrypt("sha256:aaa", b"secret").unwrap();
-        assert!(enc.decrypt_all("sha256:bbb", &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size).is_err());
+        assert!(enc
+            .decrypt_all(
+                "sha256:bbb",
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size
+            )
+            .is_err());
     }
 
     #[test]
@@ -375,8 +399,12 @@ mod tests {
         let e2 = enc.encrypt(sigma, b"same content").unwrap();
         assert_ne!(e1.base_nonce, e2.base_nonce);
         assert_ne!(e1.disk_bytes, e2.disk_bytes);
-        let p1 = enc.decrypt_all(sigma, &e1.disk_bytes, &e1.base_nonce, e1.plaintext_size).unwrap();
-        let p2 = enc.decrypt_all(sigma, &e2.disk_bytes, &e2.base_nonce, e2.plaintext_size).unwrap();
+        let p1 = enc
+            .decrypt_all(sigma, &e1.disk_bytes, &e1.base_nonce, e1.plaintext_size)
+            .unwrap();
+        let p2 = enc
+            .decrypt_all(sigma, &e2.disk_bytes, &e2.base_nonce, e2.plaintext_size)
+            .unwrap();
         assert_eq!(p1, p2);
     }
 
@@ -387,7 +415,14 @@ mod tests {
         let sigma = "sha256:tamper";
         let mut encrypted = enc.encrypt(sigma, b"original content here").unwrap();
         encrypted.disk_bytes[16] ^= 0xFF;
-        assert!(enc.decrypt_all(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size).is_err());
+        assert!(enc
+            .decrypt_all(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size
+            )
+            .is_err());
     }
 
     #[test]
@@ -398,7 +433,14 @@ mod tests {
         let encrypted = enc.encrypt(sigma, b"").unwrap();
         assert_eq!(encrypted.plaintext_size, 0);
         assert_eq!(encrypted.disk_bytes.len(), 16);
-        let pt = enc.decrypt_all(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size).unwrap();
+        let pt = enc
+            .decrypt_all(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+            )
+            .unwrap();
         assert!(pt.is_empty());
     }
 
@@ -409,7 +451,16 @@ mod tests {
         let plaintext: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
         let sigma = "sha256:range1";
         let encrypted = enc.encrypt(sigma, &plaintext).unwrap();
-        let range = enc.decrypt_range(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size, 100, 200).unwrap();
+        let range = enc
+            .decrypt_range(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+                100,
+                200,
+            )
+            .unwrap();
         assert_eq!(range, &plaintext[100..300]);
     }
 
@@ -422,9 +473,21 @@ mod tests {
         let encrypted = enc.encrypt(sigma, &plaintext).unwrap();
         let offset = FRAME_SIZE as u64 - 100;
         let length = 200;
-        let range = enc.decrypt_range(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size, offset, length).unwrap();
+        let range = enc
+            .decrypt_range(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+                offset,
+                length,
+            )
+            .unwrap();
         assert_eq!(range.len(), 200);
-        assert_eq!(range, &plaintext[offset as usize..(offset + length) as usize]);
+        assert_eq!(
+            range,
+            &plaintext[offset as usize..(offset + length) as usize]
+        );
     }
 
     #[test]
@@ -434,7 +497,16 @@ mod tests {
         let plaintext = b"short";
         let sigma = "sha256:range_past";
         let encrypted = enc.encrypt(sigma, plaintext).unwrap();
-        let range = enc.decrypt_range(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size, 3, 100).unwrap();
+        let range = enc
+            .decrypt_range(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+                3,
+                100,
+            )
+            .unwrap();
         assert_eq!(range, b"rt");
     }
 
@@ -445,7 +517,16 @@ mod tests {
         let plaintext = b"hello";
         let sigma = "sha256:range_end";
         let encrypted = enc.encrypt(sigma, plaintext).unwrap();
-        let range = enc.decrypt_range(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size, 5, 10).unwrap();
+        let range = enc
+            .decrypt_range(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+                5,
+                10,
+            )
+            .unwrap();
         assert!(range.is_empty());
     }
 
@@ -456,7 +537,14 @@ mod tests {
         let sigma = "sha256:clone_test";
         let encrypted = enc.encrypt(sigma, b"clone reader data").unwrap();
         let reader_enc = enc.clone_for_reader().unwrap();
-        let pt = reader_enc.decrypt_all(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size).unwrap();
+        let pt = reader_enc
+            .decrypt_all(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+            )
+            .unwrap();
         assert_eq!(pt, b"clone reader data");
     }
 
@@ -466,7 +554,9 @@ mod tests {
         let enc = BlobEncryptor::new(&kms, "test-ns").unwrap();
         let sigma = "sha256:single_frame";
         let encrypted = enc.encrypt(sigma, b"frame test").unwrap();
-        let pt = enc.decrypt_frame(sigma, &encrypted.base_nonce, 0, &encrypted.disk_bytes).unwrap();
+        let pt = enc
+            .decrypt_frame(sigma, &encrypted.base_nonce, 0, &encrypted.disk_bytes)
+            .unwrap();
         assert_eq!(pt, b"frame test");
     }
 
@@ -474,7 +564,8 @@ mod tests {
     fn erased_key_prevents_new_encryptor() {
         let (kms, _dir) = test_kms();
         let _enc = BlobEncryptor::new(&kms, "erase-ns").unwrap();
-        kms.erase_subject_key("erase-ns", "_blob_encryption").unwrap();
+        kms.erase_subject_key("erase-ns", "_blob_encryption")
+            .unwrap();
         assert!(BlobEncryptor::new(&kms, "erase-ns").is_err());
     }
 
@@ -486,7 +577,14 @@ mod tests {
         let sigma = "sha256:exact_frame";
         let encrypted = enc.encrypt(sigma, &plaintext).unwrap();
         assert_eq!(encrypted.disk_bytes.len(), FRAME_DISK_SIZE);
-        let pt = enc.decrypt_all(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size).unwrap();
+        let pt = enc
+            .decrypt_all(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+            )
+            .unwrap();
         assert_eq!(pt, plaintext);
     }
 
@@ -498,7 +596,14 @@ mod tests {
         let sigma = "sha256:frame_plus_one";
         let encrypted = enc.encrypt(sigma, &plaintext).unwrap();
         assert_eq!(encrypted.disk_bytes.len(), FRAME_DISK_SIZE + 16 + 1);
-        let pt = enc.decrypt_all(sigma, &encrypted.disk_bytes, &encrypted.base_nonce, encrypted.plaintext_size).unwrap();
+        let pt = enc
+            .decrypt_all(
+                sigma,
+                &encrypted.disk_bytes,
+                &encrypted.base_nonce,
+                encrypted.plaintext_size,
+            )
+            .unwrap();
         assert_eq!(pt, plaintext);
     }
 
@@ -507,7 +612,8 @@ mod tests {
         let (kms, _dir) = test_kms();
         let enc = BlobEncryptor::new(&kms, "test-ns").unwrap();
         let plaintext: Vec<u8> = (0..FRAME_SIZE * 3 + 1000)
-            .map(|i| (i % 251) as u8).collect();
+            .map(|i| (i % 251) as u8)
+            .collect();
         let sigma = "sha256:test_streaming_match";
 
         // In-memory encrypt
@@ -525,28 +631,38 @@ mod tests {
         assert_eq!(stream_pt_size, plaintext.len() as u64);
 
         // Both produce valid ciphertext that decrypts to the same plaintext
-        let dec_mem = enc.decrypt_all(
-            sigma, &mem_result.disk_bytes, &mem_result.base_nonce,
-            mem_result.plaintext_size,
-        ).unwrap();
-        let dec_stream = enc.decrypt_all(
-            sigma, &ct_buf, &stream_nonce, stream_pt_size,
-        ).unwrap();
+        let dec_mem = enc
+            .decrypt_all(
+                sigma,
+                &mem_result.disk_bytes,
+                &mem_result.base_nonce,
+                mem_result.plaintext_size,
+            )
+            .unwrap();
+        let dec_stream = enc
+            .decrypt_all(sigma, &ct_buf, &stream_nonce, stream_pt_size)
+            .unwrap();
         assert_eq!(dec_mem, plaintext);
         assert_eq!(dec_stream, plaintext);
 
         // Same frame count
-        let mem_frames = (mem_result.disk_bytes.len() + FRAME_DISK_SIZE - 1) / FRAME_DISK_SIZE;
-        let stream_frames = (ct_buf.len() + FRAME_DISK_SIZE - 1) / FRAME_DISK_SIZE;
+        let mem_frames = mem_result.disk_bytes.len().div_ceil(FRAME_DISK_SIZE);
+        let stream_frames = ct_buf.len().div_ceil(FRAME_DISK_SIZE);
         assert_eq!(mem_frames, stream_frames);
 
         // Range read across frame boundary on streaming-encrypted output
         let mid_frame_offset = FRAME_SIZE as u64 + 100;
         let range_len = FRAME_SIZE as u64;
-        let range_result = enc.decrypt_range(
-            sigma, &ct_buf, &stream_nonce, stream_pt_size,
-            mid_frame_offset, range_len,
-        ).unwrap();
+        let range_result = enc
+            .decrypt_range(
+                sigma,
+                &ct_buf,
+                &stream_nonce,
+                stream_pt_size,
+                mid_frame_offset,
+                range_len,
+            )
+            .unwrap();
         assert_eq!(
             range_result,
             &plaintext[mid_frame_offset as usize..(mid_frame_offset + range_len) as usize],
@@ -555,10 +671,16 @@ mod tests {
         // Partial last frame read
         let last_frame_start = (FRAME_SIZE * 3) as u64;
         let remaining = plaintext.len() as u64 - last_frame_start;
-        let last_result = enc.decrypt_range(
-            sigma, &ct_buf, &stream_nonce, stream_pt_size,
-            last_frame_start, remaining,
-        ).unwrap();
+        let last_result = enc
+            .decrypt_range(
+                sigma,
+                &ct_buf,
+                &stream_nonce,
+                stream_pt_size,
+                last_frame_start,
+                remaining,
+            )
+            .unwrap();
         assert_eq!(last_result, &plaintext[last_frame_start as usize..]);
     }
 }

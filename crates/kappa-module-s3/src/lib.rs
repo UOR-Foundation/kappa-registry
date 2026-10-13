@@ -4,8 +4,8 @@
 //! Pure functions producing XML byte strings from store query results.
 //! No HTTP types. No async. WASM-portable.
 
-pub mod xml;
 pub mod list;
+pub mod xml;
 
 pub use list::{list_objects_v2, ListObjectsV2Request, ListObjectsV2Response, ObjectEntry};
 pub use xml::{

@@ -2,7 +2,7 @@
 //! upload session timeout, store root creation.
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 
@@ -169,7 +169,9 @@ fn transaction_begin_put_commit() {
         .unwrap();
     assert_eq!(resp.status(), 201, "txn begin should return 201");
     let body: serde_json::Value = resp.json().unwrap();
-    let txn_id = body["transaction_id"].as_str().expect("transaction should have a transaction_id");
+    let txn_id = body["transaction_id"]
+        .as_str()
+        .expect("transaction should have a transaction_id");
 
     // Stage a blob in the transaction
     let content = b"transactional-blob";
@@ -216,7 +218,9 @@ fn transaction_abort_rolls_back() {
         .send()
         .unwrap();
     let body: serde_json::Value = resp.json().unwrap();
-    let txn_id = body["transaction_id"].as_str().expect("transaction should have a transaction_id");
+    let txn_id = body["transaction_id"]
+        .as_str()
+        .expect("transaction should have a transaction_id");
 
     // Stage a blob
     let content = b"aborted-blob";

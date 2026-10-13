@@ -360,13 +360,7 @@ mod tests {
 
     fn test_store(dir: &Path) -> Arc<InMemoryStore> {
         let clock = Arc::new(NtpLamportClock::new());
-        Arc::new(
-            InMemoryStore::new(
-                MemoryStoreConfig::new(dir.join("blobs")),
-                clock,
-            )
-            .unwrap(),
-        )
+        Arc::new(InMemoryStore::new(MemoryStoreConfig::new(dir.join("blobs")), clock).unwrap())
     }
 
     fn test_kappa(content: &[u8]) -> String {

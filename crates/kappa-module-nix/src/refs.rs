@@ -58,10 +58,10 @@ pub fn scan_references(data: &[u8], candidates: &[&str]) -> Vec<String> {
         if !is_nixbase32_byte(window[STORE_PATH_HASH_LEN - 1]) {
             continue;
         }
-        if let Ok(window_str) = std::str::from_utf8(window) {
-            if candidate_set.contains(window_str) {
-                found.insert(window_str.to_string());
-            }
+        if let Ok(window_str) = std::str::from_utf8(window)
+            && candidate_set.contains(window_str)
+        {
+            found.insert(window_str.to_string());
         }
     }
     let mut result: Vec<String> = found.into_iter().collect();
@@ -159,10 +159,7 @@ pub fn decompress_and_verify(
 
     // Step 2: Compute NarHash (SHA-256 of entire decompressed NAR byte stream)
     let hash_bytes = Sha256::digest(&decompressed);
-    let computed_hash = format!(
-        "sha256:{}",
-        nix_derivation::nixbase32::encode(&hash_bytes)
-    );
+    let computed_hash = format!("sha256:{}", nix_derivation::nixbase32::encode(&hash_bytes));
     if computed_hash != expected_nar_hash {
         return Err(VerifyError::NarHashMismatch {
             expected: expected_nar_hash.to_string(),

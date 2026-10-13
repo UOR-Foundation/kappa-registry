@@ -4,15 +4,12 @@
 //! forward (by source), reverse (by target), by relation, by asserter.
 //! Indexes are maintained on put/delete and rebuilt from blobs on recovery.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
-
 use crate::canonical::canonical_bytes;
 use crate::kappa::kappa_from_bytes;
 use crate::store::KappaStore;
 use crate::types::*;
 
-use super::InMemoryStore;
+use super::{EdgeIndex, InMemoryStore};
 
 /// Map EdgeRelation to its permanent CBOR discriminant for index keys.
 /// Exhaustive match -- adding a variant without handling it is a compile error.
@@ -38,7 +35,11 @@ fn relation_index(relation: &EdgeRelation) -> u64 {
     }
 }
 
-pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) -> Result<(), StoreError> {
+pub(super) fn edge_put(
+    store: &InMemoryStore,
+    ns: &NamespaceRef,
+    edge: &Edge,
+) -> Result<(), StoreError> {
     store.ensure_namespace(ns);
 
     let edge_bytes = canonical_bytes(edge);
@@ -70,7 +71,11 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
                         // Same logical edge, different value/metadata: update in place
                         drop(edges);
                         drop(fwd);
-                        store.edges.write().unwrap().insert((uuid, ekh), edge.clone());
+                        store
+                            .edges
+                            .write()
+                            .unwrap()
+                            .insert((uuid, ekh), edge.clone());
                         return Ok(());
                     }
                 }
@@ -87,12 +92,7 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
             .insert((uuid, ek_hash), edge.clone());
     }
 
-    fn push_index(
-        index: &RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
-        uuid: [u8; 16],
-        key_hash: u64,
-        edge_kappa: &str,
-    ) {
+    fn push_index(index: &EdgeIndex, uuid: [u8; 16], key_hash: u64, edge_kappa: &str) {
         index
             .write()
             .unwrap()
@@ -101,18 +101,8 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
             .push(edge_kappa.to_string());
     }
 
-    push_index(
-        &store.fwd_index,
-        uuid,
-        item_hash(&edge.source),
-        &edge_kappa,
-    );
-    push_index(
-        &store.rev_index,
-        uuid,
-        item_hash(&edge.target),
-        &edge_kappa,
-    );
+    push_index(&store.fwd_index, uuid, item_hash(&edge.source), &edge_kappa);
+    push_index(&store.rev_index, uuid, item_hash(&edge.target), &edge_kappa);
     push_index(
         &store.rel_index,
         uuid,
@@ -136,7 +126,8 @@ pub(super) fn edge_put(store: &InMemoryStore, ns: &NamespaceRef, edge: &Edge) ->
     ];
     if inbound_relations.contains(&edge.relation) {
         let key = format!("{}\x00{}", edge.target, edge.relation.as_str());
-        store.assertion_inbound
+        store
+            .assertion_inbound
             .entry(key)
             .or_default()
             .push(edge_kappa.clone());
@@ -228,29 +219,14 @@ pub(super) fn edge_delete(
     let edge = store.edges.write().unwrap().remove(&(uuid, ek_hash));
 
     if let Some(edge) = edge {
-        fn remove_from(
-            index: &RwLock<HashMap<([u8; 16], u64), Vec<String>>>,
-            uuid: [u8; 16],
-            key_hash: u64,
-            kappa: &str,
-        ) {
+        fn remove_from(index: &EdgeIndex, uuid: [u8; 16], key_hash: u64, kappa: &str) {
             if let Some(vec) = index.write().unwrap().get_mut(&(uuid, key_hash)) {
                 vec.retain(|k| k != kappa);
             }
         }
 
-        remove_from(
-            &store.fwd_index,
-            uuid,
-            item_hash(&edge.source),
-            &edge_kappa,
-        );
-        remove_from(
-            &store.rev_index,
-            uuid,
-            item_hash(&edge.target),
-            &edge_kappa,
-        );
+        remove_from(&store.fwd_index, uuid, item_hash(&edge.source), &edge_kappa);
+        remove_from(&store.rev_index, uuid, item_hash(&edge.target), &edge_kappa);
         remove_from(
             &store.rel_index,
             uuid,

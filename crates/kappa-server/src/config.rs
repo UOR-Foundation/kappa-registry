@@ -154,8 +154,7 @@ impl Config {
         let auth_tokens = parse_auth_tokens(&env_or("KAPPA_AUTH_TOKENS", ""));
         let auth_required = env_or("KAPPA_AUTH_REQUIRED", "false") == "true";
 
-        let disk_pressure_threshold_mb: u64 =
-            env_parse("KAPPA_DISK_PRESSURE_THRESHOLD_MB", 1024);
+        let disk_pressure_threshold_mb: u64 = env_parse("KAPPA_DISK_PRESSURE_THRESHOLD_MB", 1024);
         let disk_pressure_check_interval_secs: u64 =
             env_parse("KAPPA_DISK_PRESSURE_CHECK_INTERVAL_SECS", 30);
 
@@ -163,8 +162,7 @@ impl Config {
         let tls_key = std::env::var("KAPPA_TLS_KEY").ok();
 
         let request_timeout_secs: u64 = env_parse("KAPPA_REQUEST_TIMEOUT_SECS", 300);
-        let max_api_body_bytes: usize =
-            env_parse("KAPPA_MAX_API_BODY_BYTES", 4 * 1024 * 1024);
+        let max_api_body_bytes: usize = env_parse("KAPPA_MAX_API_BODY_BYTES", 4 * 1024 * 1024);
         let proxy_trusted_header = std::env::var("KAPPA_PROXY_TRUSTED_HEADERS").ok();
         let cors_allowed_origins = env_or("KAPPA_CORS_ALLOWED_ORIGINS", "*");
 
@@ -269,16 +267,19 @@ fn parse_auth_tokens(raw: &str) -> Vec<(String, String)> {
             .filter(|t| !t.is_empty())
             .collect()
     };
-    lines.into_iter().map(|entry| {
-        if let Some((token, anchor)) = entry.split_once('=') {
-            (token.to_string(), anchor.to_string())
-        } else {
-            config_exit(&format!(
-                "KAPPA_AUTH_TOKENS: entry {:?} missing '=anchor' -- format is 'token=anchor'",
-                entry
-            ));
-        }
-    }).collect()
+    lines
+        .into_iter()
+        .map(|entry| {
+            if let Some((token, anchor)) = entry.split_once('=') {
+                (token.to_string(), anchor.to_string())
+            } else {
+                config_exit(&format!(
+                    "KAPPA_AUTH_TOKENS: entry {:?} missing '=anchor' -- format is 'token=anchor'",
+                    entry
+                ));
+            }
+        })
+        .collect()
 }
 
 /// Fatal configuration error. Prints message to stderr and exits.

@@ -22,7 +22,8 @@ pub fn timeout_layer<'a>(
         match tokio::time::timeout(deadline, next.run(cx, body)).await {
             Ok(result) => result,
             Err(_elapsed) => {
-                let body_str = r#"{"errors":[{"code":"TIMEOUT","message":"request timeout exceeded"}]}"#;
+                let body_str =
+                    r#"{"errors":[{"code":"TIMEOUT","message":"request timeout exceeded"}]}"#;
                 let mut response = Response::new(Body::from(body_str));
                 *response.status_mut() = StatusCode::GATEWAY_TIMEOUT;
                 response

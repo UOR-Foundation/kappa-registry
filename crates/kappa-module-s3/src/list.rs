@@ -90,11 +90,9 @@ pub fn list_objects_v2(
     let filtered: Vec<_> = all_tags
         .iter()
         .filter(|tag| tag.name.starts_with(prefix))
-        .filter(|tag| {
-            match &resume_after {
-                Some(after) => tag.name.as_str() > after.as_str(),
-                None => true,
-            }
+        .filter(|tag| match &resume_after {
+            Some(after) => tag.name.as_str() > after.as_str(),
+            None => true,
         })
         .collect();
 
@@ -119,12 +117,7 @@ pub fn list_objects_v2(
             let suffix = &key[prefix.len()..];
             if let Some(delim_pos) = suffix.find(delim) {
                 // Roll up into CommonPrefixes
-                let common_prefix = format!(
-                    "{}{}{}",
-                    prefix,
-                    &suffix[..delim_pos],
-                    delim
-                );
+                let common_prefix = format!("{}{}{}", prefix, &suffix[..delim_pos], delim);
                 if seen_prefixes.insert(common_prefix.clone()) {
                     common_prefixes.push(common_prefix);
                     total_count += 1;
@@ -136,13 +129,15 @@ pub fn list_objects_v2(
 
         // Regular content entry
         let size = store.blob_size(&tag.kappa).unwrap_or(0);
-        let last_modified = store.blob_get_meta(&tag.kappa, "_s3_created_ms")
+        let last_modified = store
+            .blob_get_meta(&tag.kappa, "_s3_created_ms")
             .ok()
             .and_then(|b| String::from_utf8(b).ok())
             .and_then(|ms_str| ms_str.parse::<u64>().ok())
-            .map(|ms| kappa_core::clock::epoch_ms_to_iso8601(ms))
+            .map(kappa_core::clock::epoch_ms_to_iso8601)
             .unwrap_or_else(|| "2026-01-01T00:00:00.000Z".to_string());
-        let etag = store.blob_get_meta(&tag.kappa, "_s3_etag")
+        let etag = store
+            .blob_get_meta(&tag.kappa, "_s3_etag")
             .ok()
             .and_then(|b| String::from_utf8(b).ok())
             .unwrap_or_else(|| format!("\"{}\"", &tag.kappa));
@@ -200,10 +195,8 @@ mod tests {
     fn test_store() -> (Arc<InMemoryStore>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        ).unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
         (Arc::new(store), tmp)
     }
 
@@ -244,9 +237,7 @@ mod tests {
     #[test]
     fn delimiter_rollup() {
         let (store, _tmp) = test_store();
-        seed_tags(&*store, &[
-            "a/b/c/1", "a/b/c/2", "a/b/d/1", "a/e/1",
-        ]);
+        seed_tags(&*store, &["a/b/c/1", "a/b/c/2", "a/b/d/1", "a/e/1"]);
         let req = ListObjectsV2Request {
             bucket: "bucket".into(),
             prefix: Some("a/".into()),
@@ -263,9 +254,7 @@ mod tests {
     #[test]
     fn delimiter_rollup_deeper() {
         let (store, _tmp) = test_store();
-        seed_tags(&*store, &[
-            "a/b/c/1", "a/b/c/2", "a/b/d/1",
-        ]);
+        seed_tags(&*store, &["a/b/c/1", "a/b/c/2", "a/b/d/1"]);
         let req = ListObjectsV2Request {
             bucket: "bucket".into(),
             prefix: Some("a/b/".into()),
@@ -336,7 +325,8 @@ mod tests {
             max_keys: 2,
             ..Default::default()
         };
-        let resp1 = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req1).unwrap();
+        let resp1 =
+            list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req1).unwrap();
         assert!(resp1.is_truncated);
         let token = resp1.next_continuation_token.unwrap();
 
@@ -346,7 +336,8 @@ mod tests {
             continuation_token: Some(token),
             ..Default::default()
         };
-        let resp2 = list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req2).unwrap();
+        let resp2 =
+            list_objects_v2(&*store, &NamespaceRef::deterministic("bucket"), &req2).unwrap();
         assert_eq!(resp2.contents.len(), 2);
         assert_eq!(resp2.contents[0].key, "c");
         assert_eq!(resp2.contents[1].key, "d");

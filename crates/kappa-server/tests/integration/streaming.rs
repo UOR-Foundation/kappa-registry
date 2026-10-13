@@ -11,7 +11,7 @@
 extern crate blake3;
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 
@@ -309,7 +309,8 @@ fn chunked_upload_empty_blob() {
     assert!(
         status == 201 || status == 200,
         "empty blob via chunked upload should succeed, got {} body: {}",
-        status, resp_body
+        status,
+        resp_body
     );
 
     let get = c
@@ -591,7 +592,12 @@ fn streaming_download_large_blob_rss_bounded() {
     let digest = format!("sha256:{}", hex::encode(upload_hasher.finalize()));
     let complete_url = format!("{}?digest={}", upload_url, digest);
     let resp = c.put(&complete_url).send().unwrap();
-    assert_eq!(resp.status(), 201, "upload failed: {}", resp.text().unwrap());
+    assert_eq!(
+        resp.status(),
+        201,
+        "upload failed: {}",
+        resp.text().unwrap()
+    );
 
     // Measure baseline RSS before download
     #[cfg(target_os = "linux")]
@@ -757,11 +763,19 @@ fn streaming_download_small_blob_unchanged() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("docker-content-digest").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         digest
     );
     assert_eq!(
-        resp.headers().get("accept-ranges").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("accept-ranges")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "bytes"
     );
     assert_eq!(resp.bytes().unwrap().as_ref(), content);
@@ -778,7 +792,7 @@ fn streaming_download_manifest_streams() {
         let mut m = br#"{"schemaVersion":2,"config":{"digest":"sha256:aaaa","data":""#.to_vec();
         // Pad with spaces to reach target size
         let padding_needed = manifest_size - m.len() - 3; // 3 for closing '"}}'
-        m.extend(std::iter::repeat(b' ').take(padding_needed));
+        m.extend(std::iter::repeat_n(b' ', padding_needed));
         m.extend(br#""}}"#);
         m
     };

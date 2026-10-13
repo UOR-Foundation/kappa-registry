@@ -25,16 +25,16 @@ use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::request::Bytes;
 use topcoat::router::response::IntoResponse;
 use topcoat::router::{
-    to_bytes, raw_path_params, Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
+    raw_path_params, to_bytes, Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
 };
 
 use kappa_akd::AkdManager;
 use kappa_core::canonical;
 use kappa_core::identity::assertion::IdentityAssertion;
+use kappa_core::identity::binding::IdentityBinding;
 use kappa_core::identity::node::NodeIdentity;
 use kappa_core::identity::resolution;
 use kappa_core::identity::revocation::{Revocation, RevocationReason};
-use kappa_core::identity::binding::IdentityBinding;
 use kappa_core::identity::succession::IdentitySuccession;
 use kappa_core::kappa::kappa_from_bytes;
 use kappa_core::store::KappaStore;
@@ -172,9 +172,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let audience_id = v["audience"].as_str().map(|a| a.to_string());
         let akd_label = match &audience_id {
             Some(aud) => {
-                let derived = kappa_core::identity::audience::derive_audience_label(
-                    &subject, aud,
-                );
+                let derived = kappa_core::identity::audience::derive_audience_label(&subject, aud);
                 format!("{}/{}", derived, assertion.facet)
             }
             None => format!("{}/{}", subject, assertion.facet),
@@ -311,9 +309,15 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let mut watermarks = Vec::new();
 
             for rec in &namespaces {
-                let alias = rec.aliases.first().map(|s| s.as_str()).unwrap_or(&rec.uuid_hex);
+                let alias = rec
+                    .aliases
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or(&rec.uuid_hex);
                 let uuid_bytes = hex::decode(&rec.uuid_hex).unwrap_or_default();
-                if uuid_bytes.len() != 16 { continue; }
+                if uuid_bytes.len() != 16 {
+                    continue;
+                }
                 let mut uuid_arr = [0u8; 16];
                 uuid_arr.copy_from_slice(&uuid_bytes);
                 let ns = NamespaceRef::with_name(uuid_arr, alias.to_string());
@@ -329,7 +333,10 @@ fn resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 let wm_tags = s.tag_prefix(&ns, "watermark/")?;
                 for tag in &wm_tags {
                     if let Ok(blob) = s.blob_get(&tag.kappa) {
-                        if let Ok(w) = canonical::from_canonical::<kappa_core::identity::watermark::Watermark>(&blob) {
+                        if let Ok(w) = canonical::from_canonical::<
+                            kappa_core::identity::watermark::Watermark,
+                        >(&blob)
+                        {
                             watermarks.push(w);
                         }
                     }
@@ -432,8 +439,9 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let ns = NamespaceRef::deterministic(asserter.as_str());
             let rak = revoked_assertion_kappa;
             move || {
-                let _span = tracing::info_span!("store_mutation", op = "identity_revoke", ns = %ns).entered();
-                s.ingest_verified(&k,&rb)?;
+                let _span = tracing::info_span!("store_mutation", op = "identity_revoke", ns = %ns)
+                    .entered();
+                s.ingest_verified(&k, &rb)?;
                 s.blob_put_meta(&k, "object-type", b"revocation")?;
                 s.tag_set(&ns, &format!("revocation/{}", k), &k)?;
 
@@ -556,10 +564,7 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let invalidate_before_ms = v["invalidate_before_ms"]
             .as_u64()
             .ok_or_else(|| bad_request("missing invalidate_before_ms"))?;
-        let reason = v["reason"]
-            .as_str()
-            .unwrap_or("unspecified")
-            .to_string();
+        let reason = v["reason"].as_str().unwrap_or("unspecified").to_string();
         let set_at_ms = v["set_at_ms"].as_u64().unwrap_or(0);
 
         let watermark = kappa_core::identity::watermark::Watermark {
@@ -580,8 +585,10 @@ fn watermark_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let wb = wm_bytes;
             let ns = NamespaceRef::deterministic(asserter.as_str());
             move || {
-                let _span = tracing::info_span!("store_mutation", op = "identity_watermark", ns = %ns).entered();
-                s.ingest_verified(&k,&wb)?;
+                let _span =
+                    tracing::info_span!("store_mutation", op = "identity_watermark", ns = %ns)
+                        .entered();
+                s.ingest_verified(&k, &wb)?;
                 s.blob_put_meta(&k, "object-type", b"watermark")?;
                 s.tag_set(&ns, &format!("watermark/{}", k), &k)?;
 
@@ -675,10 +682,7 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let endpoint = v["endpoint"].as_str().unwrap_or("").to_string();
 
         // Compute the anchor from algorithm + public key
-        let anchor = kappa_core::crypto::anchor::anchor_from_key_str(
-            &algorithm,
-            &public_key_bytes,
-        );
+        let anchor = kappa_core::crypto::anchor::anchor_from_key_str(&algorithm, &public_key_bytes);
 
         let s = store(cx).clone();
         let anchor_clone = anchor.clone();
@@ -691,17 +695,20 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let algo = algorithm.clone();
             let pk = public_key_hex.to_string();
             move || {
-                let _span = tracing::info_span!("store_mutation", op = "anchor_register", anchor = %a).entered();
+                let _span =
+                    tracing::info_span!("store_mutation", op = "anchor_register", anchor = %a)
+                        .entered();
                 let spec = serde_json::json!({
                     "anchor": a,
                     "algorithm": algo,
                     "public_key": pk,
                     "endpoint": ep,
                 });
-                let spec_bytes = serde_json::to_vec(&spec)
-                    .map_err(|e| kappa_core::StoreError::Io(std::io::Error::other(e.to_string())))?;
+                let spec_bytes = serde_json::to_vec(&spec).map_err(|e| {
+                    kappa_core::StoreError::Io(std::io::Error::other(e.to_string()))
+                })?;
                 let kappa = kappa_from_bytes(&spec_bytes);
-                s.ingest_verified(&kappa,&spec_bytes)?;
+                s.ingest_verified(&kappa, &spec_bytes)?;
                 s.blob_put_meta(&kappa, "object-type", b"anchor-spec")?;
                 let ns = NamespaceRef::deterministic(a.as_str());
                 s.tag_set(&ns, "anchor/spec", &kappa)?;
@@ -741,10 +748,7 @@ fn binding_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             .as_str()
             .ok_or_else(|| bad_request("missing target"))?
             .to_string();
-        let method = v["method"]
-            .as_str()
-            .unwrap_or("self-asserted")
-            .to_string();
+        let method = v["method"].as_str().unwrap_or("self-asserted").to_string();
         let trust_level = v["trust_level"].as_u64().unwrap_or(1);
         let verified_at_ms = v["verified_at_ms"].as_u64().unwrap_or(0);
 
@@ -758,12 +762,10 @@ fn binding_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
         let s = store(cx).clone();
         let ns = NamespaceRef::deterministic(target.as_str());
-        let result = tokio::task::spawn_blocking(move || {
-            s.identity_binding_put(&ns, &binding)
-        })
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(store_err)?;
+        let result = tokio::task::spawn_blocking(move || s.identity_binding_put(&ns, &binding))
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)?;
 
         let resp = serde_json::json!({"kappa": result});
         (
@@ -784,12 +786,10 @@ fn binding_get_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let s = store(cx).clone();
         let src = source.to_string();
 
-        let bindings = tokio::task::spawn_blocking(move || {
-            s.identity_binding_get(&src)
-        })
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(store_err)?;
+        let bindings = tokio::task::spawn_blocking(move || s.identity_binding_get(&src))
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)?;
 
         let items: Vec<serde_json::Value> = bindings
             .iter()
@@ -833,12 +833,10 @@ fn binding_delete_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
         let s = store(cx).clone();
         let ns = NamespaceRef::deterministic(target.as_str());
-        tokio::task::spawn_blocking(move || {
-            s.identity_binding_delete(&ns, &source, &target)
-        })
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(store_err)?;
+        tokio::task::spawn_blocking(move || s.identity_binding_delete(&ns, &source, &target))
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)?;
 
         StatusCode::NO_CONTENT.into_response(cx)
     })
@@ -853,12 +851,10 @@ fn binding_list_by_asserter_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let s = store(cx).clone();
         let a = anchor.to_string();
 
-        let bindings = tokio::task::spawn_blocking(move || {
-            s.identity_binding_list_by_asserter(&a)
-        })
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(store_err)?;
+        let bindings = tokio::task::spawn_blocking(move || s.identity_binding_list_by_asserter(&a))
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)?;
 
         let items: Vec<serde_json::Value> = bindings
             .iter()
@@ -899,10 +895,7 @@ fn succession_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             .as_str()
             .ok_or_else(|| bad_request("missing new_anchor"))?
             .to_string();
-        let reason = v["reason"]
-            .as_str()
-            .unwrap_or("rotation")
-            .to_string();
+        let reason = v["reason"].as_str().unwrap_or("rotation").to_string();
         let effective_at_ms = v["effective_at_ms"].as_u64().unwrap_or(0);
         let old_signature_hex = v["old_signature"].as_str().unwrap_or("");
         let old_signature = hex::decode(old_signature_hex).unwrap_or_default();
@@ -919,12 +912,10 @@ fn succession_put_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         };
 
         let s = store(cx).clone();
-        let result = tokio::task::spawn_blocking(move || {
-            s.identity_succession_put(&succession)
-        })
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(store_err)?;
+        let result = tokio::task::spawn_blocking(move || s.identity_succession_put(&succession))
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)?;
 
         let resp = serde_json::json!({"kappa": result});
         (
@@ -945,12 +936,10 @@ fn succession_resolve_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let s = store(cx).clone();
         let a = anchor.to_string();
 
-        let current = tokio::task::spawn_blocking(move || {
-            s.identity_succession_resolve(&a)
-        })
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(store_err)?;
+        let current = tokio::task::spawn_blocking(move || s.identity_succession_resolve(&a))
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)?;
 
         let resp = serde_json::json!({"current": current});
         (
@@ -971,12 +960,10 @@ fn succession_chain_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let s = store(cx).clone();
         let a = anchor.to_string();
 
-        let chain = tokio::task::spawn_blocking(move || {
-            s.identity_succession_chain(&a)
-        })
-        .await
-        .map_err(|e| bad_request(e.to_string()))?
-        .map_err(store_err)?;
+        let chain = tokio::task::spawn_blocking(move || s.identity_succession_chain(&a))
+            .await
+            .map_err(|e| bad_request(e.to_string()))?
+            .map_err(store_err)?;
 
         let resp = serde_json::json!({"chain": chain});
         (
@@ -996,13 +983,19 @@ fn handle_claim_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let v: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
 
-        let handle = v["handle"].as_str()
-            .ok_or_else(|| bad_request("missing handle"))?.to_string();
+        let handle = v["handle"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing handle"))?
+            .to_string();
         let protocol = v["protocol"].as_str().unwrap_or("atproto").to_string();
-        let anchor = v["anchor"].as_str()
-            .ok_or_else(|| bad_request("missing anchor"))?.to_string();
-        let verification_method = v["verification_method"].as_str()
-            .unwrap_or("unverified").to_string();
+        let anchor = v["anchor"]
+            .as_str()
+            .ok_or_else(|| bad_request("missing anchor"))?
+            .to_string();
+        let verification_method = v["verification_method"]
+            .as_str()
+            .unwrap_or("unverified")
+            .to_string();
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1027,26 +1020,30 @@ fn handle_claim_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             // Check for conflict: existing claim by different anchor
             if let Ok(existing_entry) = s.tag_get(&handles_ns, &tag_key) {
                 let existing_bytes = s.blob_get(&existing_entry.kappa)?;
-                if let Ok(existing) =
-                    serde_json::from_slice::<kappa_core::identity::handle::HandleRecord>(&existing_bytes)
+                if let Ok(existing) = serde_json::from_slice::<
+                    kappa_core::identity::handle::HandleRecord,
+                >(&existing_bytes)
                 {
                     if existing.anchor != anchor {
                         // Grace period: allow reclaim if unverified > 7 days
                         let grace_ms = 7 * 24 * 3600 * 1000u64;
-                        if existing.liveness != kappa_core::identity::handle::HandleLiveness::Unverified
+                        if existing.liveness
+                            != kappa_core::identity::handle::HandleLiveness::Unverified
                             || now_ms.saturating_sub(existing.claimed_at_ms) < grace_ms
                         {
-                            return Err(kappa_core::types::StoreError::Conflict(
-                                format!("handle {}:{} already claimed by {}", protocol, handle, existing.anchor)
-                            ));
+                            return Err(kappa_core::types::StoreError::Conflict(format!(
+                                "handle {}:{} already claimed by {}",
+                                protocol, handle, existing.anchor
+                            )));
                         }
                     }
                 }
             }
 
             // Store handle record as blob
-            let record_bytes = serde_json::to_vec(&record)
-                .map_err(|e| kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string())))?;
+            let record_bytes = serde_json::to_vec(&record).map_err(|e| {
+                kappa_core::types::StoreError::Io(std::io::Error::other(e.to_string()))
+            })?;
             let ingest = s.ingest_compute(kappa_core::kappa::Axis::Sha256, &record_bytes)?;
 
             // Forward tag: handle:{protocol}:{handle} -> record kappa
@@ -1054,7 +1051,8 @@ fn handle_claim_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
             // Reverse tag: anchor:{anchor} -> comma-appended handle keys
             let reverse_key = format!("anchor:{}", anchor);
-            let existing_reverse = s.tag_get(&handles_ns, &reverse_key)
+            let existing_reverse = s
+                .tag_get(&handles_ns, &reverse_key)
                 .map(|e| e.kappa)
                 .unwrap_or_default();
             let new_reverse = if existing_reverse.is_empty() {
@@ -1064,27 +1062,35 @@ fn handle_claim_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             };
             // Store reverse as a blob so the tag value is a kappa
             let reverse_bytes = new_reverse.as_bytes();
-            let reverse_ingest = s.ingest_compute(kappa_core::kappa::Axis::Sha256, reverse_bytes)?;
+            let reverse_ingest =
+                s.ingest_compute(kappa_core::kappa::Axis::Sha256, reverse_bytes)?;
             s.tag_set(&handles_ns, &reverse_key, &reverse_ingest.kappa)?;
 
             Ok::<String, kappa_core::types::StoreError>(ingest.kappa)
-        }).await
+        })
+        .await
         .map_err(|e| bad_request(e.to_string()))?;
 
         match result {
             Ok(kappa) => {
                 let resp = serde_json::json!({"kappa": kappa, "liveness": "unverified"});
-                (StatusCode::CREATED, [("content-type", "application/json")],
-                 serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+                (
+                    StatusCode::CREATED,
+                    [("content-type", "application/json")],
+                    serde_json::to_string(&resp).unwrap_or_default(),
+                )
+                    .into_response(cx)
             }
             Err(kappa_core::types::StoreError::Conflict(msg)) => {
                 let resp = serde_json::json!({"error": "conflict", "message": msg});
-                (StatusCode::CONFLICT, [("content-type", "application/json")],
-                 serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+                (
+                    StatusCode::CONFLICT,
+                    [("content-type", "application/json")],
+                    serde_json::to_string(&resp).unwrap_or_default(),
+                )
+                    .into_response(cx)
             }
-            Err(e) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(cx)
-            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(cx),
         }
     })
 }
@@ -1103,11 +1109,17 @@ fn handle_get_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let handles_ns = s.namespace_resolve("_handles", None)?;
             let entry = s.tag_get(&handles_ns, &tag_key)?;
             s.blob_get(&entry.kappa)
-        }).await
+        })
+        .await
         .map_err(|e| bad_request(e.to_string()))?
         .map_err(store_err)?;
 
-        (StatusCode::OK, [("content-type", "application/json")], result).into_response(cx)
+        (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            result,
+        )
+            .into_response(cx)
     })
 }
 
@@ -1138,13 +1150,18 @@ fn handle_by_anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 }
             }
             Ok::<Vec<serde_json::Value>, kappa_core::types::StoreError>(handles)
-        }).await
+        })
+        .await
         .map_err(|e| bad_request(e.to_string()))?
         .map_err(store_err)?;
 
         let resp = serde_json::json!({"handles": result});
-        (StatusCode::OK, [("content-type", "application/json")],
-         serde_json::to_string(&resp).unwrap_or_default()).into_response(cx)
+        (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response(cx)
     })
 }
 
@@ -1162,7 +1179,8 @@ fn handle_delete_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             let handles_ns = s.namespace_resolve("_handles", None)?;
             s.tag_delete(&handles_ns, &tag_key)?;
             Ok::<(), kappa_core::types::StoreError>(())
-        }).await
+        })
+        .await
         .map_err(|e| bad_request(e.to_string()))?
         .map_err(store_err)?;
 

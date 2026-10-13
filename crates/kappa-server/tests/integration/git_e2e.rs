@@ -11,7 +11,7 @@
 //! Requires `git` on PATH (provided by the Nix devshell).
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 
@@ -62,10 +62,7 @@ fn git_push_then_clone_roundtrip() {
     let (ok, _, err) = git(&["remote", "add", "origin", &repo_url], src_dir.path());
     assert!(ok, "git remote add failed: {err}");
     let (ok, stdout, err) = git(&["push", "-u", "origin", "main"], src_dir.path());
-    assert!(
-        ok,
-        "git push failed:\nstdout: {stdout}\nstderr: {err}"
-    );
+    assert!(ok, "git push failed:\nstdout: {stdout}\nstderr: {err}");
 
     // Clone into a new directory
     let clone_dir = tempfile::tempdir().unwrap();
@@ -74,10 +71,7 @@ fn git_push_then_clone_roundtrip() {
         &["clone", &repo_url, clone_path.to_str().unwrap()],
         clone_dir.path(),
     );
-    assert!(
-        ok,
-        "git clone failed:\nstdout: {stdout}\nstderr: {err}"
-    );
+    assert!(ok, "git clone failed:\nstdout: {stdout}\nstderr: {err}");
 
     // Verify the cloned content matches
     let cloned_content = std::fs::read_to_string(clone_path.join("hello.txt")).unwrap();

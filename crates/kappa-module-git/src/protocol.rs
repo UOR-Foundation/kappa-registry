@@ -121,7 +121,9 @@ pub fn write_ref_advertisement<W: Write>(
         }
 
         for (ref_name, ref_value) in &all_refs {
-            if ref_value.starts_with("ref: ") { continue; }
+            if ref_value.starts_with("ref: ") {
+                continue;
+            }
             let oid = kappa_to_hex_oid(ref_value);
             let line = if first {
                 first = false;
@@ -230,7 +232,8 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
 
         // HEAD
         if let Some(ref target) = head_target {
-            let matches = ref_prefixes.is_empty() || ref_prefixes.iter().any(|p| "HEAD".starts_with(p.as_str()));
+            let matches = ref_prefixes.is_empty()
+                || ref_prefixes.iter().any(|p| "HEAD".starts_with(p.as_str()));
             if matches {
                 let oid = kappa_to_hex_oid(target);
                 let mut line = format!("{} HEAD", oid);
@@ -238,7 +241,7 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
                     // Check if HEAD is a symbolic ref
                     if let Ok(Some(sym_target)) = refs::resolve_ref(store, namespace, "HEAD") {
                         let _ = sym_target; // HEAD resolves to the target OID, not the symref
-                        // To get the symref target name, check the raw tag value
+                                            // To get the symref target name, check the raw tag value
                         if let Ok(entry) = store.tag_get(namespace, "HEAD") {
                             if entry.kappa.starts_with("ref: ") {
                                 line.push_str(&format!(" symref-target:{}", &entry.kappa[5..]));
@@ -252,9 +255,16 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
         }
 
         for (ref_name, ref_value) in &all_refs {
-            if ref_value.starts_with("ref: ") { continue; }
-            let matches = ref_prefixes.is_empty() || ref_prefixes.iter().any(|p| ref_name.starts_with(p.as_str()));
-            if !matches { continue; }
+            if ref_value.starts_with("ref: ") {
+                continue;
+            }
+            let matches = ref_prefixes.is_empty()
+                || ref_prefixes
+                    .iter()
+                    .any(|p| ref_name.starts_with(p.as_str()));
+            if !matches {
+                continue;
+            }
             let oid = kappa_to_hex_oid(ref_value);
             let mut line = format!("{} {}", oid, ref_name);
             if peel {
@@ -286,12 +296,16 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
                 if text == "no-progress" {
                     no_progress = true;
                 } else if let Some(rest) = text.strip_prefix("deepen ") {
-                    if let Ok(d) = rest.parse::<u32>() { fetch_opts.deepen = Some(d); }
+                    if let Ok(d) = rest.parse::<u32>() {
+                        fetch_opts.deepen = Some(d);
+                    }
                 } else if let Some(rest) = text.strip_prefix("filter ") {
                     if rest == "blob:none" {
                         fetch_opts.filter = Some(FilterSpec::BlobNone);
                     } else if let Some(lim) = rest.strip_prefix("blob:limit=") {
-                        if let Ok(l) = lim.parse::<u64>() { fetch_opts.filter = Some(FilterSpec::BlobLimit(l)); }
+                        if let Ok(l) = lim.parse::<u64>() {
+                            fetch_opts.filter = Some(FilterSpec::BlobLimit(l));
+                        }
                     }
                 }
             }
@@ -367,9 +381,8 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
         // Packfile section
         encode::data_to_write(b"packfile\n", &mut response)?;
 
-        let (need_kappas, new_shallows) = compute_need_set(
-            store, namespace, &wants, &common, object_hash, &fetch_opts,
-        );
+        let (need_kappas, new_shallows) =
+            compute_need_set(store, namespace, &wants, &common, object_hash, &fetch_opts);
 
         for shallow_oid in &new_shallows {
             let line = format!("shallow {}\n", shallow_oid);
@@ -390,7 +403,10 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
         };
         let mut pack_buf = Vec::new();
         packgen::generate_pack_sorted(
-            store, &need_kappas, object_hash, &name_hints,
+            store,
+            &need_kappas,
+            object_hash,
+            &name_hints,
             progress_cb.as_ref().map(|cb| cb.as_ref()),
             &mut pack_buf,
         )?;
@@ -415,7 +431,10 @@ pub fn handle_v2_upload_pack<R: Read, W: Write>(
         encode::flush_to_write(&mut response)?;
         Ok(())
     } else {
-        Err(ProtocolError::Protocol(format!("unknown v2 command: {}", command)))
+        Err(ProtocolError::Protocol(format!(
+            "unknown v2 command: {}",
+            command
+        )))
     }
 }
 
@@ -520,7 +539,8 @@ pub fn handle_upload_pack<R: Read, W: Write>(
         }
     }
 
-    let (need_kappas, new_shallows) = compute_need_set(store, namespace, &wants, &common, object_hash, &fetch_opts);
+    let (need_kappas, new_shallows) =
+        compute_need_set(store, namespace, &wants, &common, object_hash, &fetch_opts);
 
     // Emit shallow lines for newly shallow commits
     for shallow_oid in &new_shallows {
@@ -555,15 +575,19 @@ pub fn handle_upload_pack<R: Read, W: Write>(
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let progress_ref = progress_messages.clone();
     let progress_cb = move |written: u32, total: u32| {
-        let pct = if total > 0 { written * 100 / total } else { 0 };
+        let pct = (written * 100).checked_div(total).unwrap_or(0);
         let msg = format!("Compressing objects: {}% ({}/{})\r", pct, written, total);
         progress_ref.lock().unwrap().push(msg);
     };
 
     let mut pack_buf = Vec::new();
     packgen::generate_pack_sorted(
-        store, &need_kappas, object_hash, &name_hints,
-        Some(&progress_cb), &mut pack_buf,
+        store,
+        &need_kappas,
+        object_hash,
+        &name_hints,
+        Some(&progress_cb),
+        &mut pack_buf,
     )?;
 
     // Send accumulated progress messages on channel 2
@@ -578,7 +602,10 @@ pub fn handle_upload_pack<R: Read, W: Write>(
     }
     // Send final completion message
     {
-        let done_msg = format!("Compressing objects: 100% ({}/{}), done.\n", total_objects, total_objects);
+        let done_msg = format!(
+            "Compressing objects: 100% ({}/{}), done.\n",
+            total_objects, total_objects
+        );
         let mut pkt = Vec::with_capacity(1 + done_msg.len());
         pkt.push(2);
         pkt.extend_from_slice(done_msg.as_bytes());
@@ -656,18 +683,21 @@ pub fn handle_receive_pack<R: Read, W: Write>(
 
     // Item 56: Run pre-receive hook before ref updates.
     // If it rejects, all refs are rejected.
-    let hook_updates: Vec<crate::hooks::RefUpdate> = updates.iter().map(|u| {
-        crate::hooks::RefUpdate {
+    let hook_updates: Vec<crate::hooks::RefUpdate> = updates
+        .iter()
+        .map(|u| crate::hooks::RefUpdate {
             old_oid: u.old_oid.clone(),
             new_oid: u.new_oid.clone(),
             ref_name: u.ref_name.clone(),
-        }
-    }).collect();
+        })
+        .collect();
 
     let hook_rejected = match crate::hooks::run_pre_receive(store, namespace, &hook_updates, 30) {
         Ok(()) => None,
         Err(crate::hooks::HookError::Rejected(msg)) => Some(msg),
-        Err(crate::hooks::HookError::Timeout(secs)) => Some(format!("hook timed out after {}s", secs)),
+        Err(crate::hooks::HookError::Timeout(secs)) => {
+            Some(format!("hook timed out after {}s", secs))
+        }
         Err(e) => Some(e.to_string()),
     };
 
@@ -677,7 +707,10 @@ pub fn handle_receive_pack<R: Read, W: Write>(
     if let Some(ref rejection) = hook_rejected {
         // All refs rejected by pre-receive hook
         for update in &updates {
-            let line = format!("ng {} pre-receive hook declined: {}\n", update.ref_name, rejection);
+            let line = format!(
+                "ng {} pre-receive hook declined: {}\n",
+                update.ref_name, rejection
+            );
             encode::data_to_write(line.as_bytes(), &mut response)?;
         }
         encode::flush_to_write(&mut response)?;
@@ -715,6 +748,33 @@ pub fn handle_receive_pack<R: Read, W: Write>(
     } else {
         store.tag_set_batch(namespace, &batch_updates)
     };
+
+    // A repository created by a push has no HEAD. A bare repository's HEAD
+    // names its default branch, and without one clients clone with nothing
+    // checked out ("remote HEAD refers to nonexistent ref"). Point HEAD at
+    // the pushed branch, preferring main. The push itself has succeeded, so
+    // a failure here is logged, not reported as a ref failure.
+    if batch_result.is_ok()
+        && matches!(
+            store.tag_get(namespace, "HEAD"),
+            Err(kappa_core::StoreError::NotFound(_))
+        )
+    {
+        let mut branches = batch_updates
+            .iter()
+            .map(|u| u.name.as_str())
+            .filter(|name| name.starts_with("refs/heads/"));
+        let default = batch_updates
+            .iter()
+            .map(|u| u.name.as_str())
+            .find(|name| *name == "refs/heads/main")
+            .or_else(|| branches.next());
+        if let Some(default) = default {
+            if let Err(e) = refs::set_symbolic_ref(store, namespace, "HEAD", default) {
+                tracing::warn!(error = %e, branch = default, "failed to set HEAD for new repository");
+            }
+        }
+    }
 
     let mut delete_errors: Vec<(String, String)> = Vec::new();
     for ref_name in &deletes {
@@ -775,19 +835,21 @@ pub fn handle_receive_pack<R: Read, W: Write>(
         if is_ok {
             let update = &updates[i];
             encode::data_to_write(
-                format!("option refname {}\n", ref_name).as_bytes(), &mut inner,
+                format!("option refname {}\n", ref_name).as_bytes(),
+                &mut inner,
             )?;
             encode::data_to_write(
-                format!("option old-oid {}\n", update.old_oid).as_bytes(), &mut inner,
+                format!("option old-oid {}\n", update.old_oid).as_bytes(),
+                &mut inner,
             )?;
             encode::data_to_write(
-                format!("option new-oid {}\n", update.new_oid).as_bytes(), &mut inner,
+                format!("option new-oid {}\n", update.new_oid).as_bytes(),
+                &mut inner,
             )?;
             if update.old_oid != zero_oid && update.new_oid != zero_oid {
                 let old_kappa = format!("{}:{}", prefix, update.old_oid);
-                let new_reachable = walk_reachable(
-                    store, vec![update.new_oid.clone()], object_hash,
-                );
+                let new_reachable =
+                    walk_reachable(store, vec![update.new_oid.clone()], object_hash);
                 if !new_reachable.contains(&old_kappa) {
                     encode::data_to_write(b"option forced-update\n", &mut inner)?;
                 }
@@ -879,8 +941,10 @@ fn compute_need_set(
         if let Some(ref filter) = opts.filter {
             match filter {
                 FilterSpec::BlobNone if kind == gix_object::Kind::Blob => continue,
-                FilterSpec::BlobLimit(limit) if kind == gix_object::Kind::Blob => {
-                    if _content.len() as u64 > *limit { continue; }
+                FilterSpec::BlobLimit(limit)
+                    if kind == gix_object::Kind::Blob && _content.len() as u64 > *limit =>
+                {
+                    continue;
                 }
                 _ => {}
             }
@@ -954,7 +1018,9 @@ fn walk_reachable(
     }
 
     while let Some(kappa) = queue.pop_front() {
-        if reachable.contains(&kappa) { continue; }
+        if reachable.contains(&kappa) {
+            continue;
+        }
         reachable.insert(kappa.clone());
 
         let envelope_bytes = match store.blob_get(&kappa) {
@@ -1008,8 +1074,14 @@ fn extract_children(envelope_bytes: &[u8], hash_len: usize, prefix: &str) -> Vec
                 };
                 let hash_start = nul + 1;
                 let hash_end = hash_start + hash_len;
-                if hash_end > content.len() { break; }
-                children.push(format!("{}:{}", prefix, hex::encode(&content[hash_start..hash_end])));
+                if hash_end > content.len() {
+                    break;
+                }
+                children.push(format!(
+                    "{}:{}",
+                    prefix,
+                    hex::encode(&content[hash_start..hash_end])
+                ));
                 pos = hash_end;
             }
         }
@@ -1061,10 +1133,8 @@ mod tests {
     fn test_store() -> (Arc<InMemoryStore>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        ).unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
         (Arc::new(store), tmp)
     }
 
@@ -1137,7 +1207,14 @@ mod tests {
         let (store, _tmp) = test_store();
         let ns = NamespaceRef::deterministic("test-repo");
         let mut output = Vec::new();
-        write_ref_advertisement(&*store, &ns, "git-upload-pack", &mut output, gix_hash::Kind::Sha1).unwrap();
+        write_ref_advertisement(
+            &*store,
+            &ns,
+            "git-upload-pack",
+            &mut output,
+            gix_hash::Kind::Sha1,
+        )
+        .unwrap();
 
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("git-upload-pack"));
@@ -1152,7 +1229,14 @@ mod tests {
         refs::set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/main").unwrap();
 
         let mut output = Vec::new();
-        write_ref_advertisement(&*store, &ns, "git-upload-pack", &mut output, gix_hash::Kind::Sha1).unwrap();
+        write_ref_advertisement(
+            &*store,
+            &ns,
+            "git-upload-pack",
+            &mut output,
+            gix_hash::Kind::Sha1,
+        )
+        .unwrap();
 
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("aabbccddee"));
@@ -1176,7 +1260,10 @@ mod tests {
 
     #[test]
     fn oid_to_kappa_string_sha256() {
-        assert_eq!(oid_to_kappa_string(gix_hash::Kind::Sha256, "def"), "sha256:def");
+        assert_eq!(
+            oid_to_kappa_string(gix_hash::Kind::Sha256, "def"),
+            "sha256:def"
+        );
     }
 
     // -- ITEM C: compute_need_set full graph traversal ------------------------
@@ -1190,7 +1277,11 @@ mod tests {
         let commit = store_git_commit(&*store, &tree, &[], "initial commit");
 
         let (need, _shallows) = compute_need_set(
-            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit)], &HashSet::new(), gix_hash::Kind::Sha1,
+            &*store,
+            &NamespaceRef::deterministic("repo"),
+            &[hex_oid(&commit)],
+            &HashSet::new(),
+            gix_hash::Kind::Sha1,
             &FetchOptions::default(),
         );
 
@@ -1211,23 +1302,30 @@ mod tests {
         let commit1 = store_git_commit(&*store, &tree1, &[], "first commit");
 
         let new_blob = store_git_blob(&*store, b"new content");
-        let tree2 = store_git_tree(&*store, &[
-            ("new.txt", &new_blob),
-            ("shared.txt", &shared_blob),
-        ]);
+        let tree2 = store_git_tree(
+            &*store,
+            &[("new.txt", &new_blob), ("shared.txt", &shared_blob)],
+        );
         let commit2 = store_git_commit(&*store, &tree2, &[&commit1], "second commit");
 
         let mut common = HashSet::new();
         common.insert(hex_oid(&commit1));
         let (need, _shallows) = compute_need_set(
-            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit2)], &common, gix_hash::Kind::Sha1,
+            &*store,
+            &NamespaceRef::deterministic("repo"),
+            &[hex_oid(&commit2)],
+            &common,
+            gix_hash::Kind::Sha1,
             &FetchOptions::default(),
         );
 
         assert!(need.contains(&commit2), "commit2 must be in need set");
         assert!(need.contains(&tree2), "tree2 must be in need set");
         assert!(need.contains(&new_blob), "new_blob must be in need set");
-        assert!(!need.contains(&shared_blob), "shared blob must NOT be in need set");
+        assert!(
+            !need.contains(&shared_blob),
+            "shared blob must NOT be in need set"
+        );
         assert!(!need.contains(&commit1), "commit1 must NOT be in need set");
         assert!(!need.contains(&tree1), "tree1 must NOT be in need set");
     }
@@ -1248,18 +1346,31 @@ mod tests {
             ..Default::default()
         };
         let (need, shallows) = compute_need_set(
-            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit3)], &HashSet::new(),
-            gix_hash::Kind::Sha1, &opts,
+            &*store,
+            &NamespaceRef::deterministic("repo"),
+            &[hex_oid(&commit3)],
+            &HashSet::new(),
+            gix_hash::Kind::Sha1,
+            &opts,
         );
 
         // Depth 1: only commit3, its tree, and blob. commit2 and commit1 excluded.
         assert!(need.contains(&commit3), "HEAD commit must be in need set");
         assert!(need.contains(&tree), "tree must be in need set");
         assert!(need.contains(&blob), "blob must be in need set");
-        assert!(!need.contains(&commit2), "parent must NOT be in need set at depth 1");
-        assert!(!need.contains(&commit1), "grandparent must NOT be in need set at depth 1");
+        assert!(
+            !need.contains(&commit2),
+            "parent must NOT be in need set at depth 1"
+        );
+        assert!(
+            !need.contains(&commit1),
+            "grandparent must NOT be in need set at depth 1"
+        );
         // commit3 is the shallow boundary
-        assert!(shallows.contains(&hex_oid(&commit3)), "HEAD must be marked shallow");
+        assert!(
+            shallows.contains(&hex_oid(&commit3)),
+            "HEAD must be marked shallow"
+        );
     }
 
     #[test]
@@ -1276,15 +1387,25 @@ mod tests {
             ..Default::default()
         };
         let (need, shallows) = compute_need_set(
-            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit3)], &HashSet::new(),
-            gix_hash::Kind::Sha1, &opts,
+            &*store,
+            &NamespaceRef::deterministic("repo"),
+            &[hex_oid(&commit3)],
+            &HashSet::new(),
+            gix_hash::Kind::Sha1,
+            &opts,
         );
 
         assert!(need.contains(&commit3), "HEAD commit in need set");
         assert!(need.contains(&commit2), "parent in need set at depth 2");
-        assert!(!need.contains(&commit1), "grandparent NOT in need set at depth 2");
+        assert!(
+            !need.contains(&commit1),
+            "grandparent NOT in need set at depth 2"
+        );
         // commit2 is at the boundary
-        assert!(shallows.contains(&hex_oid(&commit2)), "parent must be marked shallow");
+        assert!(
+            shallows.contains(&hex_oid(&commit2)),
+            "parent must be marked shallow"
+        );
     }
 
     // -- Partial clone test (item 50) -----------------------------------------
@@ -1302,14 +1423,24 @@ mod tests {
             ..Default::default()
         };
         let (need, _) = compute_need_set(
-            &*store, &NamespaceRef::deterministic("repo"), &[hex_oid(&commit)], &HashSet::new(),
-            gix_hash::Kind::Sha1, &opts,
+            &*store,
+            &NamespaceRef::deterministic("repo"),
+            &[hex_oid(&commit)],
+            &HashSet::new(),
+            gix_hash::Kind::Sha1,
+            &opts,
         );
 
         assert!(need.contains(&commit), "commit in need set");
         assert!(need.contains(&tree), "tree in need set");
-        assert!(!need.contains(&blob1), "blob1 must NOT be in need set with blob:none");
-        assert!(!need.contains(&blob2), "blob2 must NOT be in need set with blob:none");
+        assert!(
+            !need.contains(&blob1),
+            "blob1 must NOT be in need set with blob:none"
+        );
+        assert!(
+            !need.contains(&blob2),
+            "blob2 must NOT be in need set with blob:none"
+        );
     }
 
     // -- ITEM G: into_inner buffer preservation test --------------------------
@@ -1463,11 +1594,24 @@ mod tests {
         refs::set_symbolic_ref(&*store, &ns, "HEAD", "refs/heads/main").unwrap();
 
         let mut output = Vec::new();
-        write_ref_advertisement(&*store, &ns, "git-upload-pack", &mut output, gix_hash::Kind::Sha256).unwrap();
+        write_ref_advertisement(
+            &*store,
+            &ns,
+            "git-upload-pack",
+            &mut output,
+            gix_hash::Kind::Sha256,
+        )
+        .unwrap();
 
         let text = String::from_utf8_lossy(&output);
-        assert!(text.contains(commit_hex), "advertisement must contain 64-char OID");
-        assert!(text.contains("object-format=sha256"), "capabilities must include object-format=sha256");
+        assert!(
+            text.contains(commit_hex),
+            "advertisement must contain 64-char OID"
+        );
+        assert!(
+            text.contains("object-format=sha256"),
+            "capabilities must include object-format=sha256"
+        );
     }
 
     #[test]
@@ -1479,11 +1623,18 @@ mod tests {
         let commit = store_git_commit_sha256(&*store, &tree, &[], "sha256 commit");
 
         let (need, _shallows) = compute_need_set(
-            &*store, &NamespaceRef::deterministic("repo256"), &[hex_oid(&commit)], &HashSet::new(),
-            gix_hash::Kind::Sha256, &FetchOptions::default(),
+            &*store,
+            &NamespaceRef::deterministic("repo256"),
+            &[hex_oid(&commit)],
+            &HashSet::new(),
+            gix_hash::Kind::Sha256,
+            &FetchOptions::default(),
         );
 
-        assert!(need.iter().all(|k| k.starts_with("sha256:")), "all need set kappas must have sha256 prefix");
+        assert!(
+            need.iter().all(|k| k.starts_with("sha256:")),
+            "all need set kappas must have sha256 prefix"
+        );
         assert!(need.contains(&commit));
         assert!(need.contains(&tree));
         assert!(need.contains(&blob1));
@@ -1497,10 +1648,19 @@ mod tests {
         let blob = store_git_blob_sha256(&*store, b"pack trailer test");
 
         let mut pack_buf = Vec::new();
-        packgen::generate_pack(store.as_ref(), &[blob], gix_hash::Kind::Sha256, &mut pack_buf).unwrap();
+        packgen::generate_pack(
+            store.as_ref(),
+            &[blob],
+            gix_hash::Kind::Sha256,
+            &mut pack_buf,
+        )
+        .unwrap();
 
         // Pack header: 12 bytes. At least one entry. Trailer: 32 bytes.
-        assert!(pack_buf.len() > 12 + 32, "pack must have header + entry + trailer");
+        assert!(
+            pack_buf.len() > 12 + 32,
+            "pack must have header + entry + trailer"
+        );
         // Trailer is last 32 bytes
         let trailer = &pack_buf[pack_buf.len() - 32..];
         assert_ne!(trailer, &[0u8; 32], "trailer must not be all zeros");
@@ -1525,7 +1685,9 @@ mod tests {
     fn repo_object_format_stored_sha256() {
         let (store, _tmp) = test_store();
         let ns = NamespaceRef::deterministic("repo256");
-        store.tag_set(&ns, "_config/object_format", "sha256").unwrap();
+        store
+            .tag_set(&ns, "_config/object_format", "sha256")
+            .unwrap();
         let kind = match store.tag_get(&ns, "_config/object_format") {
             Ok(entry) => match entry.kappa.as_str() {
                 "sha256" => gix_hash::Kind::Sha256,

@@ -175,8 +175,7 @@ async fn chunk(
     let upload_id = id.to_string();
 
     // Determine offset: from Content-Range header or from bytes received
-    let received = s.upload_bytes_received(&upload_id)
-        .ok_or_else(not_found)?;
+    let received = s.upload_bytes_received(&upload_id).ok_or_else(not_found)?;
     let offset = match range_start {
         Some(start) => start as u64,
         None => received,
@@ -209,11 +208,7 @@ async fn chunk(
             (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk").into_response(cx)
         }
         Err(kappa_core::types::StoreError::Rejected(msg)) => {
-            crate::oci_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "SIZE_EXCEEDED",
-                &msg,
-            )
+            crate::oci_error(StatusCode::PAYLOAD_TOO_LARGE, "SIZE_EXCEEDED", &msg)
         }
         Err(e) => Err(bad_request(e.to_string()).into()),
     }
@@ -271,15 +266,10 @@ async fn complete(
         match result {
             Ok(_) => {}
             Err(kappa_core::types::StoreError::Conflict(_)) => {
-                return (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk")
-                    .into_response(cx);
+                return (StatusCode::RANGE_NOT_SATISFIABLE, "out-of-order chunk").into_response(cx);
             }
             Err(kappa_core::types::StoreError::Rejected(msg)) => {
-                return crate::oci_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "SIZE_EXCEEDED",
-                    &msg,
-                );
+                return crate::oci_error(StatusCode::PAYLOAD_TOO_LARGE, "SIZE_EXCEEDED", &msg);
             }
             Err(kappa_core::types::StoreError::NotFound(_)) => {
                 return Err(not_found().into());
@@ -305,11 +295,7 @@ async fn complete(
     let ingest_result = match result {
         Ok(r) => r,
         Err(kappa_core::types::StoreError::Rejected(msg)) => {
-            return crate::oci_error(
-                StatusCode::BAD_REQUEST,
-                "DIGEST_INVALID",
-                &msg,
-            );
+            return crate::oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &msg);
         }
         Err(e) => return Err(bad_request(e.to_string()).into()),
     };
@@ -336,7 +322,10 @@ async fn complete(
         [
             ("x-kappa-label", result_kappa.clone()),
             ("docker-content-digest", result_kappa.clone()),
-            ("location", format!("/v2/{}/blobs/{}", upload_ns, result_kappa)),
+            (
+                "location",
+                format!("/v2/{}/blobs/{}", upload_ns, result_kappa),
+            ),
             ("content-length", "0".to_string()),
         ],
     )

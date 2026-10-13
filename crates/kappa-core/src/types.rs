@@ -48,12 +48,20 @@ pub struct NamespaceRef {
 impl NamespaceRef {
     /// Construct from a known UUID. No display name.
     pub fn new(uuid: [u8; 16]) -> Self {
-        Self { uuid, display_name: None, protocol: None }
+        Self {
+            uuid,
+            display_name: None,
+            protocol: None,
+        }
     }
 
     /// Construct from a known UUID with a display name.
     pub fn with_name(uuid: [u8; 16], name: String) -> Self {
-        Self { uuid, display_name: Some(name), protocol: None }
+        Self {
+            uuid,
+            display_name: Some(name),
+            protocol: None,
+        }
     }
 
     /// Attach a protocol hint.
@@ -63,16 +71,24 @@ impl NamespaceRef {
     }
 
     /// The 16-byte UUID.
-    pub fn uuid(&self) -> &[u8; 16] { &self.uuid }
+    pub fn uuid(&self) -> &[u8; 16] {
+        &self.uuid
+    }
 
     /// Hex-encoded UUID string.
-    pub fn uuid_hex(&self) -> String { hex::encode(self.uuid) }
+    pub fn uuid_hex(&self) -> String {
+        hex::encode(self.uuid)
+    }
 
     /// The human-readable alias, if known.
-    pub fn display_name(&self) -> Option<&str> { self.display_name.as_deref() }
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
 
     /// Protocol hint, if set.
-    pub fn protocol(&self) -> Option<ProtocolHint> { self.protocol }
+    pub fn protocol(&self) -> Option<ProtocolHint> {
+        self.protocol
+    }
 
     /// Returns display_name if available, otherwise "ns:{hex_uuid}".
     /// Used for logging, error messages, epoch mutation namespace fields,
@@ -105,7 +121,11 @@ impl NamespaceRef {
         uuid.copy_from_slice(&hash.as_bytes()[..16]);
         uuid[6] = (uuid[6] & 0x0F) | 0x80; // custom version
         uuid[8] = (uuid[8] & 0x3F) | 0x80; // RFC 4122 variant
-        Self { uuid, display_name: Some(name.to_string()), protocol: None }
+        Self {
+            uuid,
+            display_name: Some(name.to_string()),
+            protocol: None,
+        }
     }
 
     /// Generate a new UUIDv7 (time-ordered) for a new namespace.
@@ -118,10 +138,14 @@ impl NamespaceRef {
         // UUIDv7: 48-bit timestamp in first 6 bytes
         uuid[0..6].copy_from_slice(&ms.to_be_bytes()[2..8]);
         uuid[6] = (uuid[6] & 0x0F) | 0x70; // version 7
-        // Fill remaining bytes with random
+                                           // Fill remaining bytes with random
         getrandom::fill(&mut uuid[8..16]).expect("getrandom failed");
         uuid[8] = (uuid[8] & 0x3F) | 0x80; // RFC 4122 variant
-        Self { uuid, display_name: Some(name.to_string()), protocol: None }
+        Self {
+            uuid,
+            display_name: Some(name.to_string()),
+            protocol: None,
+        }
     }
 
     /// The alias table namespace. Hardcoded well-known UUID.
@@ -136,15 +160,15 @@ impl NamespaceRef {
     /// Value: 00000000-0000-8000-8000-6b61707061 ("kappa" in ASCII
     /// at the tail, custom version 0x80, RFC 4122 variant).
     pub const ALIASES_NS: [u8; 16] = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00,
-        0x80, 0x00, 0x6b, 0x61, 0x70, 0x70, 0x61, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x80, 0x00, 0x6b, 0x61, 0x70, 0x70, 0x61,
+        0x00,
     ];
 
     /// The handles registry namespace. Hardcoded well-known UUID.
     /// Same pattern as ALIASES_NS -- exists before the alias table.
     pub const HANDLES_NS: [u8; 16] = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x00,
-        0x80, 0x00, 0x6b, 0x61, 0x70, 0x70, 0x61, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x00, 0x80, 0x00, 0x6b, 0x61, 0x70, 0x70, 0x61,
+        0x00,
     ];
 
     /// Construct the _aliases system namespace.
@@ -159,7 +183,9 @@ impl NamespaceRef {
 }
 
 impl PartialEq for NamespaceRef {
-    fn eq(&self, other: &Self) -> bool { self.uuid == other.uuid }
+    fn eq(&self, other: &Self) -> bool {
+        self.uuid == other.uuid
+    }
 }
 
 impl Eq for NamespaceRef {}
@@ -670,21 +696,15 @@ impl AttestationDigest {
                 md5::Md5::digest(content).to_vec()
             }
             Self::Crc32 => {
-                let checksum = crc_fast::checksum(
-                    crc_fast::CrcAlgorithm::Crc32IsoHdlc, content,
-                );
+                let checksum = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, content);
                 (checksum as u32).to_be_bytes().to_vec()
             }
             Self::Crc32c => {
-                let checksum = crc_fast::checksum(
-                    crc_fast::CrcAlgorithm::Crc32Iscsi, content,
-                );
+                let checksum = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, content);
                 (checksum as u32).to_be_bytes().to_vec()
             }
             Self::Crc64Nvme => {
-                let checksum = crc_fast::checksum(
-                    crc_fast::CrcAlgorithm::Crc64Nvme, content,
-                );
+                let checksum = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc64Nvme, content);
                 checksum.to_be_bytes().to_vec()
             }
         }
@@ -881,7 +901,10 @@ mod tests {
         assert!(matches!(config.mode, FederationMode::Disabled));
         assert!(config.peers.is_empty());
         assert_eq!(config.sync_interval_secs, 300);
-        assert!(matches!(config.conflict_resolution, ConflictResolution::Reject));
+        assert!(matches!(
+            config.conflict_resolution,
+            ConflictResolution::Reject
+        ));
     }
 
     #[test]

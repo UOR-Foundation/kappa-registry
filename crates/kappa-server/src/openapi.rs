@@ -153,10 +153,7 @@ fn document() -> Value {
         let req_type = fields.next().and_then(type_code);
         let resp_type = fields.next().and_then(type_code).unwrap_or("text/plain");
 
-        let params: Vec<Value> = params_str
-            .split(',')
-            .filter_map(parse_parameter)
-            .collect();
+        let params: Vec<Value> = params_str.split(',').filter_map(parse_parameter).collect();
 
         let mut op = json!({
             "operationId": op_id,
@@ -364,7 +361,11 @@ mod tests {
     fn document_has_paths() {
         let doc = document();
         let paths = doc["paths"].as_object().unwrap();
-        assert!(paths.len() >= 50, "expected >= 50 paths, got {}", paths.len());
+        assert!(
+            paths.len() >= 50,
+            "expected >= 50 paths, got {}",
+            paths.len()
+        );
     }
 
     #[test]

@@ -163,7 +163,7 @@ async fn manifest_put(
     let content = body.to_vec();
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.ingest_verified(&k,&content)
+        move || s.ingest_verified(&k, &content)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -291,7 +291,9 @@ async fn manifest_put(
         .insert("docker-content-digest", kappa.parse().unwrap());
     response.headers_mut().insert(
         "location",
-        format!("/v2/{}/manifests/{}", ns.as_str(), kappa).parse().unwrap(),
+        format!("/v2/{}/manifests/{}", ns.as_str(), kappa)
+            .parse()
+            .unwrap(),
     );
     response
         .headers_mut()
@@ -372,7 +374,10 @@ async fn manifest_get(cx: &Cx, ns: &NamespaceRef, reference: &str) -> topcoat::R
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx.blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                    if tx
+                        .blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -384,9 +389,10 @@ async fn manifest_get(cx: &Cx, ns: &NamespaceRef, reference: &str) -> topcoat::R
         }
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body_stream = StreamBody::new(stream.map(|r| r.map(|b| Frame::data(b)).map_err(|e| {
-        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-    })));
+    let body_stream = StreamBody::new(stream.map(|r| {
+        r.map(Frame::data)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }));
     let body = Body::new(body_stream);
 
     let mut response = Response::new(body);
@@ -620,7 +626,11 @@ async fn tag_list(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
 
     if has_more {
         if let Some(last_tag) = tag_names.last() {
-            let link = format!("</v2/{}/tags/list?last={}>; rel=\"next\"", ns.as_str(), last_tag);
+            let link = format!(
+                "</v2/{}/tags/list?last={}>; rel=\"next\"",
+                ns.as_str(),
+                last_tag
+            );
             return (
                 StatusCode::OK,
                 [

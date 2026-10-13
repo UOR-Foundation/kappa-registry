@@ -11,9 +11,7 @@ use std::sync::Arc;
 use topcoat::context::{app_context, Cx};
 use topcoat::router::error::bad_request;
 use topcoat::router::response::{IntoResponse, Response};
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use kappa_core::transaction::TransactionManager;
 use kappa_core::types::NamespaceRef;

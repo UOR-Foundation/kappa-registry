@@ -1,6 +1,7 @@
 //! Tests for the kappa module.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::kappa::*;
 
@@ -206,7 +207,14 @@ mod tests {
 
     #[test]
     fn every_parsed_axis_can_be_computed_and_verified() {
-        for axis in ["sha1", "sha256", "blake3", "sha3-256", "keccak256", "sha512"] {
+        for axis in [
+            "sha1",
+            "sha256",
+            "blake3",
+            "sha3-256",
+            "keccak256",
+            "sha512",
+        ] {
             let label = compute_kappa(axis, b"axis parity").unwrap();
             assert_eq!(KappaLabel::parse(label.as_str()).unwrap(), label);
             assert_eq!(verify_kappa(label.as_str(), b"axis parity"), Ok(true));
@@ -419,7 +427,10 @@ mod tests {
         let hex = "a".repeat(128);
         let kappa = format!("sha512:{}", hex);
         let path = blob_path_for(root, &kappa).unwrap();
-        assert_eq!(path, std::path::PathBuf::from(format!("/blobs/sha512/aa/aa/{}", hex)));
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(format!("/blobs/sha512/aa/aa/{}", hex))
+        );
     }
 
     #[test]
@@ -460,7 +471,11 @@ mod tests {
         let content = b"primary axis selection test";
         let mut cursor = std::io::Cursor::new(content);
         let proof = streaming_compute_multi(&["blake3", "sha256"], &mut cursor).unwrap();
-        assert!(proof.kappa().starts_with("blake3:"), "primary should be blake3, got {}", proof.kappa());
+        assert!(
+            proof.kappa().starts_with("blake3:"),
+            "primary should be blake3, got {}",
+            proof.kappa()
+        );
     }
 
     #[test]
@@ -468,7 +483,11 @@ mod tests {
         let content = b"primary axis selection test reversed";
         let mut cursor = std::io::Cursor::new(content);
         let proof = streaming_compute_multi(&["sha256", "blake3"], &mut cursor).unwrap();
-        assert!(proof.kappa().starts_with("sha256:"), "primary should be sha256, got {}", proof.kappa());
+        assert!(
+            proof.kappa().starts_with("sha256:"),
+            "primary should be sha256, got {}",
+            proof.kappa()
+        );
     }
 
     #[test]
@@ -476,9 +495,17 @@ mod tests {
         let content = b"all six axes test";
         let mut cursor = std::io::Cursor::new(content);
         let proof = streaming_compute_multi(
-            &["sha1", "sha256", "blake3", "sha512", "sha3-256", "keccak256"],
+            &[
+                "sha1",
+                "sha256",
+                "blake3",
+                "sha512",
+                "sha3-256",
+                "keccak256",
+            ],
             &mut cursor,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(proof.kappa().starts_with("sha1:"), "primary should be sha1");
         assert_eq!(proof.additional().len(), 5, "should have 5 additional axes");
     }
@@ -489,7 +516,10 @@ mod tests {
         let mut cursor = std::io::Cursor::new(content);
         let proof = streaming_compute_multi(&["sha256"], &mut cursor).unwrap();
         assert!(proof.kappa().starts_with("sha256:"));
-        assert!(proof.additional().is_empty(), "single axis should have no additional");
+        assert!(
+            proof.additional().is_empty(),
+            "single axis should have no additional"
+        );
     }
 
     #[test]
@@ -531,12 +561,23 @@ mod tests {
     #[test]
     fn streaming_compute_kappa_matches_one_shot() {
         let content = b"streaming vs oneshot comparison";
-        for axis in &["sha1", "sha256", "blake3", "sha512", "sha3-256", "keccak256"] {
+        for axis in &[
+            "sha1",
+            "sha256",
+            "blake3",
+            "sha512",
+            "sha3-256",
+            "keccak256",
+        ] {
             let mut cursor = std::io::Cursor::new(content);
             let proof = streaming_compute_kappa(axis, &mut cursor).unwrap();
             let oneshot = compute_kappa(axis, content).unwrap();
-            assert_eq!(proof.kappa(), oneshot.as_str(), "mismatch for axis {}", axis);
+            assert_eq!(
+                proof.kappa(),
+                oneshot.as_str(),
+                "mismatch for axis {}",
+                axis
+            );
         }
     }
-
 }

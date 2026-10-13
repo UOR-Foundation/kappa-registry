@@ -10,7 +10,7 @@
 //! - https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming-trailers.html
 //! - s3s/crates/s3s/src/sig_v4/methods.rs (verified test vectors)
 
-use hmac::{Hmac, Mac, KeyInit};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -173,14 +173,17 @@ pub fn parse_authorization(
         }
     }
 
-    let cred_str = credential.ok_or_else(|| SigV4Error::MalformedAuth("missing Credential".into()))?;
+    let cred_str =
+        credential.ok_or_else(|| SigV4Error::MalformedAuth("missing Credential".into()))?;
     let sig = signature.ok_or_else(|| SigV4Error::MalformedAuth("missing Signature".into()))?;
-    let sh = signed_headers.ok_or_else(|| SigV4Error::MalformedAuth("missing SignedHeaders".into()))?;
+    let sh =
+        signed_headers.ok_or_else(|| SigV4Error::MalformedAuth("missing SignedHeaders".into()))?;
 
     let cred_parts: Vec<&str> = cred_str.splitn(5, '/').collect();
     if cred_parts.len() != 5 || cred_parts[4] != AWS4_REQUEST {
         return Err(SigV4Error::MalformedAuth(format!(
-            "credential scope malformed: {}", cred_str
+            "credential scope malformed: {}",
+            cred_str
         )));
     }
 
@@ -199,7 +202,12 @@ pub fn parse_authorization(
 // Signing key derivation
 // =============================================================================
 
-pub fn derive_signing_key(secret_key: &str, date: &str, region: &str, service: &str) -> Zeroizing<Vec<u8>> {
+pub fn derive_signing_key(
+    secret_key: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> Zeroizing<Vec<u8>> {
     let mut k_secret = Zeroizing::new(format!("AWS4{}", secret_key).into_bytes());
     let k_date = hmac_sha256(&k_secret, date.as_bytes());
     k_secret.fill(0);
@@ -222,8 +230,7 @@ pub fn build_canonical_request(
 ) -> String {
     format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
-        method, canonical_uri, canonical_query, canonical_headers,
-        signed_headers, payload_hash
+        method, canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash
     )
 }
 
@@ -233,7 +240,10 @@ pub fn build_string_to_sign(
     canonical_request: &str,
 ) -> String {
     let hash = sha256_hex(canonical_request.as_bytes());
-    format!("{}\n{}\n{}\n{}", ALGORITHM_HMAC_SHA256, datetime, credential_scope, hash)
+    format!(
+        "{}\n{}\n{}\n{}",
+        ALGORITHM_HMAC_SHA256, datetime, credential_scope, hash
+    )
 }
 
 pub fn compute_signature(signing_key: &[u8], string_to_sign: &str) -> String {
@@ -319,8 +329,15 @@ pub fn create_chunk_string_to_sign(
     };
     format!(
         "{}\n{}\n{}/{}/{}/{}\n{}\n{}\n{}",
-        ALGORITHM_CHUNK, datetime, date, region, service, AWS4_REQUEST,
-        prev_signature, empty_sha256(), chunk_hash
+        ALGORITHM_CHUNK,
+        datetime,
+        date,
+        region,
+        service,
+        AWS4_REQUEST,
+        prev_signature,
+        empty_sha256(),
+        chunk_hash
     )
 }
 
@@ -333,10 +350,12 @@ pub fn compute_chunk_signature(
     prev_signature: &str,
     chunk_data: &[u8],
 ) -> String {
-    let sts = create_chunk_string_to_sign(datetime, date, region, service, prev_signature, chunk_data);
+    let sts =
+        create_chunk_string_to_sign(datetime, date, region, service, prev_signature, chunk_data);
     compute_signature(signing_key, &sts)
 }
 
+#[allow(clippy::too_many_arguments)] // one parameter per SigV4 signing input
 pub fn verify_chunk_signature(
     signing_key: &[u8],
     datetime: &str,
@@ -348,7 +367,13 @@ pub fn verify_chunk_signature(
     claimed_signature: &str,
 ) -> Result<(), SigV4Error> {
     let computed = compute_chunk_signature(
-        signing_key, datetime, date, region, service, prev_signature, chunk_data,
+        signing_key,
+        datetime,
+        date,
+        region,
+        service,
+        prev_signature,
+        chunk_data,
     );
     verify_signature(&computed, claimed_signature)
 }
@@ -368,8 +393,14 @@ pub fn create_trailer_string_to_sign(
     let trailers_hash = sha256_hex(canonical_trailers);
     format!(
         "{}\n{}\n{}/{}/{}/{}\n{}\n{}",
-        ALGORITHM_TRAILER, datetime, date, region, service, AWS4_REQUEST,
-        prev_signature, trailers_hash
+        ALGORITHM_TRAILER,
+        datetime,
+        date,
+        region,
+        service,
+        AWS4_REQUEST,
+        prev_signature,
+        trailers_hash
     )
 }
 
@@ -382,10 +413,18 @@ pub fn compute_trailer_signature(
     prev_signature: &str,
     canonical_trailers: &[u8],
 ) -> String {
-    let sts = create_trailer_string_to_sign(datetime, date, region, service, prev_signature, canonical_trailers);
+    let sts = create_trailer_string_to_sign(
+        datetime,
+        date,
+        region,
+        service,
+        prev_signature,
+        canonical_trailers,
+    );
     compute_signature(signing_key, &sts)
 }
 
+#[allow(clippy::too_many_arguments)] // one parameter per SigV4 signing input
 pub fn verify_trailer_signature(
     signing_key: &[u8],
     datetime: &str,
@@ -397,7 +436,13 @@ pub fn verify_trailer_signature(
     claimed_signature: &str,
 ) -> Result<(), SigV4Error> {
     let computed = compute_trailer_signature(
-        signing_key, datetime, date, region, service, prev_signature, canonical_trailers,
+        signing_key,
+        datetime,
+        date,
+        region,
+        service,
+        prev_signature,
+        canonical_trailers,
     );
     verify_signature(&computed, claimed_signature)
 }
@@ -407,7 +452,8 @@ pub fn verify_trailer_signature(
 // =============================================================================
 
 pub fn parse_chunk_meta(line: &[u8]) -> Result<ChunkMeta, SigV4Error> {
-    let line = line.strip_suffix(b"\r\n")
+    let line = line
+        .strip_suffix(b"\r\n")
         .ok_or_else(|| SigV4Error::ChunkParseFailed("missing CRLF".into()))?;
 
     let (size_part, sig_part) = match line.iter().position(|&b| b == b';') {
@@ -417,8 +463,9 @@ pub fn parse_chunk_meta(line: &[u8]) -> Result<ChunkMeta, SigV4Error> {
 
     let size_str = std::str::from_utf8(size_part)
         .map_err(|_| SigV4Error::ChunkParseFailed("size not utf8".into()))?;
-    let size = usize::from_str_radix(size_str, 16)
-        .map_err(|e| SigV4Error::ChunkParseFailed(format!("invalid hex size '{}': {}", size_str, e)))?;
+    let size = usize::from_str_radix(size_str, 16).map_err(|e| {
+        SigV4Error::ChunkParseFailed(format!("invalid hex size '{}': {}", size_str, e))
+    })?;
 
     if size > MAX_CHUNK_SIZE {
         return Err(SigV4Error::ChunkSizeExceeded(size, MAX_CHUNK_SIZE));
@@ -435,7 +482,8 @@ pub fn parse_chunk_meta(line: &[u8]) -> Result<ChunkMeta, SigV4Error> {
                 s
             } else {
                 return Err(SigV4Error::ChunkParseFailed(format!(
-                    "unknown chunk extension: {}", ext_str
+                    "unknown chunk extension: {}",
+                    ext_str
                 )));
             };
             if !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -473,6 +521,7 @@ pub struct ChunkStreamParser<R: std::io::Read> {
 }
 
 impl<R: std::io::Read> ChunkStreamParser<R> {
+    #[allow(clippy::too_many_arguments)] // one parameter per SigV4 signing input
     pub fn new(
         reader: R,
         signing_key: Zeroizing<Vec<u8>>,
@@ -521,7 +570,9 @@ impl<R: std::io::Read> ChunkStreamParser<R> {
                     if self.line_buf.is_empty() {
                         return Ok(None);
                     }
-                    return Err(SigV4Error::ChunkParseFailed("unexpected EOF in chunk meta".into()));
+                    return Err(SigV4Error::ChunkParseFailed(
+                        "unexpected EOF in chunk meta".into(),
+                    ));
                 }
                 Ok(_) => {
                     self.line_buf.push(byte[0]);
@@ -529,7 +580,9 @@ impl<R: std::io::Read> ChunkStreamParser<R> {
                         break;
                     }
                     if self.line_buf.len() > 1024 {
-                        return Err(SigV4Error::ChunkParseFailed("chunk meta line too long".into()));
+                        return Err(SigV4Error::ChunkParseFailed(
+                            "chunk meta line too long".into(),
+                        ));
                     }
                 }
                 Err(e) => return Err(SigV4Error::ChunkParseFailed(e.to_string())),
@@ -542,11 +595,18 @@ impl<R: std::io::Read> ChunkStreamParser<R> {
             self.finished = true;
             // Verify 0-chunk signature if signed
             if self.signed {
-                let claimed = meta.signature
-                    .ok_or_else(|| SigV4Error::ChunkParseFailed("signed mode requires chunk signature".into()))?;
+                let claimed = meta.signature.ok_or_else(|| {
+                    SigV4Error::ChunkParseFailed("signed mode requires chunk signature".into())
+                })?;
                 verify_chunk_signature(
-                    &self.signing_key, &self.datetime, &self.date, &self.region,
-                    &self.service, &self.prev_signature, &[], &claimed,
+                    &self.signing_key,
+                    &self.datetime,
+                    &self.date,
+                    &self.region,
+                    &self.service,
+                    &self.prev_signature,
+                    &[],
+                    &claimed,
                 )?;
                 self.prev_signature = claimed;
             }
@@ -555,24 +615,35 @@ impl<R: std::io::Read> ChunkStreamParser<R> {
 
         // Read chunk data
         let mut data = vec![0u8; meta.size];
-        self.reader.read_exact(&mut data)
+        self.reader
+            .read_exact(&mut data)
             .map_err(|e| SigV4Error::ChunkParseFailed(format!("reading chunk data: {}", e)))?;
 
         // Read trailing \r\n after chunk data
         let mut crlf = [0u8; 2];
-        self.reader.read_exact(&mut crlf)
+        self.reader
+            .read_exact(&mut crlf)
             .map_err(|e| SigV4Error::ChunkParseFailed(format!("reading chunk CRLF: {}", e)))?;
         if crlf != *b"\r\n" {
-            return Err(SigV4Error::ChunkParseFailed("missing CRLF after chunk data".into()));
+            return Err(SigV4Error::ChunkParseFailed(
+                "missing CRLF after chunk data".into(),
+            ));
         }
 
         // Verify chunk signature if signed
         if self.signed {
-            let claimed = meta.signature
-                .ok_or_else(|| SigV4Error::ChunkParseFailed("signed mode requires chunk signature".into()))?;
+            let claimed = meta.signature.ok_or_else(|| {
+                SigV4Error::ChunkParseFailed("signed mode requires chunk signature".into())
+            })?;
             verify_chunk_signature(
-                &self.signing_key, &self.datetime, &self.date, &self.region,
-                &self.service, &self.prev_signature, &data, &claimed,
+                &self.signing_key,
+                &self.datetime,
+                &self.date,
+                &self.region,
+                &self.service,
+                &self.prev_signature,
+                &data,
+                &claimed,
             )?;
             self.prev_signature = claimed;
         }
@@ -609,11 +680,18 @@ impl<R: std::io::Read> ChunkStreamParser<R> {
         let mut trailer_signature = None;
 
         for line in buf.split(|&b| b == b'\n') {
-            let line = if line.ends_with(b"\r") { &line[..line.len() - 1] } else { line };
-            if line.is_empty() { continue; }
+            let line = if line.ends_with(b"\r") {
+                &line[..line.len() - 1]
+            } else {
+                line
+            };
+            if line.is_empty() {
+                continue;
+            }
 
-            let colon = line.iter().position(|&b| b == b':')
-                .ok_or_else(|| SigV4Error::ChunkParseFailed("trailer header missing colon".into()))?;
+            let colon = line.iter().position(|&b| b == b':').ok_or_else(|| {
+                SigV4Error::ChunkParseFailed("trailer header missing colon".into())
+            })?;
             let name = std::str::from_utf8(&line[..colon])
                 .map_err(|_| SigV4Error::ChunkParseFailed("trailer name not utf8".into()))?
                 .to_ascii_lowercase();
@@ -640,8 +718,14 @@ impl<R: std::io::Read> ChunkStreamParser<R> {
                 canonical.push(b'\n');
             }
             verify_trailer_signature(
-                &self.signing_key, &self.datetime, &self.date, &self.region,
-                &self.service, &self.prev_signature, &canonical, &claimed,
+                &self.signing_key,
+                &self.datetime,
+                &self.date,
+                &self.region,
+                &self.service,
+                &self.prev_signature,
+                &canonical,
+                &claimed,
             )?;
         }
 
@@ -688,14 +772,19 @@ pub fn parse_presigned_url(params: &[(&str, &str)]) -> Result<PresignedUrl, SigV
     let cred = credential.ok_or_else(|| SigV4Error::MissingHeader("X-Amz-Credential".into()))?;
     let cred_parts: Vec<&str> = cred.splitn(5, '/').collect();
     if cred_parts.len() != 5 || cred_parts[4] != AWS4_REQUEST {
-        return Err(SigV4Error::MalformedAuth(format!("presigned credential malformed: {}", cred)));
+        return Err(SigV4Error::MalformedAuth(format!(
+            "presigned credential malformed: {}",
+            cred
+        )));
     }
 
     let datetime = date.ok_or_else(|| SigV4Error::MissingHeader("X-Amz-Date".into()))?;
     let exp_str = expires.ok_or_else(|| SigV4Error::MissingHeader("X-Amz-Expires".into()))?;
-    let expires_secs: u64 = exp_str.parse()
-        .map_err(|_| SigV4Error::MalformedAuth(format!("X-Amz-Expires not integer: {}", exp_str)))?;
-    let sh = signed_headers.ok_or_else(|| SigV4Error::MissingHeader("X-Amz-SignedHeaders".into()))?;
+    let expires_secs: u64 = exp_str.parse().map_err(|_| {
+        SigV4Error::MalformedAuth(format!("X-Amz-Expires not integer: {}", exp_str))
+    })?;
+    let sh =
+        signed_headers.ok_or_else(|| SigV4Error::MissingHeader("X-Amz-SignedHeaders".into()))?;
     let sig = signature.ok_or_else(|| SigV4Error::MissingHeader("X-Amz-Signature".into()))?;
 
     Ok(PresignedUrl {
@@ -740,8 +829,12 @@ pub fn build_presigned_canonical_request(
 ) -> String {
     let canonical_query = build_canonical_query(query_params);
     build_canonical_request(
-        method, canonical_uri, &canonical_query,
-        canonical_headers, signed_headers, UNSIGNED_PAYLOAD,
+        method,
+        canonical_uri,
+        &canonical_query,
+        canonical_headers,
+        signed_headers,
+        UNSIGNED_PAYLOAD,
     )
 }
 
@@ -754,8 +847,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -804,7 +896,9 @@ mod tests {
     fn derive_signing_key_produces_32_bytes() {
         let key = derive_signing_key(
             "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            "20130524", "us-east-1", "s3",
+            "20130524",
+            "us-east-1",
+            "s3",
         );
         assert_eq!(key.len(), 32);
     }
@@ -816,7 +910,12 @@ mod tests {
         let chunk1_data = vec![b'a'; 64 * 1024];
 
         let sts = create_chunk_string_to_sign(
-            "20130524T000000Z", "20130524", "us-east-1", "s3", seed, &chunk1_data,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            seed,
+            &chunk1_data,
         );
         assert!(sts.starts_with("AWS4-HMAC-SHA256-PAYLOAD\n"));
         assert!(sts.contains(seed));
@@ -832,22 +931,46 @@ mod tests {
         let seed = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
 
         let sig1 = compute_chunk_signature(
-            &key, "20130524T000000Z", "20130524", "us-east-1", "s3",
-            seed, &vec![b'a'; 64 * 1024],
+            &key,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            seed,
+            &vec![b'a'; 64 * 1024],
         );
-        assert_eq!(sig1, "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648");
+        assert_eq!(
+            sig1,
+            "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648"
+        );
 
         let sig2 = compute_chunk_signature(
-            &key, "20130524T000000Z", "20130524", "us-east-1", "s3",
-            &sig1, &vec![b'a'; 1024],
+            &key,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            &sig1,
+            &vec![b'a'; 1024],
         );
-        assert_eq!(sig2, "0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497");
+        assert_eq!(
+            sig2,
+            "0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497"
+        );
 
         let sig3 = compute_chunk_signature(
-            &key, "20130524T000000Z", "20130524", "us-east-1", "s3",
-            &sig2, &[],
+            &key,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            &sig2,
+            &[],
         );
-        assert_eq!(sig3, "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9");
+        assert_eq!(
+            sig3,
+            "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9"
+        );
     }
 
     #[test]
@@ -858,10 +981,18 @@ mod tests {
         let canonical_trailers = b"x-amz-checksum-crc32c:sOO8/Q==\n";
 
         let sig = compute_trailer_signature(
-            &key, "20130524T000000Z", "20130524", "us-east-1", "s3",
-            prev_sig, canonical_trailers,
+            &key,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            prev_sig,
+            canonical_trailers,
         );
-        assert_eq!(sig, "d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435");
+        assert_eq!(
+            sig,
+            "d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435"
+        );
     }
 
     #[test]
@@ -873,9 +1004,16 @@ mod tests {
         let expected = "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648";
 
         assert!(verify_chunk_signature(
-            &key, "20130524T000000Z", "20130524", "us-east-1", "s3",
-            seed, &data, expected,
-        ).is_ok());
+            &key,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            seed,
+            &data,
+            expected,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -885,10 +1023,16 @@ mod tests {
         let seed = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
 
         assert!(verify_chunk_signature(
-            &key, "20130524T000000Z", "20130524", "us-east-1", "s3",
-            seed, &[b'a'; 64 * 1024],
+            &key,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            seed,
+            &[b'a'; 64 * 1024],
             "0000000000000000000000000000000000000000000000000000000000000000",
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[test]
@@ -932,11 +1076,17 @@ mod tests {
     fn parse_presigned_url_valid() {
         let params = [
             ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
-            ("X-Amz-Credential", "AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"),
+            (
+                "X-Amz-Credential",
+                "AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request",
+            ),
             ("X-Amz-Date", "20130524T000000Z"),
             ("X-Amz-Expires", "86400"),
             ("X-Amz-SignedHeaders", "host"),
-            ("X-Amz-Signature", "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"),
+            (
+                "X-Amz-Signature",
+                "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+            ),
         ];
         let parsed = parse_presigned_url(&params).unwrap();
         assert_eq!(parsed.access_key, "AKIAIOSFODNN7EXAMPLE");
@@ -948,7 +1098,10 @@ mod tests {
     fn parse_presigned_url_with_token() {
         let params = [
             ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
-            ("X-Amz-Credential", "ASIA/20130524/us-east-1/s3/aws4_request"),
+            (
+                "X-Amz-Credential",
+                "ASIA/20130524/us-east-1/s3/aws4_request",
+            ),
             ("X-Amz-Date", "20130524T000000Z"),
             ("X-Amz-Expires", "3600"),
             ("X-Amz-SignedHeaders", "host"),
@@ -986,12 +1139,22 @@ mod tests {
         // Build a signed chunked body: 5 bytes + 0-chunk
         let chunk_data = b"hello";
         let sig1 = compute_chunk_signature(
-            &key, "20130524T000000Z", "20130524", "us-east-1", "s3",
-            seed, chunk_data,
+            &key,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            seed,
+            chunk_data,
         );
         let sig_final = compute_chunk_signature(
-            &key, "20130524T000000Z", "20130524", "us-east-1", "s3",
-            &sig1, &[],
+            &key,
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "s3",
+            &sig1,
+            &[],
         );
 
         let mut body = Vec::new();
@@ -1002,8 +1165,13 @@ mod tests {
 
         let mut parser = ChunkStreamParser::new(
             std::io::Cursor::new(body),
-            key, "20130524T000000Z".into(), "20130524".into(),
-            "us-east-1".into(), "s3".into(), seed.into(), true,
+            key,
+            "20130524T000000Z".into(),
+            "20130524".into(),
+            "us-east-1".into(),
+            "s3".into(),
+            seed.into(),
+            true,
         );
 
         let chunk = parser.next_chunk().unwrap().unwrap();
@@ -1023,8 +1191,13 @@ mod tests {
 
         let mut parser = ChunkStreamParser::new(
             std::io::Cursor::new(body),
-            Zeroizing::new(Vec::new()), String::new(), String::new(),
-            String::new(), String::new(), String::new(), false,
+            Zeroizing::new(Vec::new()),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
         );
 
         let chunk = parser.next_chunk().unwrap().unwrap();
@@ -1037,7 +1210,9 @@ mod tests {
     fn chunk_stream_parser_wrong_signature_rejected() {
         let key = derive_signing_key(
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            "20130524", "us-east-1", "s3",
+            "20130524",
+            "us-east-1",
+            "s3",
         );
         let seed = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
         let bad_sig = "0".repeat(64);
@@ -1048,8 +1223,13 @@ mod tests {
 
         let mut parser = ChunkStreamParser::new(
             std::io::Cursor::new(body),
-            key, "20130524T000000Z".into(), "20130524".into(),
-            "us-east-1".into(), "s3".into(), seed.into(), true,
+            key,
+            "20130524T000000Z".into(),
+            "20130524".into(),
+            "us-east-1".into(),
+            "s3".into(),
+            seed.into(),
+            true,
         );
 
         assert!(parser.next_chunk().is_err());
@@ -1078,7 +1258,14 @@ mod tests {
             ("x-amz-date", "20130524T000000Z"),
         ]);
         let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-        let cr = build_canonical_request("GET", "/test.txt", "", &canonical_headers, signed_headers, &payload_hash);
+        let cr = build_canonical_request(
+            "GET",
+            "/test.txt",
+            "",
+            &canonical_headers,
+            signed_headers,
+            &payload_hash,
+        );
         let scope = "20130524/us-east-1/s3/aws4_request";
         let sts = build_string_to_sign("20130524T000000Z", scope, &cr);
         let sig = compute_signature(&key, &sts);

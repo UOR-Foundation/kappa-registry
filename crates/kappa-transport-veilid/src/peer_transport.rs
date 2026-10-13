@@ -36,20 +36,20 @@ impl VeilidPeerTransport {
             let registry = self.node.peers();
             let mut reg = registry.write();
             if let Some(result) = reg.get_or_import(peer, |blob| {
-                self.node
-                    .import_route(blob)
-                    .map_err(|e| rekindle_transport_veilid::VeilidTransportError::RouteImportFailed {
+                self.node.import_route(blob).map_err(|e| {
+                    rekindle_transport_veilid::VeilidTransportError::RouteImportFailed {
                         peer: peer.to_string(),
                         reason: e.to_string(),
-                    })
+                    }
+                })
             }) {
                 return result.map_err(|e| TransportError::PeerNotFound(e.to_string()));
             }
         }
 
         // Cache miss: try interpreting peer as hex-encoded route blob
-        let blob = hex::decode(peer)
-            .map_err(|e| TransportError::PeerNotFound(format!("not hex: {e}")))?;
+        let blob =
+            hex::decode(peer).map_err(|e| TransportError::PeerNotFound(format!("not hex: {e}")))?;
         let target = self
             .node
             .import_route(&blob)
@@ -63,11 +63,7 @@ impl VeilidPeerTransport {
 }
 
 impl PeerTransport for VeilidPeerTransport {
-    fn call_peer(
-        &self,
-        peer: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, TransportError> {
+    fn call_peer(&self, peer: &str, data: &[u8]) -> Result<Vec<u8>, TransportError> {
         if !self.node.is_ready() {
             return Err(TransportError::NotConfigured);
         }
@@ -81,11 +77,7 @@ impl PeerTransport for VeilidPeerTransport {
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))
     }
 
-    fn send_batch(
-        &self,
-        peer: &str,
-        data: &[u8],
-    ) -> Result<(), TransportError> {
+    fn send_batch(&self, peer: &str, data: &[u8]) -> Result<(), TransportError> {
         if !self.node.is_ready() {
             return Err(TransportError::NotConfigured);
         }
@@ -99,11 +91,7 @@ impl PeerTransport for VeilidPeerTransport {
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))
     }
 
-    fn fetch_epoch_root(
-        &self,
-        peer: &str,
-        namespace: &str,
-    ) -> Result<Vec<u8>, TransportError> {
+    fn fetch_epoch_root(&self, peer: &str, namespace: &str) -> Result<Vec<u8>, TransportError> {
         if !self.node.is_ready() {
             return Err(TransportError::NotConfigured);
         }
@@ -120,10 +108,7 @@ impl PeerTransport for VeilidPeerTransport {
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))
     }
 
-    fn rtt_estimate(
-        &self,
-        peer: &str,
-    ) -> Option<std::time::Duration> {
+    fn rtt_estimate(&self, peer: &str) -> Option<std::time::Duration> {
         if !self.node.is_ready() {
             return None;
         }

@@ -117,9 +117,6 @@ kappa-reconcile = { path = "crates/kappa-reconcile" }
 [patch.crates-io]
 matchit = { git = "https://github.com/usrbinkat/matchit", branch = "usrbinkat/feat/non-terminal-catch-all" }
 
-[[test]]
-name = "bdd"
-harness = false
 
 [profile.release]
 lto = true

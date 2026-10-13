@@ -16,15 +16,15 @@
 //! - Reconciliation protocol messages are postcard-encoded with a
 //!   single protocol byte prefix, sent via `Caller::call_raw`.
 
-mod peer_transport;
 mod membership_view;
+mod peer_transport;
 pub mod reconcile;
 
-pub use peer_transport::VeilidPeerTransport;
 pub use membership_view::VeilidMembershipView;
+pub use peer_transport::VeilidPeerTransport;
 pub use reconcile::{handle_reconcile_request, ReconcileLoop};
 
+pub use rekindle_transport_veilid::config::SafetyConfig;
 /// Re-export TransportNode and TransportConfig so consumers don't need
 /// a direct dependency on rekindle-transport-veilid for node lifecycle.
-pub use rekindle_transport_veilid::{TransportNode, TransportConfig};
-pub use rekindle_transport_veilid::config::SafetyConfig;
+pub use rekindle_transport_veilid::{TransportConfig, TransportNode};

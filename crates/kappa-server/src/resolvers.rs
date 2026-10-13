@@ -40,7 +40,9 @@ impl PlcResolver {
 
 #[async_trait::async_trait]
 impl ExternalIdentifierResolver for PlcResolver {
-    fn id_type(&self) -> &str { "did:plc" }
+    fn id_type(&self) -> &str {
+        "did:plc"
+    }
 
     fn accepts(&self, identifier: &str) -> bool {
         identifier.starts_with("did:plc:")
@@ -48,7 +50,11 @@ impl ExternalIdentifierResolver for PlcResolver {
 
     async fn resolve(&self, identifier: &str) -> Result<Option<ResolvedIdentity>, String> {
         let url = format!("{}/{}", self.plc_url, identifier);
-        let resp = self.client.get(&url).send().await
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| format!("PLC directory request failed: {}", e))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -58,72 +64,104 @@ impl ExternalIdentifierResolver for PlcResolver {
             return Err(format!("PLC directory returned {}", resp.status()));
         }
 
-        let doc: serde_json::Value = resp.json().await
+        let doc: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| format!("PLC directory response parse failed: {}", e))?;
 
-        let did_key = doc.get("verificationMethods")
+        let did_key = doc
+            .get("verificationMethods")
             .and_then(|vm| vm.get("atproto"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| "DID document missing verificationMethods.atproto".to_string())?;
 
         let pubkey = decode_did_key(did_key)?;
-        let algorithm = if pubkey.len() == 33 { "p256" }
-            else if pubkey.len() == 32 { "ed25519" }
-            else { return Err(format!("unexpected public key length: {}", pubkey.len())); };
+        let algorithm = if pubkey.len() == 33 {
+            "p256"
+        } else if pubkey.len() == 32 {
+            "ed25519"
+        } else {
+            return Err(format!("unexpected public key length: {}", pubkey.len()));
+        };
 
         let anchor = anchor_from_key_str(algorithm, &pubkey);
 
-        let handle = doc.get("alsoKnownAs")
+        let handle = doc
+            .get("alsoKnownAs")
             .and_then(|aka| aka.as_array())
-            .and_then(|arr| arr.iter().find_map(|v| {
-                v.as_str()?.strip_prefix("at://").map(|h| h.to_string())
-            }))
+            .and_then(|arr| {
+                arr.iter()
+                    .find_map(|v| v.as_str()?.strip_prefix("at://").map(|h| h.to_string()))
+            })
             .unwrap_or_default();
 
-        let service_endpoint = doc.get("service")
+        let service_endpoint = doc
+            .get("service")
             .and_then(|svc| svc.as_array())
-            .and_then(|arr| arr.iter().find_map(|entry| {
-                let id = entry.get("id")?.as_str()?;
-                if id == "#atproto_pds" {
-                    entry.get("serviceEndpoint").and_then(|se| se.as_str()).map(|s| s.to_string())
-                } else { None }
-            }));
+            .and_then(|arr| {
+                arr.iter().find_map(|entry| {
+                    let id = entry.get("id")?.as_str()?;
+                    if id == "#atproto_pds" {
+                        entry
+                            .get("serviceEndpoint")
+                            .and_then(|se| se.as_str())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+            });
 
         let evidence = serde_json::to_vec(&doc).ok();
 
         Ok(Some(ResolvedIdentity {
-            anchor, public_key: pubkey, algorithm: algorithm.to_string(),
-            service_endpoint, handle, evidence,
+            anchor,
+            public_key: pubkey,
+            algorithm: algorithm.to_string(),
+            service_endpoint,
+            handle,
+            evidence,
         }))
     }
 
-    fn cache_ttl_secs(&self) -> u64 { 3600 }
+    fn cache_ttl_secs(&self) -> u64 {
+        3600
+    }
 }
 
 /// Decode a did:key to raw public key bytes.
 fn decode_did_key(did_key: &str) -> Result<Vec<u8>, String> {
-    let encoded = did_key.strip_prefix("did:key:z")
+    let encoded = did_key
+        .strip_prefix("did:key:z")
         .ok_or_else(|| format!("invalid did:key format: {}", did_key))?;
-    let decoded = bs58_decode(encoded)
-        .map_err(|e| format!("base58btc decode failed: {}", e))?;
+    let decoded = bs58_decode(encoded).map_err(|e| format!("base58btc decode failed: {}", e))?;
     if decoded.len() < 2 {
         return Err("did:key decoded bytes too short".to_string());
     }
     if decoded[0] == 0x80 && decoded.len() > 1 && decoded[1] == 0x24 {
         // P-256: multicodec 0x1200 as varint [0x80, 0x24]
-        if decoded.len() < 2 + 33 { return Err("P-256 key too short".to_string()); }
+        if decoded.len() < 2 + 33 {
+            return Err("P-256 key too short".to_string());
+        }
         Ok(decoded[2..2 + 33].to_vec())
     } else if decoded[0] == 0xED && decoded.len() > 1 && decoded[1] == 0x01 {
         // Ed25519: multicodec 0xED01
-        if decoded.len() < 2 + 32 { return Err("Ed25519 key too short".to_string()); }
+        if decoded.len() < 2 + 32 {
+            return Err("Ed25519 key too short".to_string());
+        }
         Ok(decoded[2..2 + 32].to_vec())
     } else if decoded[0] == 0xE7 && decoded.len() > 1 && decoded[1] == 0x01 {
         // secp256k1: multicodec 0xE701
-        if decoded.len() < 2 + 33 { return Err("secp256k1 key too short".to_string()); }
+        if decoded.len() < 2 + 33 {
+            return Err("secp256k1 key too short".to_string());
+        }
         Ok(decoded[2..2 + 33].to_vec())
     } else {
-        Err(format!("unsupported multicodec prefix: 0x{:02x}{:02x}",
-            decoded[0], decoded.get(1).copied().unwrap_or(0)))
+        Err(format!(
+            "unsupported multicodec prefix: 0x{:02x}{:02x}",
+            decoded[0],
+            decoded.get(1).copied().unwrap_or(0)
+        ))
     }
 }
 
@@ -132,8 +170,11 @@ fn bs58_decode(input: &str) -> Result<Vec<u8>, String> {
     const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let mut bytes: Vec<u8> = Vec::new();
     for c in input.bytes() {
-        let val = ALPHABET.iter().position(|&a| a == c)
-            .ok_or_else(|| format!("invalid base58 character: {}", c as char))? as u64;
+        let val = ALPHABET
+            .iter()
+            .position(|&a| a == c)
+            .ok_or_else(|| format!("invalid base58 character: {}", c as char))?
+            as u64;
         let mut carry = val;
         for byte in bytes.iter_mut() {
             carry += *byte as u64 * 58;
@@ -146,7 +187,11 @@ fn bs58_decode(input: &str) -> Result<Vec<u8>, String> {
         }
     }
     for c in input.bytes() {
-        if c == b'1' { bytes.push(0); } else { break; }
+        if c == b'1' {
+            bytes.push(0);
+        } else {
+            break;
+        }
     }
     bytes.reverse();
     Ok(bytes)
@@ -183,7 +228,9 @@ impl FulcioResolver {
 #[cfg(feature = "atproto")]
 #[async_trait::async_trait]
 impl ExternalIdentifierResolver for FulcioResolver {
-    fn id_type(&self) -> &str { "fulcio" }
+    fn id_type(&self) -> &str {
+        "fulcio"
+    }
 
     fn accepts(&self, identifier: &str) -> bool {
         identifier.contains('@') || identifier.starts_with("https://github.com/")
@@ -193,50 +240,73 @@ impl ExternalIdentifierResolver for FulcioResolver {
         let search_url = format!("{}/api/v1/index/retrieve", self.rekor_url);
         let search_body = serde_json::json!({ "email": identifier });
 
-        let resp = self.client.post(&search_url).json(&search_body).send().await
+        let resp = self
+            .client
+            .post(&search_url)
+            .json(&search_body)
+            .send()
+            .await
             .map_err(|e| format!("Rekor search failed: {}", e))?;
 
-        if !resp.status().is_success() { return Ok(None); }
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
 
-        let uuids: Vec<String> = resp.json().await
+        let uuids: Vec<String> = resp
+            .json()
+            .await
             .map_err(|e| format!("Rekor search response parse failed: {}", e))?;
-        if uuids.is_empty() { return Ok(None); }
+        if uuids.is_empty() {
+            return Ok(None);
+        }
 
         let entry_url = format!("{}/api/v1/log/entries/{}", self.rekor_url, uuids[0]);
-        let entry_resp = self.client.get(&entry_url).send().await
+        let entry_resp = self
+            .client
+            .get(&entry_url)
+            .send()
+            .await
             .map_err(|e| format!("Rekor entry fetch failed: {}", e))?;
-        if !entry_resp.status().is_success() { return Ok(None); }
+        if !entry_resp.status().is_success() {
+            return Ok(None);
+        }
 
-        let entry: serde_json::Value = entry_resp.json().await
+        let entry: serde_json::Value = entry_resp
+            .json()
+            .await
             .map_err(|e| format!("Rekor entry parse failed: {}", e))?;
 
-        let body_b64 = entry.as_object()
+        let body_b64 = entry
+            .as_object()
             .and_then(|map| map.values().next())
             .and_then(|v| v.get("body"))
             .and_then(|b| b.as_str())
             .ok_or_else(|| "Rekor entry missing body".to_string())?;
 
-        let body_bytes = base64_simd::STANDARD.decode_to_vec(body_b64.as_bytes())
+        let body_bytes = base64_simd::STANDARD
+            .decode_to_vec(body_b64.as_bytes())
             .map_err(|e| format!("Rekor body base64 decode failed: {}", e))?;
 
         let body: serde_json::Value = serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("Rekor body JSON parse failed: {}", e))?;
 
-        let cert_b64 = body.get("spec")
+        let cert_b64 = body
+            .get("spec")
             .and_then(|s| s.get("signature"))
             .and_then(|s| s.get("publicKey"))
             .and_then(|pk| pk.get("content"))
             .and_then(|c| c.as_str())
             .ok_or_else(|| "Rekor entry missing spec.signature.publicKey.content".to_string())?;
 
-        let cert_pem = base64_simd::STANDARD.decode_to_vec(cert_b64.as_bytes())
+        let cert_pem = base64_simd::STANDARD
+            .decode_to_vec(cert_b64.as_bytes())
             .map_err(|e| format!("cert PEM base64 decode failed: {}", e))?;
 
         // Parse certificate for public key
         use x509_parser::prelude::*;
         let pem_str = String::from_utf8_lossy(&cert_pem);
-        let (_, pem) = parse_x509_pem(pem_str.as_bytes())
-            .map_err(|e| format!("PEM parse failed: {}", e))?;
+        let (_, pem) =
+            parse_x509_pem(pem_str.as_bytes()).map_err(|e| format!("PEM parse failed: {}", e))?;
         let (_, cert) = X509Certificate::from_der(&pem.contents)
             .map_err(|e| format!("X509 parse failed: {}", e))?;
 
@@ -245,7 +315,8 @@ impl ExternalIdentifierResolver for FulcioResolver {
         let anchor = anchor_from_key_str(algorithm, pubkey_der);
 
         Ok(Some(ResolvedIdentity {
-            anchor, public_key: pubkey_der.to_vec(),
+            anchor,
+            public_key: pubkey_der.to_vec(),
             algorithm: algorithm.to_string(),
             service_endpoint: Some(self.rekor_url.clone()),
             handle: identifier.to_string(),
@@ -253,7 +324,9 @@ impl ExternalIdentifierResolver for FulcioResolver {
         }))
     }
 
-    fn cache_ttl_secs(&self) -> u64 { 60 }
+    fn cache_ttl_secs(&self) -> u64 {
+        60
+    }
 }
 
 // -- WebFingerResolver --------------------------------------------------------
@@ -267,7 +340,10 @@ pub struct WebFingerResolver {
 }
 
 impl WebFingerResolver {
-    pub fn new(registry: Weak<ResolverRegistry>, dns: Arc<hickory_resolver::TokioResolver>) -> Self {
+    pub fn new(
+        registry: Weak<ResolverRegistry>,
+        dns: Arc<hickory_resolver::TokioResolver>,
+    ) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -282,7 +358,9 @@ impl WebFingerResolver {
 
 #[async_trait::async_trait]
 impl ExternalIdentifierResolver for WebFingerResolver {
-    fn id_type(&self) -> &str { "webfinger" }
+    fn id_type(&self) -> &str {
+        "webfinger"
+    }
 
     fn accepts(&self, identifier: &str) -> bool {
         let clean = identifier.strip_prefix('@').unwrap_or(identifier);
@@ -304,12 +382,16 @@ impl ExternalIdentifierResolver for WebFingerResolver {
         };
 
         // Phase 2: DID -> anchor via registry
-        let registry = self.registry.upgrade()
+        let registry = self
+            .registry
+            .upgrade()
             .ok_or_else(|| "resolver registry dropped".to_string())?;
         registry.resolve(&did).await
     }
 
-    fn cache_ttl_secs(&self) -> u64 { 300 }
+    fn cache_ttl_secs(&self) -> u64 {
+        300
+    }
 }
 
 impl WebFingerResolver {
@@ -322,10 +404,14 @@ impl WebFingerResolver {
             Ok(r) => r,
             Err(_) => {
                 // Fallback: try domain part
-                let domain = handle.rsplit_once('.')
+                let domain = handle
+                    .rsplit_once('.')
                     .map(|(prefix, _)| {
-                        if let Some(pos) = prefix.rfind('.') { &handle[pos + 1..] }
-                        else { handle }
+                        if let Some(pos) = prefix.rfind('.') {
+                            &handle[pos + 1..]
+                        } else {
+                            handle
+                        }
                     })
                     .unwrap_or(handle);
                 let fallback_url = format!(
@@ -339,21 +425,31 @@ impl WebFingerResolver {
             }
         };
 
-        if !resp.status().is_success() { return Ok(None); }
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
 
-        let jrd: serde_json::Value = resp.json().await
+        let jrd: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| format!("WebFinger response parse failed: {}", e))?;
 
-        let did = jrd.get("links")
+        let did = jrd
+            .get("links")
             .and_then(|links| links.as_array())
-            .and_then(|arr| arr.iter().find_map(|link| {
-                let rel = link.get("rel")?.as_str()?;
-                if rel == "self" {
-                    link.get("href").and_then(|h| h.as_str())
-                        .filter(|h| h.starts_with("did:"))
-                        .map(|h| h.to_string())
-                } else { None }
-            }));
+            .and_then(|arr| {
+                arr.iter().find_map(|link| {
+                    let rel = link.get("rel")?.as_str()?;
+                    if rel == "self" {
+                        link.get("href")
+                            .and_then(|h| h.as_str())
+                            .filter(|h| h.starts_with("did:"))
+                            .map(|h| h.to_string())
+                    } else {
+                        None
+                    }
+                })
+            });
 
         Ok(did)
     }
@@ -365,7 +461,8 @@ impl WebFingerResolver {
             Err(_) => return Ok(None),
         };
 
-        let did = txt_lookup.iter()
+        let did = txt_lookup
+            .iter()
             .flat_map(|txt| txt.iter())
             .find_map(|data| {
                 let s = String::from_utf8_lossy(data);
@@ -385,11 +482,14 @@ pub struct NixKeyResolver {
 }
 
 impl NixKeyResolver {
-    pub fn new(keys: Vec<(String, Vec<u8>)>) -> Self { Self { keys } }
+    pub fn new(keys: Vec<(String, Vec<u8>)>) -> Self {
+        Self { keys }
+    }
 
     pub fn from_env() -> Self {
         let raw = std::env::var("KAPPA_NIX_TRUSTED_KEYS").unwrap_or_default();
-        let keys = raw.split(',')
+        let keys = raw
+            .split(',')
             .filter(|s| !s.is_empty())
             .filter_map(|entry| {
                 let (name, b64) = entry.split_once(':')?;
@@ -403,7 +503,9 @@ impl NixKeyResolver {
 
 #[async_trait::async_trait]
 impl ExternalIdentifierResolver for NixKeyResolver {
-    fn id_type(&self) -> &str { "nix-key" }
+    fn id_type(&self) -> &str {
+        "nix-key"
+    }
 
     fn accepts(&self, identifier: &str) -> bool {
         self.keys.iter().any(|(name, _)| name == identifier)
@@ -414,16 +516,21 @@ impl ExternalIdentifierResolver for NixKeyResolver {
             if name == identifier {
                 let anchor = anchor_from_key_str("ed25519", pubkey);
                 return Ok(Some(ResolvedIdentity {
-                    anchor, public_key: pubkey.clone(),
+                    anchor,
+                    public_key: pubkey.clone(),
                     algorithm: "ed25519".to_string(),
-                    service_endpoint: None, handle: name.clone(), evidence: None,
+                    service_endpoint: None,
+                    handle: name.clone(),
+                    evidence: None,
                 }));
             }
         }
         Ok(None)
     }
 
-    fn cache_ttl_secs(&self) -> u64 { u64::MAX }
+    fn cache_ttl_secs(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 // -- Registry builder ---------------------------------------------------------

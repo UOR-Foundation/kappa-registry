@@ -3,8 +3,8 @@
 pub mod auth;
 pub mod body_limit;
 pub mod cache;
-pub mod namespace;
 pub mod cors;
+pub mod namespace;
 pub mod proxy_trust;
 pub mod rate_limit;
 pub mod request_id;

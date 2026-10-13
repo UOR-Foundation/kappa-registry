@@ -7,8 +7,8 @@
 
 use std::str::FromStr;
 
-use nix_derivation::nixbase32;
 use nix_derivation::StorePath;
+use nix_derivation::nixbase32;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -82,7 +82,7 @@ impl NarInfo {
                 &line[colon_pos + 2..]
             } else if line.len() > colon_pos + 1 {
                 // "Key: " with nothing after space, or "Key:X" (no space)
-                &line[colon_pos + 1..].trim_start()
+                line[colon_pos + 1..].trim_start()
             } else {
                 ""
             };
@@ -165,10 +165,8 @@ impl NarInfo {
         let references = references.unwrap_or_default();
 
         // Mandatory field checks
-        let store_path =
-            store_path.ok_or(NarInfoError::MissingField("StorePath"))?;
-        let nar_hash =
-            nar_hash.ok_or(NarInfoError::MissingField("NarHash"))?;
+        let store_path = store_path.ok_or(NarInfoError::MissingField("StorePath"))?;
+        let nar_hash = nar_hash.ok_or(NarInfoError::MissingField("NarHash"))?;
         let url = url.ok_or(NarInfoError::MissingField("URL"))?;
         if url.is_empty() {
             return Err(NarInfoError::MissingField("URL"));
@@ -494,7 +492,10 @@ NarSize: 100\n\
 References: \n\
 CA: fixed:r:sha256:0000000000000000000000000000000000000000000000000000\n";
         let parsed = NarInfo::parse(text).unwrap();
-        assert_eq!(parsed.ca.as_deref(), Some("fixed:r:sha256:0000000000000000000000000000000000000000000000000000"));
+        assert_eq!(
+            parsed.ca.as_deref(),
+            Some("fixed:r:sha256:0000000000000000000000000000000000000000000000000000")
+        );
         let serialized = parsed.to_narinfo_string();
         assert_eq!(serialized, text);
     }

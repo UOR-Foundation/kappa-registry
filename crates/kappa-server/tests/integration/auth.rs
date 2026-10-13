@@ -11,7 +11,7 @@
 //! of 401 until the bearer auth middleware exists.
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 
@@ -26,10 +26,7 @@ fn anchor_from_seed(seed: &[u8; 32]) -> String {
 fn authed_server() -> (ServerGuard, String, tempfile::TempDir) {
     let anchor1 = anchor_from_seed(&[1u8; 32]);
     let anchor2 = anchor_from_seed(&[2u8; 32]);
-    let tokens = format!(
-        "test-secret-token={},backup-token={}",
-        anchor1, anchor2
-    );
+    let tokens = format!("test-secret-token={},backup-token={}", anchor1, anchor2);
     start_server_with_env(&[
         ("KAPPA_AUTH_REQUIRED", "true"),
         ("KAPPA_AUTH_TOKENS", &tokens),
@@ -305,7 +302,10 @@ fn auth_layer_before_ratelimit() {
     // during the test. 60s ensures no replenishment during the test window.
     let (guard, base, _tmp) = start_server_with_env(&[
         ("KAPPA_AUTH_REQUIRED", "true"),
-        ("KAPPA_AUTH_TOKENS", &format!("rate-test-token={}", anchor_from_seed(&[3u8; 32]))),
+        (
+            "KAPPA_AUTH_TOKENS",
+            &format!("rate-test-token={}", anchor_from_seed(&[3u8; 32])),
+        ),
         ("KAPPA_RATELIMIT_READ_PERIOD_MS", "60000"),
         ("KAPPA_RATELIMIT_READ_BURST", "3"),
     ]);

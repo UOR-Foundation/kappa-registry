@@ -39,9 +39,7 @@ pub fn response_compliance_layer<'a>(
                 if method == Method::HEAD {
                     check(h, "content-length", &path, &rid);
                 }
-            } else if h
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
+            } else if h.get("content-type").and_then(|v| v.to_str().ok())
                 == Some("text/event-stream")
             {
                 check(h, "cache-control", &path, &rid);
@@ -56,12 +54,7 @@ fn is_blob(path: &str) -> bool {
     path.contains("/blobs/") && !path.contains("/uploads") && !path.contains("/_meta")
 }
 
-fn check(
-    headers: &topcoat::router::HeaderMap,
-    name: &str,
-    path: &str,
-    request_id: &str,
-) {
+fn check(headers: &topcoat::router::HeaderMap, name: &str, path: &str, request_id: &str) {
     if !headers.contains_key(name) {
         tracing::warn!(
             header = name,

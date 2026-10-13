@@ -8,9 +8,7 @@ use std::borrow::Cow;
 use topcoat::context::Cx;
 use topcoat::router::error::{bad_request, not_found};
 use topcoat::router::response::{IntoResponse, Response};
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use kappa_core::kappa::{axis_of, compute_kappa, KappaLabel};
 use kappa_core::types::{Direction, Edge, EdgeQuery, EdgeRelation, NamespaceRef};
@@ -49,7 +47,12 @@ fn witness_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
-async fn compose(cx: &Cx, ns: &NamespaceRef, op_token: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn compose(
+    cx: &Cx,
+    ns: &NamespaceRef,
+    op_token: &str,
+    body: &[u8],
+) -> topcoat::Result<Response> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
     let operand_strs: Vec<String> = v["operands"]
@@ -120,7 +123,7 @@ async fn compose(cx: &Cx, ns: &NamespaceRef, op_token: &str, body: &[u8]) -> top
     let c = canon.clone();
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.ingest_verified(&ck,&c)
+        move || s.ingest_verified(&ck, &c)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?
@@ -149,7 +152,7 @@ async fn compose(cx: &Cx, ns: &NamespaceRef, op_token: &str, body: &[u8]) -> top
     let w = witness_data;
     tokio::task::spawn_blocking({
         let s = s.clone();
-        move || s.ingest_verified(&wk,&w)
+        move || s.ingest_verified(&wk, &w)
     })
     .await
     .map_err(|e| bad_request(e.to_string()))?

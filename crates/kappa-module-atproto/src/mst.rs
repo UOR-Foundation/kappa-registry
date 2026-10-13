@@ -30,6 +30,9 @@ pub trait BlockStore {
 }
 
 /// In-memory block store for testing.
+/// An encoded MST block: (CID, node bytes).
+pub type MstBlock = ([u8; 36], Vec<u8>);
+
 pub struct MemoryBlockStore {
     blocks: BTreeMap<[u8; 36], Vec<u8>>,
 }
@@ -107,10 +110,26 @@ pub fn leading_zeros(key: &str) -> usize {
     let hash = Sha256::digest(key.as_bytes());
     let mut zeros = 0;
     for &byte in hash.as_slice() {
-        if byte < 64 { zeros += 1; } else { break; }
-        if byte < 16 { zeros += 1; } else { break; }
-        if byte < 4 { zeros += 1; } else { break; }
-        if byte == 0 { zeros += 1; } else { break; }
+        if byte < 64 {
+            zeros += 1;
+        } else {
+            break;
+        }
+        if byte < 16 {
+            zeros += 1;
+        } else {
+            break;
+        }
+        if byte < 4 {
+            zeros += 1;
+        } else {
+            break;
+        }
+        if byte == 0 {
+            zeros += 1;
+        } else {
+            break;
+        }
     }
     zeros
 }
@@ -285,7 +304,7 @@ impl Mst {
     ///
     /// The returned all_blocks vec contains every MST node block stored,
     /// enabling the caller to create CID->kappa bridge tags for each.
-    pub fn write_to_store(&self, store: &mut dyn BlockStore) -> ([u8; 36], Vec<([u8; 36], Vec<u8>)>) {
+    pub fn write_to_store(&self, store: &mut dyn BlockStore) -> ([u8; 36], Vec<MstBlock>) {
         let mut all_blocks = Vec::new();
         if self.entries.is_empty() {
             let node_bytes = encode_node(None, &[]);
@@ -382,11 +401,9 @@ fn build_subtree(
     while i < end && keys[i].2 < layer {
         i += 1;
     }
-    if i > sub_start {
-        if layer > 0 {
-            let sub_cid = build_subtree(keys, sub_start, i, layer - 1, store, all_blocks);
-            left_subtree = Some(sub_cid);
-        }
+    if i > sub_start && layer > 0 {
+        let sub_cid = build_subtree(keys, sub_start, i, layer - 1, store, all_blocks);
+        left_subtree = Some(sub_cid);
     }
 
     while i < end {
@@ -395,7 +412,7 @@ fn build_subtree(
             let key = keys[i].0;
             let value = keys[i].1;
             let prefix_len = count_prefix_len(&prev_key, key);
-            let key_suffix = key[prefix_len..].as_bytes().to_vec();
+            let key_suffix = key.as_bytes()[prefix_len..].to_vec();
 
             // Look ahead for a right subtree
             let leaf_idx = i;
@@ -406,7 +423,14 @@ fn build_subtree(
             }
 
             let right_subtree = if i > sub_start && layer > 0 {
-                Some(build_subtree(keys, sub_start, i, layer - 1, store, all_blocks))
+                Some(build_subtree(
+                    keys,
+                    sub_start,
+                    i,
+                    layer - 1,
+                    store,
+                    all_blocks,
+                ))
             } else {
                 None
             };
@@ -435,10 +459,7 @@ fn build_subtree(
 
 /// Count the length of the common prefix between two strings.
 fn count_prefix_len(a: &str, b: &str) -> usize {
-    a.bytes()
-        .zip(b.bytes())
-        .take_while(|(x, y)| x == y)
-        .count()
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -777,12 +798,11 @@ fn skip_cbor(data: &[u8], pos: &mut usize) -> Result<(), MstError> {
     *pos += 1;
 
     match major {
-        0 | 1 => {
-            if additional >= 24 && additional <= 27 {
+        0 | 1
+            if (24..=27).contains(&additional) => {
                 let extra = 1usize << (additional - 24);
                 *pos += extra;
             }
-        }
         2 | 3 => {
             let len = read_cbor_length(additional, data, pos)?;
             *pos += len;
@@ -802,19 +822,18 @@ fn skip_cbor(data: &[u8], pos: &mut usize) -> Result<(), MstError> {
         }
         6 => {
             // tag: skip the additional info (tag number) then the value
-            if additional >= 24 && additional <= 27 {
+            if (24..=27).contains(&additional) {
                 let extra = 1usize << (additional - 24);
                 *pos += extra;
             }
             skip_cbor(data, pos)?;
         }
-        7 => {
+        7
             // simple/float
-            if additional >= 24 && additional <= 27 {
+            if (24..=27).contains(&additional) => {
                 let extra = 1usize << (additional - 24);
                 *pos += extra;
             }
-        }
         _ => {}
     }
     Ok(())

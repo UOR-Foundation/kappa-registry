@@ -118,10 +118,7 @@ impl PersistentStoreConfig {
 }
 
 impl PersistentStore {
-    pub fn new(
-        config: PersistentStoreConfig,
-        clock: Arc<dyn Clock>,
-    ) -> Result<Self, StoreError> {
+    pub fn new(config: PersistentStoreConfig, clock: Arc<dyn Clock>) -> Result<Self, StoreError> {
         let blob_root = config.blob_root;
         let db_path = config.db_path;
         let fsync = config.fsync;
@@ -160,8 +157,7 @@ impl PersistentStore {
                 .map_err(Self::redb_err)?;
             txn.open_table(tables::CREDENTIALS)
                 .map_err(Self::redb_err)?;
-            txn.open_table(tables::VERSIONS)
-                .map_err(Self::redb_err)?;
+            txn.open_table(tables::VERSIONS).map_err(Self::redb_err)?;
             txn.open_table(tables::COMPRESSION_RECORDS)
                 .map_err(Self::redb_err)?;
             txn.open_multimap_table(tables::IDENTITY_BINDINGS)
@@ -197,9 +193,7 @@ impl PersistentStore {
             None => None,
         };
 
-        let staging_root = blob_root.parent()
-            .unwrap_or(&blob_root)
-            .join("staging");
+        let staging_root = blob_root.parent().unwrap_or(&blob_root).join("staging");
         let _ = std::fs::create_dir_all(&staging_root);
         // Startup cleanup: remove orphaned staging files from prior crashes
         if let Ok(entries) = std::fs::read_dir(&staging_root) {
@@ -271,10 +265,7 @@ impl PersistentStore {
     }
 
     /// Query all assertions for a subject (any facet) from the cross-namespace index.
-    pub fn assertion_index_query_subject(
-        &self,
-        subject: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    pub fn assertion_index_query_subject(&self, subject: &str) -> Result<Vec<String>, StoreError> {
         let prefix = format!("{}\x00", subject);
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
         let table = txn
@@ -323,12 +314,10 @@ impl PersistentStore {
 /// ChunkManifest edge from the object kappa to the manifest kappa.
 /// This makes part information queryable after upload completion
 /// via GetObjectAttributes.
-fn persist_part_manifest(
-    store: &PersistentStore,
-    object_kappa: &str,
-    parts: &[PartDigests],
-) {
-    if parts.is_empty() { return; }
+fn persist_part_manifest(store: &PersistentStore, object_kappa: &str, parts: &[PartDigests]) {
+    if parts.is_empty() {
+        return;
+    }
     let manifest_json = serde_json::json!({
         "parts": parts.iter().map(|p| serde_json::json!({
             "part_number": p.part_number,
@@ -342,15 +331,20 @@ fn persist_part_manifest(
     });
     let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap_or_default();
     use kappa_core::store::KappaStore;
-    if let Ok(manifest_result) = store.ingest_compute(kappa_core::kappa::Axis::Sha256, &manifest_bytes) {
-        let _ = store.edge_put_impl("_manifests", &kappa_core::types::Edge {
-            source: object_kappa.to_string(),
-            target: manifest_result.kappa,
-            relation: kappa_core::types::EdgeRelation::ChunkManifest,
-            asserter: "_system".to_string(),
-            value_kappa: None,
-            metadata: None,
-        });
+    if let Ok(manifest_result) =
+        store.ingest_compute(kappa_core::kappa::Axis::Sha256, &manifest_bytes)
+    {
+        let _ = store.edge_put_impl(
+            "_manifests",
+            &kappa_core::types::Edge {
+                source: object_kappa.to_string(),
+                target: manifest_result.kappa,
+                relation: kappa_core::types::EdgeRelation::ChunkManifest,
+                asserter: "_system".to_string(),
+                value_kappa: None,
+                metadata: None,
+            },
+        );
     }
 }
 
@@ -360,7 +354,7 @@ fn compute_composite_etag(parts: &[PartDigests]) -> Option<String> {
     }
     let mut hasher = md5::Md5::new();
     for part in parts {
-        Md5Digest::update(&mut hasher, &part.md5);
+        Md5Digest::update(&mut hasher, part.md5.as_slice());
     }
     let combined = hasher.finalize();
     Some(format!("\"{}-{}\"", hex::encode(combined), parts.len()))
@@ -383,7 +377,9 @@ impl KappaStore for PersistentStore {
 
         let mut additional_kappas = Vec::new();
         for axis in self.mandatory_axes() {
-            if axis == client_axis { continue; }
+            if axis == client_axis {
+                continue;
+            }
             let additional = kappa_core::verified::VerifiedContent::compute(axis, content.to_vec())
                 .map_err(|e| StoreError::Rejected(e.to_string()))?;
             let additional_kappa = additional.kappa().to_string();
@@ -392,7 +388,8 @@ impl KappaStore for PersistentStore {
                 self.blob_put_impl(&additional)?;
             } else {
                 let primary_path = kappa_core::kappa::blob_path_for(&self.blob_root, &kappa)?;
-                let alt_path = kappa_core::kappa::blob_path_for(&self.blob_root, &additional_kappa)?;
+                let alt_path =
+                    kappa_core::kappa::blob_path_for(&self.blob_root, &additional_kappa)?;
                 if !alt_path.exists() {
                     if let Some(parent) = alt_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -419,16 +416,20 @@ impl KappaStore for PersistentStore {
 
         let mut additional_kappas = Vec::new();
         for mandatory in self.mandatory_axes() {
-            if mandatory == axis { continue; }
-            let additional = kappa_core::verified::VerifiedContent::compute(mandatory, content.to_vec())
-                .map_err(|e| StoreError::Rejected(e.to_string()))?;
+            if mandatory == axis {
+                continue;
+            }
+            let additional =
+                kappa_core::verified::VerifiedContent::compute(mandatory, content.to_vec())
+                    .map_err(|e| StoreError::Rejected(e.to_string()))?;
             let additional_kappa = additional.kappa().to_string();
 
             if self.encryption_key.is_some() {
                 self.blob_put_impl(&additional)?;
             } else {
                 let primary_path = kappa_core::kappa::blob_path_for(&self.blob_root, &kappa)?;
-                let alt_path = kappa_core::kappa::blob_path_for(&self.blob_root, &additional_kappa)?;
+                let alt_path =
+                    kappa_core::kappa::blob_path_for(&self.blob_root, &additional_kappa)?;
                 if !alt_path.exists() {
                     if let Some(parent) = alt_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -443,7 +444,10 @@ impl KappaStore for PersistentStore {
             .with_additional(additional_kappas))
     }
 
-    fn blob_put_verified(&self, content: &kappa_core::verified::VerifiedContent) -> Result<bool, StoreError> {
+    fn blob_put_verified(
+        &self,
+        content: &kappa_core::verified::VerifiedContent,
+    ) -> Result<bool, StoreError> {
         self.blob_put_impl(content)
     }
     fn blob_get(&self, kappa: &str) -> Result<Vec<u8>, StoreError> {
@@ -458,23 +462,13 @@ impl KappaStore for PersistentStore {
     fn blob_size(&self, kappa: &str) -> Result<u64, StoreError> {
         self.blob_size_impl(kappa)
     }
-    fn blob_get_range(
-        &self,
-        kappa: &str,
-        offset: u64,
-        length: u64,
-    ) -> Result<Vec<u8>, StoreError> {
+    fn blob_get_range(&self, kappa: &str, offset: u64, length: u64) -> Result<Vec<u8>, StoreError> {
         self.blob_get_range_impl(kappa, offset, length)
     }
     fn blob_list(&self) -> Result<Vec<String>, StoreError> {
         self.blob_list_impl()
     }
-    fn blob_put_meta(
-        &self,
-        kappa: &str,
-        key: &str,
-        value: &[u8],
-    ) -> Result<(), StoreError> {
+    fn blob_put_meta(&self, kappa: &str, key: &str, value: &[u8]) -> Result<(), StoreError> {
         self.blob_put_meta_impl(kappa, key, value)
     }
     fn blob_get_meta(&self, kappa: &str, key: &str) -> Result<Vec<u8>, StoreError> {
@@ -565,7 +559,12 @@ impl KappaStore for PersistentStore {
         compression: &str,
         uncompressed_size: u64,
     ) -> Result<kappa_core::store::IngestResult, StoreError> {
-        self.ingest_compressed_impl(uncompressed_hash, compressed_content, compression, uncompressed_size)
+        self.ingest_compressed_impl(
+            uncompressed_hash,
+            compressed_content,
+            compression,
+            uncompressed_size,
+        )
     }
     fn blob_open_compressed(
         &self,
@@ -647,7 +646,10 @@ impl KappaStore for PersistentStore {
     ) -> Result<kappa_core::store::NamespaceRecord, StoreError> {
         self.namespace_info_impl(name, protocol)
     }
-    fn namespace_list(&self, protocol: Option<&str>) -> Result<Vec<kappa_core::store::NamespaceRecord>, StoreError> {
+    fn namespace_list(
+        &self,
+        protocol: Option<&str>,
+    ) -> Result<Vec<kappa_core::store::NamespaceRecord>, StoreError> {
         self.namespace_list_impl_v2(protocol)
     }
     fn namespace_exists(&self, name: &str, protocol: Option<&str>) -> Result<bool, StoreError> {
@@ -669,10 +671,7 @@ impl KappaStore for PersistentStore {
     ) -> Result<(), StoreError> {
         PersistentStore::assertion_index_put(self, subject, facet, assertion_kappa)
     }
-    fn assertion_index_query_subject(
-        &self,
-        subject: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    fn assertion_index_query_subject(&self, subject: &str) -> Result<Vec<String>, StoreError> {
         PersistentStore::assertion_index_query_subject(self, subject)
     }
 
@@ -722,28 +721,38 @@ impl KappaStore for PersistentStore {
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 std::fs::OpenOptions::new()
-                    .create(true).write(true).mode(0o600)
-                    .open(&staging_path).map_err(StoreError::Io)?;
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(&staging_path)
+                    .map_err(StoreError::Io)?;
             }
             #[cfg(not(unix))]
             {
                 std::fs::OpenOptions::new()
-                    .create(true).write(true)
-                    .open(&staging_path).map_err(StoreError::Io)?;
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&staging_path)
+                    .map_err(StoreError::Io)?;
             }
         }
         let mut sessions = self.upload_sessions.lock().unwrap();
-        sessions.insert(id.clone(), DiskUploadSession {
-            namespace: namespace.as_str().to_string(),
-            staging_path,
-            offset: 0,
-            max_size,
-            created_at: std::time::Instant::now(),
-            part_digests: Vec::new(),
-            current_md5: md5::Md5::new(),
-            current_crc32c: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi),
-            current_crc64nvme: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme),
-        });
+        sessions.insert(
+            id.clone(),
+            DiskUploadSession {
+                namespace: namespace.as_str().to_string(),
+                staging_path,
+                offset: 0,
+                max_size,
+                created_at: std::time::Instant::now(),
+                part_digests: Vec::new(),
+                current_md5: md5::Md5::new(),
+                current_crc32c: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi),
+                current_crc64nvme: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme),
+            },
+        );
         Ok(id)
     }
 
@@ -754,14 +763,18 @@ impl KappaStore for PersistentStore {
         data: &[u8],
     ) -> Result<u64, StoreError> {
         let mut sessions = self.upload_sessions.lock().unwrap();
-        let session = sessions.get_mut(upload_id)
+        let session = sessions
+            .get_mut(upload_id)
             .ok_or_else(|| StoreError::NotFound(format!("upload {}", upload_id)))?;
         if let Some(timeout) = self.upload_timeout_secs {
             if session.created_at.elapsed() > std::time::Duration::from_secs(timeout) {
                 let staging = session.staging_path.clone();
                 sessions.remove(upload_id);
                 let _ = std::fs::remove_file(&staging);
-                return Err(StoreError::NotFound(format!("upload {} expired", upload_id)));
+                return Err(StoreError::NotFound(format!(
+                    "upload {} expired",
+                    upload_id
+                )));
             }
         }
         if offset != session.offset {
@@ -773,7 +786,8 @@ impl KappaStore for PersistentStore {
         let new_total = session.offset + data.len() as u64;
         if session.max_size > 0 && new_total > session.max_size {
             return Err(StoreError::Rejected(format!(
-                "upload exceeds max size {}", session.max_size
+                "upload exceeds max size {}",
+                session.max_size
             )));
         }
         use std::io::Write;
@@ -814,19 +828,24 @@ impl KappaStore for PersistentStore {
     ) -> Result<kappa_core::store::IngestResult, StoreError> {
         let (staging_path, part_digests) = {
             let mut sessions = self.upload_sessions.lock().unwrap();
-            let session = sessions.remove(upload_id)
+            let session = sessions
+                .remove(upload_id)
                 .ok_or_else(|| StoreError::NotFound(format!("upload {}", upload_id)))?;
             if let Some(timeout) = self.upload_timeout_secs {
                 if session.created_at.elapsed() > std::time::Duration::from_secs(timeout) {
                     let _ = std::fs::remove_file(&session.staging_path);
-                    return Err(StoreError::NotFound(format!("upload {} expired", upload_id)));
+                    return Err(StoreError::NotFound(format!(
+                        "upload {} expired",
+                        upload_id
+                    )));
                 }
             }
             (session.staging_path, session.part_digests)
         };
 
         let algo = match claimed_digest {
-            Some(claimed) => claimed.split_once(':')
+            Some(claimed) => claimed
+                .split_once(':')
                 .map(|(a, _)| a.to_string())
                 .unwrap_or_else(|| "sha256".to_string()),
             None => "sha256".to_string(),
@@ -850,14 +869,14 @@ impl KappaStore for PersistentStore {
                 let _ = std::fs::remove_file(&staging_path);
                 return Err(StoreError::Rejected(format!(
                     "digest mismatch: expected {}, computed {}",
-                    claimed, proof.kappa()
+                    claimed,
+                    proof.kappa()
                 )));
             }
         }
 
         let (final_digest, additional_pairs) = proof.into_parts();
-        let additional_kappas: Vec<String> = additional_pairs.into_iter()
-            .map(|(_, k)| k).collect();
+        let additional_kappas: Vec<String> = additional_pairs.into_iter().map(|(_, k)| k).collect();
 
         if let Some(enc) = &self.blob_encryptor {
             let ct_tmp = staging_path.with_extension("ct.tmp");
@@ -886,7 +905,9 @@ impl KappaStore for PersistentStore {
                 std::fs::rename(&ct_tmp, &blob_path).map_err(StoreError::Io)?;
                 if self.fsync {
                     if let Some(p) = blob_path.parent() {
-                        if let Ok(d) = std::fs::File::open(p) { let _ = d.sync_all(); }
+                        if let Ok(d) = std::fs::File::open(p) {
+                            let _ = d.sync_all();
+                        }
                     }
                 }
                 true
@@ -896,11 +917,17 @@ impl KappaStore for PersistentStore {
                 use crate::blob::encode_binding;
                 let txn = self.db.begin_write().map_err(Self::redb_err)?;
                 {
-                    let mut table = txn.open_table(tables::BINDING_RECORDS).map_err(Self::redb_err)?;
+                    let mut table = txn
+                        .open_table(tables::BINDING_RECORDS)
+                        .map_err(Self::redb_err)?;
                     let rec = encode_binding(&kappa, &base_nonce, plaintext_size);
-                    table.insert(final_digest.as_str(), rec.as_slice()).map_err(Self::redb_err)?;
+                    table
+                        .insert(final_digest.as_str(), rec.as_slice())
+                        .map_err(Self::redb_err)?;
                     for additional_sigma in &additional_kappas {
-                        table.insert(additional_sigma.as_str(), rec.as_slice()).map_err(Self::redb_err)?;
+                        table
+                            .insert(additional_sigma.as_str(), rec.as_slice())
+                            .map_err(Self::redb_err)?;
                     }
                 }
                 txn.commit().map_err(Self::redb_err)?;
@@ -917,7 +944,9 @@ impl KappaStore for PersistentStore {
                 for pd in &part_digests[1..] {
                     running = crc_fast::checksum_combine(
                         crc_fast::CrcAlgorithm::Crc32Iscsi,
-                        running, pd.crc32c, pd.size,
+                        running,
+                        pd.crc32c,
+                        pd.size,
                     );
                 }
                 Some(running as u32)
@@ -929,7 +958,9 @@ impl KappaStore for PersistentStore {
                 for pd in &part_digests[1..] {
                     running = crc_fast::checksum_combine(
                         crc_fast::CrcAlgorithm::Crc64Nvme,
-                        running, pd.crc64nvme, pd.size,
+                        running,
+                        pd.crc64nvme,
+                        pd.size,
                     );
                 }
                 Some(running)
@@ -940,13 +971,15 @@ impl KappaStore for PersistentStore {
             }
             if let Some(crc32c) = combined_crc32c {
                 let _ = self.blob_put_meta_impl(
-                    &result.kappa, "_s3_checksum_crc32c",
+                    &result.kappa,
+                    "_s3_checksum_crc32c",
                     crc32c.to_be_bytes().as_slice(),
                 );
             }
             if let Some(crc64nvme) = combined_crc64nvme {
                 let _ = self.blob_put_meta_impl(
-                    &result.kappa, "_s3_checksum_crc64nvme",
+                    &result.kappa,
+                    "_s3_checksum_crc64nvme",
                     crc64nvme.to_be_bytes().as_slice(),
                 );
             }
@@ -964,7 +997,9 @@ impl KappaStore for PersistentStore {
                 std::fs::rename(&staging_path, &blob_path).map_err(StoreError::Io)?;
                 if self.fsync {
                     if let Some(p) = blob_path.parent() {
-                        if let Ok(d) = std::fs::File::open(p) { let _ = d.sync_all(); }
+                        if let Ok(d) = std::fs::File::open(p) {
+                            let _ = d.sync_all();
+                        }
                     }
                 }
                 true
@@ -980,9 +1015,9 @@ impl KappaStore for PersistentStore {
                 }
             }
 
-            let mut result = kappa_core::store::IngestResult::new(
-                final_digest.clone(), newly_stored,
-            ).with_additional(additional_kappas);
+            let mut result =
+                kappa_core::store::IngestResult::new(final_digest.clone(), newly_stored)
+                    .with_additional(additional_kappas);
             let combined_crc32c: Option<u32> = if part_digests.is_empty() {
                 None
             } else {
@@ -990,7 +1025,9 @@ impl KappaStore for PersistentStore {
                 for pd in &part_digests[1..] {
                     running = crc_fast::checksum_combine(
                         crc_fast::CrcAlgorithm::Crc32Iscsi,
-                        running, pd.crc32c, pd.size,
+                        running,
+                        pd.crc32c,
+                        pd.size,
                     );
                 }
                 Some(running as u32)
@@ -1002,7 +1039,9 @@ impl KappaStore for PersistentStore {
                 for pd in &part_digests[1..] {
                     running = crc_fast::checksum_combine(
                         crc_fast::CrcAlgorithm::Crc64Nvme,
-                        running, pd.crc64nvme, pd.size,
+                        running,
+                        pd.crc64nvme,
+                        pd.size,
                     );
                 }
                 Some(running)
@@ -1013,13 +1052,15 @@ impl KappaStore for PersistentStore {
             }
             if let Some(crc32c) = combined_crc32c {
                 let _ = self.blob_put_meta_impl(
-                    &result.kappa, "_s3_checksum_crc32c",
+                    &result.kappa,
+                    "_s3_checksum_crc32c",
                     crc32c.to_be_bytes().as_slice(),
                 );
             }
             if let Some(crc64nvme) = combined_crc64nvme {
                 let _ = self.blob_put_meta_impl(
-                    &result.kappa, "_s3_checksum_crc64nvme",
+                    &result.kappa,
+                    "_s3_checksum_crc64nvme",
                     crc64nvme.to_be_bytes().as_slice(),
                 );
             }
@@ -1069,9 +1110,17 @@ impl KappaStore for PersistentStore {
     fn upload_part_info(&self, upload_id: &str) -> Vec<(u32, String, u64)> {
         let sessions = self.upload_sessions.lock().unwrap();
         match sessions.get(upload_id) {
-            Some(session) => session.part_digests.iter().map(|pd| {
-                (pd.part_number, format!("\"{}\"", hex::encode(pd.md5)), pd.size)
-            }).collect(),
+            Some(session) => session
+                .part_digests
+                .iter()
+                .map(|pd| {
+                    (
+                        pd.part_number,
+                        format!("\"{}\"", hex::encode(pd.md5)),
+                        pd.size,
+                    )
+                })
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -1079,7 +1128,8 @@ impl KappaStore for PersistentStore {
     fn upload_evict_expired(&self, timeout_secs: u64) -> usize {
         let mut sessions = self.upload_sessions.lock().unwrap();
         let before = sessions.len();
-        let expired: Vec<String> = sessions.iter()
+        let expired: Vec<String> = sessions
+            .iter()
             .filter(|(_, s)| s.created_at.elapsed() > std::time::Duration::from_secs(timeout_secs))
             .map(|(id, _)| id.clone())
             .collect();
@@ -1111,9 +1161,11 @@ impl KappaStore for PersistentStore {
         // Read phase: find existing entry with same target
         let existing_json: Option<String> = {
             let txn = self.db.begin_read().map_err(Self::redb_err)?;
-            let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+            let table = txn
+                .open_multimap_table(tables::IDENTITY_BINDINGS)
                 .map_err(Self::redb_err)?;
-            table.get(binding.source.as_str())
+            table
+                .get(binding.source.as_str())
                 .map_err(Self::redb_err)?
                 .filter_map(|v| v.ok().map(|v| v.value().to_string()))
                 .find(|json_str| {
@@ -1126,7 +1178,8 @@ impl KappaStore for PersistentStore {
 
         let txn = self.db.begin_write().map_err(Self::redb_err)?;
         {
-            let mut table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+            let mut table = txn
+                .open_multimap_table(tables::IDENTITY_BINDINGS)
                 .map_err(Self::redb_err)?;
             if let Some(ref old_json) = existing_json {
                 if old_json == &binding_json {
@@ -1134,11 +1187,13 @@ impl KappaStore for PersistentStore {
                     return Ok(kappa);
                 }
                 // Same target, different metadata -- remove old, insert new
-                table.remove(binding.source.as_str(), old_json.as_str())
+                table
+                    .remove(binding.source.as_str(), old_json.as_str())
                     .map_err(Self::redb_err)?;
             }
             // Insert (new binding or replacement)
-            table.insert(binding.source.as_str(), binding_json.as_str())
+            table
+                .insert(binding.source.as_str(), binding_json.as_str())
                 .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
@@ -1150,12 +1205,15 @@ impl KappaStore for PersistentStore {
         subject: &str,
     ) -> Result<Vec<kappa_core::identity::IdentityBinding>, StoreError> {
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
-        let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+        let table = txn
+            .open_multimap_table(tables::IDENTITY_BINDINGS)
             .map_err(Self::redb_err)?;
         let mut results = Vec::new();
         if let Ok(values) = table.get(subject) {
             for v in values.flatten() {
-                if let Ok(b) = serde_json::from_str::<kappa_core::identity::IdentityBinding>(v.value()) {
+                if let Ok(b) =
+                    serde_json::from_str::<kappa_core::identity::IdentityBinding>(v.value())
+                {
                     results.push(b);
                 }
             }
@@ -1172,9 +1230,11 @@ impl KappaStore for PersistentStore {
         // Read phase: find JSON strings to remove
         let to_remove: Vec<String> = {
             let txn = self.db.begin_read().map_err(Self::redb_err)?;
-            let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+            let table = txn
+                .open_multimap_table(tables::IDENTITY_BINDINGS)
                 .map_err(Self::redb_err)?;
-            table.get(subject)
+            table
+                .get(subject)
                 .map_err(Self::redb_err)?
                 .filter_map(|v| v.ok().map(|v| v.value().to_string()))
                 .filter(|json_str| {
@@ -1189,10 +1249,13 @@ impl KappaStore for PersistentStore {
         if !to_remove.is_empty() {
             let txn = self.db.begin_write().map_err(Self::redb_err)?;
             {
-                let mut table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+                let mut table = txn
+                    .open_multimap_table(tables::IDENTITY_BINDINGS)
                     .map_err(Self::redb_err)?;
                 for json_str in &to_remove {
-                    table.remove(subject, json_str.as_str()).map_err(Self::redb_err)?;
+                    table
+                        .remove(subject, json_str.as_str())
+                        .map_err(Self::redb_err)?;
                 }
             }
             txn.commit().map_err(Self::redb_err)?;
@@ -1205,14 +1268,17 @@ impl KappaStore for PersistentStore {
         asserter: &str,
     ) -> Result<Vec<kappa_core::identity::IdentityBinding>, StoreError> {
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
-        let table = txn.open_multimap_table(tables::IDENTITY_BINDINGS)
+        let table = txn
+            .open_multimap_table(tables::IDENTITY_BINDINGS)
             .map_err(Self::redb_err)?;
         let mut results = Vec::new();
         // Full scan -- IDENTITY_BINDINGS is keyed by source, not target/asserter
         for entry in table.iter().map_err(Self::redb_err)? {
             let (_key, values) = entry.map_err(Self::redb_err)?;
             for v in values.flatten() {
-                if let Ok(b) = serde_json::from_str::<kappa_core::identity::IdentityBinding>(v.value()) {
+                if let Ok(b) =
+                    serde_json::from_str::<kappa_core::identity::IdentityBinding>(v.value())
+                {
                     if b.target == asserter {
                         results.push(b);
                     }
@@ -1234,12 +1300,15 @@ impl KappaStore for PersistentStore {
         let kappa = kappa_core::kappa::kappa_from_value(succession);
         let txn = self.db.begin_write().map_err(Self::redb_err)?;
         {
-            let mut table = txn.open_table(tables::IDENTITY_SUCCESSIONS)
+            let mut table = txn
+                .open_table(tables::IDENTITY_SUCCESSIONS)
                 .map_err(Self::redb_err)?;
-            table.insert(
-                succession.old_anchor.as_str(),
-                succession.new_anchor.as_str(),
-            ).map_err(Self::redb_err)?;
+            table
+                .insert(
+                    succession.old_anchor.as_str(),
+                    succession.new_anchor.as_str(),
+                )
+                .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
 
@@ -1270,12 +1339,10 @@ impl KappaStore for PersistentStore {
         Ok(kappa)
     }
 
-    fn identity_succession_resolve(
-        &self,
-        anchor: &str,
-    ) -> Result<String, StoreError> {
+    fn identity_succession_resolve(&self, anchor: &str) -> Result<String, StoreError> {
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
-        let table = txn.open_table(tables::IDENTITY_SUCCESSIONS)
+        let table = txn
+            .open_table(tables::IDENTITY_SUCCESSIONS)
             .map_err(Self::redb_err)?;
         let mut current = anchor.to_string();
         let mut visited = std::collections::HashSet::new();
@@ -1291,7 +1358,7 @@ impl KappaStore for PersistentStore {
                     }
                     if visited.len() >= 10 {
                         return Err(StoreError::Rejected(
-                            "succession chain exceeds 10 hops".into()
+                            "succession chain exceeds 10 hops".into(),
                         ));
                     }
                     visited.insert(next.clone());
@@ -1302,12 +1369,10 @@ impl KappaStore for PersistentStore {
         }
     }
 
-    fn identity_succession_chain(
-        &self,
-        anchor: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    fn identity_succession_chain(&self, anchor: &str) -> Result<Vec<String>, StoreError> {
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
-        let table = txn.open_table(tables::IDENTITY_SUCCESSIONS)
+        let table = txn
+            .open_table(tables::IDENTITY_SUCCESSIONS)
             .map_err(Self::redb_err)?;
         let mut chain = vec![anchor.to_string()];
         let mut current = anchor.to_string();
@@ -1324,7 +1389,7 @@ impl KappaStore for PersistentStore {
                     }
                     if visited.len() >= 10 {
                         return Err(StoreError::Rejected(
-                            "succession chain exceeds 10 hops".into()
+                            "succession chain exceeds 10 hops".into(),
                         ));
                     }
                     visited.insert(next.clone());
@@ -1346,9 +1411,8 @@ mod tests {
 
     fn new_store() -> (PersistentStore, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = PersistentStoreConfig::new(
-            tmp.path().join("blobs"), tmp.path().join("state.redb"),
-        );
+        let mut config =
+            PersistentStoreConfig::new(tmp.path().join("blobs"), tmp.path().join("state.redb"));
         config.fsync = false;
         let clock = Arc::new(NtpLamportClock::new());
         let store = PersistentStore::new(config, clock).unwrap();
@@ -1356,9 +1420,7 @@ mod tests {
     }
 
     fn reopen(tmp: &std::path::Path) -> PersistentStore {
-        let mut config = PersistentStoreConfig::new(
-            tmp.join("blobs"), tmp.join("state.redb"),
-        );
+        let mut config = PersistentStoreConfig::new(tmp.join("blobs"), tmp.join("state.redb"));
         config.fsync = false;
         let clock = Arc::new(NtpLamportClock::new());
         PersistentStore::new(config, clock).unwrap()
@@ -1370,16 +1432,16 @@ mod tests {
     fn blob_roundtrip() {
         let (s, _d) = new_store();
         let k = kappa_from_bytes(b"hello");
-        assert!(s.ingest_verified(&k,b"hello").unwrap().newly_stored);
+        assert!(s.ingest_verified(&k, b"hello").unwrap().newly_stored);
         assert_eq!(s.blob_get(&k).unwrap(), b"hello");
-        assert!(!s.ingest_verified(&k,b"hello").unwrap().newly_stored);
+        assert!(!s.ingest_verified(&k, b"hello").unwrap().newly_stored);
     }
 
     #[test]
     fn blob_meta_roundtrip() {
         let (s, _d) = new_store();
         let k = kappa_from_bytes(b"meta");
-        s.ingest_verified(&k,b"meta").unwrap();
+        s.ingest_verified(&k, b"meta").unwrap();
         s.blob_put_meta(&k, "ct", b"text/plain").unwrap();
         assert_eq!(s.blob_get_meta(&k, "ct").unwrap(), b"text/plain");
         s.blob_delete_meta(&k, "ct").unwrap();
@@ -1518,14 +1580,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         {
             let s = reopen(tmp.path());
-            let ns = s.namespace_resolve_or_create("test-ns", "owner", None).unwrap();
+            let ns = s
+                .namespace_resolve_or_create("test-ns", "owner", None)
+                .unwrap();
             s.tag_set(&ns, "t", "k").unwrap();
         }
         {
             let s = reopen(tmp.path());
             assert!(s.namespace_exists("test-ns", None).unwrap());
             let records = s.namespace_list(None).unwrap();
-            assert!(records.iter().any(|r| r.aliases.contains(&"test-ns".to_string())));
+            assert!(records
+                .iter()
+                .any(|r| r.aliases.contains(&"test-ns".to_string())));
         }
     }
 
@@ -1572,7 +1638,7 @@ mod tests {
     fn blob_open_returns_file_for_existing() {
         let (s, _d) = new_store();
         let k = kappa_from_bytes(b"open-test");
-        s.ingest_verified(&k,b"open-test").unwrap();
+        s.ingest_verified(&k, b"open-test").unwrap();
         let mut file = s.blob_open(&k).unwrap();
         let mut buf = Vec::new();
         use std::io::Read;
@@ -1583,7 +1649,8 @@ mod tests {
     #[test]
     fn blob_open_not_found_for_missing() {
         let (s, _d) = new_store();
-        let result = s.blob_open("sha256:0000000000000000000000000000000000000000000000000000000000000000");
+        let result =
+            s.blob_open("sha256:0000000000000000000000000000000000000000000000000000000000000000");
         assert!(result.is_err());
     }
 
@@ -1592,7 +1659,7 @@ mod tests {
         let (s, _d) = new_store();
         let content: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let k = kappa_from_bytes(&content);
-        s.ingest_verified(&k,&content).unwrap();
+        s.ingest_verified(&k, &content).unwrap();
 
         let get_result = s.blob_get(&k).unwrap();
         let mut file = s.blob_open(&k).unwrap();
@@ -1606,7 +1673,7 @@ mod tests {
     fn blob_open_file_at_start() {
         let (s, _d) = new_store();
         let k = kappa_from_bytes(b"position-test");
-        s.ingest_verified(&k,b"position-test").unwrap();
+        s.ingest_verified(&k, b"position-test").unwrap();
         let mut file = s.blob_open(&k).unwrap();
         use std::io::Seek;
         let pos = file.stream_position().unwrap();
@@ -1748,11 +1815,20 @@ mod tests {
         assert!(!staging.exists());
 
         let kappa = &result.kappa;
-        assert_ne!(kappa, &digest, "kappa should differ from sigma under encryption");
+        assert_ne!(
+            kappa, &digest,
+            "kappa should differ from sigma under encryption"
+        );
         let blob_path = s.kappa_path(kappa).unwrap();
         let raw_disk = std::fs::read(&blob_path).unwrap();
-        assert_ne!(raw_disk, content, "raw file must be ciphertext, not plaintext");
-        assert!(raw_disk.len() > 16, "ciphertext should include tag overhead");
+        assert_ne!(
+            raw_disk, content,
+            "raw file must be ciphertext, not plaintext"
+        );
+        assert!(
+            raw_disk.len() > 16,
+            "ciphertext should include tag overhead"
+        );
     }
 
     #[test]
@@ -1770,9 +1846,8 @@ mod tests {
 
     fn new_store_with_timeout(timeout_secs: u64) -> (PersistentStore, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = PersistentStoreConfig::new(
-            tmp.path().join("blobs"), tmp.path().join("state.redb"),
-        );
+        let mut config =
+            PersistentStoreConfig::new(tmp.path().join("blobs"), tmp.path().join("state.redb"));
         config.fsync = false;
         config.upload_timeout_secs = Some(timeout_secs);
         let clock = Arc::new(NtpLamportClock::new());
@@ -1847,10 +1922,16 @@ mod tests {
         let id = s.upload_begin(&ns, 0).unwrap();
         s.upload_put_part(&id, 0, b"staging data").unwrap();
         let staging_path = s.staging_root.join(&id);
-        assert!(staging_path.exists(), "staging file should exist after put_part");
+        assert!(
+            staging_path.exists(),
+            "staging file should exist after put_part"
+        );
         std::thread::sleep(std::time::Duration::from_millis(1100));
         s.upload_evict_expired(0);
-        assert!(!staging_path.exists(), "staging file should be removed after eviction");
+        assert!(
+            !staging_path.exists(),
+            "staging file should be removed after eviction"
+        );
     }
 
     // -- edge_put_batch adversarial tests ----------------------------------------
@@ -1867,12 +1948,20 @@ mod tests {
         let (s, _d) = new_store();
         let ns = NamespaceRef::deterministic("ns");
         let edge = Edge {
-            source: "sha256:bsrc".into(), target: "sha256:btgt".into(),
-            relation: EdgeRelation::Owns, asserter: "a".into(),
-            value_kappa: None, metadata: None,
+            source: "sha256:bsrc".into(),
+            target: "sha256:btgt".into(),
+            relation: EdgeRelation::Owns,
+            asserter: "a".into(),
+            value_kappa: None,
+            metadata: None,
         };
         s.edge_put_batch(&ns, &[edge]).unwrap();
-        let q = EdgeQuery { anchor: "sha256:bsrc".into(), direction: Direction::Outbound, relation: None, asserter: None };
+        let q = EdgeQuery {
+            anchor: "sha256:bsrc".into(),
+            direction: Direction::Outbound,
+            relation: None,
+            asserter: None,
+        };
         assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 1);
     }
 
@@ -1880,14 +1969,24 @@ mod tests {
     fn edge_put_batch_multiple() {
         let (s, _d) = new_store();
         let ns = NamespaceRef::deterministic("ns");
-        let edges: Vec<Edge> = (0..10).map(|i| Edge {
-            source: format!("sha256:bs{i}"), target: format!("sha256:bt{i}"),
-            relation: EdgeRelation::RefersTo, asserter: "a".into(),
-            value_kappa: None, metadata: None,
-        }).collect();
+        let edges: Vec<Edge> = (0..10)
+            .map(|i| Edge {
+                source: format!("sha256:bs{i}"),
+                target: format!("sha256:bt{i}"),
+                relation: EdgeRelation::RefersTo,
+                asserter: "a".into(),
+                value_kappa: None,
+                metadata: None,
+            })
+            .collect();
         s.edge_put_batch(&ns, &edges).unwrap();
         for i in 0..10 {
-            let q = EdgeQuery { anchor: format!("sha256:bs{i}"), direction: Direction::Outbound, relation: None, asserter: None };
+            let q = EdgeQuery {
+                anchor: format!("sha256:bs{i}"),
+                direction: Direction::Outbound,
+                relation: None,
+                asserter: None,
+            };
             assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 1);
         }
     }
@@ -1896,13 +1995,23 @@ mod tests {
     fn edge_put_batch_large() {
         let (s, _d) = new_store();
         let ns = NamespaceRef::deterministic("ns");
-        let edges: Vec<Edge> = (0..500).map(|i| Edge {
-            source: "sha256:broot".into(), target: format!("sha256:bdep{i}"),
-            relation: EdgeRelation::RefersTo, asserter: "a".into(),
-            value_kappa: None, metadata: None,
-        }).collect();
+        let edges: Vec<Edge> = (0..500)
+            .map(|i| Edge {
+                source: "sha256:broot".into(),
+                target: format!("sha256:bdep{i}"),
+                relation: EdgeRelation::RefersTo,
+                asserter: "a".into(),
+                value_kappa: None,
+                metadata: None,
+            })
+            .collect();
         s.edge_put_batch(&ns, &edges).unwrap();
-        let q = EdgeQuery { anchor: "sha256:broot".into(), direction: Direction::Outbound, relation: Some(EdgeRelation::RefersTo), asserter: None };
+        let q = EdgeQuery {
+            anchor: "sha256:broot".into(),
+            direction: Direction::Outbound,
+            relation: Some(EdgeRelation::RefersTo),
+            asserter: None,
+        };
         assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 500);
     }
 
@@ -1911,12 +2020,38 @@ mod tests {
         let (s, _d) = new_store();
         let ns = NamespaceRef::deterministic("ns");
         let edges = vec![
-            Edge { source: "s".into(), target: "t1".into(), relation: EdgeRelation::Owns, asserter: "a".into(), value_kappa: None, metadata: None },
-            Edge { source: "s".into(), target: "t2".into(), relation: EdgeRelation::DerivedFrom, asserter: "a".into(), value_kappa: None, metadata: None },
-            Edge { source: "s".into(), target: "t3".into(), relation: EdgeRelation::RefersTo, asserter: "a".into(), value_kappa: None, metadata: None },
+            Edge {
+                source: "s".into(),
+                target: "t1".into(),
+                relation: EdgeRelation::Owns,
+                asserter: "a".into(),
+                value_kappa: None,
+                metadata: None,
+            },
+            Edge {
+                source: "s".into(),
+                target: "t2".into(),
+                relation: EdgeRelation::DerivedFrom,
+                asserter: "a".into(),
+                value_kappa: None,
+                metadata: None,
+            },
+            Edge {
+                source: "s".into(),
+                target: "t3".into(),
+                relation: EdgeRelation::RefersTo,
+                asserter: "a".into(),
+                value_kappa: None,
+                metadata: None,
+            },
         ];
         s.edge_put_batch(&ns, &edges).unwrap();
-        let q = EdgeQuery { anchor: "s".into(), direction: Direction::Outbound, relation: Some(EdgeRelation::DerivedFrom), asserter: None };
+        let q = EdgeQuery {
+            anchor: "s".into(),
+            direction: Direction::Outbound,
+            relation: Some(EdgeRelation::DerivedFrom),
+            asserter: None,
+        };
         assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 1);
     }
 
@@ -1924,13 +2059,23 @@ mod tests {
     fn edge_put_batch_all_queryable_by_target() {
         let (s, _d) = new_store();
         let ns = NamespaceRef::deterministic("ns");
-        let edges: Vec<Edge> = (0..5).map(|i| Edge {
-            source: format!("sha256:bsrc{i}"), target: "sha256:bshared".into(),
-            relation: EdgeRelation::RefersTo, asserter: "a".into(),
-            value_kappa: None, metadata: None,
-        }).collect();
+        let edges: Vec<Edge> = (0..5)
+            .map(|i| Edge {
+                source: format!("sha256:bsrc{i}"),
+                target: "sha256:bshared".into(),
+                relation: EdgeRelation::RefersTo,
+                asserter: "a".into(),
+                value_kappa: None,
+                metadata: None,
+            })
+            .collect();
         s.edge_put_batch(&ns, &edges).unwrap();
-        let q = EdgeQuery { anchor: "sha256:bshared".into(), direction: Direction::Inbound, relation: None, asserter: None };
+        let q = EdgeQuery {
+            anchor: "sha256:bshared".into(),
+            direction: Direction::Inbound,
+            relation: None,
+            asserter: None,
+        };
         assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 5);
     }
 
@@ -1940,16 +2085,26 @@ mod tests {
         let ns = NamespaceRef::deterministic("ns");
         {
             let s = reopen(tmp.path());
-            let edges: Vec<Edge> = (0..3).map(|i| Edge {
-                source: "sha256:reopen_src".into(), target: format!("sha256:reopen_tgt{i}"),
-                relation: EdgeRelation::Owns, asserter: "a".into(),
-                value_kappa: None, metadata: None,
-            }).collect();
+            let edges: Vec<Edge> = (0..3)
+                .map(|i| Edge {
+                    source: "sha256:reopen_src".into(),
+                    target: format!("sha256:reopen_tgt{i}"),
+                    relation: EdgeRelation::Owns,
+                    asserter: "a".into(),
+                    value_kappa: None,
+                    metadata: None,
+                })
+                .collect();
             s.edge_put_batch(&ns, &edges).unwrap();
         }
         {
             let s = reopen(tmp.path());
-            let q = EdgeQuery { anchor: "sha256:reopen_src".into(), direction: Direction::Outbound, relation: None, asserter: None };
+            let q = EdgeQuery {
+                anchor: "sha256:reopen_src".into(),
+                direction: Direction::Outbound,
+                relation: None,
+                asserter: None,
+            };
             assert_eq!(s.edge_query(&ns, &q).unwrap().len(), 3);
         }
     }
@@ -1963,7 +2118,9 @@ mod tests {
         let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
         let nar_hash = kappa_from_bytes(original);
 
-        let result = s.ingest_compressed(&nar_hash, &compressed, "zstd", original.len() as u64).unwrap();
+        let result = s
+            .ingest_compressed(&nar_hash, &compressed, "zstd", original.len() as u64)
+            .unwrap();
         assert!(result.newly_stored);
 
         // blob_open_compressed returns exact compressed bytes
@@ -1993,7 +2150,8 @@ mod tests {
         }
         let hash = kappa_from_bytes(original);
 
-        s.ingest_compressed(&hash, &compressed, "xz", original.len() as u64).unwrap();
+        s.ingest_compressed(&hash, &compressed, "xz", original.len() as u64)
+            .unwrap();
 
         let mut reader = s.blob_open_decompressed(&hash).unwrap();
         let mut got = Vec::new();
@@ -2009,13 +2167,15 @@ mod tests {
         let mut compressed = Vec::new();
         {
             use std::io::Write;
-            let mut enc = bzip2::write::BzEncoder::new(&mut compressed, bzip2::Compression::default());
+            let mut enc =
+                bzip2::write::BzEncoder::new(&mut compressed, bzip2::Compression::default());
             enc.write_all(original).unwrap();
             enc.finish().unwrap();
         }
         let hash = kappa_from_bytes(original);
 
-        s.ingest_compressed(&hash, &compressed, "bzip2", original.len() as u64).unwrap();
+        s.ingest_compressed(&hash, &compressed, "bzip2", original.len() as u64)
+            .unwrap();
 
         let mut reader = s.blob_open_decompressed(&hash).unwrap();
         let mut got = Vec::new();
@@ -2030,7 +2190,8 @@ mod tests {
         let original = b"no compression test";
         let hash = kappa_from_bytes(original);
 
-        s.ingest_compressed(&hash, original, "none", original.len() as u64).unwrap();
+        s.ingest_compressed(&hash, original, "none", original.len() as u64)
+            .unwrap();
 
         let mut reader = s.blob_open_compressed(&hash).unwrap();
         let mut got = Vec::new();
@@ -2046,7 +2207,7 @@ mod tests {
 
     #[test]
     fn compression_record_fields() {
-        use crate::blob::{encode_compression_record, decode_compression_record};
+        use crate::blob::{decode_compression_record, encode_compression_record};
         let rec = encode_compression_record("sha256:abc123", "zstd", 42000);
         let decoded = decode_compression_record(&rec).unwrap();
         assert_eq!(decoded.kappa, "sha256:abc123");
@@ -2057,7 +2218,9 @@ mod tests {
     #[test]
     fn compression_sigma_not_found() {
         let (s, _d) = new_store();
-        let result = s.blob_open_decompressed("sha256:0000000000000000000000000000000000000000000000000000000000000000");
+        let result = s.blob_open_decompressed(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        );
         assert!(result.is_err());
     }
 
@@ -2069,7 +2232,8 @@ mod tests {
         let hash = kappa_from_bytes(original);
 
         assert!(!s.blob_exists(&hash).unwrap());
-        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64)
+            .unwrap();
         assert!(s.blob_exists(&hash).unwrap());
     }
 
@@ -2080,7 +2244,8 @@ mod tests {
         let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
         let hash = kappa_from_bytes(original);
 
-        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64)
+            .unwrap();
         let size = s.blob_size(&hash).unwrap();
         assert_eq!(size, original.len() as u64);
         assert_ne!(size, compressed.len() as u64);
@@ -2094,7 +2259,8 @@ mod tests {
         let hash = kappa_from_bytes(original);
         {
             let s = reopen(tmp.path());
-            s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+            s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64)
+                .unwrap();
         }
         {
             let s = reopen(tmp.path());
@@ -2120,7 +2286,8 @@ mod tests {
         let original = b"seek test content for decompressed reader";
         let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
         let hash = kappa_from_bytes(original);
-        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+        s.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64)
+            .unwrap();
 
         let mut reader = s.blob_open_decompressed(&hash).unwrap();
         use std::io::{Read, Seek, SeekFrom};

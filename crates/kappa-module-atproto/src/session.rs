@@ -76,7 +76,9 @@ impl SessionStore {
     /// Password is stored as SHA-256 hash. In production use argon2.
     pub fn register_credentials(&self, did: &str, password: &str) {
         let hash = hash_password(password);
-        self.credentials.lock().unwrap()
+        self.credentials
+            .lock()
+            .unwrap()
             .insert(did.to_string(), hash);
     }
 
@@ -115,9 +117,13 @@ impl SessionStore {
             handle: handle.to_string(),
         };
 
-        self.sessions.lock().unwrap()
+        self.sessions
+            .lock()
+            .unwrap()
             .insert(access_token.clone(), session.clone());
-        self.refresh_index.lock().unwrap()
+        self.refresh_index
+            .lock()
+            .unwrap()
             .insert(refresh_token, access_token);
 
         Ok(session)
@@ -128,12 +134,15 @@ impl SessionStore {
     pub fn refresh_session(&self, refresh_token: &str) -> Result<Session, SessionError> {
         let access_token = {
             let mut idx = self.refresh_index.lock().unwrap();
-            idx.remove(refresh_token).ok_or(SessionError::InvalidToken)?
+            idx.remove(refresh_token)
+                .ok_or(SessionError::InvalidToken)?
         };
 
         let old = {
             let mut sessions = self.sessions.lock().unwrap();
-            sessions.remove(&access_token).ok_or(SessionError::InvalidToken)?
+            sessions
+                .remove(&access_token)
+                .ok_or(SessionError::InvalidToken)?
         };
 
         let now_ms = now_millis();
@@ -151,9 +160,13 @@ impl SessionStore {
             handle: old.handle,
         };
 
-        self.sessions.lock().unwrap()
+        self.sessions
+            .lock()
+            .unwrap()
             .insert(new_access.clone(), session.clone());
-        self.refresh_index.lock().unwrap()
+        self.refresh_index
+            .lock()
+            .unwrap()
             .insert(new_refresh, new_access);
 
         Ok(session)
@@ -163,16 +176,23 @@ impl SessionStore {
     pub fn delete_session(&self, access_token: &str) -> Result<(), SessionError> {
         let session = {
             let mut sessions = self.sessions.lock().unwrap();
-            sessions.remove(access_token).ok_or(SessionError::InvalidToken)?
+            sessions
+                .remove(access_token)
+                .ok_or(SessionError::InvalidToken)?
         };
-        self.refresh_index.lock().unwrap().remove(&session.refresh_token);
+        self.refresh_index
+            .lock()
+            .unwrap()
+            .remove(&session.refresh_token);
         Ok(())
     }
 
     /// Get session info by access token.
     pub fn get_session(&self, access_token: &str) -> Result<Session, SessionError> {
         let sessions = self.sessions.lock().unwrap();
-        let session = sessions.get(access_token).ok_or(SessionError::InvalidToken)?;
+        let session = sessions
+            .get(access_token)
+            .ok_or(SessionError::InvalidToken)?;
         if session.expires_at_ms < now_millis() {
             return Err(SessionError::ExpiredToken);
         }
@@ -246,14 +266,17 @@ impl SessionStore {
     /// valid. Handlers that require DPoP should use verify_dpop_request.
     pub fn validate_token(&self, access_token: &str) -> Option<String> {
         let sessions = self.sessions.lock().unwrap();
-        sessions.get(access_token)
+        sessions
+            .get(access_token)
             .filter(|s| s.expires_at_ms >= now_millis())
             .map(|s| s.did.clone())
     }
 }
 
 impl Default for SessionStore {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn hash_password(password: &str) -> String {
@@ -339,9 +362,7 @@ pub fn base64url_decode(input: &str) -> Result<Vec<u8>, SessionError> {
 /// Returns DpopClaims with the computed JKT (JWK Thumbprint).
 /// Generic over algorithm: supports ES256 (P-256) now, extensible to
 /// ES384 (P-384), ES512 (P-521), EdDSA via the algorithm dispatch.
-pub fn parse_and_verify_dpop_proof(
-    proof_jwt: &str,
-) -> Result<DpopClaims, SessionError> {
+pub fn parse_and_verify_dpop_proof(proof_jwt: &str) -> Result<DpopClaims, SessionError> {
     let parts: Vec<&str> = proof_jwt.split('.').collect();
     if parts.len() != 3 {
         return Err(SessionError::InvalidToken);
@@ -353,8 +374,8 @@ pub fn parse_and_verify_dpop_proof(
 
     // Decode header
     let header_bytes = base64url_decode(header_b64)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|_| SessionError::InvalidToken)?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|_| SessionError::InvalidToken)?;
 
     // Verify header fields
     let typ = header.get("typ").and_then(|v| v.as_str()).unwrap_or("");
@@ -371,9 +392,13 @@ pub fn parse_and_verify_dpop_proof(
 
     let (public_key_bytes, verify_algorithm) = match (alg, kty, crv) {
         ("ES256", "EC", "P-256") => {
-            let x_b64 = jwk.get("x").and_then(|v| v.as_str())
+            let x_b64 = jwk
+                .get("x")
+                .and_then(|v| v.as_str())
                 .ok_or(SessionError::InvalidToken)?;
-            let y_b64 = jwk.get("y").and_then(|v| v.as_str())
+            let y_b64 = jwk
+                .get("y")
+                .and_then(|v| v.as_str())
                 .ok_or(SessionError::InvalidToken)?;
             let x = base64url_decode(x_b64)?;
             let y = base64url_decode(y_b64)?;
@@ -396,26 +421,44 @@ pub fn parse_and_verify_dpop_proof(
     let verifier = kappa_core::crypto::verifier_for(verify_algorithm)
         .map_err(|_| SessionError::InvalidToken)?;
 
-    match verifier.verify(&public_key_bytes, signing_input.as_bytes(), &signature_bytes) {
+    match verifier.verify(
+        &public_key_bytes,
+        signing_input.as_bytes(),
+        &signature_bytes,
+    ) {
         Ok(true) => {}
         _ => return Err(SessionError::InvalidToken),
     }
 
     // Decode payload
     let payload_bytes = base64url_decode(payload_b64)?;
-    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|_| SessionError::InvalidToken)?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&payload_bytes).map_err(|_| SessionError::InvalidToken)?;
 
-    let jti = payload.get("jti").and_then(|v| v.as_str())
-        .ok_or(SessionError::InvalidToken)?.to_string();
-    let htm = payload.get("htm").and_then(|v| v.as_str())
-        .ok_or(SessionError::InvalidToken)?.to_string();
-    let htu = payload.get("htu").and_then(|v| v.as_str())
-        .ok_or(SessionError::InvalidToken)?.to_string();
-    let iat = payload.get("iat").and_then(|v| v.as_u64())
+    let jti = payload
+        .get("jti")
+        .and_then(|v| v.as_str())
+        .ok_or(SessionError::InvalidToken)?
+        .to_string();
+    let htm = payload
+        .get("htm")
+        .and_then(|v| v.as_str())
+        .ok_or(SessionError::InvalidToken)?
+        .to_string();
+    let htu = payload
+        .get("htu")
+        .and_then(|v| v.as_str())
+        .ok_or(SessionError::InvalidToken)?
+        .to_string();
+    let iat = payload
+        .get("iat")
+        .and_then(|v| v.as_u64())
         .ok_or(SessionError::InvalidToken)?;
-    let ath = payload.get("ath").and_then(|v| v.as_str())
-        .unwrap_or("").to_string();
+    let ath = payload
+        .get("ath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // Compute JWK Thumbprint from the key in the header
     let jkt = match (alg, kty, crv) {
@@ -427,7 +470,14 @@ pub fn parse_and_verify_dpop_proof(
         _ => return Err(SessionError::InvalidToken),
     };
 
-    Ok(DpopClaims { jti, htm, htu, iat, ath, jkt })
+    Ok(DpopClaims {
+        jti,
+        htm,
+        htu,
+        iat,
+        ath,
+        jkt,
+    })
 }
 
 /// Compute the JWK Thumbprint (RFC 7638) for a P-256 public key.
@@ -495,7 +545,9 @@ mod tests {
     fn session_create_and_get() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "secret");
-        let session = store.create_session("did:plc:test", "secret", "test.handle", "jkt123").unwrap();
+        let session = store
+            .create_session("did:plc:test", "secret", "test.handle", "jkt123")
+            .unwrap();
         assert!(!session.access_token.is_empty());
         assert!(!session.refresh_token.is_empty());
         assert_eq!(session.dpop_jkt, "jkt123");
@@ -509,7 +561,9 @@ mod tests {
     fn session_refresh_rotates_tokens() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "pass");
-        let session = store.create_session("did:plc:test", "pass", "h", "jkt").unwrap();
+        let session = store
+            .create_session("did:plc:test", "pass", "h", "jkt")
+            .unwrap();
 
         let refreshed = store.refresh_session(&session.refresh_token).unwrap();
         assert_ne!(refreshed.access_token, session.access_token);
@@ -526,7 +580,9 @@ mod tests {
     fn session_delete_revokes() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "pass");
-        let session = store.create_session("did:plc:test", "pass", "h", "jkt").unwrap();
+        let session = store
+            .create_session("did:plc:test", "pass", "h", "jkt")
+            .unwrap();
         store.delete_session(&session.access_token).unwrap();
         assert!(store.get_session(&session.access_token).is_err());
     }
@@ -535,14 +591,18 @@ mod tests {
     fn wrong_password_rejected() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "correct");
-        assert!(store.create_session("did:plc:test", "wrong", "h", "jkt").is_err());
+        assert!(store
+            .create_session("did:plc:test", "wrong", "h", "jkt")
+            .is_err());
     }
 
     #[test]
     fn dpop_verification_full_flow() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "pass");
-        let session = store.create_session("did:plc:test", "pass", "h", "my-jkt").unwrap();
+        let session = store
+            .create_session("did:plc:test", "pass", "h", "my-jkt")
+            .unwrap();
 
         let ath = base64url_sha256(session.access_token.as_bytes());
         let now_secs = now_millis() / 1000;
@@ -556,10 +616,14 @@ mod tests {
             jkt: "my-jkt".to_string(),
         };
 
-        let did = store.verify_dpop_request(
-            &session.access_token, &claims,
-            "POST", "https://pds.example.com/xrpc/com.atproto.repo.createRecord"
-        ).unwrap();
+        let did = store
+            .verify_dpop_request(
+                &session.access_token,
+                &claims,
+                "POST",
+                "https://pds.example.com/xrpc/com.atproto.repo.createRecord",
+            )
+            .unwrap();
         assert_eq!(did, "did:plc:test");
     }
 
@@ -567,7 +631,9 @@ mod tests {
     fn dpop_replay_rejected() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "pass");
-        let session = store.create_session("did:plc:test", "pass", "h", "jkt").unwrap();
+        let session = store
+            .create_session("did:plc:test", "pass", "h", "jkt")
+            .unwrap();
 
         let ath = base64url_sha256(session.access_token.as_bytes());
         let claims = DpopClaims {
@@ -580,12 +646,22 @@ mod tests {
         };
 
         // First request succeeds
-        store.verify_dpop_request(&session.access_token, &claims, "GET",
-            "https://pds.example.com/xrpc/test").unwrap();
+        store
+            .verify_dpop_request(
+                &session.access_token,
+                &claims,
+                "GET",
+                "https://pds.example.com/xrpc/test",
+            )
+            .unwrap();
 
         // Replay with same JTI fails
-        let result = store.verify_dpop_request(&session.access_token, &claims, "GET",
-            "https://pds.example.com/xrpc/test");
+        let result = store.verify_dpop_request(
+            &session.access_token,
+            &claims,
+            "GET",
+            "https://pds.example.com/xrpc/test",
+        );
         assert!(matches!(result, Err(SessionError::ReplayDetected)));
     }
 
@@ -593,7 +669,9 @@ mod tests {
     fn dpop_method_mismatch_rejected() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "pass");
-        let session = store.create_session("did:plc:test", "pass", "h", "jkt").unwrap();
+        let session = store
+            .create_session("did:plc:test", "pass", "h", "jkt")
+            .unwrap();
 
         let claims = DpopClaims {
             jti: "j1".to_string(),
@@ -605,8 +683,12 @@ mod tests {
         };
 
         // Request is POST but proof says GET
-        let result = store.verify_dpop_request(&session.access_token, &claims,
-            "POST", "https://pds.example.com/xrpc/test");
+        let result = store.verify_dpop_request(
+            &session.access_token,
+            &claims,
+            "POST",
+            "https://pds.example.com/xrpc/test",
+        );
         assert!(matches!(result, Err(SessionError::MethodMismatch)));
     }
 
@@ -614,7 +696,9 @@ mod tests {
     fn dpop_key_mismatch_rejected() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "pass");
-        let session = store.create_session("did:plc:test", "pass", "h", "correct-jkt").unwrap();
+        let session = store
+            .create_session("did:plc:test", "pass", "h", "correct-jkt")
+            .unwrap();
 
         let claims = DpopClaims {
             jti: "j2".to_string(),
@@ -625,8 +709,12 @@ mod tests {
             jkt: "wrong-jkt".to_string(), // wrong key
         };
 
-        let result = store.verify_dpop_request(&session.access_token, &claims,
-            "GET", "https://pds.example.com/xrpc/test");
+        let result = store.verify_dpop_request(
+            &session.access_token,
+            &claims,
+            "GET",
+            "https://pds.example.com/xrpc/test",
+        );
         assert!(matches!(result, Err(SessionError::KeyMismatch)));
     }
 
@@ -650,8 +738,13 @@ mod tests {
     fn validate_token_simple() {
         let store = SessionStore::new();
         store.register_credentials("did:plc:test", "pass");
-        let session = store.create_session("did:plc:test", "pass", "h", "jkt").unwrap();
-        assert_eq!(store.validate_token(&session.access_token), Some("did:plc:test".to_string()));
+        let session = store
+            .create_session("did:plc:test", "pass", "h", "jkt")
+            .unwrap();
+        assert_eq!(
+            store.validate_token(&session.access_token),
+            Some("did:plc:test".to_string())
+        );
         assert_eq!(store.validate_token("bogus"), None);
     }
 }

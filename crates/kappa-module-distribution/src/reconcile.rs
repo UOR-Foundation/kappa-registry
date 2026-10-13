@@ -12,9 +12,7 @@ use std::borrow::Cow;
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
 use topcoat::router::response::{IntoResponse, Response};
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use kappa_core::types::NamespaceRef;
 
@@ -51,7 +49,11 @@ async fn handle(cx: &Cx, ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Resp
     }
 }
 
-async fn handle_fingerprint(cx: &Cx, ns: &NamespaceRef, v: &serde_json::Value) -> topcoat::Result<Response> {
+async fn handle_fingerprint(
+    cx: &Cx,
+    ns: &NamespaceRef,
+    v: &serde_json::Value,
+) -> topcoat::Result<Response> {
     let lower = v["lower"]
         .as_str()
         .ok_or_else(|| bad_request("missing lower"))?;
@@ -210,7 +212,11 @@ async fn handle_items_request(
         .into_response(cx)
 }
 
-async fn handle_items(cx: &Cx, ns: &NamespaceRef, v: &serde_json::Value) -> topcoat::Result<Response> {
+async fn handle_items(
+    cx: &Cx,
+    ns: &NamespaceRef,
+    v: &serde_json::Value,
+) -> topcoat::Result<Response> {
     let lower = v["lower"]
         .as_str()
         .ok_or_else(|| bad_request("missing lower"))?;

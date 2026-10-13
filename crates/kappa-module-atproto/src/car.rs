@@ -151,7 +151,7 @@ fn encode_car_header(root: Option<&[u8]>) -> Vec<u8> {
     match root {
         Some(cid) => {
             buf.push(0x81); // array of 1
-            // CBOR Tag 42 for CID
+                            // CBOR Tag 42 for CID
             buf.push(0xD8);
             buf.push(42);
             // CID as byte string (with 0x00 identity multibase prefix)
@@ -277,8 +277,7 @@ fn read_cbor_string<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a str, CarE
     if *pos + len > data.len() {
         return Err(CarError::Truncated("CBOR string data"));
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len])
-        .map_err(|_| CarError::InvalidHeader)?;
+    let s = std::str::from_utf8(&data[*pos..*pos + len]).map_err(|_| CarError::InvalidHeader)?;
     *pos += len;
     Ok(s)
 }
@@ -341,19 +340,21 @@ fn skip_cbor_value(data: &[u8], pos: &mut usize) -> Result<(), CarError> {
     *pos += 1;
 
     match major {
-        0 | 1 => {
+        0 | 1
             // unsigned/negative integer
-            if additional >= 24 && additional <= 27 {
+            if (24..=27).contains(&additional) => {
                 let extra = 1 << (additional - 24);
                 *pos += extra;
             }
-        }
         2 | 3 => {
             // byte string / text string
             let len = if additional < 24 {
                 additional as usize
             } else if additional == 24 {
-                let l = data.get(*pos).copied().ok_or(CarError::Truncated("skip len"))? as usize;
+                let l = data
+                    .get(*pos)
+                    .copied()
+                    .ok_or(CarError::Truncated("skip len"))? as usize;
                 *pos += 1;
                 l
             } else {
@@ -511,9 +512,18 @@ mod tests {
         let cid2 = crate::cid::cid_for_cbor(b"two");
         let cid3 = crate::cid::cid_for_cbor(b"three");
         let blocks = vec![
-            CarBlock { cid: cid1.to_vec(), bytes: b"one".to_vec() },
-            CarBlock { cid: cid2.to_vec(), bytes: b"two".to_vec() },
-            CarBlock { cid: cid3.to_vec(), bytes: b"three".to_vec() },
+            CarBlock {
+                cid: cid1.to_vec(),
+                bytes: b"one".to_vec(),
+            },
+            CarBlock {
+                cid: cid2.to_vec(),
+                bytes: b"two".to_vec(),
+            },
+            CarBlock {
+                cid: cid3.to_vec(),
+                bytes: b"three".to_vec(),
+            },
         ];
         let encoded = encode_car(Some(&cid1), &blocks);
         let (roots, decoded) = decode_car(&encoded).unwrap();

@@ -70,12 +70,11 @@ impl gix_pack::Find for KappaStoreObjectProvider {
         id: &oid,
         buffer: &'a mut Vec<u8>,
         _pack_cache: &mut dyn gix_pack::cache::DecodeEntry,
-    ) -> Result<
-        Option<(Data<'a>, Option<gix_pack::data::entry::Location>)>,
-        gix_object::find::Error,
-    > {
-        let kappa = self.oid_to_kappa(id)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as gix_object::find::Error)?;
+    ) -> Result<Option<(Data<'a>, Option<gix_pack::data::entry::Location>)>, gix_object::find::Error>
+    {
+        let kappa = self.oid_to_kappa(id).map_err(|e| {
+            Box::new(std::io::Error::other(e.to_string())) as gix_object::find::Error
+        })?;
 
         // Read directly into caller's buffer via blob_open. One allocation.
         // No intermediate Vec<u8>. Under encryption, BlobReader is a
@@ -85,11 +84,7 @@ impl gix_pack::Find for KappaStoreObjectProvider {
             Ok(r) => r,
             Err(kappa_core::types::StoreError::NotFound(_)) => return Ok(None),
             // Sanitize: do not leak kappa-label in error messages to gitoxide
-            Err(_) => {
-                return Err(Box::new(std::io::Error::other(
-                    "object unavailable",
-                )))
-            }
+            Err(_) => return Err(Box::new(std::io::Error::other("object unavailable"))),
         };
 
         buffer.clear();
@@ -99,13 +94,10 @@ impl gix_pack::Find for KappaStoreObjectProvider {
 
         // Parse envelope header in-place from the buffer.
         // Find the NUL byte, extract Kind, compute content offset.
-        let nul_pos = buffer
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| {
-                Box::new(std::io::Error::other("invalid git envelope: no NUL"))
-                    as gix_object::find::Error
-            })?;
+        let nul_pos = buffer.iter().position(|&b| b == 0).ok_or_else(|| {
+            Box::new(std::io::Error::other("invalid git envelope: no NUL"))
+                as gix_object::find::Error
+        })?;
 
         let kind = {
             let header = &buffer[..nul_pos];
@@ -164,11 +156,8 @@ mod tests {
     fn test_store() -> (Arc<dyn KappaStore>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        )
-        .unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
         (Arc::new(store), tmp)
     }
 
@@ -226,12 +215,9 @@ mod tests {
         let (store, _tmp) = test_store();
         let content = b"multi-axis git blob";
         let envelope_bytes = envelope::wrap(gix_object::Kind::Blob, content);
-        let sha1_kappa =
-            envelope::git_object_id_sha1(gix_object::Kind::Blob, content).unwrap();
+        let sha1_kappa = envelope::git_object_id_sha1(gix_object::Kind::Blob, content).unwrap();
 
-        let result = store
-            .ingest_verified(&sha1_kappa, &envelope_bytes)
-            .unwrap();
+        let result = store.ingest_verified(&sha1_kappa, &envelope_bytes).unwrap();
 
         assert!(!result.additional_kappas.is_empty());
         let sha256_kappa = &result.additional_kappas[0];
@@ -246,8 +232,7 @@ mod tests {
         let (store, _tmp) = test_store();
         let content: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
         let envelope_bytes = envelope::wrap(gix_object::Kind::Blob, &content);
-        let kappa =
-            envelope::git_object_id_sha1(gix_object::Kind::Blob, &content).unwrap();
+        let kappa = envelope::git_object_id_sha1(gix_object::Kind::Blob, &content).unwrap();
 
         store.ingest_verified(&kappa, &envelope_bytes).unwrap();
 

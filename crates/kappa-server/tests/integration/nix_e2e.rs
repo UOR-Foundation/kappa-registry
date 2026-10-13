@@ -55,9 +55,14 @@ fn nix_sha256_bare(data: &[u8]) -> String {
 fn nix_cache_info_returns_correct_format() {
     let (_guard, base, _tmp) = start_server();
     let c = nix_client();
-    let resp = c.get(format!("{}/nix/nix-cache-info", base)).send().unwrap();
+    let resp = c
+        .get(format!("{}/nix/nix-cache-info", base))
+        .send()
+        .unwrap();
     assert_eq!(resp.status(), 200, "nix-cache-info should return 200");
-    let ct = resp.headers().get("content-type")
+    let ct = resp
+        .headers()
+        .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(ct.contains("text/x-nix-cache-info"), "content-type: {ct}");
@@ -95,12 +100,18 @@ fn nar_put_then_narinfo_put_then_get_roundtrip() {
     let nar_url = format!("nar/{}.nar.zst", file_hash_bare);
 
     // Step 1: PUT the compressed NAR
-    let resp = c.put(format!("{}/nix/{}", base, nar_url))
+    let resp = c
+        .put(format!("{}/nix/{}", base, nar_url))
         .header("content-type", "application/x-nix-nar")
         .body(compressed.clone())
         .send()
         .unwrap();
-    assert_eq!(resp.status(), 201, "NAR PUT failed: {}", resp.text().unwrap_or_default());
+    assert_eq!(
+        resp.status(),
+        201,
+        "NAR PUT failed: {}",
+        resp.text().unwrap_or_default()
+    );
 
     // Step 2: PUT the narinfo (after NAR exists)
     let narinfo_text = format!(
@@ -120,19 +131,28 @@ fn nar_put_then_narinfo_put_then_get_roundtrip() {
         nar_size = nar.len(),
     );
 
-    let resp = c.put(format!("{}/nix/{}.narinfo", base, store_hash))
+    let resp = c
+        .put(format!("{}/nix/{}.narinfo", base, store_hash))
         .header("content-type", "text/x-nix-narinfo")
         .body(narinfo_text.clone())
         .send()
         .unwrap();
-    assert_eq!(resp.status(), 201, "narinfo PUT failed: {}", resp.text().unwrap_or_default());
+    assert_eq!(
+        resp.status(),
+        201,
+        "narinfo PUT failed: {}",
+        resp.text().unwrap_or_default()
+    );
 
     // Step 3: GET the narinfo back
-    let resp = c.get(format!("{}/nix/{}.narinfo", base, store_hash))
+    let resp = c
+        .get(format!("{}/nix/{}.narinfo", base, store_hash))
         .send()
         .unwrap();
     assert_eq!(resp.status(), 200, "narinfo GET failed");
-    let ct = resp.headers().get("content-type")
+    let ct = resp
+        .headers()
+        .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(ct.contains("text/x-nix-narinfo"), "content-type: {ct}");
@@ -141,12 +161,14 @@ fn nar_put_then_narinfo_put_then_get_roundtrip() {
     assert!(body.contains(&store_path), "body missing StorePath: {body}");
 
     // Step 4: GET the NAR back
-    let resp = c.get(format!("{}/nix/{}", base, nar_url))
-        .send()
-        .unwrap();
+    let resp = c.get(format!("{}/nix/{}", base, nar_url)).send().unwrap();
     assert_eq!(resp.status(), 200, "NAR GET failed");
     let nar_bytes = resp.bytes().unwrap();
-    assert_eq!(nar_bytes.as_ref(), compressed.as_slice(), "NAR content mismatch");
+    assert_eq!(
+        nar_bytes.as_ref(),
+        compressed.as_slice(),
+        "NAR content mismatch"
+    );
 }
 
 #[test]
@@ -171,20 +193,25 @@ fn head_narinfo_returns_200_for_existing() {
     // PUT NAR then narinfo
     c.put(format!("{}/nix/{}", base, nar_url))
         .body(compressed.clone())
-        .send().unwrap();
+        .send()
+        .unwrap();
     let narinfo_text = format!(
         "StorePath: {store_path}\nURL: {nar_url}\nCompression: zstd\n\
          FileHash: {file_hash}\nFileSize: {}\nNarHash: {nar_hash}\n\
          NarSize: {}\nReferences: \n",
-        compressed.len(), nar.len(),
+        compressed.len(),
+        nar.len(),
     );
     c.put(format!("{}/nix/{}.narinfo", base, store_hash))
         .body(narinfo_text)
-        .send().unwrap();
+        .send()
+        .unwrap();
 
     // HEAD should return 200
-    let resp = c.head(format!("{}/nix/{}.narinfo", base, store_hash))
-        .send().unwrap();
+    let resp = c
+        .head(format!("{}/nix/{}.narinfo", base, store_hash))
+        .send()
+        .unwrap();
     assert_eq!(resp.status(), 200, "HEAD existing narinfo should be 200");
 }
 
@@ -192,8 +219,13 @@ fn head_narinfo_returns_200_for_existing() {
 fn head_narinfo_returns_404_for_missing() {
     let (_guard, base, _tmp) = start_server();
     let c = nix_client();
-    let resp = c.head(format!("{}/nix/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo", base))
-        .send().unwrap();
+    let resp = c
+        .head(format!(
+            "{}/nix/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo",
+            base
+        ))
+        .send()
+        .unwrap();
     assert_eq!(resp.status(), 404, "HEAD missing narinfo should be 404");
 }
 
@@ -223,23 +255,39 @@ fn narinfo_put_before_nar_accepted() {
         "StorePath: {store_path}\nURL: {nar_url}\nCompression: zstd\n\
          FileHash: {file_hash}\nFileSize: {}\nNarHash: {nar_hash}\n\
          NarSize: {}\nReferences: \n",
-        compressed.len(), nar.len(),
+        compressed.len(),
+        nar.len(),
     );
-    let resp = c.put(format!("{}/nix/{}.narinfo", base, store_hash))
+    let resp = c
+        .put(format!("{}/nix/{}.narinfo", base, store_hash))
         .body(narinfo_text)
-        .send().unwrap();
-    assert_eq!(resp.status(), 201, "narinfo PUT before NAR should succeed: {}", resp.text().unwrap_or_default());
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "narinfo PUT before NAR should succeed: {}",
+        resp.text().unwrap_or_default()
+    );
 
     // Step 2: PUT the NAR (triggers deferred verification)
-    let resp = c.put(format!("{}/nix/{}", base, nar_url))
+    let resp = c
+        .put(format!("{}/nix/{}", base, nar_url))
         .body(compressed)
-        .send().unwrap();
+        .send()
+        .unwrap();
     assert_eq!(resp.status(), 201, "NAR PUT should succeed");
 
     // Step 3: GET narinfo still works (verification passed)
-    let resp = c.get(format!("{}/nix/{}.narinfo", base, store_hash))
-        .send().unwrap();
-    assert_eq!(resp.status(), 200, "narinfo should still be accessible after NAR upload");
+    let resp = c
+        .get(format!("{}/nix/{}.narinfo", base, store_hash))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "narinfo should still be accessible after NAR upload"
+    );
 }
 
 #[test]
@@ -264,7 +312,8 @@ fn narinfo_put_with_wrong_hash_returns_400() {
     // PUT the NAR
     c.put(format!("{}/nix/{}", base, nar_url))
         .body(compressed.clone())
-        .send().unwrap();
+        .send()
+        .unwrap();
 
     // PUT narinfo with WRONG URL hash (different store hash in URL vs body)
     let wrong_hash = "cccccccccccccccccccccccccccccccc";
@@ -272,12 +321,19 @@ fn narinfo_put_with_wrong_hash_returns_400() {
         "StorePath: {store_path}\nURL: {nar_url}\nCompression: zstd\n\
          FileHash: {file_hash}\nFileSize: {}\nNarHash: {nar_hash}\n\
          NarSize: {}\nReferences: \n",
-        compressed.len(), nar.len(),
+        compressed.len(),
+        nar.len(),
     );
-    let resp = c.put(format!("{}/nix/{}.narinfo", base, wrong_hash))
+    let resp = c
+        .put(format!("{}/nix/{}.narinfo", base, wrong_hash))
         .body(narinfo_text)
-        .send().unwrap();
-    assert_eq!(resp.status(), 400, "narinfo PUT with wrong hash should be 400");
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "narinfo PUT with wrong hash should be 400"
+    );
 }
 
 #[test]
@@ -290,23 +346,33 @@ fn nar_put_is_idempotent() {
     let file_hash_bare = nix_sha256_bare(&compressed);
     let nar_url = format!("nar/{}.nar.zst", file_hash_bare);
 
-    let resp1 = c.put(format!("{}/nix/{}", base, nar_url))
+    let resp1 = c
+        .put(format!("{}/nix/{}", base, nar_url))
         .body(compressed.clone())
-        .send().unwrap();
+        .send()
+        .unwrap();
     assert_eq!(resp1.status(), 201);
 
-    let resp2 = c.put(format!("{}/nix/{}", base, nar_url))
+    let resp2 = c
+        .put(format!("{}/nix/{}", base, nar_url))
         .body(compressed)
-        .send().unwrap();
-    assert_eq!(resp2.status(), 201, "second PUT should also succeed (idempotent)");
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp2.status(),
+        201,
+        "second PUT should also succeed (idempotent)"
+    );
 }
 
 #[test]
 fn get_missing_nar_returns_404() {
     let (_guard, base, _tmp) = start_server();
     let c = nix_client();
-    let resp = c.get(format!("{}/nix/nar/nonexistent.nar.zst", base))
-        .send().unwrap();
+    let resp = c
+        .get(format!("{}/nix/nar/nonexistent.nar.zst", base))
+        .send()
+        .unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -314,9 +380,16 @@ fn get_missing_nar_returns_404() {
 fn nix_paths_do_not_get_warning_header() {
     let (_guard, base, _tmp) = start_server();
     let c = nix_client();
-    let resp = c.get(format!("{}/nix/nix-cache-info", base)).send().unwrap();
+    let resp = c
+        .get(format!("{}/nix/nix-cache-info", base))
+        .send()
+        .unwrap();
     assert_eq!(resp.status(), 200);
     // Nix responses should NOT have the OCI Warning: 299 header
     let warning = resp.headers().get("warning");
-    assert!(warning.is_none(), "Nix response should not have Warning header, got: {:?}", warning);
+    assert!(
+        warning.is_none(),
+        "Nix response should not have Warning header, got: {:?}",
+        warning
+    );
 }

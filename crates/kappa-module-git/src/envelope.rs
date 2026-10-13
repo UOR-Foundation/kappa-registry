@@ -43,8 +43,7 @@ pub fn unwrap(envelope: &[u8]) -> Result<(Kind, &[u8]), EnvelopeError> {
         .ok_or_else(|| EnvelopeError::Invalid("no space in header".into()))?;
 
     let kind_bytes = &header[..space_pos];
-    let kind = Kind::from_bytes(kind_bytes)
-        .map_err(|e| EnvelopeError::Invalid(e.to_string()))?;
+    let kind = Kind::from_bytes(kind_bytes).map_err(|e| EnvelopeError::Invalid(e.to_string()))?;
 
     let size_bytes = &header[space_pos + 1..];
     let declared_size: usize = std::str::from_utf8(size_bytes)
@@ -93,7 +92,12 @@ pub fn kappa_to_oid(kappa: &str) -> Result<ObjectId, EnvelopeError> {
     let hash_kind = match algo {
         "sha1" => gix_hash::Kind::Sha1,
         "sha256" => gix_hash::Kind::Sha256,
-        _ => return Err(EnvelopeError::Invalid(format!("unsupported git hash: {}", algo))),
+        _ => {
+            return Err(EnvelopeError::Invalid(format!(
+                "unsupported git hash: {}",
+                algo
+            )))
+        }
     };
 
     ObjectId::from_hex(hex.as_bytes())
@@ -201,7 +205,10 @@ mod tests {
         let kappa = "sha1:ce013625030ba8dba906f756967f9e9ca394464a";
         let oid = kappa_to_oid(kappa).unwrap();
         assert_eq!(oid.kind(), gix_hash::Kind::Sha1);
-        assert_eq!(format!("{}", oid), "ce013625030ba8dba906f756967f9e9ca394464a");
+        assert_eq!(
+            format!("{}", oid),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
     }
 
     #[test]

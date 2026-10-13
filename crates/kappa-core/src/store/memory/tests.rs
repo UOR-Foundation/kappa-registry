@@ -12,11 +12,8 @@ use super::*;
 fn test_store() -> (InMemoryStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(NtpLamportClock::new());
-    let store = InMemoryStore::new(
-        MemoryStoreConfig::new(dir.path().join("blobs")),
-        clock,
-    )
-    .unwrap();
+    let store =
+        InMemoryStore::new(MemoryStoreConfig::new(dir.path().join("blobs")), clock).unwrap();
     (store, dir)
 }
 
@@ -26,7 +23,12 @@ fn test_store() -> (InMemoryStore, tempfile::TempDir) {
 fn blob_put_get_roundtrip() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"hello world");
-    assert!(store.ingest_verified(&kappa,b"hello world").unwrap().newly_stored);
+    assert!(
+        store
+            .ingest_verified(&kappa, b"hello world")
+            .unwrap()
+            .newly_stored
+    );
     assert!(kappa.starts_with("sha256:"));
     assert_eq!(store.blob_get(&kappa).unwrap(), b"hello world");
 }
@@ -35,8 +37,8 @@ fn blob_put_get_roundtrip() {
 fn blob_put_idempotent() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"same");
-    assert!(store.ingest_verified(&kappa,b"same").unwrap().newly_stored);
-    assert!(!store.ingest_verified(&kappa,b"same").unwrap().newly_stored);
+    assert!(store.ingest_verified(&kappa, b"same").unwrap().newly_stored);
+    assert!(!store.ingest_verified(&kappa, b"same").unwrap().newly_stored);
 }
 
 #[test]
@@ -50,7 +52,7 @@ fn blob_get_not_found() {
 fn blob_exists_and_delete() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"exists");
-    store.ingest_verified(&kappa,b"exists").unwrap();
+    store.ingest_verified(&kappa, b"exists").unwrap();
     assert!(store.blob_exists(&kappa).unwrap());
     store.blob_delete(&kappa).unwrap();
     assert!(!store.blob_exists(&kappa).unwrap());
@@ -60,7 +62,7 @@ fn blob_exists_and_delete() {
 fn blob_get_range() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"0123456789");
-    store.ingest_verified(&kappa,b"0123456789").unwrap();
+    store.ingest_verified(&kappa, b"0123456789").unwrap();
     assert_eq!(store.blob_get_range(&kappa, 3, 4).unwrap(), b"3456");
 }
 
@@ -68,7 +70,7 @@ fn blob_get_range() {
 fn blob_get_range_past_end() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"short");
-    store.ingest_verified(&kappa,b"short").unwrap();
+    store.ingest_verified(&kappa, b"short").unwrap();
     assert_eq!(store.blob_get_range(&kappa, 3, 100).unwrap(), b"rt");
 }
 
@@ -86,7 +88,7 @@ fn blob_put_computed_convenience() {
 fn blob_meta_put_get_roundtrip() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"meta test");
-    store.ingest_verified(&kappa,b"meta test").unwrap();
+    store.ingest_verified(&kappa, b"meta test").unwrap();
     store
         .blob_put_meta(&kappa, "content-type", b"text/plain")
         .unwrap();
@@ -100,7 +102,7 @@ fn blob_meta_put_get_roundtrip() {
 fn blob_meta_not_found() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"no meta");
-    store.ingest_verified(&kappa,b"no meta").unwrap();
+    store.ingest_verified(&kappa, b"no meta").unwrap();
     assert!(matches!(
         store.blob_get_meta(&kappa, "missing"),
         Err(StoreError::NotFound(_))
@@ -111,7 +113,7 @@ fn blob_meta_not_found() {
 fn blob_meta_delete() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"del meta");
-    store.ingest_verified(&kappa,b"del meta").unwrap();
+    store.ingest_verified(&kappa, b"del meta").unwrap();
     store.blob_put_meta(&kappa, "key", b"value").unwrap();
     store.blob_delete_meta(&kappa, "key").unwrap();
     assert!(matches!(
@@ -431,7 +433,7 @@ fn epoch_current_tracks_latest() {
 fn blob_open_default_roundtrip() {
     let (store, _dir) = test_store();
     let kappa = kappa_from_bytes(b"open default");
-    store.ingest_verified(&kappa,b"open default").unwrap();
+    store.ingest_verified(&kappa, b"open default").unwrap();
     let mut file = store.blob_open(&kappa).unwrap();
     let mut buf = Vec::new();
     use std::io::Read;
@@ -451,7 +453,7 @@ fn blob_open_default_matches_blob_get() {
     let (store, _dir) = test_store();
     let content: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
     let kappa = kappa_from_bytes(&content);
-    store.ingest_verified(&kappa,&content).unwrap();
+    store.ingest_verified(&kappa, &content).unwrap();
 
     let get_result = store.blob_get(&kappa).unwrap();
     let mut file = store.blob_open(&kappa).unwrap();
@@ -471,7 +473,9 @@ fn namespace_tracked() {
     store.tag_set(&ns, "t", "sha256:a").unwrap();
     assert!(store.namespace_exists("ns", None).unwrap());
     let records = store.namespace_list(None).unwrap();
-    assert!(records.iter().any(|r| r.aliases.contains(&"ns".to_string())));
+    assert!(records
+        .iter()
+        .any(|r| r.aliases.contains(&"ns".to_string())));
 }
 
 // -- Multi-axis ingest --------------------------------------------------------
@@ -517,7 +521,9 @@ fn ingest_compute_blake3_produces_sha256_additional() {
     let blake3_label = crate::kappa::KappaLabel::blake3(content);
     let sha256_label = crate::kappa::KappaLabel::sha256(content);
 
-    let result = store.ingest_compute(crate::kappa::Axis::Blake3, content).unwrap();
+    let result = store
+        .ingest_compute(crate::kappa::Axis::Blake3, content)
+        .unwrap();
     assert_eq!(result.kappa, blake3_label.as_str());
     assert_eq!(result.additional_kappas.len(), 1);
     assert_eq!(result.additional_kappas[0], sha256_label.as_str());
@@ -532,7 +538,9 @@ fn ingest_compute_sha256_no_additional() {
     let (store, _dir) = test_store();
     let content = b"sha256 compute no extra";
 
-    let result = store.ingest_compute(crate::kappa::Axis::Sha256, content).unwrap();
+    let result = store
+        .ingest_compute(crate::kappa::Axis::Sha256, content)
+        .unwrap();
     assert!(result.additional_kappas.is_empty());
 }
 
@@ -630,7 +638,9 @@ fn compression_memory_store_roundtrip() {
     let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
     let hash = crate::kappa::kappa_from_bytes(original);
 
-    store.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+    store
+        .ingest_compressed(&hash, &compressed, "zstd", original.len() as u64)
+        .unwrap();
 
     let mut reader = store.blob_open_decompressed(&hash).unwrap();
     let mut got = Vec::new();
@@ -676,14 +686,16 @@ fn edge_put_batch_single() {
 fn edge_put_batch_multiple() {
     let (store, _dir) = test_store();
     let ns = NamespaceRef::deterministic("ns");
-    let edges: Vec<Edge> = (0..10).map(|i| Edge {
-        source: format!("sha256:src{i}"),
-        target: format!("sha256:tgt{i}"),
-        relation: EdgeRelation::RefersTo,
-        asserter: "a".into(),
-        value_kappa: None,
-        metadata: None,
-    }).collect();
+    let edges: Vec<Edge> = (0..10)
+        .map(|i| Edge {
+            source: format!("sha256:src{i}"),
+            target: format!("sha256:tgt{i}"),
+            relation: EdgeRelation::RefersTo,
+            asserter: "a".into(),
+            value_kappa: None,
+            metadata: None,
+        })
+        .collect();
     store.edge_put_batch(&ns, &edges).unwrap();
     for i in 0..10 {
         let q = EdgeQuery {
@@ -701,14 +713,16 @@ fn edge_put_batch_multiple() {
 fn edge_put_batch_large() {
     let (store, _dir) = test_store();
     let ns = NamespaceRef::deterministic("ns");
-    let edges: Vec<Edge> = (0..500).map(|i| Edge {
-        source: "sha256:root".into(),
-        target: format!("sha256:dep{i}"),
-        relation: EdgeRelation::RefersTo,
-        asserter: "a".into(),
-        value_kappa: None,
-        metadata: None,
-    }).collect();
+    let edges: Vec<Edge> = (0..500)
+        .map(|i| Edge {
+            source: "sha256:root".into(),
+            target: format!("sha256:dep{i}"),
+            relation: EdgeRelation::RefersTo,
+            asserter: "a".into(),
+            value_kappa: None,
+            metadata: None,
+        })
+        .collect();
     store.edge_put_batch(&ns, &edges).unwrap();
     let q = EdgeQuery {
         anchor: "sha256:root".into(),
@@ -725,12 +739,38 @@ fn edge_put_batch_mixed_relations() {
     let (store, _dir) = test_store();
     let ns = NamespaceRef::deterministic("ns");
     let edges = vec![
-        Edge { source: "s".into(), target: "t1".into(), relation: EdgeRelation::Owns, asserter: "a".into(), value_kappa: None, metadata: None },
-        Edge { source: "s".into(), target: "t2".into(), relation: EdgeRelation::DerivedFrom, asserter: "a".into(), value_kappa: None, metadata: None },
-        Edge { source: "s".into(), target: "t3".into(), relation: EdgeRelation::RefersTo, asserter: "a".into(), value_kappa: None, metadata: None },
+        Edge {
+            source: "s".into(),
+            target: "t1".into(),
+            relation: EdgeRelation::Owns,
+            asserter: "a".into(),
+            value_kappa: None,
+            metadata: None,
+        },
+        Edge {
+            source: "s".into(),
+            target: "t2".into(),
+            relation: EdgeRelation::DerivedFrom,
+            asserter: "a".into(),
+            value_kappa: None,
+            metadata: None,
+        },
+        Edge {
+            source: "s".into(),
+            target: "t3".into(),
+            relation: EdgeRelation::RefersTo,
+            asserter: "a".into(),
+            value_kappa: None,
+            metadata: None,
+        },
     ];
     store.edge_put_batch(&ns, &edges).unwrap();
-    let q = EdgeQuery { anchor: "s".into(), direction: Direction::Outbound, relation: Some(EdgeRelation::DerivedFrom), asserter: None };
+    let q = EdgeQuery {
+        anchor: "s".into(),
+        direction: Direction::Outbound,
+        relation: Some(EdgeRelation::DerivedFrom),
+        asserter: None,
+    };
     let results = store.edge_query(&ns, &q).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].target, "t2");
@@ -740,14 +780,16 @@ fn edge_put_batch_mixed_relations() {
 fn edge_put_batch_all_queryable_by_target() {
     let (store, _dir) = test_store();
     let ns = NamespaceRef::deterministic("ns");
-    let edges: Vec<Edge> = (0..5).map(|i| Edge {
-        source: format!("sha256:src{i}"),
-        target: "sha256:shared_target".into(),
-        relation: EdgeRelation::RefersTo,
-        asserter: "a".into(),
-        value_kappa: None,
-        metadata: None,
-    }).collect();
+    let edges: Vec<Edge> = (0..5)
+        .map(|i| Edge {
+            source: format!("sha256:src{i}"),
+            target: "sha256:shared_target".into(),
+            relation: EdgeRelation::RefersTo,
+            asserter: "a".into(),
+            value_kappa: None,
+            metadata: None,
+        })
+        .collect();
     store.edge_put_batch(&ns, &edges).unwrap();
     let q = EdgeQuery {
         anchor: "sha256:shared_target".into(),
@@ -766,7 +808,9 @@ fn compression_memory_store_compressed_reader() {
     let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
     let hash = crate::kappa::kappa_from_bytes(original);
 
-    store.ingest_compressed(&hash, &compressed, "zstd", original.len() as u64).unwrap();
+    store
+        .ingest_compressed(&hash, &compressed, "zstd", original.len() as u64)
+        .unwrap();
 
     let mut reader = store.blob_open_compressed(&hash).unwrap();
     let mut got = Vec::new();

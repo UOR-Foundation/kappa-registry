@@ -4,11 +4,11 @@ pub mod memory;
 
 use crate::epoch::EpochRoot;
 use crate::kappa::Axis;
-use crate::verified::VerifiedContent;
 pub use crate::types::{
-    DeleteResult, Edge, EdgeQuery, EdgeRelation, EpochMutation, NamespaceRef, StoreError,
-    TagEntry, TagUpdate, VersionEntry,
+    DeleteResult, Edge, EdgeQuery, EdgeRelation, EpochMutation, NamespaceRef, StoreError, TagEntry,
+    TagUpdate, VersionEntry,
 };
+use crate::verified::VerifiedContent;
 
 /// Trait object for streaming blob reads. Implemented by std::fs::File
 /// (unencrypted path, zero-copy) and FrameDecryptingReader (encrypted
@@ -114,11 +114,7 @@ pub trait KappaStore: Send + Sync {
     /// Both InMemoryStore and PersistentStore inherit this default.
     /// PersistentStore may override for hard-link/binding-record
     /// optimization, but the observable behavior is identical.
-    fn ingest_verified(
-        &self,
-        claimed: &str,
-        content: &[u8],
-    ) -> Result<IngestResult, StoreError> {
+    fn ingest_verified(&self, claimed: &str, content: &[u8]) -> Result<IngestResult, StoreError> {
         let verified = VerifiedContent::verify(claimed, content.to_vec())
             .map_err(|e| StoreError::Rejected(e.to_string()))?;
         let client_axis = verified.axis();
@@ -127,7 +123,9 @@ pub trait KappaStore: Send + Sync {
 
         let mut additional_kappas = Vec::new();
         for axis in self.mandatory_axes() {
-            if axis == client_axis { continue; }
+            if axis == client_axis {
+                continue;
+            }
             let additional = VerifiedContent::compute(axis, content.to_vec())
                 .map_err(|e| StoreError::Rejected(e.to_string()))?;
             let additional_kappa = additional.kappa().to_string();
@@ -140,11 +138,7 @@ pub trait KappaStore: Send + Sync {
 
     /// Store bytes and compute the digest under the given axis, plus
     /// all mandatory axes that differ.
-    fn ingest_compute(
-        &self,
-        axis: Axis,
-        content: &[u8],
-    ) -> Result<IngestResult, StoreError> {
+    fn ingest_compute(&self, axis: Axis, content: &[u8]) -> Result<IngestResult, StoreError> {
         let verified = VerifiedContent::compute(axis, content.to_vec())
             .map_err(|e| StoreError::Rejected(e.to_string()))?;
         let kappa = verified.kappa().to_string();
@@ -152,7 +146,9 @@ pub trait KappaStore: Send + Sync {
 
         let mut additional_kappas = Vec::new();
         for mandatory in self.mandatory_axes() {
-            if mandatory == axis { continue; }
+            if mandatory == axis {
+                continue;
+            }
             let additional = VerifiedContent::compute(mandatory, content.to_vec())
                 .map_err(|e| StoreError::Rejected(e.to_string()))?;
             let additional_kappa = additional.kappa().to_string();
@@ -166,10 +162,7 @@ pub trait KappaStore: Send + Sync {
     /// Low-level verified put. Implementations override this.
     /// Called by ingest_verified and ingest_compute for each address.
     /// Handlers never call this directly.
-    fn blob_put_verified(
-        &self,
-        content: &VerifiedContent,
-    ) -> Result<bool, StoreError>;
+    fn blob_put_verified(&self, content: &VerifiedContent) -> Result<bool, StoreError>;
 
     // -- Blob read operations (6) ---------------------------------------------
 
@@ -199,8 +192,19 @@ pub trait KappaStore: Send + Sync {
 
     // -- Namespace-scoped metadata (2) ----------------------------------------
 
-    fn meta_set(&self, ns: &NamespaceRef, kappa: &str, key: &str, value: &str) -> Result<(), StoreError>;
-    fn meta_query(&self, ns: &NamespaceRef, key: &str, value: &str) -> Result<Vec<String>, StoreError>;
+    fn meta_set(
+        &self,
+        ns: &NamespaceRef,
+        kappa: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), StoreError>;
+    fn meta_query(
+        &self,
+        ns: &NamespaceRef,
+        key: &str,
+        value: &str,
+    ) -> Result<Vec<String>, StoreError>;
 
     // -- Tag: namespace-scoped name-to-kappa bindings (6) ---------------------
 
@@ -240,7 +244,11 @@ pub trait KappaStore: Send + Sync {
 
     // -- Epoch: signed state chain (3) ----------------------------------------
 
-    fn epoch_advance(&self, ns: &NamespaceRef, mutations: Vec<EpochMutation>) -> Result<String, StoreError>;
+    fn epoch_advance(
+        &self,
+        ns: &NamespaceRef,
+        mutations: Vec<EpochMutation>,
+    ) -> Result<String, StoreError>;
     fn epoch_current(&self, ns: &NamespaceRef) -> Result<Option<String>, StoreError>;
     fn epoch_get(&self, kappa: &str) -> Result<EpochRoot, StoreError>;
 
@@ -257,12 +265,8 @@ pub trait KappaStore: Send + Sync {
     /// `offset` must equal the number of bytes previously appended
     /// (sequential writes only, no gaps, no overlaps).
     /// Returns the new total byte count.
-    fn upload_put_part(
-        &self,
-        upload_id: &str,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<u64, StoreError>;
+    fn upload_put_part(&self, upload_id: &str, offset: u64, data: &[u8])
+        -> Result<u64, StoreError>;
 
     /// Complete a streaming upload.
     ///
@@ -432,7 +436,9 @@ pub trait KappaStore: Send + Sync {
         protocol: Option<&str>,
     ) -> Result<(), StoreError> {
         let _ = (old_name, new_name, actor, protocol);
-        Err(StoreError::Rejected("namespace_rename not implemented".into()))
+        Err(StoreError::Rejected(
+            "namespace_rename not implemented".into(),
+        ))
     }
 
     /// Add an additional alias to an existing namespace UUID.
@@ -444,7 +450,9 @@ pub trait KappaStore: Send + Sync {
         protocol: Option<&str>,
     ) -> Result<(), StoreError> {
         let _ = (uuid, alias, actor, protocol);
-        Err(StoreError::Rejected("namespace_add_alias not implemented".into()))
+        Err(StoreError::Rejected(
+            "namespace_add_alias not implemented".into(),
+        ))
     }
 
     /// Transfer ownership of a namespace to a new anchor.
@@ -455,7 +463,9 @@ pub trait KappaStore: Send + Sync {
         actor: &str,
     ) -> Result<(), StoreError> {
         let _ = (uuid, new_owner, actor);
-        Err(StoreError::Rejected("namespace_transfer not implemented".into()))
+        Err(StoreError::Rejected(
+            "namespace_transfer not implemented".into(),
+        ))
     }
 
     /// Get namespace metadata: UUID, owner, creation time, aliases.
@@ -465,22 +475,17 @@ pub trait KappaStore: Send + Sync {
         protocol: Option<&str>,
     ) -> Result<NamespaceRecord, StoreError> {
         let _ = (name, protocol);
-        Err(StoreError::Rejected("namespace_info not implemented".into()))
+        Err(StoreError::Rejected(
+            "namespace_info not implemented".into(),
+        ))
     }
 
     /// List all namespaces. Returns records with display names.
     /// Optional protocol filter.
-    fn namespace_list(
-        &self,
-        protocol: Option<&str>,
-    ) -> Result<Vec<NamespaceRecord>, StoreError>;
+    fn namespace_list(&self, protocol: Option<&str>) -> Result<Vec<NamespaceRecord>, StoreError>;
 
     /// Check if a namespace exists by alias name.
-    fn namespace_exists(
-        &self,
-        name: &str,
-        protocol: Option<&str>,
-    ) -> Result<bool, StoreError>;
+    fn namespace_exists(&self, name: &str, protocol: Option<&str>) -> Result<bool, StoreError>;
 
     /// Delete a namespace. Marks as tombstoned. Removes all aliases.
     /// Content remains until GC. Only owner can delete.
@@ -491,7 +496,9 @@ pub trait KappaStore: Send + Sync {
         protocol: Option<&str>,
     ) -> Result<(), StoreError> {
         let _ = (name, actor, protocol);
-        Err(StoreError::Rejected("namespace_delete not implemented".into()))
+        Err(StoreError::Rejected(
+            "namespace_delete not implemented".into(),
+        ))
     }
 
     // -- Versioning (5, optional) -------------------------------------------------
@@ -552,10 +559,7 @@ pub trait KappaStore: Send + Sync {
         Ok(())
     }
 
-    fn assertion_index_query_subject(
-        &self,
-        _subject: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    fn assertion_index_query_subject(&self, _subject: &str) -> Result<Vec<String>, StoreError> {
         Ok(Vec::new())
     }
 
@@ -567,7 +571,9 @@ pub trait KappaStore: Send + Sync {
         _ns: &NamespaceRef,
         _binding: &crate::identity::IdentityBinding,
     ) -> Result<String, StoreError> {
-        Err(StoreError::Rejected("identity_binding_put not implemented".into()))
+        Err(StoreError::Rejected(
+            "identity_binding_put not implemented".into(),
+        ))
     }
 
     /// Query bindings for a subject (external identifier).
@@ -575,7 +581,9 @@ pub trait KappaStore: Send + Sync {
         &self,
         _subject: &str,
     ) -> Result<Vec<crate::identity::IdentityBinding>, StoreError> {
-        Err(StoreError::Rejected("identity_binding_get not implemented".into()))
+        Err(StoreError::Rejected(
+            "identity_binding_get not implemented".into(),
+        ))
     }
 
     /// Delete a binding by subject and target.
@@ -585,7 +593,9 @@ pub trait KappaStore: Send + Sync {
         _subject: &str,
         _target: &str,
     ) -> Result<(), StoreError> {
-        Err(StoreError::Rejected("identity_binding_delete not implemented".into()))
+        Err(StoreError::Rejected(
+            "identity_binding_delete not implemented".into(),
+        ))
     }
 
     /// List all bindings for an asserter anchor.
@@ -593,7 +603,9 @@ pub trait KappaStore: Send + Sync {
         &self,
         _asserter: &str,
     ) -> Result<Vec<crate::identity::IdentityBinding>, StoreError> {
-        Err(StoreError::Rejected("identity_binding_list_by_asserter not implemented".into()))
+        Err(StoreError::Rejected(
+            "identity_binding_list_by_asserter not implemented".into(),
+        ))
     }
 
     // -- Identity succession (3, forcing function) ----------------------------
@@ -603,25 +615,25 @@ pub trait KappaStore: Send + Sync {
         &self,
         _succession: &crate::identity::IdentitySuccession,
     ) -> Result<String, StoreError> {
-        Err(StoreError::Rejected("identity_succession_put not implemented".into()))
+        Err(StoreError::Rejected(
+            "identity_succession_put not implemented".into(),
+        ))
     }
 
     /// Resolve the current anchor at the end of a succession chain.
     /// Follows succession edges from the given anchor, up to 10 hops.
-    fn identity_succession_resolve(
-        &self,
-        _anchor: &str,
-    ) -> Result<String, StoreError> {
-        Err(StoreError::Rejected("identity_succession_resolve not implemented".into()))
+    fn identity_succession_resolve(&self, _anchor: &str) -> Result<String, StoreError> {
+        Err(StoreError::Rejected(
+            "identity_succession_resolve not implemented".into(),
+        ))
     }
 
     /// Get the full succession chain from an anchor.
     /// Returns the ordered list of anchors: [original, successor1, successor2, ...current].
-    fn identity_succession_chain(
-        &self,
-        _anchor: &str,
-    ) -> Result<Vec<String>, StoreError> {
-        Err(StoreError::Rejected("identity_succession_chain not implemented".into()))
+    fn identity_succession_chain(&self, _anchor: &str) -> Result<Vec<String>, StoreError> {
+        Err(StoreError::Rejected(
+            "identity_succession_chain not implemented".into(),
+        ))
     }
 }
 

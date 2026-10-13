@@ -21,20 +21,16 @@ pub const TAGS: TableDefinition<&str, &str> = TableDefinition::new("tags");
 pub const EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("edges");
 
 // Forward index: Key: "{ns}\x00{source}"  Values: edge kappa strings
-pub const EDGE_FWD: MultimapTableDefinition<&str, &str> =
-    MultimapTableDefinition::new("edge_fwd");
+pub const EDGE_FWD: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("edge_fwd");
 
 // Reverse index: Key: "{ns}\x00{target}"  Values: edge kappa strings
-pub const EDGE_REV: MultimapTableDefinition<&str, &str> =
-    MultimapTableDefinition::new("edge_rev");
+pub const EDGE_REV: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("edge_rev");
 
 // Relation index: Key: "{ns}\x00{relation_str}"  Values: edge kappa strings
-pub const EDGE_REL: MultimapTableDefinition<&str, &str> =
-    MultimapTableDefinition::new("edge_rel");
+pub const EDGE_REL: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("edge_rel");
 
 // Asserter index: Key: "{ns}\x00{asserter}"  Values: edge kappa strings
-pub const EDGE_ASR: MultimapTableDefinition<&str, &str> =
-    MultimapTableDefinition::new("edge_asr");
+pub const EDGE_ASR: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("edge_asr");
 
 // -- Sequences ----------------------------------------------------------------
 // Key: "{ns}\x00{name}"  Value: counter as 8-byte big-endian (encrypted when enabled)
@@ -46,8 +42,7 @@ pub const BLOB_META: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_m
 
 // -- Namespace-scoped metadata ------------------------------------------------
 // Key: "{ns}\x00{meta_key}\x00{meta_value}"  Values: kappa strings
-pub const NS_META: MultimapTableDefinition<&str, &str> =
-    MultimapTableDefinition::new("ns_meta");
+pub const NS_META: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("ns_meta");
 
 // -- Namespaces ---------------------------------------------------------------
 // Key: "{ns}"  Value: () (presence-only)
@@ -66,13 +61,11 @@ pub const NAMESPACE_RECORDS: TableDefinition<&[u8], &[u8]> =
 // -- Alias history ------------------------------------------------------------
 // Key: [uuid:16][timestamp_be:8]  Value: JSON-encoded AliasEvent
 // Append-only audit log of alias changes (create, rename, delete, transfer).
-pub const ALIAS_HISTORY: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("alias_history");
+pub const ALIAS_HISTORY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("alias_history");
 
 // -- Epoch current pointer ----------------------------------------------------
 // Key: "{ns}"  Value: "{kappa}" of the current epoch root
-pub const EPOCH_CURRENT: TableDefinition<&str, &str> =
-    TableDefinition::new("epoch_current");
+pub const EPOCH_CURRENT: TableDefinition<&str, &str> = TableDefinition::new("epoch_current");
 
 // -- Binding records (sigma-to-kappa mapping for encrypted stores) ------------
 // Key: "{sigma}"  Value: dCBOR-encoded BindingRecord
@@ -80,20 +73,17 @@ pub const EPOCH_CURRENT: TableDefinition<&str, &str> =
 // The binding record maps the protocol-facing sigma to the storage-facing kappa
 // plus the encryption nonce needed to decrypt. When encryption is disabled,
 // this table is empty and unused (sigma == kappa, identity transform).
-pub const BINDING_RECORDS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("binding_records");
+pub const BINDING_RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("binding_records");
 
 // -- Credentials --------------------------------------------------------------
 // Key: access_key_id  Value: TableEncryptor-encrypted credential record
-pub const CREDENTIALS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("credentials");
+pub const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
 
 // -- Versions -----------------------------------------------------------------
 // Key: "{ns}\x00{key}\x00{!timestamp_be}"  Value: dCBOR VersionEntry
 // Key ordering: namespace ascending, key ascending, timestamp descending
 // (bit-inverted timestamp so newest sorts first in ascending B-tree).
-pub const VERSIONS: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("versions");
+pub const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions");
 
 // -- Compression records (sigma-to-kappa mapping for compressed blobs) --------
 // Key: "{uncompressed_hash}" (sigma -- hash of uncompressed content)

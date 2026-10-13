@@ -60,8 +60,8 @@ fn build_server_config(
     let key_file = std::fs::File::open(&tls_config.key_path)
         .map_err(|e| format!("key {}: {}", tls_config.key_path, e))?;
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<_> =
+        rustls_pemfile::certs(&mut io::BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
         return Err("no certificates found in cert file".into());
     }
@@ -72,17 +72,17 @@ fn build_server_config(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     let mut config = if let Some(ref ca_path) = tls_config.client_ca_path {
-        let ca_file = std::fs::File::open(ca_path)
-            .map_err(|e| format!("client CA {}: {}", ca_path, e))?;
+        let ca_file =
+            std::fs::File::open(ca_path).map_err(|e| format!("client CA {}: {}", ca_path, e))?;
         let mut root_store = rustls::RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut io::BufReader::new(ca_file)) {
             root_store.add(cert?)?;
         }
-        let verifier =
-            rustls::server::WebPkiClientVerifier::builder_with_provider(
-                Arc::new(root_store),
-                provider.clone(),
-            ).build()?;
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store),
+            provider.clone(),
+        )
+        .build()?;
         rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
             .with_client_cert_verifier(verifier)

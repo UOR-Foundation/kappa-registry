@@ -1,7 +1,7 @@
 //! WebSocket endpoint integration tests.
 
 #[path = "helpers/mod.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod helpers;
 use helpers::*;
 
@@ -127,7 +127,9 @@ fn ws_crdt_connects_and_receives_initial_state() {
         );
 
         socket
-            .send(tungstenite::Message::binary(b"crdt-update-payload".to_vec()))
+            .send(tungstenite::Message::binary(
+                b"crdt-update-payload".to_vec(),
+            ))
             .unwrap();
         ws_close(&mut socket);
         true

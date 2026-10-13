@@ -60,7 +60,9 @@ pub fn build_root_set(store: &dyn KappaStore) -> Result<Vec<String>, StoreError>
 
     for record in &namespaces {
         let uuid = hex::decode(&record.uuid_hex).unwrap_or_default();
-        if uuid.len() != 16 { continue; }
+        if uuid.len() != 16 {
+            continue;
+        }
         let mut uuid_arr = [0u8; 16];
         uuid_arr.copy_from_slice(&uuid);
         let name = record.aliases.first().cloned().unwrap_or_default();
@@ -174,11 +176,8 @@ mod tests {
         use crate::store::KappaStore;
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        )
-        .unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
 
         let ns = NamespaceRef::deterministic("ns");
         let content = b"content-a";
@@ -201,11 +200,8 @@ mod tests {
         use crate::store::KappaStore;
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        )
-        .unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
 
         let ns = NamespaceRef::deterministic("ns");
         let tagged_content = b"tagged-content";
@@ -231,11 +227,8 @@ mod tests {
         use crate::store::KappaStore;
         let tmp = tempfile::tempdir().unwrap();
         let clock = std::sync::Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        )
-        .unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
 
         let ns = NamespaceRef::deterministic("ns");
         let root_content = b"root-content";

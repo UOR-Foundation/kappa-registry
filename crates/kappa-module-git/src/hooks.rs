@@ -72,8 +72,12 @@ pub fn run_pre_receive(
     // Build stdin: old_oid new_oid ref_name\n per update
     let mut stdin_data = Vec::new();
     for update in updates {
-        writeln!(stdin_data, "{} {} {}", update.old_oid, update.new_oid, update.ref_name)
-            .map_err(|e| HookError::ExecutionFailed(e.to_string()))?;
+        writeln!(
+            stdin_data,
+            "{} {} {}",
+            update.old_oid, update.new_oid, update.ref_name
+        )
+        .map_err(|e| HookError::ExecutionFailed(e.to_string()))?;
     }
 
     // Execute with timeout
@@ -95,7 +99,9 @@ pub fn run_pre_receive(
             if status.success() {
                 Ok(())
             } else {
-                let stderr = child.stderr.take()
+                let stderr = child
+                    .stderr
+                    .take()
                     .map(|mut s| {
                         let mut buf = String::new();
                         use std::io::Read;
@@ -142,7 +148,9 @@ pub fn spawn_post_receive(
         let tmp_dir = std::env::temp_dir().join("kappa-hooks");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let script_path = tmp_dir.join(format!("post-receive-{}", uuid::Uuid::new_v4()));
-        if std::fs::write(&script_path, &hook_script).is_err() { return; }
+        if std::fs::write(&script_path, &hook_script).is_err() {
+            return;
+        }
 
         #[cfg(unix)]
         {
@@ -152,7 +160,11 @@ pub fn spawn_post_receive(
 
         let mut stdin_data = Vec::new();
         for update in &updates {
-            let _ = writeln!(stdin_data, "{} {} {}", update.old_oid, update.new_oid, update.ref_name);
+            let _ = writeln!(
+                stdin_data,
+                "{} {} {}",
+                update.old_oid, update.new_oid, update.ref_name
+            );
         }
 
         let mut child = match std::process::Command::new(&script_path)
@@ -163,7 +175,10 @@ pub fn spawn_post_receive(
             .spawn()
         {
             Ok(c) => c,
-            Err(_) => { let _ = std::fs::remove_file(&script_path); return; }
+            Err(_) => {
+                let _ = std::fs::remove_file(&script_path);
+                return;
+            }
         };
 
         if let Some(ref mut stdin) = child.stdin {
@@ -196,10 +211,10 @@ fn load_hook(
     hook_name: &str,
 ) -> Result<Vec<u8>, HookError> {
     let tag_name = format!("_hooks/{}", hook_name);
-    let entry = store.tag_get(namespace, &tag_name)
+    let entry = store
+        .tag_get(namespace, &tag_name)
         .map_err(|_| HookError::NotFound(hook_name.to_string()))?;
-    store.blob_get(&entry.kappa)
-        .map_err(|e| HookError::Store(e))
+    store.blob_get(&entry.kappa).map_err(HookError::Store)
 }
 
 /// Store a hook script in the namespace.
@@ -210,10 +225,12 @@ pub fn set_hook(
     script: &[u8],
 ) -> Result<(), HookError> {
     let kappa = kappa_core::kappa::kappa_from_bytes(script);
-    store.ingest_verified(&kappa, script)
+    store
+        .ingest_verified(&kappa, script)
         .map_err(HookError::Store)?;
     let tag_name = format!("_hooks/{}", hook_name);
-    store.tag_set(namespace, &tag_name, &kappa)
+    store
+        .tag_set(namespace, &tag_name, &kappa)
         .map_err(HookError::Store)?;
     Ok(())
 }
@@ -225,7 +242,8 @@ pub fn delete_hook(
     hook_name: &str,
 ) -> Result<(), HookError> {
     let tag_name = format!("_hooks/{}", hook_name);
-    store.tag_delete(namespace, &tag_name)
+    store
+        .tag_delete(namespace, &tag_name)
         .map_err(HookError::Store)?;
     Ok(())
 }

@@ -28,7 +28,10 @@ impl PersistentStore {
         let mut access_key_bytes = [0u8; 15];
         getrandom::fill(&mut access_key_bytes)
             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
-        let access_key_id = format!("KAPPA{}", hex::encode(&access_key_bytes[..10]).to_uppercase());
+        let access_key_id = format!(
+            "KAPPA{}",
+            hex::encode(&access_key_bytes[..10]).to_uppercase()
+        );
 
         let mut secret_bytes = [0u8; 30];
         getrandom::fill(&mut secret_bytes)
@@ -87,11 +90,14 @@ impl PersistentStore {
     pub fn credential_load(&self, access_key_id: &str) -> Result<Credential, StoreError> {
         let txn = self.db.begin_read().map_err(Self::redb_err)?;
         let table = txn.open_table(CREDENTIALS).map_err(Self::redb_err)?;
-        let raw = table.get(access_key_id).map_err(Self::redb_err)?
+        let raw = table
+            .get(access_key_id)
+            .map_err(Self::redb_err)?
             .ok_or_else(|| StoreError::NotFound(format!("credential {}", access_key_id)))?;
 
         let decrypted = match &self.table_encryptor {
-            Some(enc) => enc.decrypt_value(access_key_id, raw.value())
+            Some(enc) => enc
+                .decrypt_value(access_key_id, raw.value())
                 .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
             None => raw.value().to_vec(),
         };
@@ -105,7 +111,8 @@ impl PersistentStore {
             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
 
         let stored = match &self.table_encryptor {
-            Some(enc) => enc.encrypt_value(&cred.access_key_id, &json)
+            Some(enc) => enc
+                .encrypt_value(&cred.access_key_id, &json)
                 .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
             None => json,
         };
@@ -113,7 +120,8 @@ impl PersistentStore {
         let txn = self.db.begin_write().map_err(Self::redb_err)?;
         {
             let mut table = txn.open_table(CREDENTIALS).map_err(Self::redb_err)?;
-            table.insert(cred.access_key_id.as_str(), stored.as_slice())
+            table
+                .insert(cred.access_key_id.as_str(), stored.as_slice())
                 .map_err(Self::redb_err)?;
         }
         txn.commit().map_err(Self::redb_err)?;
@@ -154,9 +162,9 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use kappa_core::crypto::sigv4::CredentialLookup;
-    use kappa_core::clock::ntp_lamport::NtpLamportClock;
     use crate::PersistentStore;
+    use kappa_core::clock::ntp_lamport::NtpLamportClock;
+    use kappa_core::crypto::sigv4::CredentialLookup;
     use std::sync::Arc;
 
     fn new_store() -> (PersistentStore, tempfile::TempDir) {

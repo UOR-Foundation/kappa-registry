@@ -27,10 +27,10 @@ pub mod watermark;
 
 pub use absence::AbsenceProof;
 pub use assertion::IdentityAssertion;
+pub use binding::IdentityBinding;
 pub use handle::{HandleLiveness, HandleRecord};
 pub use node::NodeIdentity;
-pub use revocation::{Revocation, RevocationReason};
-pub use binding::IdentityBinding;
 pub use resolver::{ExternalIdentifierResolver, ResolvedIdentity, ResolverRegistry};
+pub use revocation::{Revocation, RevocationReason};
 pub use succession::IdentitySuccession;
 pub use trust::{DegradeReason, PeerRecord, TrustPosition};

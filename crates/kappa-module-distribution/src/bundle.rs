@@ -8,9 +8,7 @@ use std::borrow::Cow;
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
 use topcoat::router::response::{IntoResponse, Response};
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use kappa_core::types::NamespaceRef;
 
@@ -97,7 +95,7 @@ async fn ingest(cx: &Cx, _ns: &NamespaceRef, body: &[u8]) -> topcoat::Result<Res
             .map_err(|e| kappa_core::StoreError::Rejected(e.to_string()))?;
         let mut kappas = Vec::with_capacity(entries.len());
         for entry in &entries {
-            s.ingest_verified(&entry.kappa,&entry.content)?;
+            s.ingest_verified(&entry.kappa, &entry.content)?;
             kappas.push(entry.kappa.clone());
         }
         Ok::<Vec<String>, kappa_core::StoreError>(kappas)

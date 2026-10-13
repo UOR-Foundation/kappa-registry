@@ -78,9 +78,8 @@ pub fn generate_pack<W: Write>(
             let mut content = Vec::with_capacity(content_size as usize);
             reader.read_to_end(&mut content)?;
 
-            let mut encoder = flate2::write::ZlibEncoder::new(
-                Vec::new(), flate2::Compression::default(),
-            );
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
             encoder.write_all(&content)?;
             let compressed = encoder.finish()?;
 
@@ -97,13 +96,16 @@ pub fn generate_pack<W: Write>(
                 bytes_written: 0,
             };
             let mut encoder = flate2::write::ZlibEncoder::new(
-                &mut hashing_writer, flate2::Compression::default(),
+                &mut hashing_writer,
+                flate2::Compression::default(),
             );
 
             let mut chunk = [0u8; STREAM_CHUNK];
             loop {
                 let n = reader.read(&mut chunk)?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 encoder.write_all(&chunk[..n])?;
             }
             encoder.finish()?;
@@ -111,7 +113,8 @@ pub fn generate_pack<W: Write>(
         }
     }
 
-    let trailer = hasher.try_finalize()
+    let trailer = hasher
+        .try_finalize()
         .map_err(|e| PackGenError::Hash(e.to_string()))?;
     writer.write_all(trailer.as_slice())?;
     total_bytes += trailer.as_slice().len() as u64;
@@ -134,25 +137,31 @@ fn read_envelope_header(reader: &mut dyn Read) -> Result<(gix_object::Kind, u64)
     loop {
         let n = reader.read(&mut byte)?;
         if n == 0 {
-            return Err(PackGenError::Io(io::Error::other("unexpected EOF in envelope header")));
+            return Err(PackGenError::Io(io::Error::other(
+                "unexpected EOF in envelope header",
+            )));
         }
         if byte[0] == 0 {
             break;
         }
         header_bytes.push(byte[0]);
         if header_bytes.len() > 64 {
-            return Err(PackGenError::Io(io::Error::other("envelope header too long")));
+            return Err(PackGenError::Io(io::Error::other(
+                "envelope header too long",
+            )));
         }
     }
 
     let header_str = std::str::from_utf8(&header_bytes)
         .map_err(|_| PackGenError::Io(io::Error::other("envelope header not utf8")))?;
-    let space_pos = header_str.find(' ')
+    let space_pos = header_str
+        .find(' ')
         .ok_or_else(|| PackGenError::Io(io::Error::other("no space in envelope header")))?;
 
-    let kind = gix_object::Kind::from_bytes(header_str[..space_pos].as_bytes())
+    let kind = gix_object::Kind::from_bytes(&header_str.as_bytes()[..space_pos])
         .map_err(|e| PackGenError::Io(io::Error::other(e.to_string())))?;
-    let size: u64 = header_str[space_pos + 1..].parse()
+    let size: u64 = header_str[space_pos + 1..]
+        .parse()
         .map_err(|_| PackGenError::Io(io::Error::other("envelope size not decimal")))?;
 
     Ok((kind, size))
@@ -181,12 +190,16 @@ fn encode_pack_entry_header(type_id: u8, mut size: u64) -> Vec<u8> {
     let mut header = Vec::with_capacity(10);
     let mut first = (type_id << 4) | (size as u8 & 0x0F);
     size >>= 4;
-    if size > 0 { first |= 0x80; }
+    if size > 0 {
+        first |= 0x80;
+    }
     header.push(first);
     while size > 0 {
         let mut byte = size as u8 & 0x7F;
         size >>= 7;
-        if size > 0 { byte |= 0x80; }
+        if size > 0 {
+            byte |= 0x80;
+        }
         header.push(byte);
     }
     header
@@ -211,17 +224,20 @@ fn sort_objects(
     kappas: &[String],
     _name_hints: &std::collections::HashMap<String, String>,
 ) -> Vec<PackObject> {
-    let mut objects: Vec<PackObject> = kappas.iter().filter_map(|kappa| {
-        let envelope = store.blob_get(kappa).ok()?;
-        let (kind, content) = crate::envelope::unwrap(&envelope).ok()?;
-        let hint = _name_hints.get(kappa).cloned().unwrap_or_default();
-        Some(PackObject {
-            kappa: kappa.clone(),
-            kind,
-            size: content.len() as u64,
-            name_hint: hint,
+    let mut objects: Vec<PackObject> = kappas
+        .iter()
+        .filter_map(|kappa| {
+            let envelope = store.blob_get(kappa).ok()?;
+            let (kind, content) = crate::envelope::unwrap(&envelope).ok()?;
+            let hint = _name_hints.get(kappa).cloned().unwrap_or_default();
+            Some(PackObject {
+                kappa: kappa.clone(),
+                kind,
+                size: content.len() as u64,
+                name_hint: hint,
+            })
         })
-    }).collect();
+        .collect();
 
     objects.sort_by(|a, b| {
         let kind_ord = kind_sort_key(a.kind).cmp(&kind_sort_key(b.kind));
@@ -272,22 +288,24 @@ pub fn generate_pack_sorted<W: Write>(
     let mut window: std::collections::VecDeque<(gix_object::Kind, Vec<u8>, u64)> =
         std::collections::VecDeque::with_capacity(DELTA_WINDOW);
     // Track pack offsets for OFS_DELTA encoding
-    let mut kappa_to_offset: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut kappa_to_offset: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
 
     for (idx, obj) in sorted.iter().enumerate() {
         let entry_offset = total_bytes;
         kappa_to_offset.insert(obj.kappa.clone(), entry_offset);
 
         let envelope = store.blob_get(&obj.kappa)?;
-        let (kind, content) = crate::envelope::unwrap(&envelope)
-            .map_err(|e| PackGenError::Envelope(e))?;
+        let (kind, content) = crate::envelope::unwrap(&envelope).map_err(PackGenError::Envelope)?;
         let content = content.to_vec();
 
         // Try delta against window objects of same type
         let mut best_delta: Option<(Vec<u8>, u64)> = None; // (delta_bytes, base_offset)
         if content.len() >= 32 {
             for (w_kind, w_content, w_offset) in window.iter().rev() {
-                if *w_kind != kind { continue; }
+                if *w_kind != kind {
+                    continue;
+                }
                 if let Some(delta) = crate::ingest::compute_delta(w_content, &content) {
                     let is_better = match &best_delta {
                         Some((prev, _)) => delta.len() < prev.len(),
@@ -317,9 +335,8 @@ pub fn generate_pack_sorted<W: Write>(
                 total_bytes += ofs_header.len() as u64;
 
                 // Compress delta
-                let mut encoder = flate2::write::ZlibEncoder::new(
-                    Vec::new(), flate2::Compression::default(),
-                );
+                let mut encoder =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
                 encoder.write_all(&delta)?;
                 let compressed = encoder.finish()?;
                 hasher.update(&compressed);
@@ -352,9 +369,8 @@ pub fn generate_pack_sorted<W: Write>(
         writer.write_all(&entry_header)?;
         total_bytes += entry_header.len() as u64;
 
-        let mut encoder = flate2::write::ZlibEncoder::new(
-            Vec::new(), flate2::Compression::default(),
-        );
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&content)?;
         let compressed = encoder.finish()?;
         hasher.update(&compressed);
@@ -372,7 +388,8 @@ pub fn generate_pack_sorted<W: Write>(
         }
     }
 
-    let trailer = hasher.try_finalize()
+    let trailer = hasher
+        .try_finalize()
         .map_err(|e| PackGenError::Hash(e.to_string()))?;
     writer.write_all(trailer.as_slice())?;
     total_bytes += trailer.as_slice().len() as u64;
@@ -424,7 +441,9 @@ mod tests {
                 size |= ((byte & 0x7F) as u64) << shift;
                 shift += 7;
                 idx += 1;
-                if byte & 0x80 == 0 { break; }
+                if byte & 0x80 == 0 {
+                    break;
+                }
             }
         }
         (type_id, size)
@@ -438,10 +457,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        ).unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
 
         let mut output = Vec::new();
         let result = generate_pack(&store, &[], gix_hash::Kind::Sha1, &mut output).unwrap();
@@ -458,10 +475,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        ).unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
 
         let content = b"hello pack generation";
         let envelope_bytes = envelope::wrap(gix_object::Kind::Blob, content);
@@ -469,9 +484,7 @@ mod tests {
         store.ingest_verified(&kappa, &envelope_bytes).unwrap();
 
         let mut output = Vec::new();
-        let result = generate_pack(
-            &store, &[kappa], gix_hash::Kind::Sha1, &mut output,
-        ).unwrap();
+        let result = generate_pack(&store, &[kappa], gix_hash::Kind::Sha1, &mut output).unwrap();
         assert_eq!(result.objects_written, 1);
         assert_eq!(&output[0..4], b"PACK");
         assert_eq!(u32::from_be_bytes(output[8..12].try_into().unwrap()), 1);

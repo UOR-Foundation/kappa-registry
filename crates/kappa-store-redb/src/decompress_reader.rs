@@ -20,18 +20,22 @@ pub fn decompress(data: &[u8], algorithm: &str) -> Result<Vec<u8>, StoreError> {
             use std::io::Read;
             let mut decoder = xz2::read::XzDecoder::new(data);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out)
-                .map_err(|e| StoreError::Io(std::io::Error::other(format!("xz decompress: {e}"))))?;
+            decoder.read_to_end(&mut out).map_err(|e| {
+                StoreError::Io(std::io::Error::other(format!("xz decompress: {e}")))
+            })?;
             Ok(out)
         }
         "bzip2" => {
             use std::io::Read;
             let mut decoder = bzip2::read::BzDecoder::new(data);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out)
-                .map_err(|e| StoreError::Io(std::io::Error::other(format!("bzip2 decompress: {e}"))))?;
+            decoder.read_to_end(&mut out).map_err(|e| {
+                StoreError::Io(std::io::Error::other(format!("bzip2 decompress: {e}")))
+            })?;
             Ok(out)
         }
-        other => Err(StoreError::Rejected(format!("unsupported compression algorithm: {other}"))),
+        other => Err(StoreError::Rejected(format!(
+            "unsupported compression algorithm: {other}"
+        ))),
     }
 }

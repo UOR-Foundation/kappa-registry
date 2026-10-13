@@ -9,9 +9,7 @@ use std::borrow::Cow;
 use topcoat::context::Cx;
 use topcoat::router::error::bad_request;
 use topcoat::router::response::{IntoResponse, Response};
-use topcoat::router::{
-    Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
-};
+use topcoat::router::{Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode};
 
 use kappa_core::store::blob_put_computed;
 use kappa_core::types::{Edge, EdgeRelation, NamespaceRef};
@@ -63,7 +61,12 @@ fn list_route(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
-async fn register_schema(cx: &Cx, ns: &NamespaceRef, scope: &str, body: &[u8]) -> topcoat::Result<Response> {
+async fn register_schema(
+    cx: &Cx,
+    ns: &NamespaceRef,
+    scope: &str,
+    body: &[u8],
+) -> topcoat::Result<Response> {
     let s = store(cx).clone();
     let n = ns.clone();
     let sc = scope.to_string();

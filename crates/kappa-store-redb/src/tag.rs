@@ -60,7 +60,8 @@ impl PersistentStore {
             let plaintext_value = format!("{}\x00{}", kappa, version);
             let db_value = match &self.table_encryptor {
                 Some(enc) => {
-                    let encrypted = enc.encrypt_value(&db_key, plaintext_value.as_bytes())
+                    let encrypted = enc
+                        .encrypt_value(&db_key, plaintext_value.as_bytes())
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                     hex::encode(&encrypted)
                 }
@@ -87,7 +88,8 @@ impl PersistentStore {
             Some(enc) => {
                 let encrypted_bytes = hex::decode(raw_value)
                     .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
-                let plaintext = enc.decrypt_value(&db_key, &encrypted_bytes)
+                let plaintext = enc
+                    .decrypt_value(&db_key, &encrypted_bytes)
                     .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                 String::from_utf8(plaintext)
                     .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?
@@ -119,7 +121,8 @@ impl PersistentStore {
                 Some(enc) => {
                     let bytes = hex::decode(raw)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
-                    let pt = enc.decrypt_value(db_key, &bytes)
+                    let pt = enc
+                        .decrypt_value(db_key, &bytes)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                     String::from_utf8(pt)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
@@ -138,9 +141,9 @@ impl PersistentStore {
                 {
                     let (k, v) = item.map_err(Self::redb_err)?;
                     let key_str = k.value();
-                    let name = key_str.strip_prefix(&prefix).ok_or_else(|| {
-                        StoreError::Io(std::io::Error::other("prefix mismatch"))
-                    })?;
+                    let name = key_str
+                        .strip_prefix(&prefix)
+                        .ok_or_else(|| StoreError::Io(std::io::Error::other("prefix mismatch")))?;
                     let decrypted = decrypt_value(key_str, v.value())?;
                     entries.push(parse_entry(name, &decrypted)?);
                 }
@@ -181,7 +184,8 @@ impl PersistentStore {
                 Some(enc) => {
                     let bytes = hex::decode(raw)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
-                    let pt = enc.decrypt_value(db_key, &bytes)
+                    let pt = enc
+                        .decrypt_value(db_key, &bytes)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                     String::from_utf8(pt)
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))
@@ -200,9 +204,9 @@ impl PersistentStore {
                 {
                     let (k, v) = item.map_err(Self::redb_err)?;
                     let key_str = k.value();
-                    let name = key_str.strip_prefix(&ns_prefix).ok_or_else(|| {
-                        StoreError::Io(std::io::Error::other("prefix mismatch"))
-                    })?;
+                    let name = key_str
+                        .strip_prefix(&ns_prefix)
+                        .ok_or_else(|| StoreError::Io(std::io::Error::other("prefix mismatch")))?;
                     let decrypted = decrypt_value(key_str, v.value())?;
                     entries.push(parse_entry(name, &decrypted)?);
                 }
@@ -269,7 +273,8 @@ impl PersistentStore {
                 let plaintext_value = format!("{}\x00{}", update.kappa, version);
                 let db_value = match &self.table_encryptor {
                     Some(enc) => {
-                        let encrypted = enc.encrypt_value(&db_key, plaintext_value.as_bytes())
+                        let encrypted = enc
+                            .encrypt_value(&db_key, plaintext_value.as_bytes())
                             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                         hex::encode(&encrypted)
                     }

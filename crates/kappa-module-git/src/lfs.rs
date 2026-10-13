@@ -102,10 +102,7 @@ pub fn process_batch(
                         size: obj.size,
                         actions: Some(LfsActions {
                             download: Some(LfsAction {
-                                href: format!(
-                                    "{}/v2/{}/blobs/sha256:{}",
-                                    base_url, repo, obj.oid
-                                ),
+                                href: format!("{}/v2/{}/blobs/sha256:{}", base_url, repo, obj.oid),
                                 expires_at: None,
                             }),
                             upload: None,
@@ -141,17 +138,11 @@ pub fn process_batch(
                         actions: Some(LfsActions {
                             download: None,
                             upload: Some(LfsAction {
-                                href: format!(
-                                    "{}/v2/{}/blobs/sha256:{}",
-                                    base_url, repo, obj.oid
-                                ),
+                                href: format!("{}/v2/{}/blobs/sha256:{}", base_url, repo, obj.oid),
                                 expires_at: None,
                             }),
                             verify: Some(LfsAction {
-                                href: format!(
-                                    "{}/{}.git/info/lfs/objects/verify",
-                                    base_url, repo
-                                ),
+                                href: format!("{}/{}.git/info/lfs/objects/verify", base_url, repo),
                                 expires_at: None,
                             }),
                         }),
@@ -193,10 +184,7 @@ pub fn verify_object(
     if size != expected_size {
         return Err(LfsError {
             code: 422,
-            message: format!(
-                "size mismatch: expected {}, actual {}",
-                expected_size, size
-            ),
+            message: format!("size mismatch: expected {}, actual {}", expected_size, size),
         });
     }
     Ok(())
@@ -212,11 +200,8 @@ mod tests {
     fn test_store() -> (Arc<InMemoryStore>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        )
-        .unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
         (Arc::new(store), tmp)
     }
 
@@ -241,7 +226,13 @@ mod tests {
         let resp = process_batch(&*store, "http://localhost:5000", "myrepo", &req);
         assert_eq!(resp.objects.len(), 1);
         assert!(resp.objects[0].actions.is_some());
-        let download = resp.objects[0].actions.as_ref().unwrap().download.as_ref().unwrap();
+        let download = resp.objects[0]
+            .actions
+            .as_ref()
+            .unwrap()
+            .download
+            .as_ref()
+            .unwrap();
         assert!(download.href.contains("sha256:"));
         assert!(resp.objects[0].error.is_none());
     }
