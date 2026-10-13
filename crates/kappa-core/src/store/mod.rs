@@ -291,6 +291,24 @@ pub trait KappaStore: Send + Sync {
     /// Abort a streaming upload. Removes the staging file.
     fn upload_abort(&self, upload_id: &str) -> Result<(), StoreError>;
 
+    /// Re-attach to an upload whose staging file survived a restart.
+    ///
+    /// The session continues at the staging file's length, which is returned.
+    /// Per-part digests are not rebuilt: a resumed upload has no S3 part
+    /// records for the bytes written before the restart. The content is still
+    /// verified in full by `upload_complete`.
+    ///
+    /// Stores that keep no staging across restarts refuse.
+    fn upload_resume(
+        &self,
+        upload_id: &str,
+        namespace: &NamespaceRef,
+        max_size: u64,
+    ) -> Result<u64, StoreError> {
+        let _ = (upload_id, namespace, max_size);
+        Err(StoreError::Rejected("upload_resume is not supported by this store".into()))
+    }
+
     /// Bytes received so far for an upload. None if ID not found.
     fn upload_bytes_received(&self, upload_id: &str) -> Option<u64>;
 

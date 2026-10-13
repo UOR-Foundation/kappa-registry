@@ -103,6 +103,11 @@ pub struct PersistentStoreConfig {
     pub fsync: bool,
     pub encryption_key: Option<[u8; 32]>,
     pub upload_timeout_secs: Option<u64>,
+    /// Keep staging files found at open, so an embedder can re-attach to
+    /// interrupted uploads with `upload_resume`. Default `false`: staging is
+    /// wiped at open, as before. The embedder then owns the cleanup of
+    /// staging files it does not resume.
+    pub preserve_staging: bool,
 }
 
 impl PersistentStoreConfig {
@@ -113,6 +118,7 @@ impl PersistentStoreConfig {
             fsync: true,
             encryption_key: None,
             upload_timeout_secs: None,
+            preserve_staging: false,
         }
     }
 }
@@ -124,6 +130,7 @@ impl PersistentStore {
         let fsync = config.fsync;
         let encryption_key = config.encryption_key;
         let upload_timeout_secs = config.upload_timeout_secs;
+        let preserve_staging = config.preserve_staging;
 
         std::fs::create_dir_all(&blob_root).map_err(StoreError::Io)?;
         if let Some(parent) = db_path.parent() {
@@ -195,8 +202,11 @@ impl PersistentStore {
 
         let staging_root = blob_root.parent().unwrap_or(&blob_root).join("staging");
         let _ = std::fs::create_dir_all(&staging_root);
-        // Startup cleanup: remove orphaned staging files from prior crashes
-        if let Ok(entries) = std::fs::read_dir(&staging_root) {
+        // Startup cleanup: remove orphaned staging files from prior crashes,
+        // unless the embedder asked to keep them for `upload_resume`.
+        if preserve_staging {
+            // kept
+        } else if let Ok(entries) = std::fs::read_dir(&staging_root) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     let _ = std::fs::remove_file(entry.path());
@@ -754,6 +764,42 @@ impl KappaStore for PersistentStore {
             },
         );
         Ok(id)
+    }
+
+    fn upload_resume(
+        &self,
+        upload_id: &str,
+        namespace: &NamespaceRef,
+        max_size: u64,
+    ) -> Result<u64, StoreError> {
+        // The id becomes a file name under the staging root.
+        if upload_id.is_empty()
+            || upload_id.contains(['/', '\\'])
+            || upload_id == "."
+            || upload_id == ".."
+        {
+            return Err(StoreError::Rejected(format!("invalid upload id {upload_id:?}")));
+        }
+        let staging_path = self.staging_root.join(upload_id);
+        let offset = std::fs::metadata(&staging_path)
+            .map_err(|_| StoreError::NotFound(format!("upload {}", upload_id)))?
+            .len();
+        let mut sessions = self.upload_sessions.lock().unwrap();
+        if let Some(existing) = sessions.get(upload_id) {
+            return Ok(existing.offset);
+        }
+        sessions.insert(upload_id.to_string(), DiskUploadSession {
+            namespace: namespace.as_str().to_string(),
+            staging_path,
+            offset,
+            max_size,
+            created_at: std::time::Instant::now(),
+            part_digests: Vec::new(),
+            current_md5: md5::Md5::new(),
+            current_crc32c: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi),
+            current_crc64nvme: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme),
+        });
+        Ok(offset)
     }
 
     fn upload_put_part(
@@ -1777,6 +1823,69 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let evicted = s.upload_evict_expired(0);
         assert_eq!(evicted, 1);
+    }
+
+    #[test]
+    fn upload_resumes_after_reopen_when_staging_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let open = || {
+            let mut config = PersistentStoreConfig::new(
+                tmp.path().join("blobs"),
+                tmp.path().join("state.redb"),
+            );
+            config.fsync = false;
+            config.preserve_staging = true;
+            PersistentStore::new(config, Arc::new(NtpLamportClock::new())).unwrap()
+        };
+        let id = {
+            let s = open();
+            let ns = s.namespace_resolve_or_create("resume", "test", None).unwrap();
+            let id = s.upload_begin(&ns, 0).unwrap();
+            s.upload_put_part(&id, 0, b"hello ").unwrap();
+            id
+        }; // dropped: the session map is gone, the staging file is not
+
+        let s = open();
+        let ns = s.namespace_resolve_or_create("resume", "test", None).unwrap();
+        assert_eq!(s.upload_bytes_received(&id), None, "sessions do not survive by themselves");
+        assert_eq!(s.upload_resume(&id, &ns, 0).unwrap(), 6);
+        assert_eq!(s.upload_resume(&id, &ns, 0).unwrap(), 6, "idempotent");
+        s.upload_put_part(&id, 6, b"world").unwrap();
+        let digest = kappa_from_bytes(b"hello world");
+        let result = s.upload_complete(&id, Some(digest.as_str())).unwrap();
+        assert_eq!(result.kappa, digest);
+        assert_eq!(s.blob_get(&digest).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn upload_resume_refuses_paths_and_unknown_ids() {
+        let (s, _d) = new_store();
+        let ns = s.namespace_resolve_or_create("resume", "test", None).unwrap();
+        assert!(s.upload_resume("../escape", &ns, 0).is_err());
+        assert!(s.upload_resume("no-such-upload", &ns, 0).is_err());
+    }
+
+    #[test]
+    fn staging_is_wiped_at_open_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let open = || {
+            let mut config = PersistentStoreConfig::new(
+                tmp.path().join("blobs"),
+                tmp.path().join("state.redb"),
+            );
+            config.fsync = false;
+            PersistentStore::new(config, Arc::new(NtpLamportClock::new())).unwrap()
+        };
+        let id = {
+            let s = open();
+            let ns = s.namespace_resolve_or_create("resume", "test", None).unwrap();
+            let id = s.upload_begin(&ns, 0).unwrap();
+            s.upload_put_part(&id, 0, b"hello").unwrap();
+            id
+        };
+        let s = open();
+        let ns = s.namespace_resolve_or_create("resume", "test", None).unwrap();
+        assert!(s.upload_resume(&id, &ns, 0).is_err(), "default behaviour is unchanged");
     }
 
     // -- Encrypted upload lifecycle -------------------------------------------
