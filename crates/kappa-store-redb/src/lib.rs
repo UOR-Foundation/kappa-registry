@@ -902,6 +902,13 @@ impl KappaStore for PersistentStore {
                 if let Some(parent) = blob_path.parent() {
                     std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
                 }
+                // Data before name: after a power loss the blob must not
+                // exist under its address with bytes that never reached disk.
+                if self.fsync {
+                    // A write handle: Windows refuses to flush a read-only one.
+                    std::fs::OpenOptions::new().write(true).open(&ct_tmp)
+                        .and_then(|f| f.sync_all()).map_err(StoreError::Io)?;
+                }
                 std::fs::rename(&ct_tmp, &blob_path).map_err(StoreError::Io)?;
                 if self.fsync {
                     if let Some(p) = blob_path.parent() {
@@ -993,6 +1000,13 @@ impl KappaStore for PersistentStore {
             } else {
                 if let Some(parent) = blob_path.parent() {
                     std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
+                }
+                // Data before name: after a power loss the blob must not
+                // exist under its address with bytes that never reached disk.
+                if self.fsync {
+                    // A write handle: Windows refuses to flush a read-only one.
+                    std::fs::OpenOptions::new().write(true).open(&staging_path)
+                        .and_then(|f| f.sync_all()).map_err(StoreError::Io)?;
                 }
                 std::fs::rename(&staging_path, &blob_path).map_err(StoreError::Io)?;
                 if self.fsync {
@@ -1777,6 +1791,22 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let evicted = s.upload_evict_expired(0);
         assert_eq!(evicted, 1);
+    }
+
+    #[test]
+    fn upload_completes_with_fsync_on() {
+        // The other upload tests turn fsync off for speed. This one keeps the
+        // default, so the sync before the publishing rename runs on every
+        // system (Windows refuses to flush a read-only handle).
+        let tmp = tempfile::tempdir().unwrap();
+        let config = PersistentStoreConfig::new(tmp.path().join("blobs"), tmp.path().join("state.redb"));
+        assert!(config.fsync);
+        let s = PersistentStore::new(config, Arc::new(NtpLamportClock::new())).unwrap();
+        let ns = s.namespace_resolve_or_create("fsync", "test", None).unwrap();
+        let id = s.upload_begin(&ns, 0).unwrap();
+        s.upload_put_part(&id, 0, b"durable").unwrap();
+        let digest = kappa_from_bytes(b"durable");
+        assert_eq!(s.upload_complete(&id, Some(digest.as_str())).unwrap().kappa, digest);
     }
 
     // -- Encrypted upload lifecycle -------------------------------------------
