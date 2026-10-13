@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 use topcoat::context::{app_context, try_app_context, try_request_context, Cx};
 use topcoat::router::response::Response;
-use topcoat::router::{Body, Next, StatusCode};
+use topcoat::router::{to_bytes, Body, Next, StatusCode};
 
 use kappa_core::store::KappaStore;
 use kappa_core::types::{DetectedOperation, ResolvedNamespace};
 
-use crate::auth::{authorize, AuthDecision, AuthError, BearerAuth};
+use crate::auth::{authorize, check_authority_edge, AuthDecision, AuthError, BearerAuth};
 use crate::ratelimit::{classify_request, OpClass};
 
 pub fn auth_layer<'a>(cx: &'a Cx, body: Body, next: Next<'a>) -> topcoat::router::LayerFuture<'a> {
@@ -75,14 +75,7 @@ pub fn auth_layer<'a>(cx: &'a Cx, body: Body, next: Next<'a>) -> topcoat::router
                     return Ok(response);
                 }
                 Ok(Err(AuthError::Forbidden { reason })) => {
-                    let body_str =
-                        format!(r#"{{"errors":[{{"code":"DENIED","message":"{reason}"}}]}}"#);
-                    let mut response = Response::new(Body::from(body_str));
-                    *response.status_mut() = StatusCode::FORBIDDEN;
-                    response
-                        .headers_mut()
-                        .insert("content-type", "application/json".parse().unwrap());
-                    return Ok(response);
+                    return Ok(denied(&reason));
                 }
                 Ok(Err(AuthError::Store(e))) => {
                     tracing::error!(error = %e, "store error during auth check");
@@ -99,6 +92,56 @@ pub fn auth_layer<'a>(cx: &'a Cx, body: Body, next: Next<'a>) -> topcoat::router
             }
         }
 
+        // Edge writes: capability and delegation edges are claims of
+        // authority, checked against the caller (see check_authority_edge).
+        // The body is buffered to read the relation, then passed on intact.
+        let body = if method == "PUT" && path.starts_with("/v2/") && path.ends_with("/edges/") {
+            let bytes = match to_bytes(body, usize::MAX).await {
+                Ok(b) => b,
+                Err(_) => {
+                    let mut response = Response::new(Body::from("failed to read request body"));
+                    *response.status_mut() = StatusCode::BAD_REQUEST;
+                    return Ok(response);
+                }
+            };
+            let store = app_context::<Arc<dyn KappaStore>>(&cx).clone();
+            let (b, asserter_owned) = (bytes.clone(), asserter.clone());
+            let result = tokio::task::spawn_blocking(move || {
+                check_authority_edge(&*store, &resolved, &asserter_owned, &b)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(AuthError::Forbidden { reason })) => return Ok(denied(&reason)),
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "authority edge check failed");
+                    let mut response = Response::new(Body::from("internal server error"));
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "authority edge check spawn_blocking failed");
+                    let mut response = Response::new(Body::from("internal server error"));
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    return Ok(response);
+                }
+            }
+            Body::from(bytes)
+        } else {
+            body
+        };
+
         next.run(&cx, body).await
     })
+}
+
+/// 403 with the registry's JSON error shape.
+fn denied(reason: &str) -> Response {
+    let body_str = format!(r#"{{"errors":[{{"code":"DENIED","message":"{reason}"}}]}}"#);
+    let mut response = Response::new(Body::from(body_str));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response
+        .headers_mut()
+        .insert("content-type", "application/json".parse().unwrap());
+    response
 }

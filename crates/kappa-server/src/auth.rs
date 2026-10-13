@@ -210,6 +210,82 @@ pub fn authorize(
     }
 }
 
+/// Check a request that writes an edge (`PUT /v2/{ns}/edges/`).
+///
+/// Capability and Delegation edges are claims of authority, so the
+/// caller may only make its own claims:
+/// - the caller must be authenticated,
+/// - the edge's source must be the caller, and
+/// - a Capability edge is a root of authority (delegation chains end at
+///   one), so only the namespace owner or a `_root` admin may create it.
+///   Otherwise any writer could mint itself a capability and keep access
+///   after its delegation is revoked.
+///
+/// Other relations pass through. Malformed bodies pass through too; the
+/// edge handler rejects them.
+pub fn check_authority_edge(
+    store: &dyn KappaStore,
+    ns: &ResolvedNamespace,
+    asserter: &str,
+    body: &[u8],
+) -> Result<(), AuthError> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(());
+    };
+    let relation = v["relation"].as_str().and_then(EdgeRelation::parse);
+    let is_capability = matches!(relation, Some(EdgeRelation::Capability));
+    if !is_capability && !matches!(relation, Some(EdgeRelation::Delegation)) {
+        return Ok(());
+    }
+    let forbidden = |reason: &str| {
+        Err(AuthError::Forbidden {
+            reason: reason.to_owned(),
+        })
+    };
+
+    if asserter == "anonymous" {
+        return forbidden("capability and delegation edges require an authenticated caller");
+    }
+    if v["source"].as_str() != Some(asserter) {
+        return forbidden("edge source must be the caller");
+    }
+    if is_capability {
+        let is_owner = match ns {
+            ResolvedNamespace::Exists(ns_ref) => store
+                .namespace_info(ns_ref.as_str(), None)
+                .is_ok_and(|info| info.owner == asserter),
+            // The write creates the namespace and the caller becomes its owner.
+            ResolvedNamespace::NotFound { .. } => true,
+            ResolvedNamespace::NoNamespace => false,
+        };
+        // `_root` admin: a direct admin capability on `_root`, or an admin
+        // delegation chain on `_root`. Checked explicitly rather than via
+        // `authorize`, whose namespace-level rules do not apply here.
+        let is_root_admin = || -> Result<bool, AuthError> {
+            let root_ns = store.namespace_resolve("_root", None)?;
+            let direct = EdgeQuery {
+                anchor: asserter.to_string(),
+                direction: Direction::Outbound,
+                relation: Some(EdgeRelation::Capability),
+                asserter: Some(asserter.to_string()),
+            };
+            if store
+                .edge_query(&root_ns, &direct)
+                .is_ok_and(|edges| edges.iter().any(|e| cap_permits(e, OpClass::Admin)))
+            {
+                return Ok(true);
+            }
+            check_delegation(store, &root_ns, OpClass::Admin, asserter, 0)
+        };
+        if !is_owner && !is_root_admin()? {
+            return forbidden(
+                "only the namespace owner or a _root admin can create capability edges",
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Check if `target` is authorized via delegation chain.
 /// Returns `Ok(Some(delegation_depth))` if authorized (the depth from
 /// the edge that authorized `target`), `Ok(None)` if not.
@@ -292,6 +368,13 @@ fn check_delegation_inner(
                 if now_ms > expires {
                     continue;
                 }
+            }
+
+            // A delegation speaks for its source, so it counts only if the
+            // source asserted it. An edge anyone else wrote "on behalf of"
+            // the source grants nothing.
+            if edge.asserter != edge.source {
+                continue;
             }
 
             let delegator = &edge.source;

@@ -31,3 +31,15 @@ pub struct IdentitySuccession {
     #[cbor(n = 5)]
     pub new_signature: Vec<u8>,
 }
+
+impl IdentitySuccession {
+    /// The canonical bytes both keys sign: this succession with both
+    /// signatures cleared.
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        crate::canonical::canonical_bytes(&IdentitySuccession {
+            old_signature: Vec::new(),
+            new_signature: Vec::new(),
+            ..self.clone()
+        })
+    }
+}
