@@ -9,10 +9,15 @@ description = "OCI distribution protocol module for kappa-registry."
 
 [lib]
 name = "kappa_module_oci"
-path = "src/lib.rs"
+path = "src/v1/lib.rs"
 
 [dependencies]
 kappa-core = { workspace = true }
+kappa-store = { workspace = true }
+kappa-handler = { workspace = true }
+kappa-types = { workspace = true }
+kappa-crypto = { workspace = true }
+http = { workspace = true }
 topcoat = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
@@ -30,3 +35,12 @@ tokio-stream = "0.1"
 http-body-util = "0.1"
 http-body = "1"
 futures-util = "0.3"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-store-memory = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

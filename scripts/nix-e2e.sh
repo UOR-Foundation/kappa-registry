@@ -31,12 +31,19 @@ SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; if [ "${FAILED:-0}" = "1" ]; then echo "--- server log ---"; tail -100 "$TMP/server.log" 2>/dev/null; echo "--- end server log ---"; fi; rm -rf "$TMP"' EXIT
 
 echo "Waiting for server on port $PORT..."
-for i in $(seq 1 50); do
+ready=0
+for _ in $(seq 1 50); do
     if curl -sf "http://127.0.0.1:$PORT/_status" >/dev/null 2>&1; then
+        ready=1
         break
     fi
     sleep 0.1
 done
+if ((ready == 0)); then
+    echo "FAIL: kappa-server did not answer /_status on port $PORT within 5 seconds" >&2
+    FAILED=1
+    exit 1
+fi
 
 ENDPOINT="http://127.0.0.1:$PORT"
 

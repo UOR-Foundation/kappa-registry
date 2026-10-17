@@ -14,8 +14,8 @@
 //! kappa-core does not depend on serde_json or tokio.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_EVENTS_PER_NAMESPACE: usize = 10_000;
 

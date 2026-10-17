@@ -1,0 +1,102 @@
+[package]
+name = "kappa-perf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Calibration framework, floor measurements, workload benchmarks, property tests, loom models, and performance gates for kappa-registry. Informed by rekindle-transport-ipc calibration architecture, RFC 9162 Certificate Transparency, SuRF/FST (SIGMOD 2018), CONIKS/SEEMless/Parakeet/OPTIKS verifiable key directories, facebook/akd append-only authenticated dictionaries, etcd performance methodology, Zanzibar authorization, ANN-Benchmarks/VDBBench harness design, criterion statistical method, wrk2 coordinated-omission correction, and the KAPPA-PERF-001 specification."
+
+[lib]
+name = "kappa_perf"
+path = "src/v1/lib.rs"
+
+[dependencies]
+kappa-types = { workspace = true, features = ["test-util"] }
+# Store fixtures and benchmarks acquire scopes through kappa-fixture and
+# stores and authorities through the backends' own `test_support`.
+kappa-store = { workspace = true }
+kappa-fixture = { workspace = true }
+kappa-store-memory = { workspace = true, features = ["test-util"] }
+kappa-store-redb = { workspace = true, features = ["test-util"] }
+kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-core = { workspace = true }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-reconcile = { workspace = true }
+
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tempfile = { workspace = true }
+# The calibration harness wraps criterion; benches and the library share it.
+criterion = { workspace = true }
+hdrhistogram = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = { workspace = true }
+tokio = { workspace = true }
+redb = { workspace = true }
+arc-swap = { workspace = true }
+imbl = { workspace = true }
+rustix = { workspace = true }
+kappa-succinct = { workspace = true }
+kappa-cursor = { workspace = true }
+memchr = { workspace = true }
+# The http bench: the assembled server in process, driven open-loop over
+# hyper's connection-level HTTP/1.1 client, one TCP connection per load task;
+# hyper-util supplies only the tokio I/O adapter.
+kappa-server = { path = "../kappa-server" }
+http = { workspace = true }
+bytes = "1.12"
+hyper = { version = "1.12", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
+# Reference implementations of the digest and signature floors.
+aws-lc-rs = { workspace = true }
+rekindle-hash = { workspace = true }
+
+[features]
+default = ["sha256-mb"]
+sha256-mb = ["rekindle-hash/sha256-mb"]
+loom = []
+
+[[bin]]
+name = "perf-report"
+path = "src/v1/bin/perf_report.rs"
+
+[[test]]
+name = "v1"
+path = "tests/v1/main.rs"
+
+[[test]]
+name = "proptest_digest"
+path = "tests/v1/proptest_digest.rs"
+
+[[bench]]
+name = "floors"
+path = "benches/v1/floors.rs"
+harness = false
+
+[[bench]]
+name = "workloads"
+path = "benches/v1/workloads.rs"
+harness = false
+
+[[bench]]
+name = "contention"
+path = "benches/v1/contention.rs"
+harness = false
+
+[[bench]]
+name = "http"
+path = "benches/v1/http.rs"
+harness = false
+
+[lints]
+workspace = true

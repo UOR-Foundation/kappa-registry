@@ -7,7 +7,7 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use kappa_core::crypto::anchor::anchor_from_key_str;
+use kappa_crypto::anchor::anchor_from_key_str;
 use kappa_core::identity::resolver::{
     ExternalIdentifierResolver, ResolvedIdentity, ResolverRegistry,
 };
@@ -71,7 +71,8 @@ impl ExternalIdentifierResolver for PlcResolver {
             else if pubkey.len() == 32 { "ed25519" }
             else { return Err(format!("unexpected public key length: {}", pubkey.len())); };
 
-        let anchor = anchor_from_key_str(algorithm, &pubkey);
+        let anchor = anchor_from_key_str(algorithm, &pubkey)
+            .map_err(|e| format!("anchor derivation failed: {e}"))?;
 
         let handle = doc.get("alsoKnownAs")
             .and_then(|aka| aka.as_array())
@@ -242,7 +243,8 @@ impl ExternalIdentifierResolver for FulcioResolver {
 
         let pubkey_der = cert.public_key().raw;
         let algorithm = "p256";
-        let anchor = anchor_from_key_str(algorithm, pubkey_der);
+        let anchor = anchor_from_key_str(algorithm, pubkey_der)
+            .map_err(|e| format!("anchor derivation failed: {e}"))?;
 
         Ok(Some(ResolvedIdentity {
             anchor, public_key: pubkey_der.to_vec(),
@@ -412,7 +414,8 @@ impl ExternalIdentifierResolver for NixKeyResolver {
     async fn resolve(&self, identifier: &str) -> Result<Option<ResolvedIdentity>, String> {
         for (name, pubkey) in &self.keys {
             if name == identifier {
-                let anchor = anchor_from_key_str("ed25519", pubkey);
+                let anchor = anchor_from_key_str("ed25519", pubkey)
+                    .map_err(|e| format!("anchor derivation failed: {e}"))?;
                 return Ok(Some(ResolvedIdentity {
                     anchor, public_key: pubkey.clone(),
                     algorithm: "ed25519".to_string(),

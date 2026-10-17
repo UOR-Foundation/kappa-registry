@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `NamespaceRef: From<&str>` is not satisfied
+  --> tests/v1/compile_fail/namespace_ref_no_from_str.rs:12:72
+   |
+12 |     let _ns: kappa_store::namespace::NamespaceRef = "arbitrary-string".into();
+   |                                                                        ^^^^ the trait `From<&str>` is not implemented for `NamespaceRef`
+   |
+   = note: required for `&str` to implement `Into<NamespaceRef>`

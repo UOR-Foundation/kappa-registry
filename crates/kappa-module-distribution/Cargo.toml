@@ -9,12 +9,17 @@ description = "Kappa-distribution protocol extension handlers."
 
 [lib]
 name = "kappa_module_distribution"
-path = "src/lib.rs"
+path = "src/v1/lib.rs"
 
 [dependencies]
 kappa-core = { workspace = true }
+kappa-types = { workspace = true }
+kappa-crypto = { workspace = true }
+kappa-store = { workspace = true }
+kappa-handler = { workspace = true }
 kappa-reconcile = { workspace = true }
-topcoat = { workspace = true }
+topcoat = { workspace = true, features = ["sse"] }
+futures-util = "0.3"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,3 +29,10 @@ blake3 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 bytes = "1"
+
+[dev-dependencies]
+kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-fixture = { workspace = true }
+kappa-store-memory = { workspace = true, features = ["test-util"] }
+kappa-store-redb = { workspace = true }

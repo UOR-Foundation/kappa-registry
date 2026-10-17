@@ -1,0 +1,11 @@
+error[E0451]: fields `id`, `display_name` and `protocol` of struct `NamespaceRef` are private
+  --> tests/v1/compile_fail/namespace_ref_struct_closed.rs:13:9
+   |
+12 |     let _ns = kappa_store::namespace::NamespaceRef {
+   |               ------------------------------------ in this type
+13 |         id: [0u8; 16],
+   |         ^^ private field
+14 |         display_name: "fabricated".to_string(),
+   |         ^^^^^^^^^^^^ private field
+15 |         protocol: None,
+   |         ^^^^^^^^ private field

@@ -26,14 +26,20 @@ KAPPA_RATELIMIT_ADMIN_PERIOD_MS=0 \
 RUST_LOG=debug \
   "$BINARY" 2>"$TMP/server.log" &
 SERVER_PID=$!
-trap "kill $SERVER_PID 2>/dev/null || true; echo '--- server log ---'; cat $TMP/server.log 2>/dev/null; echo '--- end server log ---'; rm -rf $TMP" EXIT
+trap 'kill "$SERVER_PID" 2>/dev/null || true; echo "--- server log ---"; cat "$TMP/server.log" 2>/dev/null; echo "--- end server log ---"; rm -rf "$TMP"' EXIT
 
-for i in $(seq 1 50); do
+ready=0
+for _ in $(seq 1 50); do
   if curl -sf "http://127.0.0.1:$PORT/_status" >/dev/null 2>&1; then
+    ready=1
     break
   fi
   sleep 0.1
 done
+if ((ready == 0)); then
+  echo "FAIL: kappa-server did not answer /_status on port $PORT within 5 seconds" >&2
+  exit 1
+fi
 
 ENDPOINT="http://127.0.0.1:$PORT"
 
@@ -48,30 +54,30 @@ AWS="aws --endpoint-url $ENDPOINT --no-sign-request"
 
 echo "=== create bucket ==="
 $AWS s3 mb s3://testbucket 2>&1
-echo "exit: $?"
+echo "ok"
 
 echo ""
 echo "=== list buckets ==="
 $AWS s3 ls 2>&1
-echo "exit: $?"
+echo "ok"
 
 echo ""
 echo "=== put object ==="
 echo "hello from kappa s3" > "$TMP/hello.txt"
 $AWS s3 cp "$TMP/hello.txt" s3://testbucket/hello.txt 2>&1
-echo "exit: $?"
+echo "ok"
 
 echo ""
 echo "=== get object ==="
 $AWS s3 cp s3://testbucket/hello.txt "$TMP/downloaded.txt" 2>&1
-echo "exit: $?"
+echo "ok"
 diff "$TMP/hello.txt" "$TMP/downloaded.txt"
 echo "files match"
 
 echo ""
 echo "=== list objects ==="
 $AWS s3 ls s3://testbucket/ 2>&1
-echo "exit: $?"
+echo "ok"
 
 echo ""
 echo "=== put multiple objects ==="
@@ -92,12 +98,12 @@ $AWS s3 ls s3://testbucket/dir/ 2>&1 || echo "s3 ls prefix exit: $?"
 echo ""
 echo "=== head object ==="
 $AWS s3api head-object --bucket testbucket --key hello.txt 2>&1
-echo "exit: $?"
+echo "ok"
 
 echo ""
 echo "=== delete object ==="
 $AWS s3 rm s3://testbucket/hello.txt 2>&1
-echo "exit: $?"
+echo "ok"
 
 echo ""
 echo "=== verify deleted ==="
@@ -111,7 +117,7 @@ fi
 echo ""
 echo "=== delete bucket ==="
 $AWS s3 rb s3://testbucket --force 2>&1
-echo "exit: $?"
+echo "ok"
 
 echo ""
 echo "SUCCESS: S3 bucket ops + object CRUD complete"

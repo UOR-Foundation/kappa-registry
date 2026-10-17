@@ -65,8 +65,7 @@ impl EpochRoot {
             &fields.signer_anchor,
         );
         let leaf_refs: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
-        let root_hash = merkle::merkle_root(&leaf_refs)
-            .expect("epoch root always has EPOCH_LEAF_COUNT > 0 leaves");
+        let root_hash = merkle::merkle_root(&leaf_refs);
 
         EpochRoot {
             namespace: fields.namespace,
@@ -157,8 +156,7 @@ impl EpochRoot {
 
         // Recompute Merkle root from the 7 Merkle leaves only
         let leaf_refs: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
-        let root_hash = merkle::merkle_root(&leaf_refs)
-            .ok_or_else(|| EpochError::MalformedLeafData("empty leaves".into()))?;
+        let root_hash = merkle::merkle_root(&leaf_refs);
 
         // Decode fields from dCBOR leaves
         let namespace: String =
@@ -261,21 +259,15 @@ fn encode_leaves(
 }
 
 pub fn mutations_merkle_root(mutations: &[EpochMutation]) -> [u8; 32] {
-    if mutations.is_empty() {
-        return [0u8; 32];
-    }
     let encoded: Vec<Vec<u8>> = mutations.iter().map(canonical_bytes).collect();
     let leaf_refs: Vec<&[u8]> = encoded.iter().map(|e| e.as_slice()).collect();
-    merkle::merkle_root(&leaf_refs).unwrap_or([0u8; 32])
+    merkle::merkle_root(&leaf_refs)
 }
 
 pub fn state_merkle_root(sorted_tags: &[crate::types::TagEntry]) -> [u8; 32] {
-    if sorted_tags.is_empty() {
-        return [0u8; 32];
-    }
     let encoded: Vec<Vec<u8>> = sorted_tags.iter().map(canonical_bytes).collect();
     let leaf_refs: Vec<&[u8]> = encoded.iter().map(|e| e.as_slice()).collect();
-    merkle::merkle_root(&leaf_refs).unwrap_or([0u8; 32])
+    merkle::merkle_root(&leaf_refs)
 }
 
 #[cfg(test)]
@@ -357,7 +349,7 @@ mod tests {
 
     #[test]
     fn mutations_merkle_root_empty() {
-        assert_eq!(mutations_merkle_root(&[]), [0u8; 32]);
+        assert_eq!(mutations_merkle_root(&[]), merkle::EMPTY_ROOT);
     }
 
     #[test]

@@ -45,11 +45,7 @@ pub fn blob_path_for(root: &Path, kappa: &str) -> Result<PathBuf, StoreError> {
             )));
         }
     }
-    Ok(root
-        .join(algo)
-        .join(&hex[..2])
-        .join(&hex[2..4])
-        .join(hex))
+    Ok(root.join(algo).join(&hex[..2]).join(&hex[2..4]).join(hex))
 }
 
 /// Extract algorithm and hex digest from a kappa-label string.

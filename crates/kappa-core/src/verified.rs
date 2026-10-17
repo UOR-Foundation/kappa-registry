@@ -10,7 +10,7 @@
 //! the type proves a property (verification happened) by construction,
 //! not by convention.
 
-use crate::kappa::{compute_kappa, verify_kappa, Axis, KappaLabel, LabelError};
+use crate::kappa::{Axis, KappaLabel, LabelError, compute_kappa, verify_kappa};
 
 /// Proof that a streaming hash computation completed successfully.
 ///
@@ -66,7 +66,10 @@ impl StreamingVerificationProof {
 
     /// The axis string of the primary kappa.
     pub fn axis(&self) -> &str {
-        self.primary.split_once(':').map(|(a, _)| a).unwrap_or("sha256")
+        self.primary
+            .split_once(':')
+            .map(|(a, _)| a)
+            .unwrap_or("sha256")
     }
 
     /// Additional verified kappa-labels from multi-axis computation.
@@ -139,9 +142,7 @@ impl VerifiedContent {
             let axis = label.axis().to_string();
             return Err(LabelError::DigestMismatch {
                 expected: claimed.to_string(),
-                computed: compute_kappa(label.axis(), &content)?
-                    .as_str()
-                    .to_string(),
+                computed: compute_kappa(label.axis(), &content)?.as_str().to_string(),
                 axis,
             });
         }

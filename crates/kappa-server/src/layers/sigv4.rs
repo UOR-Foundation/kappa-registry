@@ -13,7 +13,7 @@ use topcoat::context::{try_app_context, Cx};
 use topcoat::router::response::Response;
 use topcoat::router::{Body, StatusCode};
 
-use kappa_core::crypto::sigv4;
+use kappa_crypto::sigv4;
 
 /// Authenticated S3 principal, inserted into request context after
 /// successful SigV4 verification. Downstream handlers read this to

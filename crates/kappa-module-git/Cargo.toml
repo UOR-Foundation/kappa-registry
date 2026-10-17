@@ -9,16 +9,23 @@ description = "Git smart HTTP protocol module for kappa-registry."
 
 [lib]
 name = "kappa_module_git"
-path = "src/lib.rs"
+path = "src/v1/lib.rs"
 
 [dependencies]
 kappa-core = { workspace = true }
+kappa-types = { workspace = true }
+kappa-store = { workspace = true }
+kappa-handler = { workspace = true }
+topcoat = { workspace = true }
 
-gix-object = "0.58"
-gix-pack = { version = "0.68", features = ["streaming-input", "generate"] }
-gix-hash = { version = "0.23", features = ["sha1", "sha256"] }
-gix-features = { version = "0.46", features = ["zlib", "progress"] }
-gix-packetline = { version = "0.21", features = ["blocking-io"] }
+gix-object = "0.65"
+gix-pack = { version = "0.75", features = ["streaming-input", "generate"] }
+gix-hash = { version = "0.27", features = ["sha1", "sha256"] }
+gix-features = { version = "0.50", features = ["progress"] }
+gix-packetline = { version = "0.23", features = ["blocking-io"] }
+# The error contract of the gix crates above: `Find::try_find_cached`
+# returns `ExnResult`, packet-line decoding `ExnMessageResult`.
+gix-error = "0.4"
 flate2 = "1"
 
 hex = { workspace = true }
@@ -29,4 +36,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-store-memory = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

@@ -205,7 +205,7 @@ impl KappaLabel {
         let mut buf = [0u8; 135];
         buf[..prefix_len].copy_from_slice(&self.buf[..prefix_len]);
         let hex_bytes = &self.buf[prefix_len..self.len as usize];
-        for (i, pair) in hex_bytes.chunks_exact(2).enumerate() {
+        for (i, pair) in hex_bytes.as_chunks::<2>().0.iter().enumerate() {
             let hi = hex_nibble(pair[0]).unwrap();
             let lo = hex_nibble(pair[1]).unwrap();
             let byte = (hi << 4) | lo;

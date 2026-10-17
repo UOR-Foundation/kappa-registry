@@ -1,0 +1,7 @@
+error[E0433]: cannot find module or crate `kappa_succinct` in this scope
+ --> tests/v1/compile_fail/hint_no_absence.rs:9:13
+  |
+9 |     let h = kappa_succinct::Hint::from_unverified_bytes(&[]).unwrap();
+  |             ^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `kappa_succinct`
+  |
+  = help: if you wanted to use a crate named `kappa_succinct`, use `cargo add kappa_succinct` to add it to your `Cargo.toml`

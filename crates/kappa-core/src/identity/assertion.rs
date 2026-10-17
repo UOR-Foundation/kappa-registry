@@ -203,18 +203,15 @@ mod tests {
     #[test]
     fn double_entry_produces_one_epoch() {
         use crate::clock::ntp_lamport::NtpLamportClock;
-        use crate::store::memory::{InMemoryStore, MemoryStoreConfig};
         use crate::store::KappaStore;
+        use crate::store::memory::{InMemoryStore, MemoryStoreConfig};
         use crate::types::NamespaceRef;
         use std::sync::Arc;
 
         let tmp = tempfile::tempdir().unwrap();
         let clock = Arc::new(NtpLamportClock::new());
-        let store = InMemoryStore::new(
-            MemoryStoreConfig::new(tmp.path().join("blobs")),
-            clock,
-        )
-        .unwrap();
+        let store =
+            InMemoryStore::new(MemoryStoreConfig::new(tmp.path().join("blobs")), clock).unwrap();
 
         let a = IdentityAssertion {
             asserter: "asserter-a".into(),

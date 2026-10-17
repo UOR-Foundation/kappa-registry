@@ -5,30 +5,57 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Optional redb query accelerator for kappa-registry."
+description = "PersistentStore: KappaStore with content-addressed blob files (framed AEAD, fs-verity) indexed by a redb B+tree, crash-safe mutation buffer, and StorageBackend seam."
 
 [lib]
 name = "kappa_store_redb"
-path = "src/lib.rs"
+path = "src/v1/lib.rs"
 
 [dependencies]
-kappa-core = { workspace = true }
+kappa-types = { workspace = true }
+kappa-store = { workspace = true }
+kappa-cursor = { workspace = true }
+kappa-crypto = { workspace = true }
+kappa-succinct = { workspace = true }
 rekindle-aead = { workspace = true }
+dcbor = { workspace = true }
 redb = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
-md-5 = "0.10"
+md-5 = "0.11"
 serde = { workspace = true }
 serde_json = { workspace = true }
 getrandom = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+zeroize = { workspace = true }
 base64-simd = "0.8"
 crc-fast = "1"
-zstd = "0.13"
+zstd = "0.14"
 xz2 = "0.1"
-bzip2 = "0.5"
+bzip2 = "0.6"
+kappa-fixture = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# FS_IOC_ENABLE_VERITY on placed content files.
+rustix = { workspace = true }
+
+[features]
+# Persistent-store acquisition (`test_support`) for tests and benchmarks.
+test-util = ["kappa-crypto/test-util", "dep:kappa-fixture"]
 
 [dev-dependencies]
+kappa-store-redb = { path = ".", features = ["test-util"] }
+kappa-fixture = { workspace = true }
+kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-store-memory = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

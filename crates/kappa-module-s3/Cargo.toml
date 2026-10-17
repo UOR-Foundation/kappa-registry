@@ -9,14 +9,30 @@ description = "S3-compatible protocol module for kappa-registry."
 
 [lib]
 name = "kappa_module_s3"
-path = "src/lib.rs"
+path = "src/v1/lib.rs"
 
 [dependencies]
 kappa-core = { workspace = true }
-quick-xml = { version = "0.37", features = ["serialize"] }
+kappa-store = { workspace = true }
+kappa-handler = { workspace = true }
+kappa-types = { workspace = true }
+chrono = { workspace = true }
+http = { workspace = true }
+topcoat = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+md-5 = "0.11"
+bytes = "1"
+quick-xml = { version = "0.42", features = ["serialize"] }
 base64-simd = "0.8"
 
 thiserror = { workspace = true }
 
 [dev-dependencies]
+kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-store-memory = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

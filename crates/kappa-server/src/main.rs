@@ -21,7 +21,7 @@ use topcoat::router::{
 };
 
 use kappa_core::clock::ntp_lamport::NtpLamportClock;
-use kappa_core::crypto::keystore::KeyStore;
+use kappa_crypto::keystore::KeyStore;
 use kappa_core::events::InMemoryEventLog;
 use kappa_core::store::KappaStore;
 use kappa_core::transaction::TransactionManager;
@@ -1762,7 +1762,7 @@ async fn main() {
                         && !expected_sha.starts_with("STREAMING-")
                         && !expected_sha.is_empty()
                     {
-                        let computed = kappa_core::crypto::sigv4::sha256_hex(&content);
+                        let computed = kappa_crypto::sigv4::sha256_hex(&content);
                         if computed != *expected_sha {
                             let err = kappa_module_s3::encode_s3_error_xml(
                                 "XAmzContentSHA256Mismatch",
@@ -3465,7 +3465,7 @@ async fn probe_peer_http(
 
     // Verify signature over "{namespace}\n{root}\n{timestamp}"
     let message = format!("{}\n{}\n{}", namespace, root, timestamp);
-    let verifier = match kappa_core::crypto::verifier_for(algorithm) {
+    let verifier = match kappa_crypto::verifier_for(algorithm) {
         Ok(v) => v,
         Err(_) => return ProbeResult::SignatureInvalid(format!("{}: unsupported algorithm {}", peer_url, algorithm)),
     };
@@ -3476,7 +3476,8 @@ async fn probe_peer_http(
     }
 
     // Compute anchor from the peer's public key
-    let peer_anchor = kappa_core::crypto::anchor::anchor_from_key_str(algorithm, &public_key);
+    let peer_anchor = kappa_crypto::anchor::anchor_from_key_str(algorithm, &public_key)
+        .unwrap_or_else(|_| format!("unknown:{}", hex::encode(&public_key)));
 
     // Equivocation detection: same epoch number, different root hash
     if let Some(prev) = peer_epochs.get(&peer_anchor) {

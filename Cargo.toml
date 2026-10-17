@@ -1,14 +1,18 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/kappa-core",
+    "crates/kappa-store",
+    "crates/kappa-crypto",
+    "crates/kappa-fixture",
+    "crates/kappa-handler",
     "crates/kappa-types",
     "crates/kappa-server",
     "crates/kappa-store-redb",
     "crates/kappa-module-oci",
     "crates/kappa-module-identity",
     "crates/kappa-module-distribution",
-    "crates/kappa-akd",
+    "crates/kappa-transparency",
     "crates/kappa-reconcile",
     "crates/kappa-transport-veilid",
     "crates/kappa-module-git",
@@ -16,12 +20,16 @@ members = [
     "crates/kappa-module-nix",
     "crates/kappa-conformance",
     "crates/kappa-module-atproto",
+    "crates/kappa-cursor",
+    "crates/kappa-succinct",
+    "crates/kappa-store-memory",
+    "crates/kappa-perf",
 ]
 
 [workspace.package]
 version = "0.2.0"
-edition = "2021"
-rust-version = "1.95"
+edition = "2024"
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -36,7 +44,7 @@ blake3 = "1"
 sha1-checked = "0.10"
 hex = "0.4"
 
-# Crypto ecosystem -- rand 0.10 lineage (frost 3.0.0 + ed25519-dalek 3.0.0)
+# Crypto ecosystem -- current rand 0.10 lineage; FROST 3.0.0 uses rand_core 0.6.
 rand = { version = "0.10", default-features = false }
 rand_core = { version = "0.10", default-features = false }
 getrandom = { version = "0.4", features = ["sys_rng"] }
@@ -48,13 +56,23 @@ k256 = { version = "0.14", features = ["ecdsa"] }
 signature = "3"
 
 # Signing -- threshold (all no_std+alloc, NCC-audited v3.0.0)
-frost-core = { version = "3", features = ["serialization"] }
-frost-ed25519 = { version = "3", features = ["serialization"] }
-frost-p256 = { version = "3", features = ["serialization"] }
-frost-secp256k1 = { version = "3", features = ["serialization"] }
+frost-core = { version = "=3.0.0", features = ["serialization"] }
+frost-ed25519 = { version = "=3.0.0", features = ["serialization"] }
+frost-p256 = { version = "=3.0.0", features = ["serialization"] }
+frost-secp256k1 = { version = "=3.0.0", features = ["serialization"] }
 
 # Symmetric encryption (AES-256-GCM + AEGIS-128L via rekindle-aead)
 rekindle-aead = { git = "https://github.com/ScopeCreep-zip/rekindle", branch = "feat/cli-tui-restructure-rewrite", default-features = false }
+
+# Lock-free buffer primitives (ReorderRing, CreditGuard, SlabPool)
+rekindle-transport-buff = { git = "https://github.com/ScopeCreep-zip/rekindle", branch = "feat/cli-tui-restructure-rewrite", default-features = false }
+
+# Reference implementations the calibration judges kappa's own paths
+# against: aws-lc's assembly digests and signatures, and ISA-L's AVX2
+# multi-buffer SHA-256 lanes (its `sha256-mb` feature assembles them with
+# nasm at build time).
+aws-lc-rs = "1.18.1"
+rekindle-hash = { git = "https://github.com/ScopeCreep-zip/rekindle", branch = "feat/cli-tui-restructure-rewrite", default-features = false, features = ["sha256-mb"] }
 
 # Key management
 zeroize = "1.9"
@@ -79,10 +97,13 @@ redb = "4"
 
 # Identifiers
 uuid = { version = "1", features = ["v4"] }
-chrono = "0.4"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 
 # Filesystem / temp
 tempfile = "3"
+
+# Safe syscall bindings: page-cache advice, futex and getpid floors
+rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
 
 # Serialization for non-canonical paths (checkpoints, HTTP JSON compat)
 serde = { version = "1", features = ["derive"] }
@@ -95,32 +116,77 @@ governor = "0.10"
 # Concurrent hash map
 dashmap = "6"
 
-# AKD (std-only, kappa-akd crate only)
-akd = { version = "0.12", features = ["serde_serialization", "whatsapp_v1"] }
 async-trait = "0.1"
 
 # JSON Schema validation
-jsonschema = "0.49"
+jsonschema = "0.58"
 
 # Merkle search tree for reconciliation
 merkle-search-tree = "0.8"
 
+# DID key decoding
+bs58 = "0.5"
+unsigned-varint = "0.8"
+
 # Inter-crate
 kappa-core = { path = "crates/kappa-core" }
+kappa-store = { path = "crates/kappa-store" }
+kappa-crypto = { path = "crates/kappa-crypto" }
+kappa-fixture = { path = "crates/kappa-fixture" }
+kappa-handler = { path = "crates/kappa-handler" }
 kappa-types = { path = "crates/kappa-types" }
 kappa-store-redb = { path = "crates/kappa-store-redb" }
 kappa-module-oci = { path = "crates/kappa-module-oci" }
 kappa-module-identity = { path = "crates/kappa-module-identity" }
-kappa-akd = { path = "crates/kappa-akd" }
+kappa-transparency = { path = "crates/kappa-transparency" }
 kappa-reconcile = { path = "crates/kappa-reconcile" }
+kappa-cursor = { path = "crates/kappa-cursor" }
+kappa-succinct = { path = "crates/kappa-succinct" }
+kappa-store-memory = { path = "crates/kappa-store-memory" }
+
+# Benchmarking: criterion-rs/criterion.rs (the maintained upstream; the
+# bheisler repository redirects there after 0.7).
+criterion = { version = "0.8.2", features = ["html_reports"] }
+# Latency distributions: PERF-DOC-011/012/013 percentiles, coordinated-
+# omission correction, V2+DEFLATE encoding for cross-host merging.
+hdrhistogram = { version = "7.6.0", default-features = false, features = ["serialization"] }
+# Read-bandwidth floor: runtime-dispatched (AVX2 or SSE2) full-width vector
+# loads, independent of the build's target CPU, like the libc memcpy that
+# the copy floor measures (PERF-CAL-012).
+memchr = "2.8.3"
+
+# Succinct data structures
+fid-rs = "0.2"
+arc-swap = "1"
+roaring = "0.11"
+
+# Persistent B+tree collections: structural sharing for generation snapshots
+imbl = "7"
 
 [patch.crates-io]
 matchit = { git = "https://github.com/usrbinkat/matchit", branch = "usrbinkat/feat/non-terminal-catch-all" }
 
-[[test]]
-name = "bdd"
-harness = false
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "deny"
 
 [profile.release]
 lto = true
+codegen-units = 1
 strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 1

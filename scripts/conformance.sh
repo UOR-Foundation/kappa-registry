@@ -32,14 +32,8 @@ PORT=9877
 ADDR="127.0.0.1:${PORT}"
 REPORT_DIR="${REPO_ROOT}/tmp/conformance-report"
 
-cleanup() {
-    if [[ -n "${REGISTRY_PID:-}" ]]; then
-        kill "${REGISTRY_PID}" 2>/dev/null || true
-        wait "${REGISTRY_PID}" 2>/dev/null || true
-    fi
-    # Preserve store for post-mortem. Cleaned up by the next run.
-}
-trap cleanup EXIT
+# Stop the registry on exit. The store is preserved for post-mortem.
+trap 'if [[ -n "${REGISTRY_PID:-}" ]]; then kill "${REGISTRY_PID}" 2>/dev/null || true; wait "${REGISTRY_PID}" 2>/dev/null || true; fi' EXIT
 
 echo "starting registry on ${ADDR} with store at ${STORE_DIR}"
 KAPPA_STORE_ROOT="${STORE_DIR}" \
@@ -72,15 +66,14 @@ echo ""
 
 mkdir -p "${REPORT_DIR}"
 
+EXIT_CODE=0
 KAPPA_REGISTRY_URL="http://${ADDR}" \
 KAPPA_NAMESPACE="_conformance/test/v1:conformance" \
 KAPPA_TEST_LEVELS=1,2,3,4,5 \
 KAPPA_TEARDOWN_ENABLED=true \
 KAPPA_TEARDOWN_ORDER=tags-first \
 KAPPA_REPORT_DIR="${REPORT_DIR}" \
-    "${CONFORMANCE_BIN}"
-
-EXIT_CODE=$?
+    "${CONFORMANCE_BIN}" || EXIT_CODE=$?
 
 echo ""
 if [[ ${EXIT_CODE} -eq 0 ]]; then

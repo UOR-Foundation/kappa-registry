@@ -1,0 +1,122 @@
+pub mod session;
+
+use topcoat::router::{Method, RouterBuilder};
+
+pub fn register(builder: RouterBuilder) -> RouterBuilder {
+    builder
+        // Server
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.server.describeServer",
+            crate::server::describe::describe_server
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.server.createAccount",
+            crate::server::account::create_account
+        ))
+        // Sessions
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.server.createSession",
+            session::create_session
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.server.refreshSession",
+            session::refresh_session
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.server.deleteSession",
+            session::delete_session
+        ))
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.server.getSession",
+            session::get_session
+        ))
+        // Sync
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.sync.getLatestCommit",
+            crate::sync::get_repo::get_latest_commit
+        ))
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.sync.listRepos",
+            crate::sync::list_repos::list_repos
+        ))
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.sync.getRepo",
+            crate::sync::get_repo::get_repo
+        ))
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.sync.getBlob",
+            crate::sync::get_blob::get_blob
+        ))
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.sync.subscribeRepos",
+            crate::sync::firehose::subscribe_repos
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.sync.requestCrawl",
+            crate::sync::crawl::request_crawl
+        ))
+        // Identity
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.identity.resolveHandle",
+            crate::identity::resolve_handle::resolve_handle
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.identity.updateHandle",
+            crate::identity::update_handle::update_handle
+        ))
+        // Repo
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.repo.describeRepo",
+            crate::repo::read::describe_repo
+        ))
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.repo.getRecord",
+            crate::repo::read::get_record
+        ))
+        .route(xrpc_route!(
+            Method::GET,
+            "/xrpc/com.atproto.repo.listRecords",
+            crate::repo::read::list_records
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.repo.createRecord",
+            crate::repo::write::create_record
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.repo.putRecord",
+            crate::repo::write::put_record
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.repo.deleteRecord",
+            crate::repo::write::delete_record
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.repo.uploadBlob",
+            crate::repo::write::upload_blob
+        ))
+        .route(xrpc_route!(
+            Method::POST,
+            "/xrpc/com.atproto.repo.applyWrites",
+            crate::repo::write::apply_writes
+        ))
+}

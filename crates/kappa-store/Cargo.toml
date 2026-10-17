@@ -1,0 +1,33 @@
+[package]
+name = "kappa-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "KappaStore sub-trait definitions and composed operations. No implementations. No IO. Depends on kappa-types for all types."
+
+[lib]
+name = "kappa_store"
+path = "src/v1/lib.rs"
+
+[dependencies]
+kappa-types = { workspace = true }
+kappa-cursor = { workspace = true }
+kappa-crypto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+roaring = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+dcbor = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

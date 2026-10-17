@@ -13,7 +13,8 @@ use helpers::*;
 fn anchor_from_seed(seed: &[u8; 32]) -> String {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(seed);
     let public_key = signing_key.verifying_key().to_bytes();
-    kappa_core::crypto::anchor::anchor_from_key_str("ed25519", &public_key)
+    kappa_crypto::anchor::anchor_from_key_str("ed25519", &public_key)
+        .expect("ed25519 anchor derivation")
 }
 
 const OWNER_SEED: [u8; 32] = [10u8; 32];

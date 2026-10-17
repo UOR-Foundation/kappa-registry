@@ -15,13 +15,14 @@ pub mod witness;
 // Core modules
 pub mod bundle;
 pub mod canonical;
-pub mod crypto;
 pub mod delta;
 pub mod epoch;
 pub mod gc;
 pub mod identity;
 pub mod kappa;
-pub mod merkle;
+/// Re-export of `kappa_types::merkle`. New code uses `kappa_types::merkle`
+/// directly.
+pub use kappa_types::merkle;
 pub mod store;
 pub mod transaction;
 pub mod types;
@@ -29,15 +30,11 @@ pub mod verified;
 pub mod version;
 
 pub use canonical::{canonical_bytes, from_canonical};
-pub use crypto::{
-    anchor::{AsserterAnchor, NodeAnchor, SubjectAnchor},
-    verifier_for, CryptoError, Signer, ThresholdSigner, Verifier,
-};
 pub use epoch::{EpochRoot, EpochRootFields};
 pub use kappa::{
-    axis_of, blob_path_for, compute_kappa, kappa_from_bytes,
-    kappa_from_value, sha256_raw, split_kappa, streaming_compute_kappa,
-    streaming_compute_multi, verify_kappa, Axis, KappaLabel, LabelError,
+    Axis, KappaLabel, LabelError, axis_of, blob_path_for, compute_kappa, kappa_from_bytes,
+    kappa_from_value, sha256_raw, split_kappa, streaming_compute_kappa, streaming_compute_multi,
+    verify_kappa,
 };
 pub use store::KappaStore;
 pub use types::*;

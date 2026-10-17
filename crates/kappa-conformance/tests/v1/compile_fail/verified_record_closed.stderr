@@ -1,0 +1,26 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/v1/compile_fail/verified_record_closed.rs:13:5
+   |
+13 |     kappa_crypto::Verified(record)
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> $WORKSPACE/crates/kappa-crypto/src/v1/verified.rs
+   |
+   | pub struct Verified<T>(T);
+   |                        ^ private field
+help: you might have meant to use the `from_verified` associated function
+   |
+13 |     kappa_crypto::Verified::from_verified(record)
+   |                           +++++++++++++++
+
+error[E0624]: associated function `from_verified` is private
+  --> tests/v1/compile_fail/verified_record_closed.rs:19:29
+   |
+19 |     kappa_crypto::Verified::from_verified(record)
+   |                             ^^^^^^^^^^^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/kappa-crypto/src/v1/verified.rs
+   |
+   |     pub(crate) fn from_verified(inner: T) -> Self {
+   |     --------------------------------------------- private associated function defined here

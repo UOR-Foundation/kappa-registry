@@ -3,7 +3,7 @@
 //! Secrets are envelope-encrypted via TableEncryptor at rest.
 //! Rotation stores current + previous secret with a 5-minute grace period.
 
-use kappa_core::crypto::sigv4::{CredentialLookup, CredentialResult};
+use kappa_crypto::sigv4::{CredentialLookup, CredentialResult};
 use kappa_core::types::StoreError;
 use redb::ReadableDatabase;
 
@@ -154,7 +154,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use kappa_core::crypto::sigv4::CredentialLookup;
+    use kappa_crypto::sigv4::CredentialLookup;
     use kappa_core::clock::ntp_lamport::NtpLamportClock;
     use crate::PersistentStore;
     use std::sync::Arc;

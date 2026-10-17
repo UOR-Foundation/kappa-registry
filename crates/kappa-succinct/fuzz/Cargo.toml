@@ -1,0 +1,41 @@
+[package]
+name = "kappa-succinct-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# rust-fuzz/libfuzzer, tracks the latest release.
+libfuzzer-sys = "0.4.13"
+kappa-succinct = { path = ".." }
+kappa-store = { path = "../../kappa-store" }
+
+# The fuzz targets build with sanitizer and coverage instrumentation that
+# must not reach the main workspace's artifacts: an independent workspace,
+# as cargo-fuzz generates it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "trie_deserialize"
+path = "fuzz_targets/trie_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "epoch_deserialize"
+path = "fuzz_targets/epoch_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mutations_decode"
+path = "fuzz_targets/mutations_decode.rs"
+test = false
+doc = false
+bench = false

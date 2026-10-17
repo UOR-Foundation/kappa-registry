@@ -88,7 +88,14 @@ fn streaming_proof_closed_constructor() {
 #[test]
 fn compute_all_six_axes() {
     let content = b"all axes";
-    for axis in [Axis::Sha1, Axis::Sha256, Axis::Blake3, Axis::Sha512, Axis::Sha3_256, Axis::Keccak256] {
+    for axis in [
+        Axis::Sha1,
+        Axis::Sha256,
+        Axis::Blake3,
+        Axis::Sha512,
+        Axis::Sha3_256,
+        Axis::Keccak256,
+    ] {
         let vc = VerifiedContent::compute(axis, content.to_vec()).unwrap();
         assert!(vc.kappa().contains(':'));
         assert_eq!(vc.content(), content);

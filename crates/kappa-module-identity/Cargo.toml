@@ -9,12 +9,16 @@ description = "Identity HTTP protocol module for kappa-registry."
 
 [lib]
 name = "kappa_module_identity"
-path = "src/lib.rs"
+path = "src/v1/lib.rs"
 
 [dependencies]
 kappa-core = { workspace = true }
-kappa-akd = { path = "../kappa-akd" }
-akd = { workspace = true }
+kappa-store = { workspace = true }
+kappa-crypto = { workspace = true }
+kappa-handler = { workspace = true }
+kappa-types = { workspace = true }
+kappa-transparency = { workspace = true }
+serde = { workspace = true }
 topcoat = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

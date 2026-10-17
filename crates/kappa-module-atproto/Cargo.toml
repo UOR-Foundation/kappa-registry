@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "kappa_module_atproto"
+path = "src/v1/lib.rs"
+
 [dependencies]
 sha2 = { workspace = true }
 thiserror = { workspace = true }
@@ -13,8 +17,22 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 http = { workspace = true }
 kappa-core = { workspace = true }
+kappa-store = { workspace = true }
+kappa-cursor = { workspace = true }
+kappa-crypto = { workspace = true }
+kappa-handler = { workspace = true }
+dcbor = { workspace = true }
+getrandom = { workspace = true }
+argon2 = "0.6"
+subtle = "2"
 topcoat = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
 bytes = "1"
+
+[dev-dependencies]
+kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-store-memory = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

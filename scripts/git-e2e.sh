@@ -25,14 +25,20 @@ KAPPA_RATELIMIT_ADMIN_PERIOD_MS=0 \
 RUST_LOG=warn \
   "$BINARY" &
 SERVER_PID=$!
-trap "kill $SERVER_PID 2>/dev/null || true; rm -rf $TMP" EXIT
+trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
-for i in $(seq 1 50); do
+ready=0
+for _ in $(seq 1 50); do
   if curl -sf "http://127.0.0.1:$PORT/_status" >/dev/null 2>&1; then
+    ready=1
     break
   fi
   sleep 0.1
 done
+if ((ready == 0)); then
+  echo "FAIL: kappa-server did not answer /_status on port $PORT within 5 seconds" >&2
+  exit 1
+fi
 
 BASE="http://127.0.0.1:$PORT"
 
@@ -51,12 +57,12 @@ GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@test.com \
   git commit -q -m "initial commit"
 GIT_TERMINAL_PROMPT=0 git remote add origin "$BASE/myrepo.git"
 GIT_TERMINAL_PROMPT=0 git push -u origin main 2>&1
-echo "push exit: $?"
+echo "push: ok"
 
 echo ""
 echo "=== git clone ==="
 GIT_TERMINAL_PROMPT=0 git clone "$BASE/myrepo.git" "$TMP/cloned" 2>&1
-echo "clone exit: $?"
+echo "clone: ok"
 
 echo ""
 echo "=== verify cloned content ==="
@@ -78,12 +84,12 @@ GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@test.com \
 GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@test.com \
   git commit -q -m "second commit"
 GIT_TERMINAL_PROMPT=0 git push 2>&1
-echo "second push exit: $?"
+echo "second push: ok"
 
 cd "$TMP/cloned"
 GIT_TERMINAL_PROMPT=0 git fetch origin 2>&1
 GIT_TERMINAL_PROMPT=0 git merge origin/main --no-edit 2>&1
-echo "fetch+merge exit: $?"
+echo "fetch+merge: ok"
 
 diff "$GITDIR/hello.txt" "$TMP/cloned/hello.txt"
 echo "files match after fetch"

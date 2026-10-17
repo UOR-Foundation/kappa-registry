@@ -8,12 +8,12 @@
 
 use std::sync::RwLock;
 
-use crate::crypto::anchor::NodeAnchor;
-use crate::crypto::keystore::KeyStore;
-use crate::crypto::{CryptoError, Signer};
 use crate::identity::trust::TrustPosition;
-use crate::store::{blob_put_computed, KappaStore};
+use crate::store::{KappaStore, blob_put_computed};
 use crate::types::{NamespaceRef, StoreError};
+use kappa_crypto::anchor::NodeAnchor;
+use kappa_crypto::keystore::KeyStore;
+use kappa_crypto::{CryptoError, Signer};
 
 /// A registry node's identity, established at bootstrap.
 ///
@@ -34,7 +34,7 @@ impl NodeIdentity {
     /// Idempotent: on existing state this loads and returns the same
     /// anchor. It will not mint a second identity (I-8).
     ///
-    /// The signing key is retained in the returned NodeIdentity so
+    /// The signing key is retained in the returned `NodeIdentity` so
     /// handlers can call sign() for epoch root signatures, identity
     /// assertions, and federation messages.
     pub fn bootstrap(keys: &KeyStore, store: &dyn KappaStore) -> Result<Self, StoreError> {
@@ -42,10 +42,8 @@ impl NodeIdentity {
             .load_or_generate_ed25519("default")
             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
 
-        let anchor = NodeAnchor::from_key(
-            signer.algorithm(),
-            crate::crypto::Signer::public_key(&signer),
-        );
+        let anchor = NodeAnchor::from_key(signer.algorithm(), signer.public_key())
+            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
 
         let ns = NamespaceRef::deterministic(&anchor.as_namespace());
         let anchor_kappa = blob_put_computed(store, anchor.as_str().as_bytes())?;
@@ -57,12 +55,12 @@ impl NodeIdentity {
         let position_kappa = blob_put_computed(store, b"unprobed")?;
         store.tag_set(&ns, "trust/position", &position_kappa)?;
 
-        // Root of trust: grant the node anchor read/write/admin on _root.
-        // All other authority flows from delegation edges created from
-        // the node anchor to configured token anchors at server startup.
-        // The node anchor is never exposed as a bearer token.
-        let root_ns = store.namespace_resolve("_root", None)
-            .map_err(|e| StoreError::Rejected(format!("_root namespace must exist before node bootstrap: {}", e)))?;
+        let root_ns = store.namespace_resolve("_root", None).map_err(|e| {
+            StoreError::Rejected(format!(
+                "_root namespace must exist before node bootstrap: {}",
+                e
+            ))
+        })?;
         let ops_bytes = br#"{"ops":["read","write","admin"]}"#.to_vec();
         store.edge_put(
             &root_ns,
@@ -77,7 +75,7 @@ impl NodeIdentity {
         )?;
 
         tracing::info!(
-            anchor = anchor.as_str(),
+            anchor = %anchor,
             algorithm = signer.algorithm(),
             "node identity bootstrapped with _root capability"
         );
@@ -120,13 +118,6 @@ impl NodeIdentity {
     }
 
     /// Update trust position from a batch of probe results.
-    ///
-    /// Examines all probe results to determine the aggregate trust state:
-    /// - All verified -> Federated { verified_peers: count }
-    /// - Any equivocation -> Degraded { reason: Equivocation, ... }
-    /// - Any invalid signature -> Degraded { reason: SignatureInvalid, ... }
-    /// - All unreachable -> Standalone (absence is not failure, I-3)
-    /// - No probes -> Unprobed
     pub fn update_from_probes(&self, results: &[super::probe::ProbeResult]) {
         use super::probe::ProbeResult;
         use super::trust::DegradeReason;

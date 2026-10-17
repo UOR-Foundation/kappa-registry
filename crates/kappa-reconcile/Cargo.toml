@@ -9,9 +9,12 @@ description = "MST reconciliation for kappa-registry federation."
 
 [lib]
 name = "kappa_reconcile"
-path = "src/lib.rs"
+path = "src/v1/lib.rs"
 
 [dependencies]
+kappa-store = { path = "../kappa-store" }
 blake3 = { workspace = true }
+dcbor = { workspace = true }
 merkle-search-tree = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }

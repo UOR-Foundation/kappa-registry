@@ -39,13 +39,8 @@ PORT=9878
 ADDR="127.0.0.1:${PORT}"
 REPORT_DIR="${REPO_ROOT}/tmp/oci-conformance-report"
 
-cleanup() {
-    if [[ -n "${REGISTRY_PID:-}" ]]; then
-        kill "${REGISTRY_PID}" 2>/dev/null || true
-        wait "${REGISTRY_PID}" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
+# Stop the registry on exit.
+trap 'if [[ -n "${REGISTRY_PID:-}" ]]; then kill "${REGISTRY_PID}" 2>/dev/null || true; wait "${REGISTRY_PID}" 2>/dev/null || true; fi' EXIT
 
 echo "starting registry on ${ADDR} with store at ${STORE_DIR}"
 REG_LOG="${REPORT_DIR}/registry.log"
@@ -74,6 +69,7 @@ echo "registry running (pid ${REGISTRY_PID})"
 echo "running OCI distribution-spec conformance suite..."
 echo ""
 
+EXIT_CODE=0
 OCI_REGISTRY="${ADDR}" \
 OCI_TLS=disabled \
 OCI_REPO1=conformance/repo1 \
@@ -90,9 +86,7 @@ OCI_API_MANIFESTS_TAG_PARAM=true \
 OCI_DATA_SPARSE=true \
 OCI_RESULTS_DIR="${REPORT_DIR}" \
 OCI_LOG=warn \
-    "${OCI_BIN}"
-
-EXIT_CODE=$?
+    "${OCI_BIN}" || EXIT_CODE=$?
 
 echo ""
 if [[ ${EXIT_CODE} -eq 0 ]]; then

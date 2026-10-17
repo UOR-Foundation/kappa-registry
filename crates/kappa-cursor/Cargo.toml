@@ -1,0 +1,20 @@
+[package]
+name = "kappa-cursor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Ordered cursor trait and set-algebra combinators for kappa-registry."
+
+[dependencies]
+# Zero dependencies. This crate is the shared contract between
+# kappa-store (types + traits), kappa-store-redb (B+tree cursors),
+# and kappa-succinct (LOUDS trie cursors). None depends on the others
+# through this crate.
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

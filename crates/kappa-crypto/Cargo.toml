@@ -1,0 +1,64 @@
+[package]
+name = "kappa-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Cryptographic primitives: signing, verification, AEAD, SigV4, key management."
+
+[lib]
+name = "kappa_crypto"
+path = "src/v1/lib.rs"
+
+[dependencies]
+coset = "0.4.2"
+ml-dsa = { version = "0.1.1", features = ["zeroize"] }
+kappa-types = { workspace = true }
+
+ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
+k256 = { workspace = true }
+signature = { workspace = true }
+frost-core = { workspace = true }
+frost-ed25519 = { workspace = true }
+frost-p256 = { workspace = true }
+frost-secp256k1 = { workspace = true }
+rand_core = { workspace = true }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+getrandom = { workspace = true }
+rekindle-aead = { workspace = true }
+zeroize = { workspace = true }
+
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+hmac = "0.13"
+subtle = "2"
+md-5 = "0.11"
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Fixture key stores acquired inside a shared filesystem scope (test-util).
+kappa-fixture = { workspace = true, optional = true }
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+aws-lc-rs = { workspace = true }
+
+# The key store's directory owner: descriptor-relative opens, links,
+# renames and removals, directory fsync, flock, and the effective user.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+kappa-crypto = { path = ".", features = ["test-util"] }
+kappa-fixture = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+# Adversarial signers and fixture authorities and key stores for tests in
+# this and dependent crates.
+test-util = ["dep:kappa-fixture"]

@@ -158,7 +158,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
             signature,
         };
 
-        let asserter_anchor = kappa_core::crypto::anchor::asserter_from_signature(
+        let asserter_anchor = kappa_crypto::anchor::asserter_from_signature(
             algorithm,
             &public_key_bytes,
             &assertion.signable_bytes(),
@@ -166,7 +166,7 @@ fn assert_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         )
         .map_err(|e| bad_request(format!("signature verification failed: {}", e)))?;
 
-        assertion.asserter = asserter_anchor.as_str().to_string();
+        assertion.asserter = asserter_anchor.to_string();
 
         // Derive audience label if audience field is present
         let audience_id = v["audience"].as_str().map(|a| a.to_string());
@@ -675,10 +675,11 @@ fn anchor_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
         let endpoint = v["endpoint"].as_str().unwrap_or("").to_string();
 
         // Compute the anchor from algorithm + public key
-        let anchor = kappa_core::crypto::anchor::anchor_from_key_str(
+        let anchor = kappa_crypto::anchor::anchor_from_key_str(
             &algorithm,
             &public_key_bytes,
-        );
+        )
+        .map_err(|e| bad_request(format!("anchor derivation failed: {e}")))?;
 
         let s = store(cx).clone();
         let anchor_clone = anchor.clone();

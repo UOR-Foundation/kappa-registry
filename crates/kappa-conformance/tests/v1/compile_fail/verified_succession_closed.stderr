@@ -1,0 +1,9 @@
+error[E0451]: fields `inner` and `old_public_key` of struct `VerifiedSuccession` are private
+  --> tests/v1/compile_fail/verified_succession_closed.rs:14:9
+   |
+13 |     kappa_store::VerifiedSuccession {
+   |     ------------------------------- in this type
+14 |         inner: admitted,
+   |         ^^^^^ private field
+15 |         old_public_key: Vec::new(),
+   |         ^^^^^^^^^^^^^^ private field

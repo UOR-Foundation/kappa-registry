@@ -1,0 +1,29 @@
+[package]
+name = "kappa-transparency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Authenticated identity directory: a sorted-leaf Merkle map and an append-only transition log, committed by signed epochs, with membership, absence, three-state history and append-only audit proofs."
+
+[lib]
+name = "kappa_transparency"
+path = "src/v1/lib.rs"
+
+[dependencies]
+kappa-types = { workspace = true }
+kappa-store = { workspace = true }
+kappa-crypto = { workspace = true }
+dcbor = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+kappa-store-memory = { workspace = true, features = ["test-util"] }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-crypto = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

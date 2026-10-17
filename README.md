@@ -882,10 +882,26 @@ curl -X POST \
   "http://127.0.0.1:5000/v2/example/_reconcile"
 ```
 
-Range-based set reconciliation using XOR-monoid fingerprints for
-O(difference) federation sync.
+Range-based set reconciliation uses the shared `sha256-add256-v1`
+fingerprint. Each leaf hashes a domain separator and length-framed tag name
+and binary kappa key; leaves are added modulo 2^256. Insertion and removal
+are distinct operations, and repeated leaves do not cancel as they do under
+XOR. Fingerprints detect state differences; authenticated epoch and proof
+verification establish the evidence behind a state claim.
 
 ### Namespace root and proofs
+
+The v1 epoch wire record binds the stable 16-byte namespace UUID at CBOR
+key 0. Display names and aliases are routing metadata, so renaming a
+namespace does not change the identity authenticated by its history.
+Key 2 references the preceding epoch, key 8 references succession evidence
+on a signer transition, key 9 contains the COSE envelope as a byte string,
+and key 10 commits the mutation ledger's content address. The signing payload
+includes key 10 and excludes key 9. A ledger commitment alone is not an index
+absence proof.
+Absent predecessor and rotation references are omitted map keys. Present
+references must decode as valid kappas; explicit nulls, malformed references,
+and unknown epoch fields are rejected rather than silently discarded.
 
 ```bash
 # Root hash
@@ -915,6 +931,19 @@ Tag mutations emit Server-Sent Events:
 ```bash
 curl -N "http://127.0.0.1:5000/v2/example/_events"
 ```
+
+Resume with `?since=42` or the `Last-Event-ID: 42` header. If both are
+present, `since` takes precedence. Cursors must be unsigned decimal integers.
+Use `?prefix=releases/` to filter tag names. Namespaces may contain slashes.
+Mutation frames contain a snake-case event name, a sequence `id`, and a JSON
+mutation record. Idle streams send keep-alive comments every 30 seconds.
+
+Replay is bounded and process-local. If eviction or compaction discarded
+namespace events after the requested cursor, the server sends
+`event: resync_required` with JSON `after` and `discarded_through` fields,
+then closes the stream. This control event has no ID: it does not acknowledge
+missing mutations. Rebuild namespace state before subscribing again.
+Replay history and sequence continuity do not survive a server restart.
 
 ### WebSocket CRDT
 
@@ -1242,8 +1271,24 @@ cargo build --release --features "oci,identity-http,distribution,git,s3,nix,atpr
 # Unit and integration tests
 cargo test --workspace
 
+# Public-interface Cucumber suite against the real server binary
+cargo test -p kappa-server --test bdd
+
 # Include AT Protocol tests
 cargo test --workspace --features atproto
+
+# Succinct index: bounded default suite
+cargo test -p kappa-succinct --features bitmap
+
+# Succinct index: opt-in endurance/scale tests, with progress output
+cargo test --release -p kappa-succinct --features bitmap --test conformance -- --ignored --nocapture --test-threads=1
+
+# Realistic identities, concurrent retained readers, mutation/rebuild latency,
+# index reconstruction, and Linux process high-water RSS (default: 10M keys)
+cargo test --release -p kappa-succinct --test production_workloads -- --ignored --nocapture --test-threads=1
+
+# Larger population and reader pressure; provision resources for the workload
+KAPPA_SCALE_KEYS=100000000 KAPPA_SCALE_READERS=100 KAPPA_SCALE_ROUNDS=8 cargo test --release -p kappa-succinct --test production_workloads -- --ignored --nocapture --test-threads=1
 
 # kappa-distribution conformance (187 tests)
 ./scripts/conformance.sh
@@ -1256,6 +1301,15 @@ cargo test --workspace --features atproto
 ./scripts/s3-e2e.sh       # S3 bucket ops + object CRUD
 ./scripts/nix-e2e.sh      # nix copy + narinfo/NAR verification
 ```
+
+Succinct endurance tests are marked `#[ignore = "endurance: ..."]` and may
+take several minutes or require substantial memory. The default mutation
+oracle uses 32 cases of up to 255 operations; the endurance version retains
+100 cases of up to 9,999 operations. The default write/rebuild test uses
+1,024 writes; endurance exercises one million. Both tiers assert the same
+oracle and configured-overflow contracts. `--ignored` runs only ignored tests;
+`--include-ignored` runs both tiers. Use one test thread for scale runs to
+avoid concurrent high-memory workloads. Progress is visible with `--nocapture`.
 
 ---
 

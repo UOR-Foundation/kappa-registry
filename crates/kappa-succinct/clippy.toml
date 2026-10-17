@@ -1,0 +1,4 @@
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "non-deterministic iteration order incompatible with ordered cursor contract" },
+    { path = "std::collections::HashSet", reason = "non-deterministic iteration order incompatible with ordered cursor contract" },
+]

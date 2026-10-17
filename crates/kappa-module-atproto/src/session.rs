@@ -393,7 +393,7 @@ pub fn parse_and_verify_dpop_proof(
     let signing_input = format!("{}.{}", header_b64, payload_b64);
     let signature_bytes = base64url_decode(signature_b64)?;
 
-    let verifier = kappa_core::crypto::verifier_for(verify_algorithm)
+    let verifier = kappa_crypto::verifier_for(verify_algorithm)
         .map_err(|_| SessionError::InvalidToken)?;
 
     match verifier.verify(&public_key_bytes, signing_input.as_bytes(), &signature_bytes) {

@@ -35,12 +35,11 @@ pub enum ClockError {
 pub fn parse_datetime_to_epoch_secs(datetime: &str) -> Result<u64, ClockError> {
     let parsed = chrono::NaiveDateTime::parse_from_str(datetime, "%Y%m%dT%H%M%SZ")
         .map_err(|e| ClockError::InvalidFormat(format!("{}: {}", datetime, e)))?;
-    let epoch = parsed
-        .and_utc()
-        .timestamp();
+    let epoch = parsed.and_utc().timestamp();
     if epoch < 0 {
         return Err(ClockError::InvalidFormat(format!(
-            "{} is before Unix epoch", datetime
+            "{} is before Unix epoch",
+            datetime
         )));
     }
     Ok(epoch as u64)

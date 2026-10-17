@@ -84,10 +84,10 @@ pub fn encode(objects: &[(&str, &[u8])], use_deltas: bool) -> Vec<u8> {
         let window_start = idx.saturating_sub(DELTA_WINDOW_SIZE);
         let mut best: Option<(usize, Vec<u8>)> = None;
         for (ci, &(_, _, base)) in indexed.iter().enumerate().take(idx).skip(window_start) {
-            if let Some(d) = delta::compute_delta(base, content) {
-                if best.as_ref().is_none_or(|(_, prev)| d.len() < prev.len()) {
-                    best = Some((ci, d));
-                }
+            if let Some(d) = delta::compute_delta(base, content)
+                && best.as_ref().is_none_or(|(_, prev)| d.len() < prev.len())
+            {
+                best = Some((ci, d));
             }
         }
         plans.push(EntryPlan {
@@ -113,12 +113,12 @@ pub fn encode(objects: &[(&str, &[u8])], use_deltas: bool) -> Vec<u8> {
             if emitted[i] {
                 continue;
             }
-            if let Some((base_idx, _)) = &plans[i].delta_base {
-                if emitted[*base_idx] {
-                    order.push(i);
-                    emitted[i] = true;
-                    progress = true;
-                }
+            if let Some((base_idx, _)) = &plans[i].delta_base
+                && emitted[*base_idx]
+            {
+                order.push(i);
+                emitted[i] = true;
+                progress = true;
             }
         }
         if !progress {
@@ -142,19 +142,19 @@ pub fn encode(objects: &[(&str, &[u8])], use_deltas: bool) -> Vec<u8> {
 
     for &idx in &order {
         let plan = &plans[idx];
-        if let Some((base_idx, ref delta_bytes)) = plan.delta_base {
-            if emitted[base_idx] {
-                out.push(ENTRY_TYPE_DELTA);
-                let kb = plan.kappa.as_bytes();
-                out.extend_from_slice(&(kb.len() as u16).to_be_bytes());
-                out.extend_from_slice(kb);
-                let bk = plans[base_idx].kappa.as_bytes();
-                out.extend_from_slice(&(bk.len() as u16).to_be_bytes());
-                out.extend_from_slice(bk);
-                out.extend_from_slice(&(delta_bytes.len() as u64).to_be_bytes());
-                out.extend_from_slice(delta_bytes);
-                continue;
-            }
+        if let Some((base_idx, ref delta_bytes)) = plan.delta_base
+            && emitted[base_idx]
+        {
+            out.push(ENTRY_TYPE_DELTA);
+            let kb = plan.kappa.as_bytes();
+            out.extend_from_slice(&(kb.len() as u16).to_be_bytes());
+            out.extend_from_slice(kb);
+            let bk = plans[base_idx].kappa.as_bytes();
+            out.extend_from_slice(&(bk.len() as u16).to_be_bytes());
+            out.extend_from_slice(bk);
+            out.extend_from_slice(&(delta_bytes.len() as u64).to_be_bytes());
+            out.extend_from_slice(delta_bytes);
+            continue;
         }
         out.push(ENTRY_TYPE_FULL);
         let kb = plan.kappa.as_bytes();

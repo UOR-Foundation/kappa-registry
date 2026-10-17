@@ -1,0 +1,24 @@
+error[E0624]: associated function `single` is private
+  --> tests/v1/compile_fail/streaming_proof_closed.rs:14:69
+   |
+14 |     let _proof = kappa_store::verified::StreamingVerificationProof::single(
+   |                                                                     ^^^^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/kappa-types/src/v1/verified.rs
+   |
+   |     pub(crate) const fn single(kappa: Kappa) -> Self {
+   |     ------------------------------------------------ private associated function defined here
+
+error[E0308]: mismatched types
+  --> tests/v1/compile_fail/streaming_proof_closed.rs:15:9
+   |
+14 |     let _proof = kappa_store::verified::StreamingVerificationProof::single(
+   |                  --------------------------------------------------------- arguments to this function are incorrect
+15 |         "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Kappa`, found `String`
+   |
+note: associated function defined here
+  --> $WORKSPACE/crates/kappa-types/src/v1/verified.rs
+   |
+   |     pub(crate) const fn single(kappa: Kappa) -> Self {
+   |                         ^^^^^^

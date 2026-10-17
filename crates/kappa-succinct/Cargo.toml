@@ -1,0 +1,26 @@
+[package]
+name = "kappa-succinct"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "LOUDS-DS succinct trie with composable cursor algebra for content-addressed key spaces."
+
+[dependencies]
+kappa-types = { workspace = true }
+kappa-cursor = { path = "../kappa-cursor" }
+fid-rs = { workspace = true }
+arc-swap = "1"
+sha2 = { workspace = true }
+roaring = { workspace = true, optional = true }
+
+[features]
+default = []
+bitmap = ["dep:roaring"]
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

@@ -6,7 +6,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use kappa_core::crypto::aead::{BlobEncryptor, FRAME_DISK_SIZE, FRAME_SIZE, FRAME_TAG_SIZE};
+use kappa_crypto::aead::{BlobEncryptor, FRAME_DISK_SIZE, FRAME_SIZE, FRAME_TAG_SIZE};
 use kappa_core::store::BlobReader;
 
 /// A reader that decrypts framed AEAD blobs on demand, one frame at a time.

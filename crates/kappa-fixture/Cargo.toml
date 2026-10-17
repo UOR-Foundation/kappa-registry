@@ -1,0 +1,18 @@
+[package]
+name = "kappa-fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Test and benchmark fixture filesystem scopes, owned jointly by every resource placed in them. Below every kappa crate that keeps files, so key stores, stores, transaction managers and encryption domains share one scope mechanism."
+
+[lib]
+name = "kappa_fixture"
+path = "src/lib.rs"
+
+[dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

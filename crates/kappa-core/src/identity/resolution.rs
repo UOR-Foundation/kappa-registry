@@ -40,10 +40,10 @@ pub fn resolve_at(
         if assertion.valid_from_ms > at_ms {
             continue;
         }
-        if let Some(until) = assertion.valid_until_ms {
-            if until < at_ms {
-                continue;
-            }
+        if let Some(until) = assertion.valid_until_ms
+            && until < at_ms
+        {
+            continue;
         }
 
         let assertion_kappa =

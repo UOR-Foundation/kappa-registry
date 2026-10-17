@@ -5,14 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Conformance test suite for kappa-core primitives."
+description = "Conformance test suite for kappa-store primitives."
 
 [dev-dependencies]
 kappa-core = { workspace = true }
+kappa-handler = { workspace = true, features = ["test-util"] }
+kappa-store = { workspace = true }
+kappa-store-memory = { workspace = true, features = ["test-util"] }
+kappa-crypto = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 dcbor = { workspace = true }
+serde_json = { workspace = true }
 rand_core = { workspace = true }
 getrandom = { workspace = true }
 trybuild = "1"

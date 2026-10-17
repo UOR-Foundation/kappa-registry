@@ -1,19 +1,16 @@
 //! Sequence primitive conformance tests.
 
 use kappa_core::clock::ntp_lamport::NtpLamportClock;
-use kappa_core::store::memory::{InMemoryStore, MemoryStoreConfig};
 use kappa_core::store::KappaStore;
+use kappa_core::store::memory::{InMemoryStore, MemoryStoreConfig};
 use kappa_core::types::NamespaceRef;
 use std::sync::Arc;
 
 fn new_store() -> (InMemoryStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(NtpLamportClock::new());
-    let store = InMemoryStore::new(
-        MemoryStoreConfig::new(dir.path().join("blobs")),
-        clock,
-    )
-    .unwrap();
+    let store =
+        InMemoryStore::new(MemoryStoreConfig::new(dir.path().join("blobs")), clock).unwrap();
     (store, dir)
 }
 

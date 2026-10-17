@@ -1,0 +1,50 @@
+[package]
+name = "kappa-store-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "InMemoryStore: DRAM-tier KappaStore. All 8 sub-traits. Same epoch roots, same state_roots, same mutations_roots as any other KappaStore for the same input. Availability contract: process lifetime."
+
+[lib]
+name = "kappa_store_memory"
+path = "src/v1/mod.rs"
+
+[dependencies]
+kappa-types = { workspace = true }
+kappa-store = { workspace = true }
+kappa-crypto = { workspace = true }
+kappa-cursor = { workspace = true }
+kappa-succinct = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+imbl = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+md-5 = "0.11"
+tempfile = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+zstd = "0.14"
+xz2 = "0.1"
+bzip2 = "0.6"
+kappa-fixture = { workspace = true, optional = true }
+
+[features]
+default = []
+# Memory-store acquisition (`test_support`) for tests and benchmarks.
+test-util = ["kappa-crypto/test-util", "dep:kappa-fixture"]
+
+[dev-dependencies]
+kappa-store-memory = { path = ".", features = ["test-util"] }
+kappa-fixture = { workspace = true }
+kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-handler = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

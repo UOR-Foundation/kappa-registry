@@ -82,7 +82,7 @@ pub struct PersistentStore {
     encryption_key: Option<[u8; 32]>,
     /// Cached BlobEncryptor for the current encryption key.
     /// Constructed once at store creation, reused for all operations.
-    blob_encryptor: Option<kappa_core::crypto::aead::BlobEncryptor>,
+    blob_encryptor: Option<kappa_crypto::aead::BlobEncryptor>,
     /// Cached TableEncryptor for redb value encryption.
     table_encryptor: Option<encrypted::TableEncryptor>,
     /// Upload session timeout in seconds. Sessions older than this are
@@ -180,10 +180,10 @@ impl PersistentStore {
         let blob_encryptor = match &encryption_key {
             Some(key) => {
                 let erased_dir = blob_root.join("_erased");
-                let kms = kappa_core::crypto::kms::FileKms::new(*key, erased_dir)
+                let kms = kappa_crypto::kms::FileKms::new(*key, erased_dir)
                     .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
                 Some(
-                    kappa_core::crypto::aead::BlobEncryptor::new(&kms, "_default")
+                    kappa_crypto::aead::BlobEncryptor::new(&kms, "_default")
                         .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?,
                 )
             }

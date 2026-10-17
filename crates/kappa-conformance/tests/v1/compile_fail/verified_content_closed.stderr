@@ -1,0 +1,13 @@
+error[E0560]: struct `VerifiedContent` has no field named `label`
+  --> tests/v1/compile_fail/verified_content_closed.rs:19:9
+   |
+19 |         label: kappa_store::kappa::Kappa::compute(
+   |         ^^^^^ `VerifiedContent` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0308]: mismatched types
+  --> tests/v1/compile_fail/verified_content_closed.rs:24:16
+   |
+24 |         _seal: (),
+   |                ^^ expected `Seal`, found `()`

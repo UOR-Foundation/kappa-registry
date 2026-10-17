@@ -17,12 +17,20 @@ KAPPA_RATELIMIT_ADMIN_PERIOD_MS=0 \
 RUST_LOG=warn \
   "$BINARY" 2>"$TMP/server.log" &
 SERVER_PID=$!
-trap "kill $SERVER_PID 2>/dev/null || true; rm -rf $TMP" EXIT
+trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
-for i in $(seq 1 50); do
-  if curl -sf "http://127.0.0.1:$PORT/_status" >/dev/null 2>&1; then break; fi
+ready=0
+for _ in $(seq 1 50); do
+  if curl -sf "http://127.0.0.1:$PORT/_status" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
   sleep 0.1
 done
+if ((ready == 0)); then
+  echo "FAIL: kappa-server did not answer /_status on port $PORT within 5 seconds" >&2
+  exit 1
+fi
 
 ENDPOINT="http://127.0.0.1:$PORT"
 export AWS_ACCESS_KEY_ID=test

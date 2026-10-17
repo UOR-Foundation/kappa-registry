@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::kappa::verify_kappa;
@@ -71,11 +71,11 @@ impl TransactionManager {
     ) -> Self {
         // Startup cleanup: remove orphaned staging dirs from prior crashes.
         let staging_root = store_root.join("staging");
-        if staging_root.exists() {
-            if let Ok(entries) = std::fs::read_dir(&staging_root) {
-                for entry in entries.flatten() {
-                    let _ = std::fs::remove_dir_all(entry.path());
-                }
+        if staging_root.exists()
+            && let Ok(entries) = std::fs::read_dir(&staging_root)
+        {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
         }
 
@@ -360,13 +360,7 @@ mod tests {
 
     fn test_store(dir: &Path) -> Arc<InMemoryStore> {
         let clock = Arc::new(NtpLamportClock::new());
-        Arc::new(
-            InMemoryStore::new(
-                MemoryStoreConfig::new(dir.join("blobs")),
-                clock,
-            )
-            .unwrap(),
-        )
+        Arc::new(InMemoryStore::new(MemoryStoreConfig::new(dir.join("blobs")), clock).unwrap())
     }
 
     fn test_kappa(content: &[u8]) -> String {
