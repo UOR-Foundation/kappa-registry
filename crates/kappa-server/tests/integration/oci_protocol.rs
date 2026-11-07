@@ -163,6 +163,76 @@ fn tag_list_pagination_with_last_parameter() {
     drop(guard);
 }
 
+#[test]
+fn tag_list_next_link_carries_page_size() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+
+    for tag in ["alpha", "beta", "gamma", "delta", "epsilon"] {
+        let content = format!(r#"{{"schemaVersion":2,"tag":"{}"}}"#, tag);
+        push_manifest(&c, &base, "oci-page-link", tag, content.as_bytes());
+    }
+
+    // First page: the next link must keep n=2
+    let resp = c
+        .get(format!("{}/v2/oci-page-link/tags/list?n=2", base))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let link = resp
+        .headers()
+        .get("link")
+        .expect("first page should carry a Link header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        link,
+        "</v2/oci-page-link/tags/list?n=2&last=beta>; rel=\"next\""
+    );
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["tags"], serde_json::json!(["alpha", "beta"]));
+
+    // Second page: follow the advertised link as-is
+    let next_path = link
+        .strip_prefix('<')
+        .and_then(|l| l.split_once('>'))
+        .map(|(path, _)| path)
+        .expect("Link header should be </path>; rel=\"next\"");
+    let resp = c.get(format!("{}{}", base, next_path)).send().unwrap();
+    assert_eq!(resp.status(), 200);
+    let link = resp
+        .headers()
+        .get("link")
+        .expect("second page should carry a Link header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        link,
+        "</v2/oci-page-link/tags/list?n=2&last=epsilon>; rel=\"next\""
+    );
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["tags"], serde_json::json!(["delta", "epsilon"]));
+
+    // Last page: one tag left, no next link
+    let resp = c
+        .get(format!(
+            "{}/v2/oci-page-link/tags/list?n=2&last=epsilon",
+            base
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("link").is_none(),
+        "last page should not carry a Link header"
+    );
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body["tags"], serde_json::json!(["gamma"]));
+    drop(guard);
+}
+
 // =============================================================================
 // GAP 6: Range requests on blobs
 // OCI conformance run.go:1102-1238
