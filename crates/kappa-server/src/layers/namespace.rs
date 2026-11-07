@@ -40,7 +40,7 @@ enum DetectedProtocol {
     Git,
     Nix,
     Atproto, // /xrpc/ endpoints
-    System,  // /_status, /v2/, /docs, /openapi.json, /identity
+    System,  // /_status, /v2/, /docs, /openapi.json, /identity, /passkey
     Unknown, // no protocol signal matched — 404
 }
 
@@ -154,6 +154,7 @@ fn detect_protocol(path: &str, query: &str, hdrs: &topcoat::router::HeaderMap) -
         || path == "/docs"
         || path == "/"
         || path.starts_with("/identity/")
+        || path.starts_with("/passkey/")
     {
         return DetectedProtocol::System;
     }
@@ -597,6 +598,10 @@ mod tests {
         );
         assert_eq!(
             detect_protocol("/identity/whoami", "", &HeaderMap::new()),
+            DetectedProtocol::System
+        );
+        assert_eq!(
+            detect_protocol("/passkey/credential/AQID", "", &HeaderMap::new()),
             DetectedProtocol::System
         );
     }

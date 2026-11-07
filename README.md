@@ -1060,6 +1060,44 @@ Narrowing invariant: redelegation may only narrow scope, shorten TTL,
 and decrement depth. Depth is enforced at creation and evaluation.
 Revoking a delegation cascades to all downstream delegates.
 
+### Passkeys (prism/identity/1)
+
+A Prism account is a passkey: its private key stays in the device's secure
+hardware, and the registry stores the public half after checking the WebAuthn
+ceremony that made it. The contract is `identity/PROTOCOL.md` in
+UOR-Foundation/template. Key ID is `base64url(SHA-256(spki))`; an account is
+the key ID of its first passkey.
+
+| Route | Does |
+|---|---|
+| `POST /passkey/challenge` | `{"challenge", "expires"}`: 32 random bytes, single use, 120 s |
+| `POST /passkey/register` | Registers a passkey: a new account, or a device bound by a bind assertion from a live key of the account |
+| `GET /passkey/credential/{credential}` | The key record; `404` unknown, `410` revoked |
+| `GET /passkey/account/{account}` | `{"account", "keys", "revoked"}` |
+| `POST /passkey/revoke` | `{"account", "key", "assertion"}`: revokes a key on a signed request |
+
+Registration checks the client data type and a challenge the registry issued
+(spent whether or not the rest passes), the origin against
+`KAPPA_PASSKEY_ORIGINS`, the rpId hash, the UP, UV and AT flags, that the
+attested credential ID and COSE key are the ones named, and, for a bound
+device, the bind assertion. ES256 (`p256`) and RS256 (`rsa`, 2048 bits and
+up) are accepted; `ciborium` reads the attestation object. Errors are
+`{"error": code, "message"}` with the protocol's codes.
+
+Records live in the reserved namespace `kappa/identity/passkey`, owned by the
+node anchor, so the generic `/v2/` routes cannot write them. Reads are public
+with CORS `*`; browser writes are accepted only from the identity origins,
+and the routes need no bearer token because each write is authenticated by
+its own WebAuthn ceremony or signature. Writes count against the write rate
+limit; behind a proxy set `KAPPA_PROXY_TRUSTED_HEADERS` so each client has
+its own bucket.
+
+```bash
+KAPPA_PASSKEY_ORIGINS=https://id.uor.foundation \
+KAPPA_RATELIMIT_WRITE_PERIOD_MS=1000 \
+./scripts/service.sh --start
+```
+
 ---
 
 ## Federation
@@ -1176,6 +1214,7 @@ All configuration is via environment variables.
 | `KAPPA_HANDLE_VERIFY_INTERVAL_SECS` | `3600` | Handle re-verification interval |
 | `KAPPA_HANDLE_TTL_MS` | `86400000` | Handle verification TTL (24h) |
 | `KAPPA_PDS_HOSTNAME` | (unset) | AT Protocol PDS hostname for requestCrawl |
+| `KAPPA_PASSKEY_ORIGINS` | (unset) | Identity origins for `/passkey/` (comma-separated; https, or `http://localhost` for development) |
 
 ### Rate limiting
 
@@ -1219,6 +1258,7 @@ All three must pass with zero warnings before any commit.
 | `git` | yes | Git smart HTTP protocol |
 | `s3` | yes | S3-compatible API |
 | `nix` | yes | Nix binary cache protocol |
+| `passkey` | yes | Passkey key records (prism/identity/1) |
 | `atproto` | **no** | AT Protocol XRPC endpoints |
 | `veilid` | no | Veilid transport for federation |
 
@@ -1231,7 +1271,7 @@ cargo build --release --features atproto
 Enable all features:
 
 ```bash
-cargo build --release --features "oci,identity-http,distribution,git,s3,nix,atproto"
+cargo build --release --features "oci,identity-http,distribution,git,s3,nix,passkey,atproto"
 ```
 
 ---
@@ -1271,6 +1311,7 @@ kappa-module-git        Git smart HTTP: pack ingest/gen, refs, hooks, LFS
 kappa-module-s3         S3 ListObjectsV2, XML encoding
 kappa-module-nix        Nix narinfo codec, NAR verification, key format
 kappa-module-identity   identity HTTP endpoints, handle registry
+kappa-module-passkey    passkey key records: WebAuthn checks, /passkey/ routes
 kappa-module-atproto    MST, CAR, TID, CID, commits, XRPC, sessions, firehose
 kappa-akd               append-only key directory for absence proofs
 kappa-conformance       conformance tests, compile-fail tests

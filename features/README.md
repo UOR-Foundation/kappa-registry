@@ -12,6 +12,13 @@ Every user-facing interface has an enforced scenario in
 - `@interface:http-api` covers the registry protocol under `/v2/`.
 - `@interface:openapi` covers the generated OpenAPI document at `/openapi.json`.
 - `@interface:scalar` covers the Scalar page at `/docs` and its bundled asset.
+- `@interface:passkey` covers the passkey routes under `/passkey/` in
+  `features/suites/s0_interfaces/passkey.feature`. It is not tagged
+  `@status:enforced`: `tests/bdd.rs` is not compiled by any Cargo target (the
+  workspace root has no package, and the runner imports `axum` and a
+  `kappa_registry` crate that no longer exist), so `cargo test --test bdd`
+  reports no such target. Its scenarios run against the real server binary in
+  `crates/kappa-server/tests/integration/passkey_http.rs`.
 
 When a new interface is added, add a tagged feature scenario for it in the same
 change. Interface scenarios must exercise the public boundary, not call handler
