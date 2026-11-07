@@ -16,6 +16,7 @@ members = [
     "crates/kappa-module-nix",
     "crates/kappa-conformance",
     "crates/kappa-module-atproto",
+    "crates/kappa-module-passkey",
 ]
 
 [workspace.package]

@@ -111,6 +111,12 @@ const ROUTES: &[&str] = &[
     "post|/identity/succession|identity_succession_put|Create identity succession|Identity||j|j",
     "get|/identity/succession/{anchor}/chain|identity_succession_chain|Full succession chain|Identity|anchor:path!|-|j",
     "get|/identity/succession/{anchor}|identity_succession_resolve|Resolve to current anchor|Identity|anchor:path!|-|j",
+    // Passkeys (prism/identity/1)
+    "post|/passkey/challenge|passkey_challenge|Issue a single-use WebAuthn challenge|Passkey||-|j",
+    "post|/passkey/register|passkey_register|Register a passkey after verifying its WebAuthn ceremony|Passkey||j|j",
+    "get|/passkey/credential/{credential}|passkey_credential|Key record for a credential (404 unknown, 410 revoked)|Passkey|credential:path!|-|j",
+    "get|/passkey/account/{account}|passkey_account|Every key record of an account|Passkey|account:path!|-|j",
+    "post|/passkey/revoke|passkey_revoke|Revoke a key on an assertion by a live key of the account|Passkey||j|j",
     // Cluster
     "get|/cluster/members|cluster_members|List cluster members|System||-|j",
     "get|/cluster/status|cluster_status|Cluster status|System||-|j",
@@ -408,5 +414,23 @@ mod tests {
         assert!(paths.contains_key("/identity/whoami"));
         assert!(paths.contains_key("/openapi.json"));
         assert!(paths.contains_key("/docs"));
+    }
+
+    #[test]
+    fn passkey_routes_present_with_methods() {
+        let doc = document();
+        let paths = &doc["paths"];
+        for (path, method) in [
+            ("/passkey/challenge", "post"),
+            ("/passkey/register", "post"),
+            ("/passkey/credential/{credential}", "get"),
+            ("/passkey/account/{account}", "get"),
+            ("/passkey/revoke", "post"),
+        ] {
+            assert!(
+                paths[path][method].is_object(),
+                "OpenAPI lacks {method} {path}"
+            );
+        }
     }
 }

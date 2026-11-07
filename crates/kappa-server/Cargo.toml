@@ -53,6 +53,7 @@ kappa-module-git = { path = "../kappa-module-git", optional = true }
 kappa-module-s3 = { path = "../kappa-module-s3", optional = true }
 kappa-module-nix = { path = "../kappa-module-nix", optional = true }
 kappa-module-atproto = { path = "../kappa-module-atproto", optional = true }
+kappa-module-passkey = { path = "../kappa-module-passkey", optional = true }
 gix-hash = { version = "0.23", features = ["sha1"], optional = true }
 
 [dev-dependencies]
@@ -73,6 +74,11 @@ getrandom = { workspace = true }
 kappa-core = { workspace = true }
 zstd = "0.13"
 nix-derivation = { git = "https://github.com/cachix/nix-derivation" }
+kappa-module-passkey = { path = "../kappa-module-passkey", features = ["testing"] }
+
+[[test]]
+name = "passkey_http"
+path = "tests/integration/passkey_http.rs"
 
 [[test]]
 name = "nix_e2e"
@@ -147,7 +153,8 @@ name = "delegation"
 path = "tests/integration/delegation.rs"
 
 [features]
-default = ["oci", "identity-http", "distribution", "git", "s3", "nix"]
+default = ["oci", "identity-http", "distribution", "git", "s3", "nix", "passkey"]
+passkey = ["dep:kappa-module-passkey"]
 oci = ["dep:kappa-module-oci"]
 identity-http = ["dep:kappa-module-identity"]
 distribution = ["dep:kappa-module-distribution"]

@@ -360,6 +360,17 @@ async fn main() {
     // -- Router --
     let mut builder = Router::builder().compression(Compression::off());
 
+    // The router refuses state-changing cross-origin browser requests. The
+    // identity page writes to /passkey/ from its own origin, so those routes
+    // are exempt here and the CORS layer admits only the configured identity
+    // origins; each write is also authenticated by its WebAuthn ceremony.
+    #[cfg(feature = "passkey")]
+    {
+        builder = builder.origin_policy(
+            topcoat::router::OriginPolicy::new().exempt_paths(kappa_module_passkey::PATHS),
+        );
+    }
+
     // Layer chain: topcoat runs the LAST registered layer OUTERMOST.
     // Registration order: innermost first, outermost last.
     //
@@ -514,6 +525,35 @@ async fn main() {
             builder = builder.app_context(akd.clone());
         }
         builder = kappa_module_identity::register(builder);
+    }
+    // -- Passkey key records (prism/identity/1) --
+    // The namespace is owned by the node anchor so the generic /v2/ routes
+    // cannot write it; without a node identity the routes are not served.
+    #[cfg(feature = "passkey")]
+    {
+        let passkey_config = kappa_module_passkey::PasskeyConfig::parse(&cfg.passkey_origins)
+            .unwrap_or_else(|e| config::config_exit(&format!("KAPPA_PASSKEY_ORIGINS: {e}")));
+        match &node_identity {
+            Some(ni) => {
+                let state = kappa_module_passkey::PasskeyState::new(
+                    passkey_config,
+                    &*store,
+                    ni.anchor().as_str(),
+                )
+                .unwrap_or_else(|e| {
+                    config::config_exit(&format!("passkey namespace bootstrap failed: {e}"))
+                });
+                tracing::info!(
+                    origins = ?state.config.origins().iter().map(|o| o.origin.as_str()).collect::<Vec<_>>(),
+                    "passkey routes enabled"
+                );
+                builder = builder.app_context(Arc::new(state));
+                builder = kappa_module_passkey::register(builder);
+            }
+            None => {
+                tracing::warn!("passkey routes disabled: no node identity to own their namespace")
+            }
+        }
     }
     #[cfg(feature = "distribution")]
     {

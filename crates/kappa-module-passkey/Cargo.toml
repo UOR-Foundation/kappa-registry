@@ -1,0 +1,40 @@
+[package]
+name = "kappa-module-passkey"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Passkey (WebAuthn) key records for prism/identity/1."
+
+[lib]
+name = "kappa_module_passkey"
+path = "src/lib.rs"
+
+[features]
+# Builds WebAuthn-shaped test vectors (real P-256 and RSA signatures) for the
+# server's integration tests. Never enabled in a release build.
+testing = ["dep:rand_core", "dep:rand_core_06"]
+
+[dependencies]
+kappa-core = { workspace = true }
+topcoat = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+p256 = { workspace = true }
+rsa = { version = "0.9", features = ["sha2"] }
+ciborium = "0.2"
+base64 = "0.22"
+thiserror = { workspace = true }
+rand_core = { workspace = true, optional = true }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand_core = { workspace = true }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }

@@ -19,6 +19,7 @@
 //!   KAPPA_RATELIMIT_WRITE_BURST       GCRA burst capacity for writes (default 200)
 //!   KAPPA_RATELIMIT_ADMIN_PERIOD_MS   GCRA token interval for admin ops (default 0 = disabled)
 //!   KAPPA_RATELIMIT_ADMIN_BURST       GCRA burst capacity for admin ops (default 50)
+//!   KAPPA_PASSKEY_ORIGINS       identity origins for /passkey/ (comma separated, default none)
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -110,6 +111,11 @@ pub struct Config {
     pub federation_peers: Vec<String>,
     /// Probe interval in seconds.
     pub probe_interval_secs: u64,
+    /// Identity origins whose WebAuthn ceremonies the passkey routes accept,
+    /// comma separated (https, or http://localhost for development). Each
+    /// origin's host is its rpId. Default empty: every registration is
+    /// refused with `origin`.
+    pub passkey_origins: String,
 }
 
 impl Config {
@@ -176,6 +182,7 @@ impl Config {
             .map(|s| s.trim().to_string())
             .collect();
         let probe_interval_secs: u64 = env_parse("KAPPA_PROBE_INTERVAL_SECS", 60);
+        let passkey_origins = env_or("KAPPA_PASSKEY_ORIGINS", "");
 
         Config {
             listen_addr,
@@ -202,6 +209,7 @@ impl Config {
             veilid_insecure,
             federation_peers,
             probe_interval_secs,
+            passkey_origins,
         }
     }
 
@@ -285,7 +293,7 @@ fn parse_auth_tokens(raw: &str) -> Vec<(String, String)> {
 /// Fatal configuration error. Prints message to stderr and exits.
 #[cold]
 #[inline(never)]
-fn config_exit(msg: &str) -> ! {
+pub(crate) fn config_exit(msg: &str) -> ! {
     eprintln!("configuration error: {msg}");
     std::process::exit(2);
 }
@@ -341,6 +349,7 @@ mod tests {
             veilid_insecure: false,
             federation_peers: Vec::new(),
             probe_interval_secs: 60,
+            passkey_origins: String::new(),
         };
         assert_eq!(cfg.listen_host(), "10.0.0.1");
         assert_eq!(cfg.listen_port(), "8080");
