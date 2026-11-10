@@ -163,6 +163,43 @@ fn tag_list_pagination_with_last_parameter() {
     drop(guard);
 }
 
+#[test]
+fn tag_list_link_header_carries_page_size() {
+    let (guard, base, _tmp) = start_server();
+    let c = client();
+
+    for tag in ["a1", "a2", "a3", "a4", "a5"] {
+        let content = format!(r#"{{"schemaVersion":2,"tag":"{}"}}"#, tag);
+        push_manifest(&c, &base, "oci-link", tag, content.as_bytes());
+    }
+
+    let resp = c
+        .get(format!("{}/v2/oci-link/tags/list?n=2", base))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let link = resp
+        .headers()
+        .get("link")
+        .expect("paginated response must have a Link header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        link.contains("n=2"),
+        "Link header must carry the requested page size: {link}"
+    );
+    assert!(
+        link.contains("last="),
+        "Link header must carry last cursor: {link}"
+    );
+
+    let body: serde_json::Value = resp.json().unwrap();
+    let tags = body["tags"].as_array().unwrap();
+    assert_eq!(tags.len(), 2, "page must respect n=2");
+    drop(guard);
+}
+
 // =============================================================================
 // GAP 6: Range requests on blobs
 // OCI conformance run.go:1102-1238
