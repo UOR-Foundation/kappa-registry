@@ -35,7 +35,8 @@ publish = false
 
 [workspace.dependencies]
 # Deterministic CBOR (dCBOR, draft-mcnally-deterministic-cbor)
-dcbor = { git = "https://github.com/usrbinkat/bc-dcbor-rust", branch = "feat/dcbor-derive", features = ["derive", "multithreaded"] }
+# Pin the contribution from the fork's feat/dcbor-derive branch.
+dcbor = { git = "https://github.com/usrbinkat/bc-dcbor-rust", rev = "b5f19f66493849c7dac8c578beecc7a996554e40", features = ["derive", "multithreaded", "hashbrown", "custom-std-collections"] }
 
 # Hashing
 sha2 = "0.11"

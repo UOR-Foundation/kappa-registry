@@ -170,6 +170,7 @@ fn canonical(c: &mut Criterion, s: &mut CalibratedSession) -> BenchResult {
         tag_count: 10_000,
         rotation_kappa: None,
         ledger_root: &ledger,
+        state: &Kappa::sha256(b"commit-bench-namespace-state"),
     });
     let entry_bytes = canonical_bytes(&entry);
     let root_bytes = root.to_bytes();

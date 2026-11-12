@@ -1,34 +1,29 @@
-//! Installation of prepared content under the store writer.
+//! Installation of prepared content under the store writer: the native
+//! row mechanics every admission and every store-produced record uses.
 //!
 //! Preparation (hashing, chunking, allocation, durability) happens outside
 //! any writer and produces a [`PreparedContent`]: a verified identity, a
 //! validated [`BlobRecord`], and, for external content, the pin that kept
 //! its allocation protected since creation. Installation is the only
-//! write to `BLOB_INDEX` and `ALLOCATIONS`, runs inside the transaction of
-//! the epoch execution that publishes the content, and does three things:
+//! write to `BLOB_INDEX` and `ALLOCATIONS` and runs inside the transaction
+//! of the epoch execution that publishes the content. It refuses or
+//! validates (a composite's components must each have a committed row of
+//! the shape its level requires with the declared logical size, and none
+//! may be the composite itself), writes the row, and for external content
+//! writes the owner marker beside the allocation
+//! (`allocation::write_owner_marker`, durable before the row can commit, so
+//! reclamation always finds the namespace whose rows decide the
+//! allocation) and the `ALLOCATIONS` entry.
 //!
-//! 1. refuses or validates: an identity with a committed row is a
-//!    duplicate (reported, nothing written, the caller abandons its
-//!    allocation); a composite's components must each have a committed
-//!    row of the shape its level requires with the declared logical size,
-//!    and none may be the composite itself;
-//! 2. writes the row and, for external content, the owner marker beside
-//!    the allocation (`allocation::write_owner_marker`, durable before
-//!    the row can commit, so reclamation always finds the namespace whose
-//!    rows decide the allocation) and the `ALLOCATIONS` entry;
-//! 3. records the `ContentPublish` mutation naming a `ContentCommitment`
-//!    of (identity, chunk size, chunk root), itself installed as inline
-//!    content in the same transaction, so the chunk root a reader checks
-//!    is authenticated by the epoch the transaction seals.
-//!
-//! A record the store produces while sealing (an internal install) records
-//! no mutation: neither the commitment nor digest-alias evidence. The
-//! sealing ledger cannot commit itself, and a mutation recorded after the
-//! seal is refused by `commit_epoch_transaction`. Its identities are still
-//! installed exactly as for published content, whatever its representation:
-//! the holder under the lowest axis and an alias row for every other
-//! verified identity, so the record resolves under the identity its caller
-//! supplied and under every mandatory axis.
+//! Logical admission is a transition (`content_admit`): its evidence is
+//! the canonical `ContentAdmissionRecord`, recorded through the transition
+//! boundary, which calls into these mechanics for the row. A record the
+//! store produces (transition evidence, the ledger, roots and state
+//! records the seal writes) is installed without admission
+//! ([`install_internal_in_txn`]): the identities are installed exactly as
+//! for published content, the holder under the lowest axis and an alias
+//! row for every other verified identity, so the record resolves under the
+//! identity its caller supplied and under every mandatory axis.
 //!
 //! Rows are encrypted, written and read through the `BLOB_INDEX` row codec
 //! (`blob_rows`).
@@ -36,22 +31,16 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use kappa_store::canonical::canonical_bytes;
-use kappa_store::clock::ClockMs;
-use kappa_store::epoch::MutationOp;
 use kappa_store::error::StoreError;
 use kappa_store::kappa::Kappa;
 use kappa_store::namespace::NamespaceRef;
-use kappa_store::verified::VerifiedContent;
-use kappa_types::content::ContentAlias;
-use kappa_types::{Axis, ContentCommitment};
 
 use crate::PersistentStore;
 use crate::allocation::{Owner, Pin, Protection, write_owner_marker};
 use crate::blob_rows::{record_in_txn, write_row};
+use crate::derived_index::claim_allocation;
 use crate::referrers::{Referrer, establish};
 use crate::representation::{BlobRecord, Kind, Representation, RepresentationLimits};
-use crate::tables::ALLOCATIONS;
 use crate::unsettled_index::DiscoveryKey;
 
 /// Content ready to install: its verified identity, its record, and the
@@ -127,9 +116,29 @@ impl PreparedContent {
         &self.aliases
     }
 
+    /// The physical bytes the preparation measured for its allocation, the
+    /// amount the unsettled budget charges; zero for unallocated content.
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.pin.as_ref().map_or(0, Pin::bytes)
+    }
+
     pub(crate) fn owned_by(mut self, owner: &Arc<Protection>) -> Self {
         self.owner = Some(Arc::clone(owner));
         self
+    }
+
+    /// The identity, record, allocation pin and aliases, for the admission
+    /// that installs them (`content_admit`).
+    pub(crate) fn into_parts(self) -> (Kappa, BlobRecord, Option<Pin>, Vec<Kappa>) {
+        (self.identity, self.record, self.pin, self.aliases)
+    }
+
+    /// Whether `store` prepared this content: only its own protection can
+    /// install it.
+    pub(crate) fn owned_by_store(&self, store: &PersistentStore) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &store.protection))
     }
 }
 
@@ -165,32 +174,9 @@ pub enum Installed {
     Existing,
 }
 
-/// Install `prepared` for `ns` inside `txn`, recording the `ContentPublish`
-/// commitment for external content. Returns the pin for external content
-/// so the caller holds it until the transaction's outcome is known: a
-/// committed row protects the allocation through `ALLOCATIONS`, an aborted
-/// one leaves it unprotected and reclaimable.
-pub fn install_in_txn(
-    store: &PersistentStore,
-    txn: &redb::WriteTransaction,
-    ns: &NamespaceRef,
-    prepared: PreparedContent,
-    now: ClockMs,
-    limits: RepresentationLimits,
-) -> Result<(Installed, Option<Pin>), StoreError> {
-    Install {
-        store,
-        txn,
-        ns,
-        now,
-        limits,
-    }
-    .run(prepared, Evidence::Recorded)
-}
-
-/// Install a record the store produces while sealing. No mutation is
-/// recorded (see the module documentation). Such content is read in full
-/// and verified against its identity; it has no range or stream path.
+/// Install a record the store produces, without admission (see the module
+/// documentation). Such content is read in full and verified against its
+/// identity; it has no range or stream path.
 pub fn install_internal_in_txn(
     store: &PersistentStore,
     txn: &redb::WriteTransaction,
@@ -198,32 +184,43 @@ pub fn install_internal_in_txn(
     prepared: PreparedContent,
     limits: RepresentationLimits,
 ) -> Result<(Installed, Option<Pin>), StoreError> {
-    Install {
+    if !prepared.owned_by_store(store) {
+        return Err(StoreError::Rejected(
+            "prepared content belongs to another store".into(),
+        ));
+    }
+    let install = Install {
         store,
         txn,
         ns,
-        now: ClockMs::from_raw(0),
         limits,
+    };
+    let PreparedContent {
+        identity,
+        record,
+        pin,
+        aliases,
+        ..
+    } = prepared;
+    let (holder, aliases) = canonical_order(identity, aliases);
+    let installed = if record_in_txn(store, txn, &holder)?.is_some() {
+        Installed::Existing
+    } else {
+        install.row(&holder, &record, pin.is_some())?;
+        Installed::New
+    };
+    for alias in &aliases {
+        install.alias_row(&holder, record.total_size(), alias)?;
     }
-    .run(prepared, Evidence::Withheld)
-}
-
-/// Whether an installation records its evidence in the ledger.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Evidence {
-    /// Commitment and alias mutations are recorded for the epoch to seal.
-    Recorded,
-    /// The installation runs inside the seal: no mutation may be recorded.
-    Withheld,
+    Ok((installed, pin))
 }
 
 /// One installation's transaction context.
-struct Install<'a> {
-    store: &'a PersistentStore,
-    txn: &'a redb::WriteTransaction,
-    ns: &'a NamespaceRef,
-    now: ClockMs,
-    limits: RepresentationLimits,
+pub(crate) struct Install<'a> {
+    pub(crate) store: &'a PersistentStore,
+    pub(crate) txn: &'a redb::WriteTransaction,
+    pub(crate) ns: &'a NamespaceRef,
+    pub(crate) limits: RepresentationLimits,
 }
 
 impl Install<'_> {
@@ -242,53 +239,27 @@ impl Install<'_> {
         Ok(())
     }
 
-    fn run(
+    /// Validate and write the new row of `identity`, establish the
+    /// references it assembles from, and for external content its owner
+    /// marker and allocation ownership.
+    pub(crate) fn row(
         &self,
-        prepared: PreparedContent,
-        evidence: Evidence,
-    ) -> Result<(Installed, Option<Pin>), StoreError> {
-        let PreparedContent {
-            identity,
-            record,
-            pin,
-            aliases,
-            owner,
-        } = prepared;
-        if !owner
-            .as_ref()
-            .is_some_and(|owner| Arc::ptr_eq(owner, &self.store.protection))
-        {
-            return Err(StoreError::Rejected(
-                "prepared content belongs to another store".into(),
-            ));
+        identity: &Kappa,
+        record: &BlobRecord,
+        pinned: bool,
+    ) -> Result<(), StoreError> {
+        self.validate(identity, record, pinned)?;
+        self.write(identity, record)?;
+        for child in referenced(record) {
+            establish(
+                self.store,
+                self.txn,
+                self.ns,
+                &child,
+                &Referrer::representation(identity),
+            )?;
         }
-        // Canonical correspondence: among the verified identities of these
-        // bytes, the representation is held by the one under the lowest
-        // axis discriminant and every other identity aliases it, whichever
-        // axis the request named. Equivalent ingestions under different
-        // primary axes therefore converge on one alias topology, and replay
-        // never meets two contradictory bindings for the same bytes.
-        let (identity, aliases) = canonical_order(identity, aliases);
-        let installed = if record_in_txn(self.store, self.txn, &identity)?.is_some() {
-            Installed::Existing
-        } else {
-            self.validate(&identity, &record, pin.is_some())?;
-            self.write(&identity, &record)?;
-            // Every identity a representation assembles from is retained
-            // by it.
-            for child in referenced(&record) {
-                establish(
-                    self.store,
-                    self.txn,
-                    &child,
-                    &Referrer::representation(&identity),
-                )?;
-            }
-            self.install_external(&identity, &record, evidence)?;
-            Installed::New
-        };
-        self.install_aliases(&identity, record.total_size(), &aliases, evidence)?;
-        Ok((installed, pin))
+        self.install_external(identity, record)
     }
 
     /// Refuse a record whose representation cannot be installed: external
@@ -401,22 +372,10 @@ impl Install<'_> {
         })
     }
 
-    /// For external content: the owner marker, the `ALLOCATIONS` entry
-    /// and, when evidence is recorded, the `ContentPublish` commitment.
-    /// Other representations own no allocation and commit no chunk root.
-    fn install_external(
-        &self,
-        identity: &Kappa,
-        record: &BlobRecord,
-        evidence: Evidence,
-    ) -> Result<(), StoreError> {
-        let Representation::External {
-            allocation,
-            chunk_size,
-            chunk_root,
-            ..
-        } = record.representation()
-        else {
+    /// For external content: the owner marker and the `ALLOCATIONS` entry.
+    /// Other representations own no allocation.
+    fn install_external(&self, identity: &Kappa, record: &BlobRecord) -> Result<(), StoreError> {
+        let Representation::External { allocation, .. } = record.representation() else {
             return Ok(());
         };
         // The marker is written while the preparation's pin still protects
@@ -432,99 +391,57 @@ impl Install<'_> {
             },
             self.store.fsync,
         )?;
-        let mut allocations = self
-            .txn
-            .open_table(ALLOCATIONS)
-            .map_err(crate::error::redb)?;
-        let previous = allocations
-            .insert(allocation.0.as_slice(), identity.key_bytes().as_slice())
-            .map_err(crate::error::redb)?
-            .is_some();
-        drop(allocations);
-        if previous {
-            // A fresh allocation is owned by no committed row: an entry here
-            // is a projection that diverged from `BLOB_INDEX`.
-            return Err(self.store.index_diverged(
-                "ALLOCATIONS",
-                format!("allocation {} is already owned", allocation.hex()),
-            ));
-        }
-        if evidence == Evidence::Withheld {
-            return Ok(());
-        }
-        let commitment = ContentCommitment::new(identity.clone(), *chunk_size, *chunk_root)?;
-        self.record_evidence(MutationOp::ContentPublish, canonical_bytes(&commitment))
+        // A fresh allocation is owned by no committed row: an existing entry
+        // is a projection that diverged from `BLOB_INDEX`, refused there.
+        claim_allocation(self.store, self.txn, self.ns, allocation, identity)
     }
 
-    /// Install `aliases` as the same verified bytes as `target` under the
-    /// store's other mandatory axes: one hop to the target's row, no
-    /// composition. This is the only path that writes alias rows, so the
-    /// new and the already-installed content paths index them identically:
-    /// a new alias row establishes its representation referrer on `target`,
-    /// and an existing row is accepted only when it already selects the
-    /// same bytes. Callers pass identities in canonical order
-    /// (`canonical_order`), so an alias never names a holder under a higher
-    /// axis than its own. The `ContentAlias` evidence of each alias is
-    /// recorded only when `evidence` is recorded; the rows are installed
-    /// either way.
-    fn install_aliases(
+    /// Install `alias` as the same verified bytes as `target` under another
+    /// mandatory axis: one hop to the target's row, no composition. This is
+    /// the only path that writes alias rows, so admitted and store-produced
+    /// content index them identically: a new alias row establishes its
+    /// representation referrer on `target`, and an existing row is accepted
+    /// only when it already selects the same bytes. Callers pass identities
+    /// in canonical order (`canonical_order`), so an alias never names a
+    /// holder under a higher axis than its own. Returns whether the row is
+    /// new.
+    pub(crate) fn alias_row(
         &self,
         target: &Kappa,
         length: u64,
-        aliases: &[Kappa],
-        evidence: Evidence,
-    ) -> Result<(), StoreError> {
-        for alias in aliases.iter().filter(|alias| *alias != target) {
-            if alias.axis().discriminant() < target.axis().discriminant() {
-                return Err(StoreError::Internal(format!(
-                    "alias {alias} would name a holder under a higher axis"
+        alias: &Kappa,
+    ) -> Result<bool, StoreError> {
+        if alias == target {
+            return Ok(false);
+        }
+        if alias.axis().discriminant() < target.axis().discriminant() {
+            return Err(StoreError::Internal(format!(
+                "alias {alias} would name a holder under a higher axis"
+            )));
+        }
+        if let Some(existing) = record_in_txn(self.store, self.txn, alias)? {
+            if existing.total_size() != length {
+                return Err(StoreError::Conflict("digest alias length differs".into()));
+            }
+            if let Representation::Alias { target: selected } = existing.representation()
+                && selected != target
+            {
+                return Err(StoreError::Conflict(format!(
+                    "digest alias {alias} already names {selected}, not {target}"
                 )));
             }
-            if let Some(existing) = record_in_txn(self.store, self.txn, alias)? {
-                if existing.total_size() != length {
-                    return Err(StoreError::Conflict("digest alias length differs".into()));
-                }
-                if let Representation::Alias { target: selected } = existing.representation()
-                    && selected != target
-                {
-                    return Err(StoreError::Conflict(format!(
-                        "digest alias {alias} already names {selected}, not {target}"
-                    )));
-                }
-            } else {
-                let record = BlobRecord::alias(target.clone(), length, self.limits)?;
-                self.write(alias, &record)?;
-                establish(
-                    self.store,
-                    self.txn,
-                    target,
-                    &Referrer::representation(alias),
-                )?;
-            }
-            if evidence == Evidence::Recorded {
-                let binding = ContentAlias::new(alias.clone(), target.clone(), length)?;
-                self.record_evidence(MutationOp::ContentAlias, canonical_bytes(&binding))?;
-            }
+            return Ok(false);
         }
-        Ok(())
-    }
-
-    /// Install evidence `bytes` as inline content (once per identity) and
-    /// record `op` naming it in the epoch the transaction seals.
-    fn record_evidence(&self, op: MutationOp, bytes: Vec<u8>) -> Result<(), StoreError> {
-        let evidence = VerifiedContent::compute(Axis::Sha256, &bytes)?;
-        if record_in_txn(self.store, self.txn, evidence.kappa())?.is_none() {
-            let record = BlobRecord::inline(bytes, None, self.limits)?;
-            self.write(evidence.kappa(), &record)?;
-        }
-        self.store.record_mutation_in_txn(
+        let record = BlobRecord::alias(target.clone(), length, self.limits)?;
+        self.write(alias, &record)?;
+        establish(
+            self.store,
             self.txn,
             self.ns,
-            op,
-            evidence.kappa().clone(),
-            self.now,
-            None,
-        )
+            target,
+            &Referrer::representation(alias),
+        )?;
+        Ok(true)
     }
 }
 

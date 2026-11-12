@@ -10,13 +10,12 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
+use kappa_reconcile::ReconcileTransport;
 use kappa_store::time::Clock;
 use kappa_store::traits::BlobStore;
 use kappa_store::{ContentIdentity, ExecutionStore, PreparationBounds, PreparedContent};
 use kappa_types::kappa::Kappa;
 use kappa_types::namespace::NamespaceRef;
-
-use rekindle_types::transport::Transport;
 
 use super::wire::{
     BlobFetchReport, BlobPullRequest, BlobPullResponse, DeferredBlob, MissingBlob, TagEntryWire,
@@ -83,7 +82,7 @@ pub async fn fetch_missing_blobs<T, S>(
     timeout: Duration,
 ) -> BlobFetchReport
 where
-    T: Transport,
+    T: ReconcileTransport + ?Sized,
     S: BlobStore + ExecutionStore + Send + Sync + ?Sized + 'static,
 {
     let mut report = BlobFetchReport {

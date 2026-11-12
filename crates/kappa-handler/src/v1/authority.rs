@@ -216,7 +216,7 @@ fn delegated<S: AuthorityStore + ?Sized>(
     depth: u32,
     visiting: &mut HashSet<(Kappa, [u8; 16])>,
 ) -> Result<bool, StoreError> {
-    if depth > DELEGATION_CHAIN_MAX_DEPTH {
+    if depth >= DELEGATION_CHAIN_MAX_DEPTH {
         return Ok(false);
     }
     let root = store.namespace_resolve(ROOT_NAMESPACE, None)?;

@@ -27,6 +27,19 @@ pub enum StoreError {
     #[error("capacity exceeded: {0}")]
     CapacityExceeded(String),
 
+    /// The operation's work allowance refused its next unit before the
+    /// unit started: what it reports was done, nothing else, and nothing
+    /// absent was concluded. A limit refusal may be retried with a larger
+    /// allowance or later; a deadline refusal reports the deadline passed.
+    #[error("work refused: {0}")]
+    WorkRefused(crate::work::WorkExhausted),
+
+    /// The store's durable state cannot be opened under this build or
+    /// configuration without an upgrade or a compatible configuration; it
+    /// was not modified.
+    #[error("upgrade required: {0}")]
+    UpgradeRequired(String),
+
     /// Retry the conditional mutation using the returned record's version.
     /// Captured at the failed comparison, not by a subsequent racing read.
     /// None denotes absence (version zero); another writer can still win
@@ -77,6 +90,12 @@ pub enum StoreError {
         detail: String,
     },
 
+    /// A publication known not to be published whose signing coordinate is
+    /// consumed. The backend retains its candidate and resources, and its
+    /// namespace refuses other publications until it is resolved.
+    #[error("{0}")]
+    PublicationRetained(Box<RetainedPublication>),
+
     /// A rotation of the signing authority has an unknown commit outcome on
     /// this handle. Nothing is sealed under either authority until the store
     /// is reopened and its persisted history selects one.
@@ -112,6 +131,102 @@ pub enum StoreError {
     /// no authority history to select with.
     #[error("store has no authority history to select among {offered} offered keys")]
     AuthorityHistoryAbsent { offered: usize },
+}
+
+/// How far a retained publication progressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublicationPhase {
+    /// Prepared and its coordinate consumed; the signer was not invoked.
+    Prepared,
+    /// The signer was invoked and returned nothing the store observed. A
+    /// signature may exist, so the signer is never invoked again.
+    SignerInvoked,
+    /// The signer returned an error and no bytes.
+    SignerRefused,
+    /// The signer returned bytes; no signed root has been formed from them.
+    SignatureReturned,
+    /// The returned bytes are conclusively invalid for this candidate.
+    SignatureInvalid,
+    /// A signed root exists and the evidence it names is being completed.
+    Completing,
+    /// The signed publication is being installed into its candidate view.
+    Installing,
+    /// The candidate's discovery registrations are being made.
+    Registering,
+}
+
+impl PublicationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::SignerInvoked => "signer invoked",
+            Self::SignerRefused => "signer refused",
+            Self::SignatureReturned => "signature returned",
+            Self::SignatureInvalid => "signature invalid",
+            Self::Completing => "completing signed evidence",
+            Self::Installing => "installing",
+            Self::Registering => "registering",
+        }
+    }
+}
+
+/// What resolution of a retained publication can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecoveryDisposition {
+    /// Its retained progress supports another resolution attempt. Each
+    /// attempt still checks current authority, authorization, predecessor
+    /// and work admission before it continues.
+    Resumable,
+    /// No resolution can publish it: no valid signature exists for its
+    /// coordinate, or the authority or authorization it depends on can no
+    /// longer hold.
+    Terminal,
+}
+
+impl RecoveryDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resumable => "resumable",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// The outcome record of a publication known not to be published whose
+/// coordinate is consumed, derived from the backend's retained state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedPublication {
+    pub namespace: [u8; 16],
+    pub incarnation: [u8; 16],
+    /// The consumed coordinate.
+    pub epoch_number: u64,
+    /// The identity of the unsigned root, naming the candidate.
+    pub candidate: crate::kappa::Kappa,
+    /// The signed root, present only once one was formed from the bytes
+    /// the signer returned.
+    pub signed_root: Option<crate::kappa::Kappa>,
+    pub phase: PublicationPhase,
+    pub disposition: RecoveryDisposition,
+    /// Why the publication stopped where it did.
+    pub cause: String,
+}
+
+impl std::fmt::Display for RetainedPublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "epoch {} of namespace {} retained unpublished ({}, {}), candidate {}",
+            self.epoch_number,
+            hex_namespace(&self.namespace),
+            self.phase.as_str(),
+            self.disposition.as_str(),
+            self.candidate,
+        )?;
+        if let Some(root) = &self.signed_root {
+            write!(f, ", signed root {root}")?;
+        }
+        write!(f, ": {}", self.cause)
+    }
 }
 
 fn hex_namespace(namespace: &[u8; 16]) -> String {

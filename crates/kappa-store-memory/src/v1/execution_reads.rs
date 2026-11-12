@@ -12,7 +12,6 @@ use kappa_store::{
 use super::blob_read;
 use super::edge::edge_query_in;
 use super::execution::MemoryExecution;
-use super::identity_local::session_expired;
 use super::namespace_write::{namespace_get_meta_in, namespace_info_in};
 use super::sequence::sequence_current_in;
 use super::tag::{tag_get_in, tag_get_raw_in};
@@ -56,12 +55,21 @@ impl ExecutionReads for MemoryExecution<'_> {
         })
     }
 
+    /// Read and verified on the execution's allowance.
     fn blob_get_verified(
         &self,
         identity: &Kappa,
         maximum: u64,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        self.lookup(|cx| blob_read::verified(cx.view, identity, Some(maximum)))
+        self.lookup(|cx| {
+            self.lend(|meter| {
+                Ok(
+                    blob_read::verified(cx.view, identity, Some(maximum), meter)?
+                        .into_parts()
+                        .1,
+                )
+            })
+        })
     }
 
     fn handle_get(
@@ -85,13 +93,10 @@ impl ExecutionReads for MemoryExecution<'_> {
     }
 
     /// The dependency is the row as observed, expired or not; expiry is
-    /// decided here against the execution's time.
+    /// decided against the execution's time, and a live session's expiry
+    /// again against the time its publication is installed at.
     fn session_get(&self, token: &str) -> Result<Option<(Kappa, Vec<u8>)>, StoreError> {
-        let now = self.issued_at();
-        let row = self.read(|cx| Ok(cx.session_row(token)))?;
-        Ok(row.and_then(|(anchor, expires_at_ms, metadata)| {
-            (!session_expired(expires_at_ms, now)).then_some((anchor, metadata))
-        }))
+        self.read(|cx| Ok(cx.live_session(token)))
     }
 
     fn credential_get(&self, credential_id: &str) -> Result<Option<CredentialLookup>, StoreError> {

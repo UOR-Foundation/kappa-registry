@@ -66,7 +66,7 @@ fn durable_authority_owns_backend_through_last_reference() -> TestResult {
         backend.clone(),
         DurationMs::from_millis(100),
     )?);
-    let retained = clock.clone();
+    let retained = clock.retain();
     drop(clock);
     assert!(
         WallClock::durable(
@@ -248,7 +248,7 @@ fn concurrent_issuance_has_no_duplicates_or_lost_progress() -> TestResult {
     let clock = Arc::new(WallClock::recovered(source(200), CausalTime::new(200, 0)?));
     let workers: Vec<_> = (0..8)
         .map(|_| {
-            let clock = clock.clone();
+            let clock = clock.retain();
             std::thread::spawn(move || {
                 (0..512)
                     .map(|_| clock.now().map(CausalTime::from_encoded))

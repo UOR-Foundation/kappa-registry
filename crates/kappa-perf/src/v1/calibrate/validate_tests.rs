@@ -193,6 +193,87 @@ fn a_measurement_never_bounds_itself() -> TestResult {
     Ok(())
 }
 
+/// A refusal is bounded by the admitted call at the same conditions, and
+/// only by it: another backend's admitted call is not a bound.
+#[test]
+fn a_refusal_is_bounded_by_the_admitted_call_at_the_same_conditions() -> TestResult {
+    let rules = rules();
+    let admitted =
+        id("osc:lat/store.publish?backend=redb&durability=immediate&mutations=1&outcome=admitted")?;
+    let other =
+        id("osc:lat/store.publish?backend=memory&durability=none&mutations=1&outcome=admitted")?;
+    let refused = id(
+        "osc:lat/store.publish?backend=redb&durability=immediate&mutations=1&outcome=refused_capacity",
+    )?;
+    let established = [at(&admitted, 2_000_000.0, false), at(&other, 1.0, false)];
+    let cheap = evaluate(&rules, &at(&refused, 20_000.0, false), &established);
+    let bound: Vec<_> = cheap
+        .iter()
+        .filter(|r| r.rule == "refused_le_admitted")
+        .collect();
+    assert_eq!(bound.len(), 1, "{cheap:?}");
+    assert_eq!(bound[0].bound_id, admitted.canonical());
+    assert!(bound[0].passed);
+    let amplifying = evaluate(&rules, &at(&refused, 3_000_000.0, false), &established);
+    let violation = amplifying
+        .iter()
+        .find(|r| r.rule == "refused_le_admitted")
+        .ok_or("missing")?;
+    assert!(!violation.passed);
+    assert_eq!(violation.severity, Severity::Error);
+    assert!(
+        evaluate(&rules, &at(&admitted, 2_000_000.0, false), &established)
+            .iter()
+            .all(|r| r.rule != "refused_le_admitted"),
+        "an admitted call is never the subject"
+    );
+    Ok(())
+}
+
+/// Interference is judged tail against tail at the spec's 2x
+/// (PERF-SYS-008), and a quiescent record without a distribution bounds
+/// nothing.
+#[test]
+fn interference_is_bounded_by_twice_the_quiescent_tail() -> TestResult {
+    let rules = rules();
+    let quiet = id(
+        "osc:lat/store.publish?backend=redb&durability=immediate&interference=none&mutations=1",
+    )?;
+    let under = id(
+        "osc:lat/store.publish?backend=redb&durability=immediate&interference=gc_sweep&mutations=1",
+    )?;
+    let established = [Established {
+        id: &quiet,
+        value: 1_000_000.0,
+        tail: Some(2_000_000.0),
+        from_baseline: false,
+    }];
+    let gate = |tail: Option<f64>| {
+        evaluate(
+            &rules,
+            &Established {
+                id: &under,
+                value: 1_100_000.0,
+                tail,
+                from_baseline: false,
+            },
+            &established,
+        )
+        .into_iter()
+        .filter(|r| r.rule == "interference_p99_le_2x_quiescent")
+        .collect::<Vec<_>>()
+    };
+    let held = gate(Some(3_900_000.0));
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert!(held[0].passed);
+    assert!((held[0].bound - 4_000_000.0).abs() < f64::EPSILON);
+    let broken = gate(Some(4_100_000.0));
+    assert!(!broken[0].passed);
+    assert_eq!(broken[0].severity, Severity::Error);
+    assert!(gate(None).is_empty(), "no distribution, no comparison");
+    Ok(())
+}
+
 /// The time-to-first-result gate compares 99th percentiles, not medians:
 /// a median within bounds does not excuse a tail that grew with the index,
 /// and a measurement without a distribution is not compared at all.

@@ -1,327 +1,330 @@
+//! Replay of a namespace's signed history into its reconstructed state.
+//!
+//! Every ledger mutation names its canonical transition evidence; replay
+//! fetches that evidence from the namespace, verifies its identity and
+//! interprets it through the shared transition boundary
+//! (`PreparedTransition::decode`), so the operation, scope and index effect
+//! a writer derived are the ones replay derives. Each interpreted
+//! transition is then applied to the reconstructed state with its own
+//! correspondence checks: a removal names what is held, a retirement the
+//! exact admission it removes, a sequence advances by one.
+//!
+//! Each epoch is checked against everything it signs: its chain position,
+//! its ledger and mutation root, the tag-state digest, and the namespace
+//! state it commits: the authority record (of the instance replay began
+//! with), the current-state index root rebuilt from the replayed index
+//! effects and that authority record, and the history log extended by
+//! exactly its ledger.
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use kappa_types::canonical::from_canonical;
-use kappa_types::epoch::{EpochMutation, MutationOp};
+use kappa_types::canonical::{canonical_bytes, from_canonical};
+use kappa_types::content::{ContentAdmissionEvidence, ContentAdmissionRecord, MetadataSubject};
+use kappa_types::epoch::EpochMutation;
 use kappa_types::epoch_root::mutations_merkle_root;
 use kappa_types::error::StoreError;
 use kappa_types::kappa::Kappa;
-use kappa_types::namespace::NamespaceRef;
+use kappa_types::merkle::StreamingTree;
+use kappa_types::namespace::{LogicalIncarnation, NamespaceRef};
+use kappa_types::state_index::{self, Change, Node, NodeSource, Path, Value};
+use kappa_types::tag::TagEntry;
 use kappa_types::verified::VerifiedContent;
+use kappa_types::work::WorkMeter;
+use kappa_types::{AuthorityState, EpochRoot, NamespaceState, state_key};
 
 use crate::identity_ops::AnchorKeyResolver;
+use crate::namespace_commitment::seal_index;
 use crate::traits::blob::BlobStore;
 use crate::traits::epoch::EpochStore;
+use crate::transition::{PreparedTransition, RecordTransition, TransitionDomain};
 
 /// Reconstructed namespace state from epoch chain replay.
 ///
-/// Tags keyed by name. The `BTreeMap` provides sorted iteration
-/// for comparison against live state.
+/// The verifier's model, derived by applying committed transitions; not
+/// the signed commitment record an epoch names (`NamespaceState`), which
+/// replay checks it against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NamespaceState {
+pub struct ReplayedNamespaceState {
+    /// Tag name to the identity it targets: what the tag-state digest
+    /// commits.
     pub tags: BTreeMap<String, Kappa>,
+    /// Tag name to its complete current entry.
+    pub tag_entries: BTreeMap<String, TagEntry>,
+    /// Evidence identity of the current namespace record.
     pub namespace_record: Option<Kappa>,
     pub sequences: BTreeMap<String, u64>,
-    /// Namespace metadata reconstructed from `MetadataUpdate` evidence.
+    /// Namespace metadata.
     pub metadata: BTreeMap<String, Vec<u8>>,
+    /// Blob metadata by content identity and key.
+    pub blob_metadata: BTreeMap<(Kappa, String), Vec<u8>>,
+    /// Identities of the edges the namespace currently holds.
     pub edges: BTreeSet<Kappa>,
+    /// Operation identity to its receipt's identity.
     pub operations: BTreeMap<[u8; 32], Kappa>,
-    /// Chunk framing committed for content identities, keyed by the
-    /// content identity. One commitment per identity: the framing is a
-    /// function of the bytes, so a second differing commitment is evidence
-    /// of inconsistency and a second equal one of a duplicate publication.
-    pub commitments: BTreeMap<Kappa, kappa_types::ContentCommitment>,
-    /// Digest aliases bound in this namespace's history: alias identity to
-    /// (target identity, common length). Content shared across namespaces
-    /// is installed again by each namespace that publishes it, so an equal
-    /// binding may recur; a differing one is evidence of inconsistency.
-    pub aliases: BTreeMap<Kappa, (Kappa, u64)>,
-    /// Compositions installed in this namespace's history: composite
-    /// identity to every component list recorded for it. Two chunkings of
-    /// the same bytes are both true of them, so distinct lists accumulate;
-    /// an equal one recurring is a reinstallation and changes nothing.
+    /// Content identity to its current logical admission.
+    pub admissions: BTreeMap<Kappa, ContentAdmissionRecord>,
+    /// Every component list recorded for a composite identity: two
+    /// chunkings of the same bytes are both true of them.
     pub compositions: BTreeMap<Kappa, BTreeSet<Vec<(Kappa, u64)>>>,
-    /// Identities admitted as records (`RecordPublish`, and every other
-    /// record-naming mutation whose evidence was accepted) rather than
-    /// through a content commitment: retirement of such an identity is
-    /// admitted when a record-naming mutation preceded it.
-    pub retired_inline: BTreeSet<Kappa>,
+    pub assertions: BTreeSet<Kappa>,
+    pub revocations: BTreeSet<Kappa>,
+    pub watermarks: BTreeSet<Kappa>,
+    /// Old anchor to the evidence of its succession.
+    pub successions: BTreeMap<Kappa, Kappa>,
+    /// Authorization scope (index path) to its latest governed transition.
+    pub authorization: BTreeMap<Path, Kappa>,
+    /// Identity member (index path) to the evidence of its current record.
+    pub members: BTreeMap<Path, Kappa>,
+    /// The authority record the last replayed epoch commits.
+    pub authority: Option<AuthorityState>,
+    /// The namespace-state record the last replayed epoch commits.
+    pub committed: Option<NamespaceState>,
+    /// The history log of every replayed mutation.
+    pub history: StreamingTree,
+    /// The current-state index entries the replayed transitions derive,
+    /// with the committed authority entry.
+    pub index: BTreeMap<Path, Value>,
 }
 
-impl NamespaceState {
-    /// Apply a single mutation to the reconstructed state.
-    ///
-    /// TagSet/TagDelete use the context field as the tag name.
-    /// Missing tag identity is rejected rather than inventing a different key.
-    pub fn apply(&mut self, mutation: &EpochMutation) -> Result<(), StoreError> {
-        match mutation.op {
-            MutationOp::TagSet => {
-                let name = mutation
-                    .context
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| StoreError::Rejected("TagSet lacks tag identity".into()))?;
-                self.tags.insert(name.to_string(), mutation.kappa.clone());
+fn rejected(message: impl Into<String>) -> StoreError {
+    StoreError::Rejected(message.into())
+}
+
+impl ReplayedNamespaceState {
+    /// Interpret `mutation` against the `evidence` bytes it names, in the
+    /// namespace instance `domain`, and apply it. Returns the index effect
+    /// the transition derives. A refusal changes nothing.
+    pub fn apply(
+        &mut self,
+        domain: TransitionDomain,
+        mutation: &EpochMutation,
+        evidence: &[u8],
+    ) -> Result<Change, StoreError> {
+        let evidence = VerifiedContent::verify(&mutation.kappa, evidence)?;
+        let transition = PreparedTransition::decode(domain, mutation, evidence)?;
+        let change = transition.index_change();
+        self.apply_record(transition.record(), &mutation.kappa, change)?;
+        match change.1 {
+            Some(value) => self.index.insert(change.0, value),
+            None => self.index.remove(&change.0),
+        };
+        Ok(change)
+    }
+
+    /// The state change of one interpreted transition, whose evidence is
+    /// `id`, checked before anything changes.
+    fn apply_record(
+        &mut self,
+        record: &RecordTransition,
+        id: &Kappa,
+        change: Change,
+    ) -> Result<(), StoreError> {
+        match record {
+            RecordTransition::TagSet(entry) => {
+                self.tags.insert(entry.name.clone(), entry.kappa.clone());
+                self.tag_entries.insert(entry.name.clone(), entry.clone());
             }
-            MutationOp::TagDelete => {
-                let name = mutation
-                    .context
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| StoreError::Rejected("TagDelete lacks tag identity".into()))?;
-                if self.tags.get(name) != Some(&mutation.kappa) {
-                    return Err(StoreError::Rejected(
-                        "TagDelete does not match reconstructed state".into(),
-                    ));
-                }
-                self.tags.remove(name);
-            }
-            MutationOp::AssertionPublish
-            | MutationOp::RevocationPublish
-            | MutationOp::AnchorOrigin => {
-                // Non-tag mutations do not affect the tag state.
-                // They are recorded for audit trail completeness.
-            }
-            MutationOp::RecordPublish => {
-                // The record is content the namespace admitted, named by
-                // its identity; no state derives from its bytes, which a
-                // later retirement may have released. The signed ledger is
-                // the evidence of the admission.
-                if mutation.context.is_some() {
-                    return Err(StoreError::Rejected(
-                        "record publication carries a context".into(),
-                    ));
-                }
-                self.retired_inline.insert(mutation.kappa.clone());
-            }
-            MutationOp::ContentRetire => {
-                if mutation.context.is_some() {
-                    return Err(StoreError::Rejected(
-                        "content retirement carries a context".into(),
-                    ));
-                }
-                // The namespace no longer selects a representation for the
-                // identity: its commitment, alias binding and compositions
-                // are no longer live. A retirement of an identity this
-                // history never admitted is evidence of inconsistency.
-                let committed = self.commitments.remove(&mutation.kappa).is_some();
-                let aliased = self.aliases.remove(&mutation.kappa).is_some();
-                let composed = self.compositions.remove(&mutation.kappa).is_some();
-                if !(committed
-                    || aliased
-                    || composed
-                    || self.retired_inline.remove(&mutation.kappa))
-                {
-                    return Err(StoreError::Rejected(format!(
-                        "content {} retired without a preceding admission",
-                        mutation.kappa
+            RecordTransition::TagDelete(entry) => {
+                if self.tag_entries.get(&entry.name) != Some(entry) {
+                    return Err(rejected(format!(
+                        "tag {} removal names an entry the namespace does not hold",
+                        entry.name
                     )));
                 }
+                self.tags.remove(&entry.name);
+                self.tag_entries.remove(&entry.name);
             }
-            _ => return Err(StoreError::Rejected("unsupported replay mutation".into())),
-        }
-        Ok(())
-    }
-
-    /// Admit content-addressed record evidence before changing reconstructed state.
-    pub fn apply_record(
-        &mut self,
-        ns: &NamespaceRef,
-        mutation: &EpochMutation,
-        bytes: &[u8],
-    ) -> Result<(), StoreError> {
-        VerifiedContent::verify(&mutation.kappa, bytes)?;
-        self.apply_evidence(ns, mutation, bytes)?;
-        // Every admitted record-naming mutation admits the record's
-        // identity as content of the namespace, which a later retirement
-        // may name. Rejected evidence admits nothing.
-        self.retired_inline.insert(mutation.kappa.clone());
-        Ok(())
-    }
-
-    /// The state change the verified record `bytes` of `mutation` makes.
-    fn apply_evidence(
-        &mut self,
-        ns: &NamespaceRef,
-        mutation: &EpochMutation,
-        bytes: &[u8],
-    ) -> Result<(), StoreError> {
-        match mutation.op {
-            MutationOp::EdgePut | MutationOp::EdgeDelete => self.apply_edge(mutation, bytes),
-            MutationOp::OperationPublish => self.apply_operation(ns, mutation, bytes),
-            MutationOp::ContentPublish => self.apply_commitment(mutation, bytes),
-            MutationOp::ContentAlias => self.apply_alias(mutation, bytes),
-            MutationOp::ContentCompose => self.apply_composition(mutation, bytes),
-            MutationOp::NamespaceUpdate => {
-                let record: crate::NamespaceInfo = from_canonical(bytes)?;
-                if record.ns.id() != ns.id() || mutation.context.is_some() {
-                    return Err(StoreError::Rejected(
-                        "invalid namespace mutation evidence".into(),
-                    ));
+            RecordTransition::EdgePut(_) => {
+                if !self.edges.insert(id.clone()) {
+                    return Err(rejected("duplicate edge publication"));
                 }
-                self.namespace_record = Some(mutation.kappa.clone());
-                Ok(())
             }
-            MutationOp::SequenceUpdate => self.apply_sequence(ns, mutation, bytes),
-            MutationOp::MetadataUpdate => self.apply_metadata(ns, mutation, bytes),
-            _ => Err(StoreError::Rejected("unsupported record mutation".into())),
-        }
-    }
-
-    fn apply_edge(&mut self, mutation: &EpochMutation, bytes: &[u8]) -> Result<(), StoreError> {
-        let record: kappa_types::EdgeInput = from_canonical(bytes)?;
-        if mutation.context.as_deref() != Some(record.relation.to_string().as_str()) {
-            return Err(StoreError::Rejected(
-                "edge mutation relation mismatch".into(),
-            ));
-        }
-        if mutation.op == MutationOp::EdgePut {
-            if !self.edges.insert(mutation.kappa.clone()) {
-                return Err(StoreError::Rejected("duplicate edge publication".into()));
+            RecordTransition::EdgeDelete(_) => {
+                if !self.edges.remove(id) {
+                    return Err(rejected("edge deletion lacks preceding publication"));
+                }
             }
-        } else if !self.edges.remove(&mutation.kappa) {
-            return Err(StoreError::Rejected(
-                "edge deletion lacks preceding publication".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn apply_operation(
-        &mut self,
-        ns: &NamespaceRef,
-        mutation: &EpochMutation,
-        bytes: &[u8],
-    ) -> Result<(), StoreError> {
-        let receipt: kappa_types::OperationReceipt = from_canonical(bytes)?;
-        receipt.validate()?;
-        if receipt.namespace_id() != ns.id().as_slice() || mutation.context.is_some() {
-            return Err(StoreError::Rejected(
-                "invalid replay operation receipt".into(),
-            ));
-        }
-        let identity = receipt.operation_id()?;
-        if self.operations.contains_key(identity) {
-            return Err(StoreError::Rejected(
-                "operation published more than once".into(),
-            ));
-        }
-        self.operations.insert(*identity, mutation.kappa.clone());
-        Ok(())
-    }
-
-    fn apply_commitment(
-        &mut self,
-        mutation: &EpochMutation,
-        bytes: &[u8],
-    ) -> Result<(), StoreError> {
-        // Decoding is strict: a malformed commitment never decodes.
-        let record: kappa_types::ContentCommitment = from_canonical(bytes)?;
-        if mutation.context.is_some() {
-            return Err(StoreError::Rejected(
-                "content commitment carries a context".into(),
-            ));
-        }
-        if self.commitments.contains_key(record.identity()) {
-            return Err(StoreError::Rejected(format!(
-                "content {} committed more than once",
-                record.identity()
-            )));
-        }
-        self.commitments.insert(record.identity().clone(), record);
-        Ok(())
-    }
-
-    fn apply_alias(&mut self, mutation: &EpochMutation, bytes: &[u8]) -> Result<(), StoreError> {
-        // Decoding is strict: an alias on its own axis never decodes.
-        let record: kappa_types::content::ContentAlias = from_canonical(bytes)?;
-        if mutation.context.is_some() {
-            return Err(StoreError::Rejected(
-                "content alias carries a context".into(),
-            ));
-        }
-        let binding = (record.target().clone(), record.length());
-        match self.aliases.get(record.alias()) {
-            Some(existing) if existing != &binding => Err(StoreError::Rejected(format!(
-                "content alias {} rebound to another target",
-                record.alias()
-            ))),
-            Some(_) => Ok(()),
-            None => {
-                self.aliases.insert(record.alias().clone(), binding);
-                Ok(())
+            RecordTransition::Assertion(_) => {
+                self.assertions.insert(id.clone());
+            }
+            RecordTransition::Revocation(_) => {
+                self.revocations.insert(id.clone());
+            }
+            RecordTransition::Watermark(_) => {
+                self.watermarks.insert(id.clone());
+            }
+            RecordTransition::Succession(succession) => {
+                self.successions
+                    .insert(succession.old_anchor.clone(), id.clone());
+            }
+            RecordTransition::Session(_)
+            | RecordTransition::Credential(_)
+            | RecordTransition::Trust(_) => {
+                self.authorization.insert(change.0, id.clone());
+            }
+            RecordTransition::Member(_) => match change.1 {
+                Some(_) => {
+                    self.members.insert(change.0, id.clone());
+                }
+                None => {
+                    if self.members.remove(&change.0).is_none() {
+                        return Err(rejected("member removal names no current member"));
+                    }
+                }
+            },
+            RecordTransition::Metadata(meta) => self.apply_metadata(meta)?,
+            RecordTransition::Sequence(sequence) => {
+                let previous = self.sequences.get(&sequence.name).copied().unwrap_or(0);
+                if sequence.name.is_empty() || previous.checked_add(1) != Some(sequence.value) {
+                    return Err(rejected("invalid sequence mutation evidence"));
+                }
+                self.sequences.insert(sequence.name.clone(), sequence.value);
+            }
+            RecordTransition::NamespaceUpdate(_) => {
+                self.namespace_record = Some(id.clone());
+            }
+            RecordTransition::ContentPublish(admission)
+            | RecordTransition::ContentAlias(admission)
+            | RecordTransition::ContentCompose(admission)
+            | RecordTransition::RecordPublish(admission) => self.admit(admission)?,
+            RecordTransition::ContentRetire(retirement) => {
+                self.retire(retirement.removed())?;
+            }
+            RecordTransition::OperationPublish(receipt) => {
+                let operation = receipt.operation_id()?;
+                if self.operations.contains_key(operation) {
+                    return Err(rejected("operation published more than once"));
+                }
+                self.operations.insert(*operation, id.clone());
             }
         }
-    }
-
-    fn apply_composition(
-        &mut self,
-        mutation: &EpochMutation,
-        bytes: &[u8],
-    ) -> Result<(), StoreError> {
-        // Decoding is strict: an empty, self-naming or mis-summed
-        // composition never decodes.
-        let record: kappa_types::content::ContentComposition = from_canonical(bytes)?;
-        if mutation.context.is_some() {
-            return Err(StoreError::Rejected(
-                "content composition carries a context".into(),
-            ));
-        }
-        let components = record
-            .components()
-            .iter()
-            .map(|component| (component.identity.clone(), component.length))
-            .collect();
-        self.compositions
-            .entry(record.identity().clone())
-            .or_default()
-            .insert(components);
-        Ok(())
-    }
-
-    fn apply_sequence(
-        &mut self,
-        ns: &NamespaceRef,
-        mutation: &EpochMutation,
-        bytes: &[u8],
-    ) -> Result<(), StoreError> {
-        let record: kappa_types::epoch::SequenceRecord = from_canonical(bytes)?;
-        let previous = self.sequences.get(&record.name).copied().unwrap_or(0);
-        if record.namespace_id != ns.id().as_slice()
-            || record.name.is_empty()
-            || mutation.context.as_deref() != Some(record.name.as_str())
-            || previous.checked_add(1) != Some(record.value)
-        {
-            return Err(StoreError::Rejected(
-                "invalid sequence mutation evidence".into(),
-            ));
-        }
-        self.sequences.insert(record.name, record.value);
         Ok(())
     }
 
     fn apply_metadata(
         &mut self,
-        ns: &NamespaceRef,
-        mutation: &EpochMutation,
-        bytes: &[u8],
+        meta: &kappa_types::content::MetadataTransition,
     ) -> Result<(), StoreError> {
-        let record: kappa_types::epoch::MetadataRecord = from_canonical(bytes)?;
-        if record.namespace_id != ns.id().as_slice()
-            || record.key.is_empty()
-            || mutation.context.as_deref() != Some(record.key.as_str())
-        {
-            return Err(StoreError::Rejected(
-                "invalid metadata mutation evidence".into(),
-            ));
+        match (meta.subject(), meta.value()) {
+            (MetadataSubject::Namespace, Some(value)) => {
+                self.metadata.insert(meta.key().to_owned(), value.to_vec());
+            }
+            (MetadataSubject::Namespace, None) => {
+                if self.metadata.remove(meta.key()).is_none() {
+                    return Err(rejected("metadata deletion names no current key"));
+                }
+            }
+            (MetadataSubject::Blob(identity), Some(value)) => {
+                self.blob_metadata
+                    .insert((identity.clone(), meta.key().to_owned()), value.to_vec());
+            }
+            (MetadataSubject::Blob(identity), None) => {
+                if self
+                    .blob_metadata
+                    .remove(&(identity.clone(), meta.key().to_owned()))
+                    .is_none()
+                {
+                    return Err(rejected("blob metadata deletion names no current key"));
+                }
+            }
         }
-        match record.value {
-            Some(value) => {
-                self.metadata.insert(record.key, value);
+        Ok(())
+    }
+
+    /// Admit one logical admission: an identity is admitted at most once
+    /// until retired; an alias needs its target admitted, a composition
+    /// each of its components.
+    fn admit(&mut self, record: &ContentAdmissionRecord) -> Result<(), StoreError> {
+        let identity = record.admission().identity();
+        if self.admissions.contains_key(identity) {
+            return Err(rejected(format!("content {identity} admitted twice")));
+        }
+        match record.evidence() {
+            ContentAdmissionEvidence::Alias(alias) => {
+                if !self.admissions.contains_key(alias.target()) {
+                    return Err(rejected(format!(
+                        "alias {identity} names {}, which the namespace does not admit",
+                        alias.target()
+                    )));
+                }
+            }
+            ContentAdmissionEvidence::Composition(composition) => {
+                if let Some(missing) = composition
+                    .components()
+                    .iter()
+                    .find(|component| !self.admissions.contains_key(&component.identity))
+                {
+                    return Err(rejected(format!(
+                        "composite {identity} names {}, which the namespace does not admit",
+                        missing.identity
+                    )));
+                }
+                self.compositions
+                    .entry(identity.clone())
+                    .or_default()
+                    .insert(
+                        composition
+                            .components()
+                            .iter()
+                            .map(|component| (component.identity.clone(), component.length))
+                            .collect(),
+                    );
+            }
+            ContentAdmissionEvidence::VerifiedBytes | ContentAdmissionEvidence::Chunked(_) => {}
+        }
+        self.admissions.insert(identity.clone(), record.clone());
+        Ok(())
+    }
+
+    /// Retire exactly the admission `removed`: it must be the one held, no
+    /// remaining alias or composite may select it, and its blob metadata
+    /// must already have been removed by its own transitions.
+    fn retire(
+        &mut self,
+        removed: &kappa_types::content::ContentAdmission,
+    ) -> Result<(), StoreError> {
+        let identity = removed.identity();
+        match self.admissions.get(identity) {
+            Some(held) if held.admission() == removed => {}
+            Some(_) => {
+                return Err(rejected(format!(
+                    "retirement of {identity} names another admission than the one held"
+                )));
             }
             None => {
-                self.metadata.remove(&record.key);
+                return Err(rejected(format!(
+                    "content {identity} retired without a preceding admission"
+                )));
             }
         }
+        let selected =
+            self.admissions
+                .values()
+                .any(|other| match other.evidence() {
+                    ContentAdmissionEvidence::Alias(alias) => alias.target() == identity,
+                    ContentAdmissionEvidence::Composition(composition) => composition
+                        .components()
+                        .iter()
+                        .any(|component| component.identity == *identity),
+                    ContentAdmissionEvidence::VerifiedBytes
+                    | ContentAdmissionEvidence::Chunked(_) => false,
+                });
+        if selected {
+            return Err(rejected(format!(
+                "content {identity} retired while another admission selects it"
+            )));
+        }
+        if self
+            .blob_metadata
+            .range((identity.clone(), String::new())..)
+            .next()
+            .is_some_and(|((owner, _), _)| owner == identity)
+        {
+            return Err(rejected(format!(
+                "content {identity} retired with its blob metadata still held"
+            )));
+        }
+        self.admissions.remove(identity);
         Ok(())
     }
 }
@@ -331,16 +334,14 @@ impl NamespaceState {
 /// Walks numbered history from genesis to the captured head and reconstructs state through
 /// `target_epoch`. Epoch zero denotes the empty state before genesis.
 /// Verifies content identities, ledger commitments, chain continuity, mutation
-/// roots, and reconstructed state commitments. This structural verification
-/// does not establish signer authority; authenticated admission is separate.
-///
-/// Aborts on: corrupt mutation blob, `mutations_root` mismatch,
-/// missing history, discontinuous linkage, or reconstructed state mismatch.
+/// roots, the tag-state digest and the namespace-state commitment of every
+/// replayed epoch. This structural verification does not establish signer
+/// authority; authenticated admission is separate.
 pub fn replay_to<S>(
     store: &S,
     ns: &NamespaceRef,
     target_epoch: u64,
-) -> Result<NamespaceState, StoreError>
+) -> Result<ReplayedNamespaceState, StoreError>
 where
     S: EpochStore + BlobStore + ?Sized,
 {
@@ -364,7 +365,7 @@ pub fn replay_authenticated<S>(
     target_epoch: u64,
     trusted_genesis: &Kappa,
     key_resolver: &AnchorKeyResolver<'_>,
-) -> Result<NamespaceState, StoreError>
+) -> Result<ReplayedNamespaceState, StoreError>
 where
     S: EpochStore + BlobStore + ?Sized,
 {
@@ -433,12 +434,182 @@ where
     })
 }
 
+/// The index nodes replay rebuilds, read back through `NodeSource`.
+#[derive(Default)]
+struct ReplayNodes(BTreeMap<[u8; 32], Node>);
+
+impl NodeSource for ReplayNodes {
+    fn node(&self, hash: &[u8; 32]) -> Result<Node, StoreError> {
+        self.0
+            .get(hash)
+            .copied()
+            .ok_or_else(|| StoreError::Internal("replayed index node missing".into()))
+    }
+}
+
+/// The namespace state `root` commits and the authority record it names,
+/// each verified against its identity and against the other.
+fn committed_state<S>(
+    store: &S,
+    ns: &NamespaceRef,
+    root: &EpochRoot,
+) -> Result<(NamespaceState, AuthorityState), StoreError>
+where
+    S: BlobStore + ?Sized,
+{
+    let state_bytes = store.blob_get_in(ns, root.state())?;
+    VerifiedContent::verify(root.state(), &state_bytes)?;
+    let state: NamespaceState = from_canonical(&state_bytes)?;
+    if state.namespace() != ns.id() {
+        return Err(rejected("epoch commits another namespace's state"));
+    }
+    let authority_bytes = store.blob_get_in(ns, state.authority())?;
+    VerifiedContent::verify(state.authority(), &authority_bytes)?;
+    let authority: AuthorityState = from_canonical(&authority_bytes)?;
+    if !state.names(&authority) {
+        return Err(rejected(
+            "committed state does not name its authority record",
+        ));
+    }
+    Ok((state, authority))
+}
+
+/// The ledger `root` signs, read from the namespace (current with its
+/// commit, never through a projection), verified against the root's ledger
+/// identity and decoded, with its Merkle root checked against the root's
+/// mutation commitment.
+fn signed_ledger<S>(
+    store: &S,
+    ns: &NamespaceRef,
+    root: &EpochRoot,
+) -> Result<Vec<EpochMutation>, StoreError>
+where
+    S: BlobStore + ?Sized,
+{
+    let mutation_blob = store.blob_get_in(ns, root.ledger_root())?;
+    VerifiedContent::verify(root.ledger_root(), &mutation_blob)?;
+    let mutations: Vec<EpochMutation> = from_canonical(&mutation_blob).map_err(|e| {
+        StoreError::Internal(format!(
+            "epoch {} mutation blob decode: {e}",
+            root.epoch_number(),
+        ))
+    })?;
+    if mutations_merkle_root(&mutations) != root.mutations_root() {
+        return Err(rejected(format!(
+            "epoch {} mutations_root mismatch",
+            root.epoch_number(),
+        )));
+    }
+    Ok(mutations)
+}
+
+/// The state replay rebuilds across epochs: the reconstructed namespace,
+/// the index nodes and root its transitions derive, and the instance the
+/// genesis epoch commits.
+#[derive(Default)]
+struct Rebuild {
+    state: ReplayedNamespaceState,
+    nodes: ReplayNodes,
+    index_root: [u8; 32],
+    domain: Option<TransitionDomain>,
+}
+
+impl Rebuild {
+    fn new() -> Self {
+        Self {
+            index_root: state_index::EMPTY,
+            ..Self::default()
+        }
+    }
+
+    /// Apply the admitted epoch `root` with its verified `mutations` and
+    /// check everything it commits: its instance, the index root its
+    /// transitions and authority record derive, the history its ledger
+    /// extends, and the tag-state digest and count.
+    fn apply_epoch<S>(
+        &mut self,
+        store: &S,
+        ns: &NamespaceRef,
+        root: &EpochRoot,
+        mutations: &[EpochMutation],
+    ) -> Result<(), StoreError>
+    where
+        S: BlobStore + ?Sized,
+    {
+        // The instance genesis commits governs every later epoch.
+        let (committed, authority) = committed_state(store, ns, root)?;
+        let instance = TransitionDomain::new(
+            *ns.id(),
+            LogicalIncarnation::from_bytes(*committed.incarnation()),
+        );
+        if *self.domain.get_or_insert(instance) != instance {
+            return Err(rejected("epoch commits another namespace incarnation"));
+        }
+        let state = &mut self.state;
+        let mut changes = Vec::with_capacity(mutations.len() + 1);
+        for mutation in mutations {
+            let bytes = store.blob_get_in(ns, &mutation.kappa)?;
+            changes.push(state.apply(instance, mutation, &bytes)?);
+            // The push cannot fail, so the history taken here is always
+            // restored below.
+            let appended = std::mem::take(&mut state.history)
+                .push(&canonical_bytes(mutation), |_, _| {
+                    Ok::<_, std::convert::Infallible>(())
+                });
+            state.history = match appended {
+                Ok(history) => history,
+                Err(never) => match never {},
+            };
+        }
+        let authority_entry = state_key::authority_entry(&canonical_bytes(&authority));
+        state.index.insert(authority_entry.0, authority_entry.1);
+        let update = seal_index(
+            &self.nodes,
+            self.index_root,
+            changes,
+            &authority,
+            &mut WorkMeter::unbounded(),
+        )?;
+        for node in update.created {
+            self.nodes.0.insert(node.hash(), node);
+        }
+        self.index_root = update.root;
+
+        if self.index_root != *committed.index_root() {
+            return Err(rejected(format!(
+                "epoch {} commits an index root its transitions do not derive",
+                root.epoch_number()
+            )));
+        }
+        if state.history.leaves() != committed.history_size()
+            || state.history.root() != *committed.history_root()
+        {
+            return Err(rejected(format!(
+                "epoch {} commits a history its ledgers do not extend",
+                root.epoch_number()
+            )));
+        }
+        let mut digest = kappa_types::StateDigest::default();
+        for (name, identity) in &state.tags {
+            digest.insert(name, identity);
+        }
+        if digest.into_bytes().as_slice() != root.state_digest()
+            || state.tags.len() as u64 != root.tag_count()
+        {
+            return Err(rejected("reconstructed epoch state commitment mismatch"));
+        }
+        state.authority = Some(authority);
+        state.committed = Some(committed);
+        Ok(())
+    }
+}
+
 fn replay_with_admission<S>(
     store: &S,
     ns: &NamespaceRef,
     target_epoch: u64,
-    mut admit: impl FnMut(&kappa_types::EpochRoot) -> Result<(), StoreError>,
-) -> Result<NamespaceState, StoreError>
+    mut admit: impl FnMut(&EpochRoot) -> Result<(), StoreError>,
+) -> Result<ReplayedNamespaceState, StoreError>
 where
     S: EpochStore + BlobStore + ?Sized,
 {
@@ -451,12 +622,12 @@ where
     }
 
     if current_num == 0 {
-        return Ok(NamespaceState::default());
+        return Ok(ReplayedNamespaceState::default());
     }
 
     // Admit one ledger at a time. Historical mutation populations must not
     // accumulate in memory alongside the reconstructed state.
-    let mut state = NamespaceState::default();
+    let mut rebuild = Rebuild::new();
     let mut predecessor = None;
     let mut predecessor_timestamp = None;
     for expected_number in 1..=current_num {
@@ -464,359 +635,34 @@ where
         let root = store.epoch_get(&walk_kappa)?;
         if root.epoch_number() != expected_number || root.prev_identifier() != predecessor.as_ref()
         {
-            return Err(StoreError::Rejected(
-                "discontinuous replay epoch chain".into(),
-            ));
+            return Err(rejected("discontinuous replay epoch chain"));
         }
         if predecessor_timestamp.is_some_and(|timestamp| root.timestamp_ms() < timestamp) {
-            return Err(StoreError::Rejected(
-                "replay epoch timestamp regressed".into(),
-            ));
+            return Err(rejected("replay epoch timestamp regressed"));
         }
         predecessor_timestamp = Some(root.timestamp_ms());
 
         // Adjacency is not evidence of ledger identity. The epoch's signed
         // commitment names the exact bytes to retrieve and verify.
         if root.namespace_id() != ns.id() || root.kappa() != &walk_kappa {
-            return Err(StoreError::Rejected(
-                "replay epoch identity mismatch".into(),
-            ));
+            return Err(rejected("replay epoch identity mismatch"));
         }
         if expected_number == current_num && walk_kappa != current_kappa {
-            return Err(StoreError::Rejected(
-                "replay history differs from captured head".into(),
-            ));
+            return Err(rejected("replay history differs from captured head"));
         }
-        // Every record of the history is the namespace's own: read from
-        // it, current with its commit, never through a projection.
-        let mutation_blob = store.blob_get_in(ns, root.ledger_root())?;
-        VerifiedContent::verify(root.ledger_root(), &mutation_blob)?;
-        let mutations: Vec<EpochMutation> = from_canonical(&mutation_blob).map_err(|e| {
-            StoreError::Internal(format!(
-                "epoch {} mutation blob decode: {e}",
-                root.epoch_number(),
-            ))
-        })?;
-
-        // Verify mutations_root. Abort on mismatch. Never skip.
-        let computed_root = mutations_merkle_root(&mutations);
-        let stored_root = root.mutations_root();
-        if computed_root != stored_root {
-            return Err(StoreError::Rejected(format!(
-                "epoch {} mutations_root mismatch",
-                root.epoch_number(),
-            )));
-        }
+        let mutations = signed_ledger(store, ns, &root)?;
 
         admit(&root)?;
         predecessor = Some(walk_kappa);
         if root.epoch_number() > target_epoch {
             continue;
         }
-        for mutation in &mutations {
-            if matches!(
-                mutation.op,
-                MutationOp::NamespaceUpdate
-                    | MutationOp::SequenceUpdate
-                    | MutationOp::MetadataUpdate
-                    | MutationOp::EdgePut
-                    | MutationOp::EdgeDelete
-                    | MutationOp::OperationPublish
-                    | MutationOp::ContentPublish
-                    | MutationOp::ContentAlias
-                    | MutationOp::ContentCompose
-            ) {
-                let bytes = store.blob_get_in(ns, &mutation.kappa)?;
-                state.apply_record(ns, mutation, &bytes)?;
-                continue;
-            }
-            state.apply(mutation)?;
-        }
-        let mut digest = kappa_types::StateDigest::default();
-        for (name, identity) in &state.tags {
-            digest.insert(name, identity);
-        }
-        if digest.into_bytes().as_slice() != root.state_digest()
-            || state.tags.len() as u64 != root.tag_count()
-        {
-            return Err(StoreError::Rejected(
-                "reconstructed epoch state commitment mismatch".into(),
-            ));
-        }
+        rebuild.apply_epoch(store, ns, &root, &mutations)?;
     }
 
-    Ok(state)
+    Ok(rebuild.state)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mutation(op: MutationOp, name: Option<&str>, content: &[u8]) -> EpochMutation {
-        EpochMutation {
-            op,
-            kappa: Kappa::sha256(content),
-            timestamp_ms: 1,
-            context: name.map(str::to_owned),
-        }
-    }
-
-    #[test]
-    fn edge_replay_requires_evidence_and_a_preceding_publication() -> Result<(), StoreError> {
-        let ns = NamespaceRef::deterministic("replayed-edges");
-        let input = kappa_types::EdgeInput {
-            source: Kappa::sha256(b"source"),
-            target: Kappa::sha256(b"target"),
-            relation: kappa_types::EdgeRelation::Builtin(kappa_types::BuiltinRelation::Owns),
-            asserter: Kappa::sha256(b"authority"),
-            created_at_ms: 1,
-            metadata: None,
-        };
-        let bytes = kappa_types::canonical::canonical_bytes(&input);
-        let relation = input.relation.to_string();
-        let put = mutation(MutationOp::EdgePut, Some(&relation), &bytes);
-        let delete = mutation(MutationOp::EdgeDelete, Some(&relation), &bytes);
-        let mut state = NamespaceState::default();
-        assert!(state.apply(&put).is_err());
-        assert!(state.apply_record(&ns, &delete, &bytes).is_err());
-        assert!(state.edges.is_empty());
-        state.apply_record(&ns, &put, &bytes)?;
-        let before = state.clone();
-        assert!(state.apply_record(&ns, &put, &bytes).is_err());
-        assert_eq!(state, before);
-        let mut malformed = delete.clone();
-        malformed.context = Some("different-relation".into());
-        assert!(state.apply_record(&ns, &malformed, &bytes).is_err());
-        assert_eq!(state, before);
-        state.apply_record(&ns, &delete, &bytes)?;
-        assert!(state.edges.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn operation_replay_rejects_duplicate_publication() -> Result<(), StoreError> {
-        let ns = NamespaceRef::deterministic("replayed-operation");
-        let receipt = kappa_types::OperationReceipt::new(
-            &ns,
-            &[23; 32],
-            Kappa::sha256(b"request"),
-            b"result".to_vec(),
-        )?;
-        let bytes = kappa_types::canonical::canonical_bytes(&receipt);
-        let publication = mutation(MutationOp::OperationPublish, None, &bytes);
-        let mut state = NamespaceState::default();
-        state.apply_record(&ns, &publication, &bytes)?;
-        let before = state.clone();
-        assert!(state.apply_record(&ns, &publication, &bytes).is_err());
-        assert_eq!(state, before);
-        assert_eq!(state.operations.get(&[23; 32]), Some(&publication.kappa));
-        Ok(())
-    }
-
-    #[test]
-    fn content_commitment_is_admitted_once_without_context() -> Result<(), StoreError> {
-        let ns = NamespaceRef::deterministic("replayed-content");
-        let identity = Kappa::sha256(b"large content");
-        let commitment = kappa_types::ContentCommitment::new(identity.clone(), 65536, [3; 32])?;
-        let bytes = kappa_types::canonical::canonical_bytes(&commitment);
-        let publication = mutation(MutationOp::ContentPublish, None, &bytes);
-        let mut state = NamespaceState::default();
-        state.apply_record(&ns, &publication, &bytes)?;
-        assert_eq!(state.commitments.get(&identity), Some(&commitment));
-        let before = state.clone();
-        assert!(state.apply_record(&ns, &publication, &bytes).is_err());
-        let with_context = mutation(MutationOp::ContentPublish, Some("x"), &bytes);
-        assert!(state.apply_record(&ns, &with_context, &bytes).is_err());
-        assert_eq!(state, before);
-        Ok(())
-    }
-
-    #[test]
-    fn content_alias_recurs_equal_and_rejects_rebinding() -> Result<(), StoreError> {
-        let ns = NamespaceRef::deterministic("replayed-aliases");
-        let target = Kappa::sha256(b"aliased content");
-        let alias = Kappa::compute(kappa_types::Axis::Sha512, b"aliased content")?;
-        let binding = kappa_types::content::ContentAlias::new(alias.clone(), target.clone(), 15)?;
-        let bytes = kappa_types::canonical::canonical_bytes(&binding);
-        let publication = mutation(MutationOp::ContentAlias, None, &bytes);
-        let mut state = NamespaceState::default();
-        state.apply_record(&ns, &publication, &bytes)?;
-        assert_eq!(state.aliases.get(&alias), Some(&(target, 15)));
-        // The same binding published again (shared content installed by a
-        // later publication) is accepted and changes nothing.
-        let before = state.clone();
-        state.apply_record(&ns, &publication, &bytes)?;
-        assert_eq!(state, before);
-        // The alias bound to another target is evidence of inconsistency.
-        let other =
-            kappa_types::content::ContentAlias::new(alias, Kappa::sha256(b"other content"), 15)?;
-        let other_bytes = kappa_types::canonical::canonical_bytes(&other);
-        let rebinding = mutation(MutationOp::ContentAlias, None, &other_bytes);
-        assert!(state.apply_record(&ns, &rebinding, &other_bytes).is_err());
-        let with_context = mutation(MutationOp::ContentAlias, Some("x"), &bytes);
-        assert!(state.apply_record(&ns, &with_context, &bytes).is_err());
-        // Alias evidence is not commitment evidence: it never decodes as one.
-        let as_commitment = mutation(MutationOp::ContentPublish, None, &bytes);
-        assert!(state.apply_record(&ns, &as_commitment, &bytes).is_err());
-        assert_eq!(state, before);
-        Ok(())
-    }
-
-    #[test]
-    fn content_compositions_accumulate_and_reject_context() -> Result<(), StoreError> {
-        use kappa_types::content::{ContentComponent, ContentComposition};
-        let ns = NamespaceRef::deterministic("replayed-compositions");
-        let whole = Kappa::sha256(b"hello world");
-        let part = |bytes: &[u8]| ContentComponent {
-            identity: Kappa::sha256(bytes),
-            length: bytes.len() as u64,
-        };
-        let two =
-            ContentComposition::new(whole.clone(), vec![part(b"hello "), part(b"world")], 11)?;
-        let bytes = kappa_types::canonical::canonical_bytes(&two);
-        let publication = mutation(MutationOp::ContentCompose, None, &bytes);
-        let mut state = NamespaceState::default();
-        state.apply_record(&ns, &publication, &bytes)?;
-        let expected = vec![(Kappa::sha256(b"hello "), 6), (Kappa::sha256(b"world"), 5)];
-        assert_eq!(
-            state.compositions.get(&whole),
-            Some(&BTreeSet::from([expected]))
-        );
-        // The same composition installed again changes nothing.
-        let before = state.clone();
-        state.apply_record(&ns, &publication, &bytes)?;
-        assert_eq!(state, before);
-        // Another chunking of the same bytes is also true of them.
-        let three = ContentComposition::new(
-            whole.clone(),
-            vec![part(b"hel"), part(b"lo "), part(b"world")],
-            11,
-        )?;
-        let three_bytes = kappa_types::canonical::canonical_bytes(&three);
-        state.apply_record(
-            &ns,
-            &mutation(MutationOp::ContentCompose, None, &three_bytes),
-            &three_bytes,
-        )?;
-        assert_eq!(state.compositions.get(&whole).map(BTreeSet::len), Some(2));
-        let accumulated = state.clone();
-        let with_context = mutation(MutationOp::ContentCompose, Some("x"), &bytes);
-        assert!(state.apply_record(&ns, &with_context, &bytes).is_err());
-        // Composition evidence is neither commitment nor alias evidence.
-        for op in [MutationOp::ContentPublish, MutationOp::ContentAlias] {
-            assert!(
-                state
-                    .apply_record(&ns, &mutation(op, None, &bytes), &bytes)
-                    .is_err()
-            );
-        }
-        assert_eq!(state, accumulated);
-        Ok(())
-    }
-
-    #[test]
-    fn sequence_evidence_rejects_gaps_and_cross_namespace_records() -> Result<(), StoreError> {
-        let ns = NamespaceRef::deterministic("replayed-sequences");
-        let mut state = NamespaceState::default();
-        for (namespace_id, value, accepted) in [
-            (ns.id().to_vec(), 1, true),
-            (ns.id().to_vec(), 3, false),
-            (NamespaceRef::deterministic("other").id().to_vec(), 2, false),
-            (ns.id().to_vec(), 2, true),
-        ] {
-            let bytes =
-                kappa_types::canonical::canonical_bytes(&kappa_types::epoch::SequenceRecord {
-                    namespace_id,
-                    name: "revision".into(),
-                    value,
-                });
-            let mutation = mutation(MutationOp::SequenceUpdate, Some("revision"), &bytes);
-            let before = state.clone();
-            let result = state.apply_record(&ns, &mutation, &bytes);
-            if accepted {
-                result?;
-                assert_eq!(state.sequences.get("revision"), Some(&value));
-            } else {
-                assert!(result.is_err());
-                assert_eq!(state, before);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn metadata_evidence_sets_deletes_and_rejects_foreign_records() -> Result<(), StoreError> {
-        let ns = NamespaceRef::deterministic("replayed-metadata");
-        let record = |namespace: &NamespaceRef, value: Option<&[u8]>| {
-            kappa_types::canonical::canonical_bytes(&kappa_types::epoch::MetadataRecord {
-                namespace_id: namespace.id().to_vec(),
-                key: "versioning".into(),
-                value: value.map(<[u8]>::to_vec),
-            })
-        };
-        let mut state = NamespaceState::default();
-        let set = record(&ns, Some(b"enabled"));
-        state.apply_record(
-            &ns,
-            &mutation(MutationOp::MetadataUpdate, Some("versioning"), &set),
-            &set,
-        )?;
-        assert_eq!(
-            state.metadata.get("versioning").map(Vec::as_slice),
-            Some(&b"enabled"[..])
-        );
-
-        let before = state.clone();
-        let foreign = record(&NamespaceRef::deterministic("other"), None);
-        let wrong_key = mutation(MutationOp::MetadataUpdate, Some("other-key"), &set);
-        assert!(
-            state
-                .apply_record(
-                    &ns,
-                    &mutation(MutationOp::MetadataUpdate, Some("versioning"), &foreign),
-                    &foreign,
-                )
-                .is_err()
-        );
-        assert!(state.apply_record(&ns, &wrong_key, &set).is_err());
-        assert_eq!(state, before);
-
-        let delete = record(&ns, None);
-        state.apply_record(
-            &ns,
-            &mutation(MutationOp::MetadataUpdate, Some("versioning"), &delete),
-            &delete,
-        )?;
-        assert!(state.metadata.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn missing_tag_identity_does_not_invent_a_key() {
-        for name in [None, Some("")] {
-            let mut state = NamespaceState::default();
-            assert!(
-                state
-                    .apply(&mutation(MutationOp::TagSet, name, b"value"))
-                    .is_err()
-            );
-            assert!(state.tags.is_empty());
-        }
-    }
-
-    #[test]
-    fn deletion_cannot_remove_a_different_content_identity() -> Result<(), StoreError> {
-        let mut state = NamespaceState::default();
-        state.apply(&mutation(MutationOp::TagSet, Some("head"), b"current"))?;
-        let before = state.clone();
-        assert!(
-            state
-                .apply(&mutation(MutationOp::TagDelete, Some("head"), b"old"))
-                .is_err()
-        );
-        assert_eq!(state, before);
-        state.apply(&mutation(MutationOp::TagDelete, Some("head"), b"current"))?;
-        assert!(state.tags.is_empty());
-        Ok(())
-    }
-}
+#[path = "replay_tests.rs"]
+mod tests;

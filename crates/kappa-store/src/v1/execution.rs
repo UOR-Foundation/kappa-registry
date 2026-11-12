@@ -21,11 +21,16 @@
 //! whose durability is unknown are reported through
 //! `StoreError::PublicationRecoveryRequired` and
 //! `StoreError::PublicationIndeterminate`; callers must route those to service
-//! recovery rather than retrying through the same backend handle.
+//! recovery rather than retrying through the same backend handle. A
+//! publication known not to be published whose signing coordinate is
+//! consumed is `StoreError::PublicationRetained`: the backend keeps it, its
+//! namespace refuses other publications, and
+//! [`ExecutionStore::resolve_publication`] advances it.
 
 use kappa_types::{
     Axis, ClockMs, EdgeInput, EpochRoot, IngestResult, Kappa, NamespaceRef, OperationReceipt, Page,
-    PageRequest, ProtocolId, StoreError, TagEntry, TagUpdate, VerifiedContent,
+    PageRequest, ProtocolId, RetainedPublication, StoreError, TagEntry, TagUpdate, VerifiedContent,
+    WorkMeter,
     identity::{
         DeviceBinding, HandleRecord, IdentityAssertion, IdentityBinding, LocatorRecord,
         PrekeyBinding, Revocation, RevocationCommitment, Succession, TrustPosition, Watermark,
@@ -406,6 +411,20 @@ pub struct Published {
     pub root: Kappa,
 }
 
+/// What [`ExecutionStore::resolve_publication`] found for a namespace.
+#[derive(Debug)]
+pub enum PublicationResolution {
+    /// The namespace retains no publication.
+    Clear,
+    /// The retained publication was published; its signed root is the
+    /// namespace's head.
+    Published(Published),
+    /// The publication remains retained: resumable, when the attempt was
+    /// refused for lack of allowance or for an authorization or authority
+    /// that may still be granted, or terminal.
+    Retained(Box<RetainedPublication>),
+}
+
 /// Lifecycle owner. Consuming methods make publication and abort terminal.
 pub trait Execution: ExecutionWrites {
     /// Bound publication by a monotonic deadline. A blocking worker cannot
@@ -518,4 +537,24 @@ pub trait ExecutionStore: ContentPreparation + Send + Sync {
         namespace: &NamespaceRef,
         clock: &dyn Clock,
     ) -> Result<Box<dyn Execution + '_>, StoreError>;
+
+    /// Advance the publication `namespace` retains after its signing
+    /// coordinate was consumed, from its recorded progress.
+    ///
+    /// Under the namespace's writer and the protection of the authority and
+    /// every authorization row the publication depends on, the backend
+    /// reads the current time from `clock` and checks the namespace
+    /// instance, the predecessor, the authority, every recorded dependency
+    /// and every temporal condition the authorization relied on, before any
+    /// work. Each unit of work is admitted against `meter`, the fresh
+    /// allowance of this call, before it starts; what earlier attempts
+    /// consumed stays recorded with the publication. The signer is never
+    /// invoked again for a coordinate it was invoked for, and the retained
+    /// signed root is published unchanged.
+    fn resolve_publication(
+        &self,
+        namespace: &NamespaceRef,
+        clock: &dyn Clock,
+        meter: &mut WorkMeter,
+    ) -> Result<PublicationResolution, StoreError>;
 }

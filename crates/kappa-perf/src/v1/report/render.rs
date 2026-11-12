@@ -6,10 +6,9 @@ use super::coverage::{Coverage, CoverageStatus};
 use super::datasets::Dataset;
 use super::format::{cell, duration, ns, value};
 use super::hosts::{Host, hosts};
-use super::references;
 use super::scale::ScaleRun;
-use super::{Inputs, Report, ReportError};
-use crate::calibrate::record::CalibrationPoint;
+use super::{Inputs, Report, ReportError, references, repetition};
+use crate::calibrate::record::{CalibrationPoint, Injection};
 use crate::calibrate::summary::ClassSummary;
 
 pub fn markdown(
@@ -24,6 +23,7 @@ pub fn markdown(
         host_section(&mut out, report, host)?;
     }
     measurements(&mut out, report)?;
+    repetition::render(&mut out, &report.repetitions())?;
     references::render(&mut out, &report.references())?;
     problems(&mut out, report)?;
     for run in &report.scale {
@@ -44,11 +44,9 @@ fn header(
         out,
         "Generated from recorded results only at unix time {generated_unix_s}.\n"
     )?;
-    writeln!(
-        out,
-        "- Calibration datasets: `{}`",
-        inputs.dataset_dir.display()
-    )?;
+    for dir in &inputs.dataset_dirs {
+        writeln!(out, "- Calibration datasets: `{}`", dir.display())?;
+    }
     for path in &inputs.scale {
         writeln!(out, "- Scale run: `{}`", path.display())?;
     }
@@ -60,14 +58,15 @@ fn header(
     writeln!(out, "## Datasets\n")?;
     writeln!(
         out,
-        "| Session | File | Records | Measured | Unmeasured | Untrusted |"
+        "| Run | Session | File | Records | Measured | Unmeasured | Untrusted |"
     )?;
-    writeln!(out, "|---|---|---:|---:|---:|---:|")?;
+    writeln!(out, "|---|---|---|---:|---:|---:|---:|")?;
     for dataset in &report.datasets {
         let measured = dataset.measured().count();
         writeln!(
             out,
-            "| {} | `{}` | {} | {measured} | {} | {} |",
+            "| `{}` | {} | `{}` | {} | {measured} | {} | {} |",
+            dataset.run.display(),
             dataset.name,
             dataset.path.display(),
             dataset.points.len(),
@@ -116,7 +115,7 @@ fn host_section(out: &mut String, report: &Report, host: &Host<'_>) -> fmt::Resu
         .filter(|(_, status)| status != "Not affected")
         .map(|(name, status)| format!("{name}: {status}"))
         .collect();
-    let rows: [(&str, String); 16] = [
+    let rows: [(&str, String); 17] = [
         ("CPU", shown(p.cpu_model.as_deref())),
         ("Microcode", shown(p.microcode.as_deref())),
         ("Host class", format!("{:?}", p.host_class)),
@@ -163,6 +162,7 @@ fn host_section(out: &mut String, report: &Report, host: &Host<'_>) -> fmt::Resu
             "Accelerators",
             format!("{} GPUs, {} RDMA devices", p.gpus, p.rdma_devices),
         ),
+        ("Source revision", shown(p.source_revision.as_deref())),
     ];
     writeln!(out, "| Property | Value |\n|---|---|")?;
     for (name, text) in rows {
@@ -255,13 +255,23 @@ fn distribution(point: &CalibrationPoint) -> String {
 }
 
 fn measurements(out: &mut String, report: &Report) -> fmt::Result {
+    let several_runs = report.repetitions().runs > 1;
     for dataset in &report.datasets {
-        writeln!(out, "## Measurements: {}\n", dataset.name)?;
+        if several_runs {
+            writeln!(
+                out,
+                "## Measurements: {} (run `{}`)\n",
+                dataset.name,
+                dataset.run.display()
+            )?;
+        } else {
+            writeln!(out, "## Measurements: {}\n", dataset.name)?;
+        }
         writeln!(
             out,
-            "| Identifier | Test | Value | Distribution | Roofline | Against floor | Against reference | Trusted |"
+            "| Identifier | Test | Value | Distribution | Roofline | Against floor | Against reference | Trusted | Seed | Fault |"
         )?;
-        writeln!(out, "|---|---|---:|---|---|---|---|---|")?;
+        writeln!(out, "|---|---|---:|---|---|---|---|---|---|---|")?;
         for point in dataset.measured() {
             let Some(measured) = point.value else {
                 continue;
@@ -291,9 +301,32 @@ fn measurements(out: &mut String, report: &Report) -> fmt::Result {
                 .reference
                 .as_ref()
                 .map_or_else(|| "-".into(), references::verdict);
+            let seed = point
+                .seed
+                .map_or_else(|| "-".into(), |seed| format!("{seed:#x}"));
+            let fault = point.fault.as_ref().map_or_else(
+                || "-".into(),
+                |f| match &f.injection {
+                    Injection::Backend {
+                        performed,
+                        refused,
+                        performed_then_failed,
+                        lost_bytes,
+                    } => format!(
+                        "{}: {performed} performed, {refused} refused, {performed_then_failed} performed then failed, {lost_bytes} bytes lost",
+                        f.armed
+                    ),
+                    Injection::Filesystem {
+                        observed,
+                        responses,
+                    } => {
+                        format!("{}: observed {observed} ({responses} responses)", f.armed)
+                    }
+                },
+            );
             writeln!(
                 out,
-                "| `{}` | {} | {} | {} | {} | {} | {} | {} |",
+                "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 cell(&point.id),
                 point.test_id.as_deref().unwrap_or("-"),
                 value(measured, &point.unit),
@@ -301,7 +334,9 @@ fn measurements(out: &mut String, report: &Report) -> fmt::Result {
                 cell(&roofline),
                 cell(&floor),
                 cell(&against_reference),
-                cell(&trusted)
+                cell(&trusted),
+                seed,
+                cell(&fault)
             )?;
         }
         writeln!(out)?;
@@ -310,10 +345,10 @@ fn measurements(out: &mut String, report: &Report) -> fmt::Result {
 }
 
 fn problems(out: &mut String, report: &Report) -> fmt::Result {
-    let listed: Vec<(&str, &CalibrationPoint)> = report
+    let listed: Vec<(&Dataset, &CalibrationPoint)> = report
         .datasets
         .iter()
-        .flat_map(|d| d.points.iter().map(move |p| (d.name.as_str(), p)))
+        .flat_map(|d| d.points.iter().map(move |p| (d, p)))
         .filter(|(_, p)| p.value.is_none() || !p.trusted || !p.diagnosis.is_empty())
         .collect();
     writeln!(out, "## Untrusted, unmeasured and diagnosed records\n")?;
@@ -322,9 +357,9 @@ fn problems(out: &mut String, report: &Report) -> fmt::Result {
     }
     writeln!(
         out,
-        "| Session | Identifier | State | Diagnosis |\n|---|---|---|---|"
+        "| Run | Session | Identifier | State | Seed | Diagnosis |\n|---|---|---|---|---|---|"
     )?;
-    for (session, point) in listed {
+    for (dataset, point) in listed {
         let state = match (point.value.is_some(), point.trusted) {
             (false, _) => "unmeasured",
             (true, false) => "untrusted",
@@ -332,8 +367,13 @@ fn problems(out: &mut String, report: &Report) -> fmt::Result {
         };
         writeln!(
             out,
-            "| {session} | `{}` | {state} | {} |",
+            "| `{}` | {} | `{}` | {state} | {} | {} |",
+            dataset.run.display(),
+            dataset.name,
             cell(&point.id),
+            point
+                .seed
+                .map_or_else(|| "-".into(), |seed| format!("{seed:#x}")),
             cell(&point.diagnosis.join("; "))
         )?;
     }

@@ -1,15 +1,15 @@
 //! kappa-core: content-addressed graph database primitives.
 
-// Seam modules (S1-S11, S13)
+// Seam modules (S1-S11, S13). Membership (S9) and the peer transport (S6)
+// are `kappa_reconcile::membership` and `kappa_reconcile::transport`: the
+// reconciliation loop is their one consumer.
 pub mod availability;
 pub mod chunks;
 pub mod clock;
 pub mod coordinator;
 pub mod counter;
 pub mod events;
-pub mod membership;
 pub mod offload;
-pub mod transport;
 pub mod witness;
 
 // Core modules

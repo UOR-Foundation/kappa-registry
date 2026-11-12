@@ -1,5 +1,5 @@
 use kappa_handler::clock_at;
-use kappa_store::{Execution, KappaStore};
+use kappa_store::{Execution, IdentityStore, KappaStore};
 use kappa_store_memory::test_support;
 use kappa_types::page::PageRequest;
 use kappa_types::{ClockMs, HandleRecord, Kappa, NamespaceRef, ProtocolId, StoreError};
@@ -87,11 +87,13 @@ fn exercise_paging(
     }
     let first = store.handle_list_by_anchor(owner, &PageRequest::first(2))?;
     assert_eq!(handles(&first), ["a", "m"]);
+    assert_eq!(first.next_after, Some(format!("{protocol}:m")));
     let second = store.handle_list_by_anchor(owner, &PageRequest::new(2, first.next_after))?;
     assert_eq!(handles(&second), ["z"]);
     assert!(second.next_after.is_none());
     let first = store.handle_list(&PageRequest::first(2))?;
     assert_eq!(handles(&first), ["a", "m"]);
+    assert_eq!(first.next_after, Some(format!("{protocol}:m")));
     let second = store.handle_list(&PageRequest::new(2, first.next_after))?;
     assert_eq!(handles(&second), ["z"]);
     assert!(second.next_after.is_none());
@@ -163,4 +165,168 @@ fn memory_handles_preserve_order_ownership_and_attestation() -> TestResult {
 #[test]
 fn persistent_handles_preserve_order_ownership_and_attestation() -> TestResult {
     exercise(kappa_store_redb::test_support::persistent_store()?.store())
+}
+
+#[test]
+fn persistent_handle_discovery_survives_reopen() -> TestResult {
+    let root = kappa_fixture::FixtureRoot::temporary()?;
+    let spec = kappa_store_redb::test_support::PersistentSpec::new().in_root(&root);
+    {
+        let store = spec.clone().acquire()?;
+        exercise(store.store())?;
+    }
+    let store = spec.acquire()?;
+    let protocol = ProtocolId::new("test")?;
+    let owner = Kappa::sha256(b"owner");
+    assert!(matches!(
+        store.handle_get(protocol.clone(), "a"),
+        Err(StoreError::NotFound(_))
+    ));
+    assert_eq!(store.handle_get(protocol, "m")?.anchor, owner);
+    let first = store.handle_list_by_anchor(&owner, &PageRequest::first(1))?;
+    assert_eq!(handles(&first), ["m"]);
+    assert_eq!(first.next_after.as_deref(), Some("test:m"));
+    let last = store.handle_list_by_anchor(&owner, &PageRequest::new(1, first.next_after))?;
+    assert_eq!(handles(&last), ["z"]);
+    assert!(last.next_after.is_none());
+    assert_eq!(
+        handles(&store.handle_list(&PageRequest::first(10))?),
+        ["m", "z"]
+    );
+    assert!(
+        store
+            .handle_list_by_anchor(&Kappa::sha256(b"replacement"), &PageRequest::first(1),)?
+            .is_empty()
+    );
+    Ok(())
+}
+
+fn access_keys(store: &(impl KappaStore + kappa_crypto::sigv4::CredentialLookup)) -> TestResult {
+    use kappa_store::identity_ops::{access_key_create, access_key_lookup, access_key_rotate};
+    let ns = NamespaceRef::deterministic("access-keys");
+    let owner = Kappa::sha256(b"access-key-owner");
+    let (id, secret) = kappa_crypto::sigv4::generate_access_key()?;
+    assert!(id.starts_with("KAPPA"));
+    assert!(access_key_lookup(store, &id, ClockMs::from_raw(0)).is_err());
+    assert!(matches!(
+        store.lookup_credential(&id, ClockMs::from_raw(0)),
+        Err(StoreError::NotFound(_))
+    ));
+    publish(store, &ns, 1, |execution| {
+        access_key_create(execution, &owner, id.clone(), secret.clone()).map(|_| ())
+    })?;
+    let current = access_key_lookup(store, &id, ClockMs::from_raw(2))?;
+    assert_eq!(current.current_secret.as_str(), secret);
+    assert_eq!(current.principal_anchor, owner);
+    assert_eq!(
+        store
+            .lookup_credential(&id, ClockMs::from_raw(2))?
+            .current_secret
+            .as_str(),
+        secret
+    );
+    assert!(current.previous_secret.is_none());
+    let mut duplicate = store.begin_execution(&ns, &clock_at(ClockMs::from_raw(3))?)?;
+    assert!(matches!(
+        access_key_create(&mut *duplicate, &owner, id.clone(), "overwrite".into()),
+        Err(StoreError::AlreadyExists(_))
+    ));
+    duplicate.abort()?;
+    publish(store, &ns, 4, |execution| {
+        access_key_rotate(execution, &id, &owner, "replacement".into(), 50).map(|_| ())
+    })?;
+    let rotated = access_key_lookup(store, &id, ClockMs::from_raw(5))?;
+    assert_eq!(rotated.current_secret.as_str(), "replacement");
+    assert_eq!(
+        rotated.previous_secret.as_ref().map(|s| s.as_str()),
+        Some(secret.as_str())
+    );
+    let (_, _, grace) = store.credential_get(&id, ClockMs::from_raw(5))?;
+    let deadline = grace.ok_or("rotation omitted grace")?.1;
+    assert!(
+        access_key_lookup(store, &id, ClockMs::from_raw(deadline))?
+            .previous_secret
+            .is_none()
+    );
+    publish(store, &ns, 6, |execution| execution.credential_delete(&id))?;
+    assert!(access_key_lookup(store, &id, ClockMs::from_raw(7)).is_err());
+    publish(store, &ns, 8, |execution| {
+        execution.credential_put("malformed-access-key", &owner, b"invalid credential")
+    })?;
+    let failure = store.lookup_credential("malformed-access-key", ClockMs::from_raw(9));
+    assert!(failure.is_err());
+    assert!(
+        !matches!(failure, Err(StoreError::NotFound(_))),
+        "corruption must not become an absent credential"
+    );
+    Ok(())
+}
+
+#[test]
+fn access_key_lifecycle_uses_governed_credentials_on_both_backends() -> TestResult {
+    access_keys(&test_support::test_store()?.into_store())?;
+    access_keys(kappa_store_redb::test_support::persistent_store()?.store())
+}
+
+fn private_authorization_reads(store: &dyn KappaStore) -> TestResult {
+    use kappa_store::identity_ops::{access_key_create, access_key_lookup, access_key_rotate};
+    let clock = clock_at(ClockMs::from_raw(1))?;
+    let owner = Kappa::sha256(b"private-owner");
+    let ns =
+        kappa_store::namespace_ensure(store, "private-authorization", Some(&owner), None, &clock)?;
+    let mut execution = store.begin_execution(&ns, &clock)?;
+    execution.session_put("private-token", &owner, i64::MAX, b"first")?;
+    assert_eq!(
+        execution.session_get("private-token")?,
+        Some((owner.clone(), b"first".to_vec()))
+    );
+    execution.session_put("private-token", &owner, i64::MAX, b"replacement")?;
+    assert_eq!(
+        execution.session_get("private-token")?,
+        Some((owner.clone(), b"replacement".to_vec()))
+    );
+    execution.session_delete("private-token")?;
+    assert!(execution.session_get("private-token")?.is_none());
+    access_key_create(
+        &mut *execution,
+        &owner,
+        "private-access".into(),
+        "first-secret".into(),
+    )?;
+    access_key_rotate(
+        &mut *execution,
+        "private-access",
+        &owner,
+        "second-secret".into(),
+        50,
+    )?;
+    let (_, bytes, grace) = execution
+        .credential_get("private-access")?
+        .ok_or("missing private credential")?;
+    let credential: kappa_types::authorization::AccessCredential =
+        kappa_types::canonical::from_canonical(&bytes)?;
+    assert_eq!(credential.secret_access_key, "second-secret");
+    assert!(grace.is_some());
+    execution.publish()?;
+    let credential = access_key_lookup(store, "private-access", ClockMs::from_raw(2))?;
+    assert_eq!(credential.current_secret.as_str(), "second-secret");
+    assert_eq!(
+        credential
+            .previous_secret
+            .as_deref()
+            .map(|secret| secret.as_str()),
+        Some("first-secret")
+    );
+    assert!(
+        store
+            .session_get("private-token", ClockMs::from_raw(2))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn authorization_reads_observe_private_writes_on_both_backends() -> TestResult {
+    private_authorization_reads(&test_support::test_store()?.into_store())?;
+    private_authorization_reads(kappa_store_redb::test_support::persistent_store()?.store())
 }

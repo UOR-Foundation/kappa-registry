@@ -38,9 +38,10 @@ use kappa_store::{
     RetirementRequest, StoreError, canonical_bytes,
 };
 
+use kappa_store::work::{Dimension, WorkMeter};
+
 use crate::PersistentStore;
 use crate::retirement_record::RetirementRecord;
-use crate::settlement::Work;
 use crate::storage::{NamespaceController, NamespaceStorage, Recording, StorageEvidence};
 use crate::storage_instance::{Incarnation, StorageInstance};
 
@@ -84,7 +85,8 @@ impl PersistentStore {
     /// namespace is present.
     ///
     /// The decision is authorized only for a principal that owns the target
-    /// namespace (`governed_retirement`).
+    /// namespace (`governed_retirement`). A namespace holding authority
+    /// activation evidence is never retired.
     pub fn retire_governed(
         &self,
         governing: &NamespaceRef,
@@ -92,6 +94,15 @@ impl PersistentStore {
         clock: &dyn Clock,
     ) -> Result<VerifiedRetirement, StoreError> {
         let signed = request.get();
+        // The store's authority is recovered from the activation evidence a
+        // control namespace holds: retiring that storage would leave the
+        // store unable to open.
+        if self.holds_activation_evidence(signed.target())? {
+            return Err(StoreError::Rejected(format!(
+                "namespace {} holds authority activation evidence; it is never retired",
+                hex::encode(signed.target())
+            )));
+        }
         let instance =
             StorageInstance::new(*signed.target(), Incarnation::Known(*signed.incarnation()));
         match signed.disposition() {
@@ -184,10 +195,12 @@ impl PersistentStore {
     }
 
     /// Release the present storage `intent` holds under `verified`: settle
-    /// it to its head, which releases the publication dependencies its
-    /// unsettled epochs hold, then record the release once nothing else
-    /// holds the namespace and its head is still the one the decision
-    /// names, and remove the storage.
+    /// it to its head within one step's reads, decoding, allocation and
+    /// hashing (its epochs and their signatures unbounded: the head is
+    /// fixed while the intent holds the namespace), which releases the
+    /// publication dependencies its unsettled epochs hold, then record the
+    /// release once nothing else holds the namespace and its head is still
+    /// the one the decision names, and remove the storage.
     fn release_present(
         &self,
         intent: crate::storage::RetirementIntent,
@@ -195,10 +208,12 @@ impl PersistentStore {
         verified: &VerifiedRetirement,
         governing: &[u8; 16],
     ) -> Result<(), StoreError> {
-        let mut work = Work {
-            mutations: u64::MAX,
-            bytes: self.recovery_step_bytes,
-        };
+        let step = self
+            .step_limit
+            .with(Dimension::Entries, u64::MAX)
+            .with(Dimension::Signatures, u64::MAX)
+            .with(Dimension::Handles, u64::MAX);
+        let mut work = WorkMeter::new(step);
         self.settle_namespace(intent.controller(), &mut work)?;
         self.forget_namespace_cursors(instance.namespace());
         let decided = verified.decision().observed_head().cloned();
@@ -209,10 +224,12 @@ impl PersistentStore {
         intent.release(
             |controller| {
                 Self::is_named(controller, instance)?;
-                let head = self.head_root(controller)?.map(|root| ObservedHead {
-                    epoch_number: root.epoch_number(),
-                    root: root.kappa().clone(),
-                });
+                let head = self
+                    .head_root(controller, &mut work)?
+                    .map(|root| ObservedHead {
+                        epoch_number: root.epoch_number(),
+                        root: root.kappa().clone(),
+                    });
                 if head != decided {
                     return Err(StoreError::Conflict(format!(
                         "the head of {instance} is not the head its retirement decision names"
@@ -245,9 +262,12 @@ impl PersistentStore {
     ) -> Result<VerifiedRetirement, StoreError> {
         let target_ref = NamespaceStorage::namespace_ref(*instance.namespace());
         let observation = TargetObservation {
-            record: self.settled_namespace_info(&target_ref)?,
+            record: self.settled_namespace_info(&target_ref, &mut self.read_meter())?,
+            // The head a signed decision publishes is the established
+            // checkpoint: a checkpoint of unknown durability is never
+            // published as the instance's last settled head.
             head: self
-                .settled_epoch(instance)?
+                .established_checkpoint(instance)?
                 .map(|(epoch_number, root)| ObservedHead { epoch_number, root }),
         };
         let release = self.release_grant(instance)?;

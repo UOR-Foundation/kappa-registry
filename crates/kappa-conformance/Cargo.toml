@@ -13,6 +13,7 @@ kappa-handler = { workspace = true, features = ["test-util"] }
 kappa-store = { workspace = true }
 kappa-store-memory = { workspace = true, features = ["test-util"] }
 kappa-crypto = { workspace = true, features = ["test-util"] }
+kappa-reconcile = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }

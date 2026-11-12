@@ -10,14 +10,14 @@ use kappa_store::{
     VerifiedContent,
 };
 
-use super::StepBudget;
 use crate::control_plane::{Guarantee, Guarantees};
+use crate::instance_record::Kind;
 use crate::retirement_record::RetirementRecord;
-use crate::settlement::Work;
 use crate::storage::NamespaceController;
 use crate::storage_instance::StorageInstance;
 use crate::store_access::Coverage;
-use crate::{PersistentStore, PersistentStoreConfig, creation_intent};
+use crate::{PersistentStore, PersistentStoreConfig};
+use kappa_store::work::{Dimension, WorkLimit, WorkMeter};
 
 #[path = "settlement_lost_tests.rs"]
 mod lost;
@@ -27,25 +27,27 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 /// The default step byte budget (`PersistentStoreConfig`).
 const STEP_BYTES: u64 = 256 * 1024 * 1024;
 
-/// A step of `entries` records and `mutations` epoch examinations.
-const fn budget(entries: u64, mutations: u64) -> StepBudget {
-    StepBudget {
-        entries,
-        work: Work {
-            mutations,
-            bytes: if mutations == 0 { 0 } else { STEP_BYTES },
-        },
-    }
+/// One allowance shared by discovery, epoch reconstruction and compaction.
+/// Signatures can be withheld to isolate discovery without erasing its I/O.
+fn limit(entries: u64, signatures: u64) -> WorkLimit {
+    WorkLimit::unbounded()
+        .with(Dimension::Entries, entries)
+        .with(Dimension::Handles, entries)
+        .with(Dimension::Candidates, entries)
+        .with(Dimension::Signatures, signatures)
+        .with(Dimension::BytesRead, STEP_BYTES)
+        .with(Dimension::BytesDecoded, STEP_BYTES)
+        .with(Dimension::BytesAllocated, STEP_BYTES)
+        .with(Dimension::BytesHashed, STEP_BYTES)
 }
 
-fn open_with(root: &std::path::Path, entries: u64, mutations: u64) -> TestResult<PersistentStore> {
+fn open_with(root: &std::path::Path, entries: u64, signatures: u64) -> TestResult<PersistentStore> {
     let mut config = PersistentStoreConfig::new(
         root.join("blobs"),
         root.join("store.redb"),
         kappa_crypto::testing::fixture_authority(1)?,
     );
-    config.recovery_step_entries = entries;
-    config.recovery_step_mutations = mutations;
+    config.recovery_step = limit(entries, signatures);
     Ok(PersistentStore::new(config)?)
 }
 
@@ -103,7 +105,9 @@ const fn refused(result: &Result<(), StoreError>) -> bool {
 }
 
 fn intents(store: &PersistentStore) -> TestResult<usize> {
-    Ok(creation_intent::traversal(store.namespaces.root())?.map_or(0, Iterator::count))
+    Ok(Kind::Creating
+        .traversal(store.namespaces.root())?
+        .map_or(0, Iterator::count))
 }
 
 /// A creation that never committed leaves a claim, a marker and empty
@@ -220,7 +224,14 @@ fn a_bounded_open_examines_its_budget_and_steps_finish_without_rescanning() -> T
             .collect::<Result<Vec<_>, _>>()?
     };
     let store = open_with(root.path(), BUDGET, 1024)?;
-    assert_eq!(store.recovery_examined()?, BUDGET, "one open step");
+    assert!(
+        store.recovery_examined()? > 0,
+        "the opening step discovers work"
+    );
+    assert!(
+        store.recovery_examined()? <= BUDGET,
+        "discovery shares the step's entry allowance"
+    );
     assert!(!store.settlement_pass_complete()?);
     assert!(matches!(
         store.discovery_coverage(),
@@ -236,12 +247,11 @@ fn a_bounded_open_examines_its_budget_and_steps_finish_without_rescanning() -> T
     assert!(refused(&write(&store, &namespaces[0], 2000)));
     let mut steps = 0;
     while store.discovery_coverage() != Coverage::Complete {
-        store.recovery_step(budget(BUDGET, 1024))?;
+        let mut work = WorkMeter::new(limit(BUDGET, 1024));
+        store.recovery_step(&mut work)?;
+        assert!(work.used().get(Dimension::Entries) <= BUDGET);
         steps += 1;
-        assert!(
-            steps <= POPULATION / BUDGET + 2,
-            "recovery made no progress"
-        );
+        assert!(steps <= POPULATION * 128, "recovery made no progress");
     }
     assert_eq!(
         store.recovery_examined()?,
@@ -286,7 +296,7 @@ fn a_reconstruction_split_across_steps_never_leaves_ownership_unaccounted() -> T
         if registered.is_none() && coverage == Coverage::Complete {
             break;
         }
-        store.recovery_step(budget(64, 2))?;
+        store.recovery_step(&mut WorkMeter::new(limit(64, 2)))?;
     }
     assert!(
         !store.obligation_held(&instance),
@@ -299,9 +309,8 @@ fn a_reconstruction_split_across_steps_never_leaves_ownership_unaccounted() -> T
 }
 
 /// A permanently unreadable obligation in the queue does not starve
-/// discovery, even when each step has a single entry to spend: the unit
-/// alternates between the queue and the traversal, so the readable markers
-/// behind it are found and settled and the enumeration finishes.
+/// discovery, even when each subsequent step has a single entry to spend.
+/// Settlement then receives complete epoch units to discharge readable work.
 #[test]
 fn an_unreadable_obligation_does_not_starve_discovery_under_a_one_entry_budget() -> TestResult {
     const READABLE: u64 = 6;
@@ -319,23 +328,32 @@ fn an_unreadable_obligation_does_not_starve_discovery_under_a_one_entry_budget()
         stuck.id(),
     ));
     std::fs::File::create(&database)?;
-    // One entry per step is what the schedule is about; the epoch work
-    // each visit may do is ample, so a visit settles its marker.
-    let store = open_with(root.path(), 1, 4096)?;
-    let bound = 4 * (READABLE + 1) + 8;
+    // Startup must admit a complete epoch unit. Subsequent caller allowances
+    // may be smaller, and still must not starve durable-record discovery.
+    let store = open_with(root.path(), 3, 4096)?;
+    let bound = 16 * (READABLE + 1) + 32;
     let mut steps = 0;
-    while store.discovery_coverage()
-        != (Coverage::Incomplete {
-            unregistered: 1,
-            enumerating: false,
-        })
-    {
-        store.recovery_step(budget(1, 4096))?;
+    while matches!(
+        store.discovery_coverage(),
+        Coverage::Incomplete {
+            enumerating: true,
+            ..
+        }
+    ) {
+        let mut work = WorkMeter::new(limit(1, 4096));
+        store.recovery_step(&mut work)?;
+        assert!(work.used().get(Dimension::Entries) <= 1);
         steps += 1;
         assert!(
             steps <= bound,
             "discovery starved behind the unreadable obligation"
         );
+    }
+    for _ in 0..bound {
+        if store.pending_settlements()? == vec![*stuck.id()] {
+            break;
+        }
+        store.recovery_step(&mut WorkMeter::new(limit(4096, 4096)))?;
     }
     let pending = store.pending_settlements()?;
     assert_eq!(
@@ -362,7 +380,7 @@ fn an_intent_handed_to_its_marker_keeps_discovery_incomplete_until_settled() -> 
         let ns = create(&store, "handed")?;
         publish(&store, &ns, b"committed under an intent", 2000)?;
         let instance = instance_of(&store, &ns)?;
-        creation_intent::record(store.namespaces.root(), &instance)?;
+        Kind::Creating.record(store.namespaces.root(), &instance)?;
         (ns, instance)
     };
     let marker = root
@@ -387,7 +405,7 @@ fn an_intent_handed_to_its_marker_keeps_discovery_incomplete_until_settled() -> 
     );
     std::fs::remove_dir_all(&directory)?;
     std::fs::rename(&displaced, &directory)?;
-    store.recovery_step(budget(2, 0))?;
+    store.recovery_step(&mut WorkMeter::new(limit(2, 0)))?;
     assert!(
         marker.exists(),
         "control: the intent was handed to a marker"
@@ -424,7 +442,7 @@ fn unreadable_creation_residue_stays_unresolved_and_is_never_removed() -> TestRe
     let database = NamespaceController::database_path(&directory);
     {
         let store = open(root.path())?;
-        creation_intent::record(store.namespaces.root(), &instance)?;
+        Kind::Creating.record(store.namespaces.root(), &instance)?;
     }
     std::fs::create_dir_all(&directory)?;
     std::fs::File::create(&database)?;

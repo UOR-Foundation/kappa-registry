@@ -13,16 +13,11 @@
 //! completed with the epoch; settlement of an instance is sequential, so a
 //! projection is never replaced by one from an older snapshot.
 
-use redb::ReadableTable;
-
-use kappa_store::authorization::{CredentialTransition, SessionTransition};
 use kappa_store::canonical::from_canonical;
-use kappa_store::epoch::{EpochMutation, MutationOp};
-use kappa_store::identity::{Revocation, Succession, TrustPosition, Watermark};
-use kappa_store::identity_scope::AnchorScope;
+use kappa_store::identity::{Revocation, Succession, Watermark};
+use kappa_store::transition::{MemberTransition, PreparedTransition, RecordTransition};
 use kappa_store::{Kappa, NamespaceRef, StoreError};
 
-use crate::content_read::ReadView;
 use crate::identity_local::{AuthorizationTable, TRUST_KEY};
 use crate::identity_write::binding_key;
 use crate::tables;
@@ -132,18 +127,6 @@ fn row(
         .transpose()
 }
 
-fn required_row(
-    txn: &redb::ReadTransaction,
-    table: redb::TableDefinition<'static, &'static [u8], &'static [u8]>,
-    kappa: &Kappa,
-    kind: &str,
-    limit: u64,
-) -> Result<Vec<u8>, StoreError> {
-    row(txn, table, kappa.key_bytes().as_slice(), limit)?.ok_or_else(|| {
-        StoreError::Internal(format!("{kind} {kappa} is in the ledger but has no row"))
-    })
-}
-
 impl IdentityEffect {
     /// Bytes of namespace rows this effect holds for projection, each
     /// already checked against the record limit when it was copied.
@@ -163,8 +146,9 @@ impl IdentityEffect {
 
     /// The predicate this effect's row answers before it is projected: a
     /// revocation or watermark is discoverable by its asserter.
-    pub fn discovery_key(&self) -> Result<Option<DiscoveryKey>, StoreError> {
-        Ok(match self {
+    pub fn discovery_keys(&self) -> Result<[Option<DiscoveryKey>; 2], StoreError> {
+        let mut secondary = None;
+        let primary = match self {
             Self::Revocation { bytes, .. } => {
                 let revocation: Revocation = from_canonical(bytes)?;
                 Some(DiscoveryKey::RevocationsBy(revocation.asserter))
@@ -173,13 +157,22 @@ impl IdentityEffect {
                 let watermark: Watermark = from_canonical(bytes)?;
                 Some(DiscoveryKey::WatermarksBy(watermark.asserter))
             }
+            Self::Succession { record } => {
+                Some(DiscoveryKey::SuccessorOf(record.old_anchor.clone()))
+            }
+            Self::Handle { key, bytes } => {
+                if let Some(bytes) = bytes {
+                    let record: kappa_store::identity::HandleRecord = from_canonical(bytes)?;
+                    secondary = Some(DiscoveryKey::HandlesBy(record.anchor));
+                }
+                Some(DiscoveryKey::Handle(key.clone()))
+            }
             Self::Assertion { .. }
-            | Self::Succession { .. }
             | Self::Binding { .. }
-            | Self::Handle { .. }
             | Self::AnchorRow { .. }
             | Self::Authorization { .. } => None,
-        })
+        };
+        Ok([primary, secondary])
     }
 
     /// `self` with the total bytes read for it: `records` read beside the
@@ -196,111 +189,106 @@ impl IdentityEffect {
 /// record read is refused before it is read when larger than `limit`, every
 /// row held after it is read; returns the effect and the bytes read.
 pub fn collect(
-    view: &ReadView,
     txn: &redb::ReadTransaction,
-    index: &impl ReadableTable<&'static [u8], &'static [u8]>,
     ns: &NamespaceRef,
-    mutation: &EpochMutation,
+    transition: &PreparedTransition,
     limit: u64,
 ) -> Result<(IdentityEffect, u64), StoreError> {
-    let kappa = mutation.kappa.clone();
-    let mut records = 0u64;
-    let mut record = |identity: &Kappa| -> Result<Vec<u8>, StoreError> {
-        let bytes = view.epoch_content_from_index(index, identity, Some(limit))?;
-        records = records
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| StoreError::Internal("identity settlement read exceeds u64".into()))?;
-        Ok(bytes)
-    };
-    let effect = match mutation.op {
-        MutationOp::AssertionPublish => IdentityEffect::Assertion {
-            bytes: required_row(txn, tables::ID_ASSERTIONS, &kappa, "assertion", limit)?,
+    let kappa = transition.evidence().kappa().clone();
+    let effect = match transition.record() {
+        RecordTransition::Assertion(_) => IdentityEffect::Assertion {
+            bytes: transition.evidence().content().to_vec(),
             kappa,
         },
-        MutationOp::RevocationPublish => IdentityEffect::Revocation {
-            bytes: required_row(txn, tables::ID_REVOCATIONS, &kappa, "revocation", limit)?,
+        RecordTransition::Revocation(_) => IdentityEffect::Revocation {
+            bytes: transition.evidence().content().to_vec(),
             kappa,
         },
-        MutationOp::AnchorOrigin => match AnchorScope::parse(mutation.context.as_deref())? {
-            AnchorScope::Watermark => IdentityEffect::Watermark {
-                bytes: required_row(txn, tables::ID_WATERMARKS, &kappa, "watermark", limit)?,
-                kappa,
-            },
-            AnchorScope::Succession => {
-                let bytes = record(&kappa)?;
-                IdentityEffect::Succession {
-                    record: Box::new(from_canonical(&bytes)?),
-                }
+        RecordTransition::Watermark(_) => IdentityEffect::Watermark {
+            bytes: transition.evidence().content().to_vec(),
+            kappa,
+        },
+        RecordTransition::Succession(record) => IdentityEffect::Succession {
+            record: Box::new(record.clone()),
+        },
+        RecordTransition::Member(
+            MemberTransition::BindingPut(record) | MemberTransition::BindingDelete(record),
+        ) => {
+            let source = record.source.clone();
+            let key = binding_key(ns, &source);
+            IdentityEffect::Binding {
+                bytes: row(txn, tables::ID_BINDINGS, key.as_slice(), limit)?,
+                key,
+                source,
             }
-            AnchorScope::Binding { source } => {
-                let key = binding_key(ns, &source);
-                IdentityEffect::Binding {
-                    bytes: row(txn, tables::ID_BINDINGS, key.as_slice(), limit)?,
-                    key,
-                    source,
-                }
-            }
-            AnchorScope::Handle { key } => IdentityEffect::Handle {
+        }
+        RecordTransition::Member(
+            MemberTransition::HandlePut(record) | MemberTransition::HandleDelete(record),
+        ) => {
+            let key = crate::identity_write::handle_key(&record.protocol, &record.handle);
+            IdentityEffect::Handle {
                 bytes: string_row(txn, tables::ID_HANDLES, &key, limit)?,
                 key,
-            },
-            AnchorScope::Device => anchor_row(txn, AnchorTable::Device, &kappa, limit)?,
-            AnchorScope::Prekey => anchor_row(txn, AnchorTable::Prekey, &kappa, limit)?,
-            AnchorScope::Locator => anchor_row(txn, AnchorTable::Locator, &kappa, limit)?,
-            AnchorScope::Commitment => anchor_row(txn, AnchorTable::Commitment, &kappa, limit)?,
-            // The transition record the ledger names is the evidence of
-            // what this epoch admitted; it is read back from the epoch's
-            // content and checked to name the scoped row before the row's
-            // current state is projected.
-            AnchorScope::Session { id } => {
-                let bytes = record(&kappa)?;
-                let transition: SessionTransition = from_canonical(&bytes)?;
-                if transition.id != id {
-                    return Err(StoreError::Rejected(format!(
-                        "session transition {kappa} names {} but the ledger scope names {id}",
-                        transition.id
-                    )));
-                }
-                IdentityEffect::Authorization {
-                    table: tables::ID_SESSIONS,
-                    bytes: string_row(txn, tables::ID_SESSIONS, &id, limit)?,
-                    key: id,
-                }
             }
-            // A credential settles its row and its grace row as two
-            // effects; the grace is the second (`collect_grace`).
-            AnchorScope::Credential { id } => {
-                let bytes = record(&kappa)?;
-                let transition: CredentialTransition = from_canonical(&bytes)?;
-                if transition.id != id {
-                    return Err(StoreError::Rejected(format!(
-                        "credential transition {kappa} names {} but the ledger scope names {id}",
-                        transition.id
-                    )));
-                }
-                IdentityEffect::Authorization {
-                    table: tables::ID_CREDENTIALS,
-                    bytes: string_row(txn, tables::ID_CREDENTIALS, &id, limit)?,
-                    key: id,
-                }
+        }
+        RecordTransition::Member(
+            MemberTransition::DevicePut(record) | MemberTransition::DeviceRevoke(record),
+        ) => anchor_row(txn, AnchorTable::Device, &record.anchor, limit)?,
+        RecordTransition::Member(MemberTransition::PrekeyPut(record)) => {
+            anchor_row(txn, AnchorTable::Prekey, &record.anchor, limit)?
+        }
+        RecordTransition::Member(MemberTransition::LocatorPut(record)) => {
+            anchor_row(txn, AnchorTable::Locator, &record.anchor, limit)?
+        }
+        RecordTransition::Member(MemberTransition::CommitmentPut(record)) => {
+            anchor_row(txn, AnchorTable::Commitment, &record.anchor, limit)?
+        }
+        // The transition record the ledger names is the evidence of
+        // what this epoch admitted; it is read back from the epoch's
+        // content and checked to name the scoped row before the row's
+        // current state is projected.
+        RecordTransition::Session(record) => {
+            let id = record.id.clone();
+            IdentityEffect::Authorization {
+                table: tables::ID_SESSIONS,
+                bytes: string_row(txn, tables::ID_SESSIONS, &id, limit)?,
+                key: id,
             }
-            AnchorScope::Trust => {
-                let bytes = record(&kappa)?;
-                let _: TrustPosition = from_canonical(&bytes)?;
-                IdentityEffect::Authorization {
-                    table: tables::ID_TRUST,
-                    bytes: string_row(txn, tables::ID_TRUST, TRUST_KEY, limit)?,
-                    key: TRUST_KEY.to_owned(),
-                }
+        }
+        // A credential settles its row and its grace row as two
+        // effects; the grace is the second (`collect_grace`).
+        RecordTransition::Credential(record) => {
+            let id = record.id.clone();
+            IdentityEffect::Authorization {
+                table: tables::ID_CREDENTIALS,
+                bytes: string_row(txn, tables::ID_CREDENTIALS, &id, limit)?,
+                key: id,
             }
+        }
+        RecordTransition::Trust(_) => IdentityEffect::Authorization {
+            table: tables::ID_TRUST,
+            bytes: string_row(txn, tables::ID_TRUST, TRUST_KEY, limit)?,
+            key: TRUST_KEY.to_owned(),
         },
-        other => {
-            return Err(StoreError::Internal(format!(
-                "{other:?} is not identity evidence"
-            )));
+        _ => {
+            return Err(StoreError::Internal(
+                "transition is not identity evidence".into(),
+            ));
         }
     };
-    effect.sized(records)
+    // These effects reuse evidence already read and accounted by the
+    // shared decoder; only mutable projection payloads performed row reads.
+    if matches!(
+        transition.record(),
+        RecordTransition::Assertion(_)
+            | RecordTransition::Revocation(_)
+            | RecordTransition::Watermark(_)
+            | RecordTransition::Succession(_)
+    ) {
+        Ok((effect, 0))
+    } else {
+        effect.sized(0)
+    }
 }
 
 /// The grace row that accompanies a credential transition: `Some` for a
@@ -308,17 +296,14 @@ pub fn collect(
 /// read, the row refused when larger than `limit`.
 pub fn collect_grace(
     txn: &redb::ReadTransaction,
-    mutation: &EpochMutation,
+    transition: &PreparedTransition,
     limit: u64,
 ) -> Result<Option<(IdentityEffect, u64)>, StoreError> {
-    if mutation.op != MutationOp::AnchorOrigin {
-        return Ok(None);
-    }
-    match AnchorScope::parse(mutation.context.as_deref())? {
-        AnchorScope::Credential { id } => IdentityEffect::Authorization {
+    match transition.record() {
+        RecordTransition::Credential(record) => IdentityEffect::Authorization {
             table: tables::ID_CREDENTIAL_GRACE,
-            bytes: string_row(txn, tables::ID_CREDENTIAL_GRACE, &id, limit)?,
-            key: id,
+            bytes: string_row(txn, tables::ID_CREDENTIAL_GRACE, &record.id, limit)?,
+            key: record.id.clone(),
         }
         .sized(0)
         .map(Some),

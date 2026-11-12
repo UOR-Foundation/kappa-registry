@@ -16,7 +16,10 @@
 //! 3. the owner marker the installer wrote beside the payload
 //!    (`allocation::Owner`) names the storage instance whose committed rows
 //!    decide: no marker means no installation ever started (a preparation
-//!    that was dropped); the installing instance's storage is classified
+//!    that was dropped); an installer that holds custody of a retained
+//!    publication (`custody`) protects every allocation it installed, since
+//!    resolution installs them again, and so does custody that cannot be
+//!    inspected; otherwise the installing instance's storage is classified
 //!    once (`namespace_snapshot::admit_instance`): storage gone or replaced
 //!    by another instance releases the allocation only when the instance's
 //!    retirement record is verified to release what it held
@@ -40,17 +43,22 @@ use redb::{ReadableMultimapTable, ReadableTable};
 
 use kappa_store::error::StoreError;
 use kappa_store::kappa::Kappa;
+use kappa_store::transition::RecordTransition;
+use kappa_store::work::Meter;
+use kappa_types::content::{ContentAdmission, ContentRetirementRecord};
 
 use crate::PersistentStore;
 use crate::allocation::{Owner, read_owner_marker};
-use crate::blob_rows::decode_row;
+use crate::blob_rows::{decode_row, record_in_txn};
 use crate::content_install::referenced;
+use crate::derived_index::{Generation, release_allocation};
 use crate::namespace_snapshot::InstanceAdmission;
 use crate::projection::Family;
 use crate::referrers::{Referrer, Source as ReferrerSource, release};
 use crate::representation::{AllocationId, Representation};
 use crate::retirement_record::RetirementRecord;
-use crate::tables::{ALLOCATIONS, BLOB_INDEX, REFERRERS};
+use crate::tables::{BLOB_INDEX, BLOB_META};
+use crate::transition_apply::{RedbPayload, TxnWriter};
 
 /// Outcome of [`retire_in_txn`].
 #[derive(Debug, PartialEq, Eq)]
@@ -66,11 +74,12 @@ pub enum Retired {
 
 /// The digest family of `identity`: its holder (the identity itself unless
 /// its row is an alias) followed by every alias row of the holder, found
-/// through the holder's representation referrers. `None` when the
-/// namespace has no row for `identity`.
+/// through the holder's representation referrers in `generation`. `None`
+/// when the namespace has no row for `identity`.
 fn family(
     store: &PersistentStore,
     txn: &redb::WriteTransaction,
+    generation: Generation,
     identity: &Kappa,
 ) -> Result<Option<Vec<Kappa>>, StoreError> {
     let index = txn.open_table(BLOB_INDEX).map_err(crate::error::redb)?;
@@ -90,7 +99,7 @@ fn family(
         _ => identity.clone(),
     };
     let referrers = txn
-        .open_multimap_table(REFERRERS)
+        .open_multimap_table(generation.referrers())
         .map_err(crate::error::redb)?;
     let mut members = vec![holder.clone()];
     for entry in referrers
@@ -107,27 +116,51 @@ fn family(
     Ok(Some(members))
 }
 
-/// Retire `identity` and the other identities of the same bytes inside
-/// `txn`, the namespace's transaction, unless a committed reference names
-/// one of them: any referrer but an alias of the family itself retains the
-/// whole family. The referrer check and the row removals run in the same
-/// write transaction, so no reference committed by another writer of this
-/// namespace can fall between them. Aliases go first, each releasing its
-/// reference to the holder, then the holder, which releases the
-/// namespace's claim on its allocation.
-pub fn retire_in_txn(
-    store: &PersistentStore,
-    txn: &redb::WriteTransaction,
-    ns: &kappa_store::NamespaceRef,
-    now: kappa_store::ClockMs,
-    identity: &Kappa,
-) -> Result<Retired, StoreError> {
-    let Some(members) = family(store, txn, identity)? else {
+/// The blob metadata keys `identity` holds in `txn`.
+fn meta_keys(txn: &redb::WriteTransaction, identity: &Kappa) -> Result<Vec<String>, StoreError> {
+    let mut prefix = identity.key_bytes();
+    prefix.push(b':');
+    let table = txn.open_table(BLOB_META).map_err(crate::error::redb)?;
+    let end = PersistentStore::prefix_successor(&prefix);
+    let range = match &end {
+        Some(end) => table.range(prefix.as_slice()..end.as_slice()),
+        None => table.range(prefix.as_slice()..),
+    }
+    .map_err(crate::error::redb)?;
+    let mut keys = Vec::new();
+    for entry in range {
+        let (key, _) = entry.map_err(crate::error::redb)?;
+        let suffix = &key.value()[prefix.len()..];
+        keys.push(
+            std::str::from_utf8(suffix)
+                .map_err(|error| StoreError::Internal(format!("blob metadata key: {error}")))?
+                .to_owned(),
+        );
+    }
+    Ok(keys)
+}
+
+/// Retire `identity` and the other identities of the same bytes inside the
+/// namespace's transaction `writer` writes, unless a committed reference
+/// names one of them: any referrer but an alias of the family itself
+/// retains the whole family. The referrer check and the removals run in
+/// the same write transaction, so no reference committed by another writer
+/// of this namespace can fall between them. Every member, aliases before
+/// the holder, first has its blob metadata removed by its own transitions,
+/// then its admission retired by a `ContentRetire` naming the exact
+/// admission; the holder releases the namespace's claim on its allocation.
+/// Refused (`Unavailable`) while the namespace's indexes are known
+/// divergent: an absent referrer there does not establish that nothing
+/// refers to the identity.
+pub fn retire_in_txn(writer: &TxnWriter<'_>, identity: &Kappa) -> Result<Retired, StoreError> {
+    let (store, txn, ns) = (writer.store, writer.txn, writer.ns);
+    let generation = store.trusted_generation(txn, ns)?;
+    let Some(members) = family(store, txn, generation, identity)? else {
         return Ok(Retired::Absent);
     };
     {
         let referrers = txn
-            .open_multimap_table(REFERRERS)
+            .open_multimap_table(generation.referrers())
             .map_err(crate::error::redb)?;
         for member in &members {
             for entry in referrers
@@ -144,100 +177,75 @@ pub fn retire_in_txn(
     }
     let mut outcome = Retired::Absent;
     for member in members.iter().rev() {
-        outcome = retire_row(store, txn, ns, now, member)?;
+        let Some(record) = record_in_txn(store, txn, member)? else {
+            continue;
+        };
+        for key in meta_keys(txn, member)? {
+            writer.admit_blob_meta(member, &key, None)?;
+        }
+        let retirement = ContentRetirementRecord::new(ContentAdmission::new(
+            *ns.id(),
+            *writer.incarnation(),
+            member.clone(),
+            record.total_size(),
+        ));
+        writer.apply(
+            RecordTransition::ContentRetire(retirement),
+            RedbPayload::NoResources,
+        )?;
+        outcome = Retired::Row(match record.representation() {
+            Representation::External { allocation, .. } => Some(*allocation),
+            _ => None,
+        });
     }
     Ok(outcome)
 }
 
-/// Remove the row of `identity`, which no reference outside its family
-/// names, recording its retirement.
-fn retire_row(
-    store: &PersistentStore,
-    txn: &redb::WriteTransaction,
-    ns: &kappa_store::NamespaceRef,
-    now: kappa_store::ClockMs,
-    identity: &Kappa,
-) -> Result<Retired, StoreError> {
-    let key = identity.key_bytes();
-    let removed = {
-        let mut index = txn.open_table(BLOB_INDEX).map_err(crate::error::redb)?;
-        index
+impl TxnWriter<'_> {
+    /// Remove exactly the admission `record` names: its row, the references
+    /// its representation held and, for external content, the namespace's
+    /// claim on the allocation. No other admission may still select it, and
+    /// its blob metadata must already be removed by its own transitions.
+    pub(crate) fn apply_retirement(
+        &self,
+        record: &ContentRetirementRecord,
+    ) -> Result<(), StoreError> {
+        let (store, txn, ns) = (self.store, self.txn, self.ns);
+        let removed = record.removed();
+        let identity = removed.identity();
+        if !meta_keys(txn, identity)?.is_empty() {
+            return Err(StoreError::Internal(format!(
+                "retirement of {identity} before its blob metadata was removed"
+            )));
+        }
+        let key = identity.key_bytes();
+        let row = txn
+            .open_table(BLOB_INDEX)
+            .map_err(crate::error::redb)?
             .remove(key.as_slice())
             .map_err(crate::error::redb)?
             .map(|guard| decode_row(store, &key, guard.value()))
             .transpose()?
-    };
-    let Some(record) = removed else {
-        return Ok(Retired::Absent);
-    };
-    // The retirement is ledger evidence of this namespace, as the admission
-    // was: settlement releases the namespace's catalog and allocation
-    // claims from it, and replay admits it against the preceding admission.
-    store.record_mutation_in_txn(
-        txn,
-        ns,
-        kappa_store::MutationOp::ContentRetire,
-        identity.clone(),
-        now,
-        None,
-    )?;
-    for child in referenced(&record) {
-        release(store, txn, &child, &Referrer::representation(identity))?;
-    }
-    let Representation::External { allocation, .. } = record.representation() else {
-        return Ok(Retired::Row(None));
-    };
-    let mut allocations = txn.open_table(ALLOCATIONS).map_err(crate::error::redb)?;
-    let owner = allocations
-        .remove(allocation.0.as_slice())
-        .map_err(crate::error::redb)?
-        .map(|guard| guard.value().to_vec());
-    if owner.as_deref() != Some(key.as_slice()) {
-        return Err(store.index_diverged(
-            "ALLOCATIONS",
-            format!(
-                "allocation {} ownership disagrees with the retired row",
-                allocation.hex()
-            ),
-        ));
-    }
-    Ok(Retired::Row(Some(*allocation)))
-}
-
-/// Replace a namespace's `ALLOCATIONS` inside `txn` with the ownership its
-/// `BLOB_INDEX` implies: every External row owns its allocation and
-/// nothing else does. Returns the number of entries.
-pub fn rebuild_allocations(
-    store: &PersistentStore,
-    txn: &redb::WriteTransaction,
-) -> Result<u64, StoreError> {
-    let mut allocations = txn.open_table(ALLOCATIONS).map_err(crate::error::redb)?;
-    allocations
-        .retain(|_, _| false)
-        .map_err(crate::error::redb)?;
-    let index = txn.open_table(BLOB_INDEX).map_err(crate::error::redb)?;
-    let mut count = 0u64;
-    for entry in index.iter().map_err(crate::error::redb)? {
-        let (key, value) = entry.map_err(crate::error::redb)?;
-        let record = decode_row(store, key.value(), value.value())?;
-        let Representation::External { allocation, .. } = record.representation() else {
-            continue;
-        };
-        if allocations
-            .insert(allocation.0.as_slice(), key.value())
-            .map_err(crate::error::redb)?
-            .is_some()
-        {
+            .ok_or_else(|| {
+                StoreError::Internal(format!(
+                    "retirement of {identity}, which the namespace does not admit"
+                ))
+            })?;
+        if row.total_size() != removed.logical_size() {
             return Err(StoreError::Internal(format!(
-                "allocation {} is selected by two committed rows",
-                allocation.hex()
+                "retirement of {identity} names {} bytes; the admission holds {}",
+                removed.logical_size(),
+                row.total_size()
             )));
         }
-        count = count
-            .checked_add(1)
-            .ok_or_else(|| StoreError::CapacityExceeded("allocation count overflow".into()))?;
+        for child in referenced(&row) {
+            release(store, txn, ns, &child, &Referrer::representation(identity))?;
+        }
+        if let Representation::External { allocation, .. } = row.representation() {
+            release_allocation(store, txn, ns, allocation, identity)?;
+        }
+        Ok(())
     }
-    Ok(count)
 }
 
 /// Outcome of one allocation's reclamation.
@@ -264,11 +272,17 @@ enum OwnerVerdict {
 }
 
 impl PersistentStore {
-    /// Whether the completed projection names an owner of `allocation`.
-    fn allocation_owned(&self, allocation: &AllocationId) -> Result<bool, StoreError> {
+    /// Whether the completed projection names an owner of `allocation`,
+    /// every owner examined on `work`: a refusal decides nothing, so it is
+    /// never taken for "no owner".
+    fn allocation_owned(
+        &self,
+        allocation: &AllocationId,
+        work: &mut dyn Meter,
+    ) -> Result<bool, StoreError> {
         Ok(!self
             .projection()?
-            .members(Family::AllocationOwner, allocation.0.as_slice())?
+            .members(Family::AllocationOwner, allocation.0.as_slice(), work)?
             .is_empty())
     }
 
@@ -307,7 +321,12 @@ impl PersistentStore {
     /// `allocation` now, read from that instance's own committed state.
     /// Evidence that cannot be read, and evidence of another instance,
     /// protect the allocation; neither is ever absence.
-    fn owner_verdict(&self, allocation: &AllocationId, owner: &Owner) -> OwnerVerdict {
+    fn owner_verdict(
+        &self,
+        allocation: &AllocationId,
+        owner: &Owner,
+        work: &mut dyn Meter,
+    ) -> OwnerVerdict {
         let (snapshot, identification) = match self.admit_instance(&owner.instance) {
             InstanceAdmission::Held {
                 snapshot,
@@ -316,6 +335,9 @@ impl PersistentStore {
             InstanceAdmission::Released(record) => {
                 return self.owner_retired(allocation, owner, &record);
             }
+            // The owner's storage was not examined: never absence. The
+            // inventory decides the allocation on a later pass.
+            InstanceAdmission::CapacityDeferred { .. } => return OwnerVerdict::Protected,
             // Missing or replaced storage without a recorded retirement is
             // unexplained absence, and unreadable evidence is unavailable:
             // both protect the allocation.
@@ -335,8 +357,19 @@ impl PersistentStore {
             return OwnerVerdict::Protected;
         }
         let decided = (|| -> Result<OwnerVerdict, StoreError> {
+            // Ownership is decided only from indexes not known divergent;
+            // a fenced namespace's allocations stay protected until its
+            // repair completes.
+            let generation = match self.trusted_snapshot_generation(&snapshot) {
+                Ok(generation) => generation,
+                Err(StoreError::Unavailable(_)) => return Ok(OwnerVerdict::Protected),
+                Err(error) => return Err(error),
+            };
             let index = snapshot.table(BLOB_INDEX)?;
-            let selected = match snapshot.view().record_from_table(&index, &owner.identity) {
+            let selected = match snapshot
+                .view()
+                .record_from_table(&index, &owner.identity, work)
+            {
                 Ok(record) => matches!(
                     record.representation(),
                     Representation::External { allocation: held, .. } if held == allocation
@@ -344,7 +377,7 @@ impl PersistentStore {
                 Err(StoreError::NotFound(_)) => false,
                 Err(error) => return Err(error),
             };
-            let allocations = snapshot.table(ALLOCATIONS)?;
+            let allocations = snapshot.table(generation.allocations())?;
             let claimed = allocations
                 .get(allocation.0.as_slice())
                 .map_err(crate::error::redb)?
@@ -356,6 +389,7 @@ impl PersistentStore {
             });
             if !corresponds {
                 let error = self.index_diverged(
+                    owner.instance.namespace(),
                     "ALLOCATIONS",
                     format!(
                         "allocation {} ownership disagrees with the committed row of {}",
@@ -395,15 +429,17 @@ impl PersistentStore {
     /// when the settled projection names an owner; otherwise let the
     /// namespace its owner marker names decide from its committed rows
     /// (see the module documentation); then delete. No step waits on the
-    /// settlement of any namespace.
+    /// settlement of any namespace. The projection's owners are read on
+    /// `work`; a refusal releases the claim and deletes nothing.
     pub(crate) fn reclaim_allocation(
         &self,
         allocation: AllocationId,
+        work: &mut dyn Meter,
     ) -> Result<Reclaimed, StoreError> {
         let Some(claim) = self.protection.claim(allocation)? else {
             return Ok(Reclaimed::Protected);
         };
-        if self.allocation_owned(&allocation)? {
+        if self.allocation_owned(&allocation, work)? {
             drop(claim);
             return Ok(Reclaimed::Owned);
         }
@@ -420,7 +456,29 @@ impl PersistentStore {
             }
         };
         if let Some(owner) = owner {
-            match self.owner_verdict(&allocation, &owner) {
+            // A retained publication of the installer will install the
+            // allocation again when it is resolved (`custody`): whatever its
+            // aborted transaction left, the allocation is protected while
+            // the custody record is held, and an unreadable record protects
+            // it too.
+            match self.holds_custody(&owner.instance) {
+                Ok(false) => {}
+                Ok(true) => {
+                    drop(claim);
+                    return Ok(Reclaimed::Protected);
+                }
+                Err(error) => {
+                    drop(claim);
+                    tracing::warn!(
+                        allocation = %allocation.hex(),
+                        instance = %owner.instance,
+                        %error,
+                        "custody of the owner unreadable; allocation protected"
+                    );
+                    return Ok(Reclaimed::Protected);
+                }
+            }
+            match self.owner_verdict(&allocation, &owner, work) {
                 OwnerVerdict::Owned => {
                     drop(claim);
                     return Ok(Reclaimed::Owned);

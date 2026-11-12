@@ -20,9 +20,6 @@ bytes = "1"
 nix-derivation = { git = "https://github.com/cachix/nix-derivation" }
 thiserror = { workspace = true }
 base64 = "0.23"
-zstd = "0.14"
-xz2 = "0.1"
-bzip2 = "0.6"
 sha2 = { workspace = true }
 topcoat = { workspace = true }
 tokio = { workspace = true }
@@ -35,3 +32,5 @@ kappa-crypto = { workspace = true, features = ["test-util"] }
 kappa-handler = { workspace = true, features = ["test-util"] }
 kappa-store-memory = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+# Encoder for NAR fixtures; decoding is `kappa_store::compression`.
+zstd = "0.14"

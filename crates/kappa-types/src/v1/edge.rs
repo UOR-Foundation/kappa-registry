@@ -202,7 +202,7 @@ impl std::fmt::Display for EdgeRelation {
 /// The store hashes this to produce the edge's kappa.
 ///
 /// CBOR key assignments (PERMANENT): 0-5
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeInput {
     pub source: Kappa,
     pub target: Kappa,
@@ -234,7 +234,7 @@ crate::wire_map::wire_map!(EdgeInput {
 /// Constructed by the store after hashing `EdgeInput`.
 /// Handlers receive Edge from queries. Handlers construct
 /// `EdgeInput` for creation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edge {
     pub kappa: Kappa,
     pub input: EdgeInput,

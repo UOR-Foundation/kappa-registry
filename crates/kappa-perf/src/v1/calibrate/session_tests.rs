@@ -393,6 +393,38 @@ fn duplicates_are_rejected_and_substrate_is_bound() -> TestResult {
     Ok(())
 }
 
+/// The seed is on every record once set; the fault summary only on the
+/// records pushed while it is set.
+#[test]
+fn seed_and_fault_are_stamped_on_the_records_they_apply_to() -> TestResult {
+    let dirs = dirs()?;
+    let mut s = session(&dirs, "stamped", Profile::L6Graded)?;
+    s.record_direct(&id("osc:bw/mem.read?size=1m")?, 1e10, None)?;
+    s.set_seed(42);
+    s.record_direct(&id("osc:bw/mem.copy?size=1m")?, 8e9, None)?;
+    let summary = crate::calibrate::record::FaultSummary {
+        armed: "crash".into(),
+        injection: crate::calibrate::record::Injection::Backend {
+            performed: 1,
+            refused: 1,
+            performed_then_failed: 0,
+            lost_bytes: 4096,
+        },
+    };
+    s.set_fault(Some(summary.clone()));
+    s.record_direct(&id("osc:bw/mem.zero?size=1m")?, 7e9, None)?;
+    s.set_fault(None);
+    s.record_direct(&id("osc:bw/mem.write?size=1m")?, 6e9, None)?;
+    let records: Vec<_> = s.records().collect();
+    assert_eq!(records[0].seed, None, "pushed before the seed was set");
+    assert_eq!(records[1].seed, Some(42));
+    assert_eq!(records[1].fault, None);
+    assert_eq!(records[2].fault.as_ref(), Some(&summary));
+    assert_eq!(records[3].fault, None, "cleared");
+    assert_eq!(records[3].seed, Some(42), "the seed stays");
+    Ok(())
+}
+
 #[test]
 fn running_marker_is_written_at_construction_and_removed_at_finalize() -> TestResult {
     let dirs = dirs()?;

@@ -27,6 +27,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use kappa_types::merkle::{self, PathStep, StreamingTree};
+use kappa_types::work::{Dimension, Meter};
 use kappa_types::{ContentCommitment, StoreError};
 
 use crate::representation::AllocationId;
@@ -125,28 +126,74 @@ impl ChunkList {
         })
     }
 
-    fn node_at(&mut self, position: u64) -> Result<[u8; 32], StoreError> {
+    /// The stored node at `position`, its examination and read charged to
+    /// `work` before the read.
+    fn node_at(&mut self, position: u64, work: &mut dyn Meter) -> Result<[u8; 32], StoreError> {
+        work.charge_all(&[(Dimension::Entries, 1), (Dimension::BytesRead, NODE)])?;
         let mut node = [0u8; 32];
         self.file.seek(SeekFrom::Start(position * NODE))?;
         self.file.read_exact(&mut node)?;
         Ok(node)
     }
 
-    /// Verify `plaintext` as chunk `index` against the committed root.
-    pub(crate) fn verify(&mut self, index: u32, plaintext: &[u8]) -> Result<(), StoreError> {
+    /// Verify `plaintext` as chunk `index` against the committed root, on
+    /// `work`. Before the path is computed, its buffers are charged at their
+    /// bound for this tree: one mountain per set bit of the chunk count,
+    /// and at most one step per level below the tallest mountain plus one
+    /// per mountain. Once the path is known, and before any node is read,
+    /// every hash the verification computes is charged: the leaf digest,
+    /// the leaf and each proof step, and the bag of the right peaks. Each
+    /// stored node is then charged as it is read.
+    pub(crate) fn verify(
+        &mut self,
+        index: u32,
+        plaintext: &[u8],
+        work: &mut dyn Meter,
+    ) -> Result<(), StoreError> {
         let index = u64::from(index);
+        let mountains = u64::from(self.chunk_count.count_ones());
+        let height = u64::from(u64::BITS - 1 - self.chunk_count.max(1).leading_zeros());
+        let steps = height + 1 + mountains;
+        // The path grows by doubling from four elements.
+        let path_bytes = mountains * size_of::<(u32, u64)>() as u64
+            + (2 * steps).max(4) * size_of::<PathStep>() as u64
+            + mountains * size_of::<u64>() as u64;
+        work.charge(Dimension::BytesAllocated, path_bytes)?;
         let path = merkle::audit_path(index, self.chunk_count)
             .ok_or_else(|| StoreError::Internal("chunk index out of range".into()))?;
+        let peaks = path
+            .iter()
+            .map(|step| match step {
+                PathStep::RightPeaks { positions } => positions.len() as u64,
+                PathStep::Sibling { .. } => 0,
+            })
+            .sum::<u64>();
+        let proof_steps = path.len() as u64;
+        work.charge_all(&[
+            (Dimension::BytesHashed, plaintext.len() as u64),
+            (
+                Dimension::BytesHashed,
+                32 + merkle::LEAF_HASH_OVERHEAD + proof_steps * merkle::NODE_HASH_INPUT,
+            ),
+            (
+                Dimension::BytesHashed,
+                peaks.saturating_sub(1) * merkle::NODE_HASH_INPUT,
+            ),
+            (
+                Dimension::BytesAllocated,
+                proof_steps * size_of::<([u8; 32], bool)>() as u64 + peaks * NODE,
+            ),
+        ])?;
         let mut proof = Vec::with_capacity(path.len());
         for step in path {
             match step {
                 PathStep::Sibling { position, left } => {
-                    proof.push((self.node_at(position)?, left));
+                    proof.push((self.node_at(position, work)?, left));
                 }
                 PathStep::RightPeaks { positions } => {
                     let mut peaks = Vec::with_capacity(positions.len());
                     for position in positions {
-                        peaks.push(self.node_at(position)?);
+                        peaks.push(self.node_at(position, work)?);
                     }
                     let bag = merkle::bag_peaks(&peaks)
                         .ok_or_else(|| StoreError::Internal("empty peak bag".into()))?;
@@ -168,8 +215,51 @@ mod tests {
     use super::*;
     use kappa_types::Kappa;
     use kappa_types::merkle::merkle_root;
+    use kappa_types::work::{WorkExhausted, WorkLimit, WorkMeter};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Verification of `chunk` as `index` with no limit on any dimension:
+    /// these tests examine the proof, not the allowance.
+    fn verify(list: &mut ChunkList, index: u32, chunk: &[u8]) -> Result<(), StoreError> {
+        list.verify(index, chunk, &mut WorkMeter::unbounded())
+    }
+
+    /// Hashing is charged before any stored node is read: an allowance one
+    /// byte short of the hashing refuses with nothing read, and the same
+    /// verification within the allowance reads its path and verifies.
+    #[test]
+    fn verification_is_refused_before_any_node_is_read() -> TestResult {
+        let chunks: Vec<Vec<u8>> = (0..600u32).map(|i| vec![(i % 251) as u8; 50]).collect();
+        let (dir, allocation, commitment) = allocation_with(&chunks)?;
+        let mut list = open(&dir, &allocation, 600, &commitment)?;
+        let mut measured = WorkMeter::unbounded();
+        list.verify(300, &chunks[300], &mut measured)?;
+        let hashed = measured.used().get(Dimension::BytesHashed);
+        assert!(measured.used().get(Dimension::BytesRead) >= 32);
+        let mut short =
+            WorkMeter::new(WorkLimit::unbounded().with(Dimension::BytesHashed, hashed - 1));
+        match list.verify(300, &chunks[300], &mut short) {
+            Err(StoreError::WorkRefused(WorkExhausted::Limit {
+                dimension: Dimension::BytesHashed,
+                ..
+            })) => {}
+            other => panic!("expected a BytesHashed refusal, got {other:?}"),
+        }
+        assert_eq!(
+            short.used().get(Dimension::BytesRead),
+            0,
+            "no node was read"
+        );
+        assert_eq!(
+            short.used().get(Dimension::Entries),
+            0,
+            "no node was examined"
+        );
+        let mut exact = WorkMeter::new(WorkLimit::unbounded().with(Dimension::BytesHashed, hashed));
+        list.verify(300, &chunks[300], &mut exact)?;
+        Ok(())
+    }
 
     fn allocation_with(
         chunks: &[Vec<u8>],
@@ -223,10 +313,10 @@ mod tests {
         let (dir, allocation, commitment) = allocation_with(&chunks)?;
         let mut list = open(&dir, &allocation, 600, &commitment)?;
         for index in [0u32, 1, 255, 256, 257, 511, 512, 599] {
-            list.verify(index, &chunks[index as usize])?;
+            verify(&mut list, index, &chunks[index as usize])?;
         }
-        assert!(list.verify(3, &chunks[4]).is_err());
-        assert!(list.verify(600, &chunks[0]).is_err());
+        assert!(verify(&mut list, 3, &chunks[4]).is_err());
+        assert!(verify(&mut list, 600, &chunks[0]).is_err());
         assert!(open(&dir, &allocation, 599, &commitment).is_err());
         // Correspondence: a commitment for another identity or chunk size
         // is refused before any byte is read.
@@ -245,14 +335,14 @@ mod tests {
             .copy_from_slice(&merkle::hash_leaf(&kappa_types::sha256_raw(&forged)));
         std::fs::write(&path, &bytes)?;
         let mut fresh = open(&dir, &allocation, 600, &commitment)?;
-        assert!(fresh.verify(300, &forged).is_err());
+        assert!(verify(&mut fresh, 300, &forged).is_err());
         assert!(
-            list.verify(300, &forged).is_err(),
+            verify(&mut list, 300, &forged).is_err(),
             "open reader accepted forgery"
         );
         // The genuine chunk 300 still verifies: its leaf is computed from
         // the plaintext, and its siblings are untouched.
-        list.verify(300, &chunks[300])?;
+        verify(&mut list, 300, &chunks[300])?;
         Ok(())
     }
 
@@ -263,7 +353,7 @@ mod tests {
         let wrong = ContentCommitment::new(identity(), 50, [7; 32])?;
         let mut list = open(&dir, &allocation, 3, &wrong)?;
         for (index, chunk) in (0u32..).zip(&chunks) {
-            assert!(list.verify(index, chunk).is_err());
+            assert!(verify(&mut list, index, chunk).is_err());
         }
         Ok(())
     }

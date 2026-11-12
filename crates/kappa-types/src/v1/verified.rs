@@ -133,6 +133,110 @@ impl VerifiedContent {
     }
 }
 
+/// Verification of content that arrives in parts: the one owner of the
+/// bytes as they are appended and of the hash over exactly those bytes, so
+/// the [`VerifiedContent`] it finishes into binds its identity to the bytes
+/// it holds and no other. The destination is allocated by the caller at the
+/// complete validated extent before construction (the caller admits and
+/// reserves that allocation); appending never grows it. An append past the
+/// extent is refused with the prefix intact, so a refused step leaves the
+/// verification resumable.
+pub struct ContentVerification {
+    expected: Kappa,
+    content: Vec<u8>,
+    hasher: crate::kappa_streaming::IncrementalHasher,
+    extent: usize,
+}
+
+impl ContentVerification {
+    /// A verification of `extent` bytes against `expected`, appended into
+    /// `content`, which must be empty with capacity for the whole extent.
+    pub fn new(
+        expected: Kappa,
+        content: Vec<u8>,
+        extent: usize,
+    ) -> Result<Self, crate::error::StoreError> {
+        if !content.is_empty() {
+            return Err(crate::error::StoreError::Internal(
+                "content verification requires an empty destination".into(),
+            ));
+        }
+        if content.capacity() < extent {
+            return Err(crate::error::StoreError::Internal(
+                "content verification destination is below its extent".into(),
+            ));
+        }
+        let hasher = crate::kappa_streaming::IncrementalHasher::new(expected.axis());
+        Ok(Self {
+            expected,
+            content,
+            hasher,
+            extent,
+        })
+    }
+
+    /// The identity the content is verified against.
+    pub const fn expected(&self) -> &Kappa {
+        &self.expected
+    }
+
+    /// Bytes appended so far.
+    pub const fn len(&self) -> usize {
+        self.content.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
+    /// Bytes the declared extent still awaits.
+    pub const fn remaining(&self) -> usize {
+        self.extent - self.content.len()
+    }
+
+    /// Whether every byte of the extent is present.
+    pub const fn is_complete(&self) -> bool {
+        self.content.len() == self.extent
+    }
+
+    /// Append `bytes`, hashing them: refused, with nothing appended or
+    /// hashed, when they would pass the extent.
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), crate::error::StoreError> {
+        if bytes.len() > self.remaining() {
+            return Err(crate::error::StoreError::Rejected(
+                "content exceeds its declared extent".into(),
+            ));
+        }
+        self.content.extend_from_slice(bytes);
+        self.hasher.update(bytes);
+        Ok(())
+    }
+
+    /// The verified content: refused when the extent is incomplete or the
+    /// bytes do not hash to the expected identity.
+    pub fn finish(self) -> Result<VerifiedContent, crate::error::StoreError> {
+        if self.content.len() != self.extent {
+            return Err(crate::error::StoreError::Rejected(
+                "content ended before its declared extent".into(),
+            ));
+        }
+        let computed = self.hasher.finalize()?;
+        if computed != self.expected {
+            return Err(KappaParseError::DigestMismatch {
+                expected: self.expected.to_string(),
+                computed: computed.to_string(),
+                axis: self.expected.axis().to_string(),
+            }
+            .into());
+        }
+        Ok(VerifiedContent {
+            kappa: computed,
+            content: self.content,
+            _seal: Seal,
+        })
+    }
+}
+
 impl StreamingVerificationProof {
     /// Construct a single-axis proof. pub(crate) only.
     pub(crate) const fn single(kappa: Kappa) -> Self {
@@ -281,6 +385,72 @@ mod tests {
         assert!(vc.is_empty());
         assert_eq!(vc.len(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn incremental_content_verification_binds_exact_appended_bytes()
+    -> Result<(), crate::error::StoreError> {
+        let bytes = b"one retained content owner";
+        let expected = Kappa::sha256(bytes);
+        let mut destination = Vec::new();
+        destination.try_reserve_exact(bytes.len()).map_err(|_| {
+            crate::error::StoreError::CapacityExceeded("test destination allocation".into())
+        })?;
+        let mut verification =
+            ContentVerification::new(expected.clone(), destination, bytes.len())?;
+        assert_eq!(verification.remaining(), bytes.len());
+        verification.append(&bytes[..7])?;
+        assert!(!verification.is_complete());
+        verification.append(&bytes[7..])?;
+        assert!(verification.is_complete());
+        let evidence = verification.finish()?;
+        assert_eq!(evidence.kappa(), &expected);
+        assert_eq!(evidence.content(), bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_content_verification_rejects_other_bytes() -> Result<(), crate::error::StoreError>
+    {
+        let mut verification =
+            ContentVerification::new(Kappa::sha256(b"right"), Vec::with_capacity(5), 5)?;
+        verification.append(b"wrong")?;
+        assert!(matches!(
+            verification.finish(),
+            Err(crate::error::StoreError::Rejected(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_content_verification_rejects_incomplete_content()
+    -> Result<(), crate::error::StoreError> {
+        let mut verification =
+            ContentVerification::new(Kappa::sha256(b"complete"), Vec::with_capacity(8), 8)?;
+        verification.append(b"comp")?;
+        assert!(matches!(
+            verification.finish(),
+            Err(crate::error::StoreError::Rejected(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn over_extent_append_preserves_verified_prefix() -> Result<(), crate::error::StoreError> {
+        let mut verification =
+            ContentVerification::new(Kappa::sha256(b"abcd"), Vec::with_capacity(4), 4)?;
+        verification.append(b"ab")?;
+        assert!(verification.append(b"cde").is_err());
+        assert_eq!(verification.len(), 2);
+        verification.append(b"cd")?;
+        assert_eq!(verification.finish()?.content(), b"abcd");
+        Ok(())
+    }
+
+    #[test]
+    fn content_verification_requires_an_empty_destination_at_its_extent() {
+        assert!(ContentVerification::new(Kappa::sha256(b"x"), vec![1], 1).is_err());
+        assert!(ContentVerification::new(Kappa::sha256(b"xy"), Vec::with_capacity(1), 2).is_err());
     }
 
     #[test]

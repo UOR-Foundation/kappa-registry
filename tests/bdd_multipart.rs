@@ -85,7 +85,7 @@ async fn numbered_upload(w: &mut BddWorld) {
     let stale = put(&client, &url, upload, 9, b"old".to_vec()).await;
     let first_bytes = vec![0x61; 5 * 1024 * 1024];
     let first = put(&client, &url, upload, 2, first_bytes.clone()).await;
-    put(&client, &url, upload, 5, b"unselected".to_vec()).await;
+    let unselected = put(&client, &url, upload, 5, b"unselected".to_vec()).await;
     let last = put(&client, &url, upload, 9, b"replacement".to_vec()).await;
     assert_eq!(last, "\"f5300127f646a4550bc4a04fbe393e79\"");
     assert_ne!(stale, last);
@@ -114,6 +114,10 @@ async fn numbered_upload(w: &mut BddWorld) {
     assert_eq!(status, StatusCode::OK, "next parts response: {xml}");
     assert!(xml.contains("<PartNumber>9</PartNumber>"), "{xml}");
     assert!(!xml.contains("<PartNumber>2</PartNumber>"), "{xml}");
+    assert!(
+        xml.contains("<ETag>&quot;f5300127f646a4550bc4a04fbe393e79&quot;</ETag>"),
+        "ListParts must expose MD5, not the full checksum receipt: {xml}"
+    );
     let wrong = format!("{}/bdd-multipart/other-object", app.base_url);
     let response = client
         .put(&wrong)
@@ -139,6 +143,32 @@ async fn numbered_upload(w: &mut BddWorld) {
     let (status, xml) = outcome(response).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "stale completion: {xml}");
     assert!(xml.contains("<Code>InvalidPart</Code>"), "{xml}");
+    for (parts, code) in [
+        (
+            vec![(2, first.as_str()), (2, first.as_str())],
+            "InvalidPartOrder",
+        ),
+        (
+            vec![(2, first.as_str()), (1, first.as_str())],
+            "InvalidPartOrder",
+        ),
+        (vec![(2, first.as_str()), (8, last.as_str())], "InvalidPart"),
+        (
+            vec![(5, unselected.as_str()), (9, last.as_str())],
+            "EntityTooSmall",
+        ),
+    ] {
+        let response = client
+            .post(&url)
+            .query(&[("uploadId", upload)])
+            .body(completion(&parts))
+            .send()
+            .await
+            .expect("invalid selection");
+        let (status, xml) = outcome(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "selection response: {xml}");
+        assert!(xml.contains(&format!("<Code>{code}</Code>")), "{xml}");
+    }
     let response = client
         .post(&url)
         .query(&[("uploadId", upload)])
@@ -148,7 +178,18 @@ async fn numbered_upload(w: &mut BddWorld) {
         .expect("selected completion");
     let (status, xml) = outcome(response).await;
     assert_eq!(status, StatusCode::OK, "selected completion: {xml}");
-    assert!(xml.contains("-2"), "{xml}");
+    assert!(xml.contains("9a5725a770527a4e2fbd49705a634cf5-2"), "{xml}");
+    let completed_xml = xml;
+    let response = client
+        .post(&url)
+        .query(&[("uploadId", upload)])
+        .body(completion(&[(2, &first), (9, &last)]))
+        .send()
+        .await
+        .expect("replay selected completion");
+    let (status, xml) = outcome(response).await;
+    assert_eq!(status, StatusCode::OK, "completion replay: {xml}");
+    assert_eq!(xml, completed_xml, "completion must replay its exact ETag");
     let mut expected = first_bytes;
     expected.extend_from_slice(b"replacement");
     w.blob_content = expected;
@@ -170,7 +211,7 @@ async fn object_reads(w: &mut BddWorld) {
             .expect("object ETag")
             .to_str()
             .expect("ETag text")
-            .ends_with("-2\"")
+            == "\"9a5725a770527a4e2fbd49705a634cf5-2\""
     );
     assert_eq!(
         response.bytes().await.expect("object bytes").as_ref(),

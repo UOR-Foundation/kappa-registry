@@ -23,7 +23,7 @@ use crate::wire_map::wire_map;
 
 /// Portable correspondence between two verified digests of identical bytes.
 /// Physical alias selection remains a derived projection of this evidence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentAlias {
     alias: Kappa,
     target: Kappa,
@@ -292,6 +292,448 @@ impl TryFrom<CBOR> for ContentCommitment {
             .map_err(|_| dcbor::Error::msg("content commitment root is not 32 bytes"))?;
         Self::new(identity, chunk_size, chunk_root)
             .map_err(|error| dcbor::Error::msg(error.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logical admission and retirement
+// ---------------------------------------------------------------------------
+
+/// One namespace instance's logical admission of a content identity.
+///
+/// Physical representation, allocation, encryption, and backend layout
+/// are excluded. Every representation produces this same value schema.
+///
+/// CBOR keys (PERMANENT): 0 namespace, 1 incarnation, 2 identity, 3 size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentAdmission {
+    namespace: [u8; 16],
+    incarnation: [u8; 16],
+    identity: Kappa,
+    logical_size: u64,
+}
+
+struct ContentAdmissionWire {
+    namespace: Vec<u8>,
+    incarnation: Vec<u8>,
+    identity: Kappa,
+    logical_size: u64,
+}
+
+wire_map!(ContentAdmissionWire {
+    namespace: bytes = 0,
+    incarnation: bytes = 1,
+    identity: value = 2,
+    logical_size: value = 3,
+});
+
+impl ContentAdmission {
+    pub const fn new(
+        namespace: [u8; 16],
+        incarnation: [u8; 16],
+        identity: Kappa,
+        logical_size: u64,
+    ) -> Self {
+        Self {
+            namespace,
+            incarnation,
+            identity,
+            logical_size,
+        }
+    }
+
+    pub const fn namespace(&self) -> &[u8; 16] {
+        &self.namespace
+    }
+    pub const fn incarnation(&self) -> &[u8; 16] {
+        &self.incarnation
+    }
+    pub const fn identity(&self) -> &Kappa {
+        &self.identity
+    }
+    pub const fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+}
+
+impl From<ContentAdmission> for CBOR {
+    fn from(v: ContentAdmission) -> Self {
+        ContentAdmissionWire {
+            namespace: v.namespace.to_vec(),
+            incarnation: v.incarnation.to_vec(),
+            identity: v.identity,
+            logical_size: v.logical_size,
+        }
+        .into()
+    }
+}
+
+impl From<&ContentAdmission> for CBOR {
+    fn from(v: &ContentAdmission) -> Self {
+        v.clone().into()
+    }
+}
+
+impl TryFrom<CBOR> for ContentAdmission {
+    type Error = dcbor::Error;
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let w = ContentAdmissionWire::try_from(cbor)?;
+        let ns: [u8; 16] = w
+            .namespace
+            .as_slice()
+            .try_into()
+            .map_err(|_| dcbor::Error::msg("admission namespace is not 16 bytes"))?;
+        let inc: [u8; 16] = w
+            .incarnation
+            .as_slice()
+            .try_into()
+            .map_err(|_| dcbor::Error::msg("admission incarnation is not 16 bytes"))?;
+        Ok(Self::new(ns, inc, w.identity, w.logical_size))
+    }
+}
+
+/// Evidence kind discriminants (PERMANENT): 0-3.
+const EVIDENCE_VERIFIED_BYTES: u64 = 0;
+const EVIDENCE_CHUNKED: u64 = 1;
+const EVIDENCE_ALIAS: u64 = 2;
+const EVIDENCE_COMPOSITION: u64 = 3;
+
+/// What justified this admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentAdmissionEvidence {
+    VerifiedBytes,
+    Chunked(ContentCommitment),
+    Alias(ContentAlias),
+    Composition(ContentComposition),
+}
+
+/// Canonical admission record: the admission and its evidence.
+///
+/// CBOR keys (PERMANENT): 0 admission, 1 evidence kind, 2 evidence
+/// payload (null for verified bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentAdmissionRecord {
+    admission: ContentAdmission,
+    evidence: ContentAdmissionEvidence,
+}
+
+impl ContentAdmissionRecord {
+    pub fn new(
+        admission: ContentAdmission,
+        evidence: ContentAdmissionEvidence,
+    ) -> Result<Self, StoreError> {
+        match &evidence {
+            ContentAdmissionEvidence::Chunked(c) => {
+                if c.identity() != admission.identity() {
+                    return Err(StoreError::Rejected(
+                        "chunk commitment identity differs from admission".into(),
+                    ));
+                }
+            }
+            ContentAdmissionEvidence::Alias(a) => {
+                if a.alias() != admission.identity() || a.length() != admission.logical_size() {
+                    return Err(StoreError::Rejected(
+                        "alias identity or length differs from admission".into(),
+                    ));
+                }
+            }
+            ContentAdmissionEvidence::Composition(c) => {
+                let identity_matches = c.identity() == admission.identity();
+                let length_matches = c.length() == admission.logical_size();
+                if !identity_matches || !length_matches {
+                    return Err(StoreError::Rejected(
+                        "composition identity or length differs from admission".into(),
+                    ));
+                }
+            }
+            ContentAdmissionEvidence::VerifiedBytes => {}
+        }
+        Ok(Self {
+            admission,
+            evidence,
+        })
+    }
+
+    pub const fn admission(&self) -> &ContentAdmission {
+        &self.admission
+    }
+    pub const fn evidence(&self) -> &ContentAdmissionEvidence {
+        &self.evidence
+    }
+}
+
+impl From<&ContentAdmissionRecord> for CBOR {
+    fn from(v: &ContentAdmissionRecord) -> Self {
+        let mut map = Map::new();
+        map.insert(0u64, Self::from(&v.admission));
+        let (kind, payload): (u64, Self) = match &v.evidence {
+            ContentAdmissionEvidence::VerifiedBytes => (EVIDENCE_VERIFIED_BYTES, Self::null()),
+            ContentAdmissionEvidence::Chunked(c) => (EVIDENCE_CHUNKED, Self::from(c.clone())),
+            ContentAdmissionEvidence::Alias(a) => (EVIDENCE_ALIAS, Self::from(a.clone())),
+            ContentAdmissionEvidence::Composition(c) => {
+                (EVIDENCE_COMPOSITION, Self::from(c.clone()))
+            }
+        };
+        map.insert(1u64, kind);
+        map.insert(2u64, payload);
+        map.into()
+    }
+}
+
+impl From<ContentAdmissionRecord> for CBOR {
+    fn from(v: ContentAdmissionRecord) -> Self {
+        Self::from(&v)
+    }
+}
+
+impl TryFrom<CBOR> for ContentAdmissionRecord {
+    type Error = dcbor::Error;
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let CBORCase::Map(map) = cbor.into_case() else {
+            return Err(dcbor::Error::WrongType);
+        };
+        for (key, _) in map.iter() {
+            let key: u64 = key.clone().try_into()?;
+            if key > 2 {
+                return Err(dcbor::Error::msg("unknown content admission record field"));
+            }
+        }
+        let admission: ContentAdmission = map.extract(0u64)?;
+        let kind: u64 = map.extract(1u64)?;
+        let payload: CBOR = map.extract(2u64)?;
+        let evidence = match kind {
+            EVIDENCE_VERIFIED_BYTES => {
+                if !matches!(payload.into_case(), CBORCase::Simple(dcbor::Simple::Null)) {
+                    return Err(dcbor::Error::msg(
+                        "verified-bytes evidence must have null payload",
+                    ));
+                }
+                ContentAdmissionEvidence::VerifiedBytes
+            }
+            EVIDENCE_CHUNKED => {
+                ContentAdmissionEvidence::Chunked(ContentCommitment::try_from(payload)?)
+            }
+            EVIDENCE_ALIAS => ContentAdmissionEvidence::Alias(ContentAlias::try_from(payload)?),
+            EVIDENCE_COMPOSITION => {
+                ContentAdmissionEvidence::Composition(ContentComposition::try_from(payload)?)
+            }
+            other => {
+                return Err(dcbor::Error::msg(format!(
+                    "unknown content admission evidence kind {other}"
+                )));
+            }
+        };
+        Self::new(admission, evidence).map_err(|e| dcbor::Error::msg(e.to_string()))
+    }
+}
+
+/// Retirement of a prior logical admission.
+///
+/// CBOR keys (PERMANENT): 0 the removed admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentRetirementRecord {
+    removed: ContentAdmission,
+}
+
+impl ContentRetirementRecord {
+    pub const fn new(removed: ContentAdmission) -> Self {
+        Self { removed }
+    }
+    pub const fn removed(&self) -> &ContentAdmission {
+        &self.removed
+    }
+}
+
+impl From<&ContentRetirementRecord> for CBOR {
+    fn from(v: &ContentRetirementRecord) -> Self {
+        let mut map = Map::new();
+        map.insert(0u64, Self::from(&v.removed));
+        map.into()
+    }
+}
+
+impl From<ContentRetirementRecord> for CBOR {
+    fn from(v: ContentRetirementRecord) -> Self {
+        Self::from(&v)
+    }
+}
+
+impl TryFrom<CBOR> for ContentRetirementRecord {
+    type Error = dcbor::Error;
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let CBORCase::Map(map) = cbor.into_case() else {
+            return Err(dcbor::Error::WrongType);
+        };
+        for (key, _) in map.iter() {
+            let key: u64 = key.clone().try_into()?;
+            if key > 0 {
+                return Err(dcbor::Error::msg("unknown content retirement record field"));
+            }
+        }
+        Ok(Self {
+            removed: map.extract(0u64)?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metadata transition
+// ---------------------------------------------------------------------------
+
+/// Canonical evidence for a metadata change, covering both namespace
+/// metadata and blob metadata. The subject distinguishes them.
+///
+/// CBOR keys (PERMANENT): 0 namespace, 1 incarnation, 2 subject kind,
+/// 3 subject identity (null for namespace), 4 key, 5 value (null for
+/// deletion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataSubject {
+    Namespace,
+    Blob(Kappa),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataTransition {
+    namespace: [u8; 16],
+    incarnation: [u8; 16],
+    subject: MetadataSubject,
+    key: String,
+    value: Option<Vec<u8>>,
+}
+
+const METADATA_SUBJECT_NAMESPACE: u64 = 0;
+const METADATA_SUBJECT_BLOB: u64 = 1;
+
+impl MetadataTransition {
+    pub const fn namespace_meta(
+        namespace: [u8; 16],
+        incarnation: [u8; 16],
+        key: String,
+        value: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            namespace,
+            incarnation,
+            subject: MetadataSubject::Namespace,
+            key,
+            value,
+        }
+    }
+
+    pub const fn blob_meta(
+        namespace: [u8; 16],
+        incarnation: [u8; 16],
+        identity: Kappa,
+        key: String,
+        value: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            namespace,
+            incarnation,
+            subject: MetadataSubject::Blob(identity),
+            key,
+            value,
+        }
+    }
+
+    pub const fn namespace(&self) -> &[u8; 16] {
+        &self.namespace
+    }
+    pub const fn incarnation(&self) -> &[u8; 16] {
+        &self.incarnation
+    }
+    pub const fn subject(&self) -> &MetadataSubject {
+        &self.subject
+    }
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    pub fn value(&self) -> Option<&[u8]> {
+        self.value.as_deref()
+    }
+}
+
+impl From<&MetadataTransition> for CBOR {
+    fn from(v: &MetadataTransition) -> Self {
+        let mut map = Map::new();
+        map.insert(0u64, ByteString::from(v.namespace.to_vec()));
+        map.insert(1u64, ByteString::from(v.incarnation.to_vec()));
+        let (kind, subject_id): (u64, Self) = match &v.subject {
+            MetadataSubject::Namespace => (METADATA_SUBJECT_NAMESPACE, Self::null()),
+            MetadataSubject::Blob(id) => (METADATA_SUBJECT_BLOB, Self::from(id.clone())),
+        };
+        map.insert(2u64, kind);
+        map.insert(3u64, subject_id);
+        map.insert(4u64, v.key.clone());
+        match &v.value {
+            Some(bytes) => map.insert(5u64, ByteString::from(bytes.clone())),
+            None => map.insert(5u64, Self::null()),
+        }
+        map.into()
+    }
+}
+
+impl From<MetadataTransition> for CBOR {
+    fn from(v: MetadataTransition) -> Self {
+        Self::from(&v)
+    }
+}
+
+impl TryFrom<CBOR> for MetadataTransition {
+    type Error = dcbor::Error;
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let CBORCase::Map(map) = cbor.into_case() else {
+            return Err(dcbor::Error::WrongType);
+        };
+        for (key, _) in map.iter() {
+            let key: u64 = key.clone().try_into()?;
+            if key > 5 {
+                return Err(dcbor::Error::msg("unknown metadata transition field"));
+            }
+        }
+        let ns_bs: ByteString = map.extract(0u64)?;
+        let ns: [u8; 16] = ns_bs
+            .as_ref()
+            .try_into()
+            .map_err(|_| dcbor::Error::msg("metadata namespace is not 16 bytes"))?;
+        let inc_bs: ByteString = map.extract(1u64)?;
+        let inc: [u8; 16] = inc_bs
+            .as_ref()
+            .try_into()
+            .map_err(|_| dcbor::Error::msg("metadata incarnation is not 16 bytes"))?;
+        let kind: u64 = map.extract(2u64)?;
+        let subject_cbor: CBOR = map.extract(3u64)?;
+        let subject = match kind {
+            METADATA_SUBJECT_NAMESPACE => {
+                if !matches!(
+                    subject_cbor.into_case(),
+                    CBORCase::Simple(dcbor::Simple::Null)
+                ) {
+                    return Err(dcbor::Error::msg("namespace metadata subject must be null"));
+                }
+                MetadataSubject::Namespace
+            }
+            METADATA_SUBJECT_BLOB => MetadataSubject::Blob(Kappa::try_from(subject_cbor)?),
+            other => {
+                return Err(dcbor::Error::msg(format!(
+                    "unknown metadata subject kind {other}"
+                )));
+            }
+        };
+        let key: String = map.extract(4u64)?;
+        let value_cbor: CBOR = map.extract(5u64)?;
+        let value = match value_cbor.into_case() {
+            CBORCase::Simple(dcbor::Simple::Null) => None,
+            CBORCase::ByteString(bs) => Some(Vec::<u8>::from(bs)),
+            _ => return Err(dcbor::Error::msg("metadata value must be bytes or null")),
+        };
+        Ok(Self {
+            namespace: ns,
+            incarnation: inc,
+            subject,
+            key,
+            value,
+        })
     }
 }
 

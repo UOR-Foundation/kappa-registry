@@ -27,6 +27,13 @@
 //!   `apply`      one execution per namespace batch of reconciled tags
 //!   `blobs`      missing blob discovery and inline fetch
 //!   `responder`  inbound request handler
+//!   `transport`  the Veilid `Transport` behind the reconciliation seam
+//!
+//! The initiator, the blob fetch and the loop run on
+//! `kappa_reconcile::ReconcileTransport`, one call per request; the peers
+//! they visit are `kappa_reconcile::PeerInfo` from a
+//! `kappa_reconcile::PeerSource`. Both are the one form every transport
+//! binding and every test shares.
 
 use std::time::Duration;
 
@@ -37,13 +44,16 @@ mod peer;
 mod report;
 mod responder;
 mod round;
+mod transport;
 mod wire;
 
 pub use apply::{NamespaceBatchOutcome, apply_namespace_batch};
 pub use blobs::fetch_missing_blobs;
+pub use kappa_reconcile::{PeerInfo, PeerSource, ReconcileTransport};
 pub use report::{PeerPhase, PeerReconcileOutcome, ReconcileReport};
 pub use responder::handle_reconcile_request;
-pub use round::{PeerEntry, PeerSource, ReconcileLoop};
+pub use round::ReconcileLoop;
+pub use transport::VeilidReconcileTransport;
 pub use wire::{
     BlobFetchReport, BlobPullRequest, BlobPullResponse, DeferredBlob, DiffPullRequest,
     DiffPullResponse, EpochRootResponse, MissingBlob, MstSnapshotRequest, MstSnapshotResponse,

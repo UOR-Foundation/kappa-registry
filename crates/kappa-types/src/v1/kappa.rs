@@ -5,8 +5,25 @@ use crate::axis::Axis;
 /// Maximum raw digest length in bytes (SHA-512 = 64 bytes).
 const MAX_DIGEST: usize = 64;
 
+/// Longest [`Kappa::key_bytes`]: the axis discriminant and the longest
+/// digest.
+pub const MAX_KEY_BYTES: usize = 1 + MAX_DIGEST;
+
 /// Lookup table for byte-to-lowercase-hex encoding.
 const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
+
+/// Every byte's two lowercase hex digits, in [`HEX_TABLE`]'s alphabet: the
+/// label's digit pairs, borrowed for as long as any value is, so its bounded
+/// encoding names them without formatting the label into storage.
+static HEX_PAIRS: [[u8; 2]; 256] = {
+    let mut pairs = [[0; 2]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        pairs[byte] = [HEX_TABLE[byte >> 4], HEX_TABLE[byte & 0x0f]];
+        byte += 1;
+    }
+    pairs
+};
 
 /// Content-address digest stored as raw bytes internally.
 ///
@@ -255,13 +272,17 @@ impl Kappa {
         len
     }
 
-    /// Allocating version of `to_key_bytes` for convenience.
+    /// Bytes [`Self::to_key_bytes`] writes: the discriminant and the digest.
+    pub const fn key_len(&self) -> usize {
+        1 + self.digest_len as usize
+    }
+
+    /// Allocating version of `to_key_bytes` for convenience: the one format,
+    /// written into a buffer of exactly [`Self::key_len`] bytes.
     pub fn key_bytes(&self) -> Vec<u8> {
-        let len = 1 + self.digest_len as usize;
-        let mut v = Vec::with_capacity(len);
-        v.push(self.axis.discriminant());
-        v.extend_from_slice(self.digest_bytes());
-        v
+        let mut bytes = vec![0; self.key_len()];
+        self.to_key_bytes(&mut bytes);
+        bytes
     }
 
     /// Format to the wire-format "algorithm:hex" string on the stack.
@@ -474,6 +495,58 @@ impl From<&Kappa> for dcbor::CBOR {
     fn from(k: &Kappa) -> Self {
         let formatted = k.format();
         Self::from(formatted.as_str().to_string())
+    }
+}
+
+/// The same text, parsed from the decoded document's borrowed string
+/// without a `String` or a CBOR node: the text's bytes are charged as
+/// scanned, and nothing is allocated. A text that is not a label is the
+/// error the symbolic conversion gives.
+impl dcbor::bounded::decode::BoundedDecodable for Kappa {
+    fn construct<A: dcbor::bounded::Allocator>(
+        node: dcbor::bounded::decode::Node<'_, '_>,
+        _: &mut dcbor::bounded::Owned<A::Permit, A::Permit>,
+        allocator: &mut A,
+    ) -> dcbor::bounded::decode::ConstructResult<Self, A> {
+        use dcbor::bounded::BoundedError;
+        use dcbor::bounded::decode::{DecodeError, Kind, visit, wrong_type};
+
+        visit(allocator)?;
+        let Kind::Text(text) = node.kind() else {
+            return Err(wrong_type());
+        };
+        allocator
+            .traverse(0, text.len() as u64)
+            .map_err(BoundedError::Refused)?;
+        Self::parse(text)
+            .map_err(|error| DecodeError::Invalid(dcbor::Error::msg(error.to_string())))
+    }
+}
+
+/// The same text, without a `String`, a formatted label or a CBOR node: the
+/// text head of the label's length, then its bytes from storage that
+/// outlives the value, the axis name, the colon and each digest byte's hex
+/// pair ([`HEX_PAIRS`]), one constant-work instruction each. The label is
+/// ASCII, already in NFC, so its bytes are copied as they are.
+impl dcbor::bounded::Schema for Kappa {
+    fn instruction(&self, index: usize) -> dcbor::bounded::encoding::Instruction<'_> {
+        use dcbor::bounded::encoding::Instruction;
+        use dcbor::bounded::{Argument, MajorType};
+        let axis = self.axis.as_str().as_bytes();
+        let digest = self.digest_bytes();
+        match index {
+            0 => Instruction::Head(
+                MajorType::Text,
+                Argument::Shortest((axis.len() + 1 + 2 * digest.len()) as u64),
+            ),
+            1 => Instruction::Bytes(axis),
+            2 => Instruction::Bytes(b":"),
+            index => digest
+                .get(index - 3)
+                .map_or(Instruction::End, |&byte| {
+                    Instruction::Bytes(&HEX_PAIRS[usize::from(byte)])
+                }),
+        }
     }
 }
 
@@ -694,6 +767,36 @@ mod tests {
         let via_display = k.to_string();
         let via_format = k.format().as_str().to_string();
         assert_eq!(via_display, via_format);
+    }
+
+    /// The bounded encoding of every axis's label is the symbolic text's,
+    /// byte for byte, every digit pair included.
+    #[test]
+    fn bounded_label_is_the_symbolic_text() -> Result<(), Box<dyn std::error::Error>> {
+        for axis in [
+            Axis::Sha256,
+            Axis::Sha512,
+            Axis::Blake3,
+            Axis::Sha1,
+            Axis::Sha3_256,
+            Axis::Keccak256,
+        ] {
+            for content in [&b""[..], &b"bounded label"[..], &[0xffu8; 64][..]] {
+                let k = Kappa::compute(axis, content)?;
+                let mut limits = dcbor::bounded::Limits::unlimited();
+                let bounded = dcbor::bounded::encode(&k, &mut limits)
+                    .map_err(|error| format!("{axis}: {error}"))?;
+                assert_eq!(
+                    bounded.as_ref(),
+                    crate::canonical::canonical_bytes(&k),
+                    "{k}"
+                );
+            }
+        }
+        assert_eq!(HEX_PAIRS[0x00], *b"00");
+        assert_eq!(HEX_PAIRS[0xa5], *b"a5");
+        assert_eq!(HEX_PAIRS[0xff], *b"ff");
+        Ok(())
     }
 
     #[test]

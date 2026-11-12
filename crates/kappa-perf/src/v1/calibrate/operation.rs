@@ -184,6 +184,18 @@ pub const SEEDED_OPERATIONS: &[&str] = &[
     "http.blob_get",
     "http.blob_put",
     "http.manifest_get",
+    // Recovery and bounded maintenance: the public calls a client has
+    // after a crash or a refusal (PERF-SYS-003, PERF-SYS-008,
+    // PERF-SYS-020..023). Each names one `MaintenanceStore` method or the
+    // reopen that runs recovery at open; crate-private recovery stages are
+    // not operations, because nothing outside the store can time them.
+    "recovery.open",
+    "settlement.step",
+    "repair.index",
+    "reclaim.unowned",
+    // Tag reconciliation over the namespace Merkle search tree
+    "reconcile.rebuild",
+    "reconcile.diff",
 ];
 
 #[cfg(test)]

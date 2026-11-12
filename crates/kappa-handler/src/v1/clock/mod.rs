@@ -19,10 +19,11 @@ pub use kappa_store::time::{Clock, ClockError};
 ///
 /// CAS provides one issuance/observation linearization point. Persistence of
 /// a recovery floor is a composition obligation, not supplied by this atomic.
+#[derive(Clone)]
 pub struct WallClock {
-    state: AtomicI64,
+    state: Arc<AtomicI64>,
     source: Arc<dyn PhysicalSource>,
-    continuity: Continuity,
+    continuity: Arc<Continuity>,
 }
 
 enum Continuity {
@@ -39,9 +40,9 @@ enum Continuity {
 impl WallClock {
     pub fn new() -> Self {
         Self {
-            state: AtomicI64::new(0),
+            state: Arc::new(AtomicI64::new(0)),
             source: Arc::new(SystemSource),
-            continuity: Continuity::ProcessLocal,
+            continuity: Arc::new(Continuity::ProcessLocal),
         }
     }
 
@@ -49,9 +50,9 @@ impl WallClock {
     /// The supplied floor must cover committed history and durable reservations.
     pub fn recovered(source: Arc<dyn PhysicalSource>, floor: CausalTime) -> Self {
         Self {
-            state: AtomicI64::new(floor.encoded().as_i64()),
+            state: Arc::new(AtomicI64::new(floor.encoded().as_i64())),
             source,
-            continuity: Continuity::ProcessLocal,
+            continuity: Arc::new(Continuity::ProcessLocal),
         }
     }
 
@@ -68,11 +69,11 @@ impl WallClock {
             return Err(ClockError::ReservationExhausted);
         }
         Ok(Self {
-            state: AtomicI64::new(recovered_floor.encoded().as_i64()),
+            state: Arc::new(AtomicI64::new(recovered_floor.encoded().as_i64())),
             source,
-            continuity: Continuity::SimulatedReservation(AtomicI64::new(
+            continuity: Arc::new(Continuity::SimulatedReservation(AtomicI64::new(
                 ceiling.encoded().as_i64(),
-            )),
+            ))),
         })
     }
 
@@ -102,18 +103,18 @@ impl WallClock {
             .reserve_time(ceiling)
             .map_err(ClockError::Persistence)?;
         Ok(Self {
-            state: AtomicI64::new(floor.encoded().as_i64()),
+            state: Arc::new(AtomicI64::new(floor.encoded().as_i64())),
             source,
-            continuity: Continuity::Durable {
+            continuity: Arc::new(Continuity::Durable {
                 _lease: lease,
                 ceiling: AtomicI64::new(ceiling.encoded().as_i64()),
                 persistence,
-            },
+            }),
         })
     }
 
     pub fn renew_reservation(&self, headroom: DurationMs) -> Result<(), ClockError> {
-        let Continuity::Durable { persistence, .. } = &self.continuity else {
+        let Continuity::Durable { persistence, .. } = self.continuity.as_ref() else {
             return Err(ClockError::DisklessAuthority);
         };
         // The continuity retains its authority lease throughout this borrow.
@@ -156,8 +157,8 @@ impl WallClock {
         CausalTime::from_encoded(ClockMs::from_raw(self.state.load(Ordering::Acquire)))
     }
 
-    const fn reservation(&self) -> Option<&AtomicI64> {
-        match &self.continuity {
+    fn reservation(&self) -> Option<&AtomicI64> {
+        match self.continuity.as_ref() {
             Continuity::ProcessLocal => None,
             Continuity::Durable { ceiling, .. } => Some(ceiling),
             #[cfg(test)]
@@ -230,6 +231,10 @@ impl Default for WallClock {
 }
 
 impl Clock for WallClock {
+    fn retain(&self) -> Arc<dyn Clock> {
+        Arc::new(self.clone())
+    }
+
     fn now(&self) -> Result<ClockMs, ClockError> {
         self.transition(None)
     }

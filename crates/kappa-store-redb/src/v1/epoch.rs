@@ -1,37 +1,35 @@
-//! Sealing, deciding and committing epochs of one namespace.
+//! Deciding and committing epochs of one namespace, and the head pointer
+//! they move.
 //!
-//! The seal runs inside the namespace's write transaction: it drains the
-//! mutation buffer into a ledger, signs the root under the registry
-//! authority, installs the records, moves the head pointer and the epoch
-//! index. The commit then asks the namespace's control plane to decide
-//! the proposal and, only when decided, commits the transaction. A
-//! rejected decision aborts; an unresolved decision or a commit whose
-//! outcome is unknown fences the namespace (and only it) until recovery.
+//! The seal runs inside the namespace's write transaction (`epoch_seal`):
+//! it drains the transition buffer into a ledger, commits the namespace
+//! state, signs the root under the authority the publication's guard keeps
+//! in force, installs the records and moves the head pointer and the epoch
+//! index ([`PersistentStore::advance_head`]). The commit then asks the
+//! namespace's control plane to decide the proposal and, only when
+//! decided, commits the transaction. A rejected decision aborts; an
+//! unresolved decision or a commit whose outcome is unknown fences the
+//! namespace (and only it) until recovery.
 
 use std::sync::atomic::Ordering;
 
 use redb::ReadableTable;
 
-use kappa_store::ContentCommitment;
-use kappa_store::canonical::from_canonical;
-use kappa_store::clock::ClockMs;
-use kappa_store::epoch::{EpochMutation, MutationOp};
-use kappa_store::epoch_publication::{EpochPublication, EpochPublicationInput};
 use kappa_store::epoch_root::EpochRoot;
 use kappa_store::error::StoreError;
 use kappa_store::kappa::Kappa;
 use kappa_store::namespace::NamespaceRef;
+use kappa_store::work::Meter;
 
 use crate::PersistentStore;
-use crate::allocation::Pin;
-use crate::commitments::{COMMITMENTS_CONTEXT, commitment_entry};
+use crate::authority::ActivationHold;
 use crate::content_read::ReadView;
-use crate::control_plane::{ASSIGNMENT_KEY, Decision};
+use crate::control_plane::Decision;
 use crate::encrypted::bound;
-use crate::epoch_blob::install_record_in_txn;
+use crate::error::CommitFailure;
 use crate::referrers::{Referrer, establish, release};
 use crate::storage::NamespaceController;
-use crate::tables::{BLOB_INDEX, COMMITMENTS, EPOCH_CURRENT, EPOCH_INDEX, MUTATION_BUFFER};
+use crate::tables::{EPOCH_CURRENT, EPOCH_INDEX};
 
 #[path = "epoch_read.rs"]
 mod read;
@@ -39,23 +37,60 @@ mod read;
 #[path = "epoch_verify.rs"]
 mod verify;
 
-/// A sealed epoch and the allocation pins its records hold until the
-/// publication settles.
-pub(crate) struct Sealed {
+/// What keeps the authority an epoch is signed under in force from before
+/// its seal through its commit classification and published-time update.
+/// Owned by the sealed epoch and handed back with every outcome, so the
+/// authority an epoch was signed and verified under is the one it commits
+/// under, and its owner decides what follows while still holding it.
+pub(crate) trait AuthorityGuard<'a> {
+    /// The activation whose candidate signs, or `None` for the installed
+    /// authority.
+    fn activation(&self) -> Option<&ActivationHold<'a>>;
+}
+
+/// The shared activation gate, held by an ordinary publication from before
+/// its seal until its commit is classified: no activation installs another
+/// authority meanwhile. Constructed only by
+/// [`PersistentStore::shared_authority`].
+pub(crate) struct SharedAuthority<'a> {
+    gate: std::sync::RwLockReadGuard<'a, ()>,
+}
+
+impl SharedAuthority<'_> {
+    /// End ordinary publication's authority exclusion after classification,
+    /// before directory reconciliation and settlement handoff.
+    pub(crate) fn release(self) {
+        drop(self.gate);
+    }
+}
+
+impl<'a> AuthorityGuard<'a> for SharedAuthority<'a> {
+    fn activation(&self) -> Option<&ActivationHold<'a>> {
+        None
+    }
+}
+
+impl<'a> AuthorityGuard<'a> for ActivationHold<'a> {
+    fn activation(&self) -> Option<&ActivationHold<'a>> {
+        Some(self)
+    }
+}
+
+/// A sealed epoch: what its commit decides, with the guard of the authority
+/// it was signed under.
+pub(crate) struct SealedEpoch<G> {
     pub(crate) root: EpochRoot,
-    pub(crate) pins: Vec<Pin>,
     pub(crate) predecessor: Option<Kappa>,
     /// Whether the ledger admits a control-plane assignment (`_assign`).
     pub(crate) assigns: bool,
+    pub(crate) guard: G,
 }
 
-/// Why a publication did not commit, classified by what is known.
-pub(crate) enum CommitFailure {
-    /// The transaction did not commit; nothing of it persists.
-    Known(StoreError),
-    /// Whether the transaction persisted is unknown; the namespace is
-    /// fenced and its dependencies belong to recovery.
-    Unknown(StoreError),
+/// A commit's outcome, with the guard the sealed epoch carried. An unknown
+/// outcome has fenced the namespace; its dependencies belong to recovery.
+pub(crate) struct Committed<G> {
+    pub(crate) outcome: Result<(u64, Kappa), CommitFailure>,
+    pub(crate) guard: G,
 }
 
 #[cfg(test)]
@@ -70,119 +105,61 @@ mod recovery_tests;
 #[path = "epoch_publication_tests.rs"]
 mod publication_tests;
 
+/// Table-encryption context label of `EPOCH_CURRENT` pointers.
+pub(crate) const POINTER_CONTEXT: &str = "epoch_ptr";
+
+/// Bytes of an `EPOCH_CURRENT` key: the namespace identity.
+pub(crate) const POINTER_KEY_BYTES: usize = 16;
+
+/// Bytes of an epoch index key ([`epoch_idx_key`]): the namespace identity
+/// and the big-endian epoch number.
+pub(crate) const EPOCH_IDX_KEY_BYTES: usize = 16 + 8;
+
 /// The AEAD context of the `EPOCH_CURRENT` pointer of namespace `ns`.
 pub(crate) fn pointer_context(ns: &[u8; 16]) -> String {
-    bound("epoch_ptr", ns)
+    bound(POINTER_CONTEXT, ns)
 }
 
-/// Epoch index key: `[ns_uuid:16][epoch_number_be:8]`.
-pub(crate) fn epoch_idx_key(ns: &NamespaceRef, epoch_number: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(24);
-    k.extend_from_slice(ns.id());
-    k.extend_from_slice(&epoch_number.to_be_bytes());
-    k
+/// Epoch index key: `[ns_uuid:16][epoch_number_be:8]`, held inline, so
+/// building it allocates nothing.
+pub(crate) fn epoch_idx_key(ns: &NamespaceRef, epoch_number: u64) -> [u8; EPOCH_IDX_KEY_BYTES] {
+    let mut key = [0u8; EPOCH_IDX_KEY_BYTES];
+    let (namespace, number) = key.split_at_mut(16);
+    namespace.copy_from_slice(ns.id());
+    number.copy_from_slice(&epoch_number.to_be_bytes());
+    key
 }
 
 impl PersistentStore {
-    fn pending_epoch_mutations(
-        txn: &redb::WriteTransaction,
-        uuid: &[u8; 16],
-    ) -> Result<Vec<EpochMutation>, StoreError> {
-        let buffer = txn
-            .open_table(MUTATION_BUFFER)
-            .map_err(crate::error::redb)?;
-        let prefix = uuid.as_slice();
-        let end = Self::prefix_successor(prefix);
-        let range = match &end {
-            Some(end) => buffer
-                .range(prefix..end.as_slice())
-                .map_err(crate::error::redb)?,
-            None => buffer.range(prefix..).map_err(crate::error::redb)?,
-        };
-        let mut mutations = Vec::new();
-        for entry in range {
-            let (key, value) = entry.map_err(crate::error::redb)?;
-            if !key.value().starts_with(prefix) {
-                break;
-            }
-            mutations.push(from_canonical(value.value())?);
-        }
-        Ok(mutations)
+    /// The guard of the installed authority for an ordinary publication:
+    /// the shared activation gate, taken before the seal and held until the
+    /// commit is classified.
+    pub(crate) fn shared_authority(&self) -> Result<SharedAuthority<'_>, StoreError> {
+        self.activation
+            .read()
+            .map(|gate| SharedAuthority { gate })
+            .map_err(|_| StoreError::Internal("authority activation lock poisoned".into()))
     }
 
-    pub(crate) fn seal_epoch_in_txn(
+    /// A view over `controller`'s database that admits epochs under the
+    /// authority a seal uses: the installed one, or the candidate of
+    /// `activation`, whose own governing epoch the installed authority does
+    /// not yet admit.
+    pub(crate) fn sealing_view(
         &self,
-        txn: &redb::WriteTransaction,
         controller: &NamespaceController,
-        ns: &NamespaceRef,
-        now: ClockMs,
-        signer_override: Option<&Kappa>,
-    ) -> Result<Sealed, StoreError> {
-        let uuid = ns.id();
-        if controller.id != *uuid {
-            return Err(StoreError::Conflict(
-                "execution namespace differs from its controller".into(),
-            ));
+        activation: Option<&ActivationHold<'_>>,
+    ) -> ReadView {
+        let mut view = self.read_view_for(controller);
+        if let Some(hold) = activation {
+            view.authority = std::sync::Arc::clone(hold.view());
         }
-        let view = self.read_view_for(controller);
-        let (committed_digest, committed_count) = self.tag_state_in_txn(txn, ns)?;
-        // Select the predecessor while holding the namespace writer.
-        // Publishing another epoch of this namespace cannot race this
-        // selection.
-        let prev_root_kappa = self.head_pointer(txn, uuid)?;
-        let predecessor = prev_root_kappa
-            .as_ref()
-            .map(|key| {
-                let index = txn.open_table(BLOB_INDEX).map_err(crate::error::redb)?;
-                view.epoch_root_from_index(&index, key)
-            })
-            .transpose()?;
-        let mutations = Self::pending_epoch_mutations(txn, uuid)?;
-        let assigns = mutations.iter().any(|mutation| {
-            mutation.op == MutationOp::MetadataUpdate
-                && mutation.context.as_deref() == Some(ASSIGNMENT_KEY)
-        });
-        let publication = self.sign_epoch(EpochPublicationInput {
-            namespace: ns,
-            predecessor: predecessor.as_ref(),
-            state_root: committed_digest.into_bytes(),
-            tag_count: committed_count,
-            mutations: &mutations,
-            now,
-            signer_override,
-        })?;
-        let mut pins = Vec::new();
-        for content in [
-            Some(publication.ledger()),
-            Some(publication.root_blob()),
-            publication.rotation_record(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let (_, pin) = install_record_in_txn(self, txn, ns, content)?;
-            pins.extend(pin);
-        }
-        self.write_commitments(txn, &view, &mutations, publication.root_blob().kappa())?;
-        self.edge_put_in_txn(txn, ns, publication.edge(), publication.edge_blob())?;
-        for (link, content) in publication.retained_links() {
-            self.edge_put_in_txn(txn, ns, link, content)?;
-        }
-        let epoch_root = publication.into_root();
-        self.advance_head(txn, ns, prev_root_kappa.as_ref(), &epoch_root)?;
-        Self::drain_mutation_buffer(txn, uuid)?;
-        self.record_time_in_txn(txn, now)?;
-        Ok(Sealed {
-            root: epoch_root,
-            pins,
-            predecessor: prev_root_kappa,
-            assigns,
-        })
+        view
     }
 
     /// The root identity `EPOCH_CURRENT` names for namespace `uuid` in
     /// `txn`; `None` before the first epoch.
-    fn head_pointer(
+    pub(crate) fn head_pointer(
         &self,
         txn: &redb::WriteTransaction,
         uuid: &[u8; 16],
@@ -195,70 +172,12 @@ impl PersistentStore {
         Ok(Some(Kappa::from_key_bytes(&bytes)?))
     }
 
-    /// Sign the epoch `input` describes under the committed authority.
-    ///
-    /// Shared activation is held while signing: no rotation can be between
-    /// its commit and its installation, so the authority snapshot is the
-    /// one in force. `authority_unresolved` is set only under the exclusive
-    /// gate, so reading it under the shared gate observes every unresolved
-    /// rotation that completed before this seal.
-    fn sign_epoch(&self, input: EpochPublicationInput<'_>) -> Result<EpochPublication, StoreError> {
-        let activation = self
-            .activation
-            .read()
-            .map_err(|_| StoreError::Internal("authority activation lock poisoned".into()))?;
-        let authority = self.authority.load();
-        if self.authority_unresolved.load(Ordering::SeqCst) {
-            return Err(StoreError::AuthorityUnresolved {
-                outgoing: Box::new(authority.anchor().clone()),
-            });
-        }
-        let publication = EpochPublication::prepare(input, &authority);
-        drop(authority);
-        drop(activation);
-        publication
-    }
-
-    /// Record the commitment coordinates of every `ContentPublish` in
-    /// `mutations`: the epoch `epoch_identity` that authenticates it and the
-    /// commitment content, both resolvable from the signed history.
-    fn write_commitments(
-        &self,
-        txn: &redb::WriteTransaction,
-        view: &ReadView,
-        mutations: &[EpochMutation],
-        epoch_identity: &Kappa,
-    ) -> Result<(), StoreError> {
-        let index = txn.open_table(BLOB_INDEX).map_err(crate::error::redb)?;
-        let mut entries = Vec::new();
-        for mutation in mutations
-            .iter()
-            .filter(|mutation| mutation.op == MutationOp::ContentPublish)
-        {
-            let bytes = view.epoch_content_from_index(&index, &mutation.kappa, None)?;
-            let commitment: ContentCommitment = from_canonical(&bytes)?;
-            entries.push((commitment.identity().key_bytes(), &mutation.kappa));
-        }
-        drop(index);
-        let mut table = txn.open_table(COMMITMENTS).map_err(crate::error::redb)?;
-        for (identity_key, commitment) in entries {
-            let value = self.encrypt_bytes(
-                &bound(COMMITMENTS_CONTEXT, &identity_key),
-                &commitment_entry(epoch_identity, commitment)?,
-            )?;
-            table
-                .insert(identity_key.as_slice(), value.as_slice())
-                .map_err(crate::error::redb)?;
-        }
-        Ok(())
-    }
-
     /// Make `epoch_root` the head of `ns`. The head referrer moves with
     /// `EPOCH_CURRENT`: the previous root is now retained by the new root's
     /// predecessor edge, the new root by being the head. The ledger and
     /// every other dependency are retained by the `EpochRoot` edges the
     /// seal writes. The epoch index gains the new root at its number.
-    fn advance_head(
+    pub(crate) fn advance_head(
         &self,
         txn: &redb::WriteTransaction,
         ns: &NamespaceRef,
@@ -268,9 +187,9 @@ impl PersistentStore {
         let uuid = ns.id();
         let head = Referrer::epoch_head(ns);
         if let Some(previous) = previous {
-            release(self, txn, previous, &head)?;
+            release(self, txn, ns, previous, &head)?;
         }
-        establish(self, txn, epoch_root.kappa(), &head)?;
+        establish(self, txn, ns, epoch_root.kappa(), &head)?;
         let root_key = epoch_root.kappa().key_bytes();
         let stored = self.encrypt_bytes(&pointer_context(uuid), &root_key)?;
         txn.open_table(EPOCH_CURRENT)
@@ -285,47 +204,60 @@ impl PersistentStore {
         Ok(())
     }
 
-    /// Remove every buffered mutation of namespace `uuid`: the seal has
-    /// drained them into the ledger.
-    fn drain_mutation_buffer(
-        txn: &redb::WriteTransaction,
-        uuid: &[u8; 16],
-    ) -> Result<(), StoreError> {
-        let mut buffer = txn
-            .open_table(MUTATION_BUFFER)
-            .map_err(crate::error::redb)?;
-        let prefix = uuid.as_slice();
-        match Self::prefix_successor(prefix) {
-            Some(end) => buffer
-                .retain_in(prefix..end.as_slice(), |_, _| false)
-                .map_err(crate::error::redb),
-            None => buffer
-                .retain_in(prefix.., |_, _| false)
-                .map_err(crate::error::redb),
-        }
-    }
-
     /// Verify the sealed transaction, decide its proposal through the
-    /// namespace's plane, and commit it. Runs under the controller's
-    /// writer gate, so the fence an unknown outcome installs is observed
-    /// by the next admission.
-    pub(crate) fn commit_epoch_transaction(
+    /// namespace's plane, and commit it, under the guard the sealed epoch
+    /// carries: the authority it was signed under stays in force through the
+    /// commit's classification and the published-time update. Runs under
+    /// the controller's writer gate, so the fence an unknown outcome
+    /// installs is observed by the next admission. The verification and,
+    /// for an unknown outcome, its resolution read on `work`, the
+    /// publication's allowance. The guard is handed back with the outcome.
+    pub(crate) fn commit_epoch_transaction<'a, G: AuthorityGuard<'a>>(
         &self,
         txn: redb::WriteTransaction,
         controller: &NamespaceController,
         ns: &NamespaceRef,
-        root: EpochRoot,
-        predecessor: Option<&Kappa>,
-        assigns: bool,
+        sealed: SealedEpoch<G>,
+        work: &mut dyn Meter,
+    ) -> Committed<G> {
+        let outcome = self.decide_and_commit(txn, controller, ns, &sealed, work);
+        Committed {
+            outcome,
+            guard: sealed.guard,
+        }
+    }
+
+    /// The body of [`Self::commit_epoch_transaction`], under the guard
+    /// `sealed` carries.
+    fn decide_and_commit<'a, G: AuthorityGuard<'a>>(
+        &self,
+        txn: redb::WriteTransaction,
+        controller: &NamespaceController,
+        ns: &NamespaceRef,
+        sealed: &SealedEpoch<G>,
+        work: &mut dyn Meter,
     ) -> Result<(u64, Kappa), CommitFailure> {
-        self.verify_sealed_transaction(&txn, controller, ns, &root)
+        let SealedEpoch {
+            root,
+            predecessor,
+            assigns,
+            guard,
+        } = sealed;
+        let predecessor = predecessor.as_ref();
+        let activation = guard.activation();
+        if let Some(hold) = activation {
+            hold.admits(controller, predecessor)
+                .map_err(CommitFailure::Known)?;
+        }
+        let verified_root = self
+            .verify_sealed_transaction(&txn, controller, ns, root, activation, work)
             .map_err(CommitFailure::Known)?;
         let number = root.epoch_number();
         let identity = root.kappa().clone();
         // Creation bootstrap: a namespace whose database admits no
         // assignment publishes only the epoch that admits one. The plane
         // it was opened under is provisional authority for exactly that.
-        if !assigns
+        if !*assigns
             && self
                 .namespaces
                 .admitted_assignment(controller)
@@ -379,16 +311,10 @@ impl PersistentStore {
         // Every external representation this transaction installs had its
         // durability established before its row was written
         // (content_prepare); inline rows are durable with this commit.
-        // Shared activation across the commit and the bound update. A
-        // rotation takes this gate exclusively, so it waits: it never
-        // observes this epoch committed while the published-time bound
-        // still excludes it.
-        let activation = self.activation.read().map_err(|_| {
-            CommitFailure::Known(StoreError::Internal(
-                "authority activation lock poisoned".into(),
-            ))
-        })?;
-        let committed = txn.commit();
+        // The guard is held from the seal through here: an activation
+        // takes the gate exclusively, so it waits, and never observes this
+        // epoch committed while the published-time bound still excludes it.
+        let committed = crate::error::classify_commit(txn.commit());
         #[cfg(test)]
         self.hooks.reach(crate::test_hooks::Point::AfterEpochCommit);
         // A failed commit may still have persisted the epoch, so its time
@@ -396,36 +322,24 @@ impl PersistentStore {
         // transaction aborted before commit never reaches this point.
         self.latest_epoch_ms
             .fetch_max(root.timestamp_ms(), Ordering::SeqCst);
-        drop(activation);
-        if let Err(error) = committed {
-            // redb can fail after durable publication. Resolve the exact
-            // immutable index entry; either way the outcome is not known
-            // to this handle until recovery, so the namespace is fenced.
-            let classified = match self.resolve_epoch_publication(controller, ns, number, &identity)
-            {
-                Ok(()) => StoreError::PublicationRecoveryRequired {
-                    namespace: *ns.id(),
-                    epoch_number: number,
-                    root: Box::new(identity),
-                    detail: error.to_string(),
-                },
-                Err(recovery) => StoreError::PublicationIndeterminate {
-                    namespace: *ns.id(),
-                    epoch_number: number,
-                    root: Box::new(identity),
-                    detail: format!("commit: {error}; recovery: {recovery}"),
-                },
-            };
-            if let Err(fence) = controller.fence() {
-                return Err(CommitFailure::Unknown(fence));
+        match committed {
+            Ok(()) => {}
+            // redb rolled the transaction back: nothing of the epoch
+            // persists, and its retained custody is resolved like any
+            // other known noncommit after the coordinate was consumed.
+            Err(CommitFailure::Known(error)) => return Err(CommitFailure::Known(error)),
+            Err(CommitFailure::Unknown(error)) => {
+                return Err(self.fence_unknown_commit(
+                    controller, ns, number, identity, activation, &error, work,
+                ));
             }
-            return Err(CommitFailure::Unknown(classified));
         }
         // Committed: from here nothing is reported as a failure of the
         // publication. The caller parks the pins against this epoch.
         controller.epoch_number.fetch_max(number, Ordering::AcqRel);
-        self.epoch_cache.insert(identity.clone(), root);
-        if assigns {
+        // Publication is committed; cache admission cannot change its outcome.
+        let _ = self.epoch_cache.insert(verified_root, work);
+        if *assigns {
             // The admitted assignment is in force from this commit; the
             // controller serves the next execution under it. A failure to
             // install it marks the controller stale: it is logged, never
@@ -440,5 +354,44 @@ impl PersistentStore {
             }
         }
         Ok((number, identity))
+    }
+
+    /// A commit of epoch `number` (`identity`) of `ns` whose outcome redb
+    /// left unknown (`error`): redb can fail after durable publication, so
+    /// the exact immutable index entry is resolved, on `work`, to name what
+    /// is known, and either way the namespace is fenced until recovery. A
+    /// resolution the allowance refuses names nothing known: the outcome
+    /// stays indeterminate.
+    #[allow(clippy::too_many_arguments)]
+    fn fence_unknown_commit(
+        &self,
+        controller: &NamespaceController,
+        ns: &NamespaceRef,
+        number: u64,
+        identity: Kappa,
+        activation: Option<&ActivationHold<'_>>,
+        error: &StoreError,
+        work: &mut dyn Meter,
+    ) -> CommitFailure {
+        let classified = match self
+            .resolve_epoch_publication(controller, ns, number, &identity, activation, work)
+        {
+            Ok(()) => StoreError::PublicationRecoveryRequired {
+                namespace: *ns.id(),
+                epoch_number: number,
+                root: Box::new(identity),
+                detail: error.to_string(),
+            },
+            Err(recovery) => StoreError::PublicationIndeterminate {
+                namespace: *ns.id(),
+                epoch_number: number,
+                root: Box::new(identity),
+                detail: format!("commit: {error}; recovery: {recovery}"),
+            },
+        };
+        match controller.fence() {
+            Ok(()) => CommitFailure::Unknown(classified),
+            Err(fence) => CommitFailure::Unknown(fence),
+        }
     }
 }

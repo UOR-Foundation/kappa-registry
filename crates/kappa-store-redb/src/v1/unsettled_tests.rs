@@ -108,6 +108,38 @@ fn debt_exceeds_the_bound_and_blocks_reservations_until_released() -> Result<(),
 
 type Debt = fn(&Arc<UnsettledBudget>, u64, u64) -> Result<Charge, StoreError>;
 
+#[test]
+fn remeasurement_at_counter_limit_never_reserves_the_same_debt_twice() -> Result<(), StoreError> {
+    let budget = Arc::new(UnsettledBudget::new(1, 1));
+    let mut debt = budget.debt(u64::MAX, u64::MAX)?;
+    debt.measure(u64::MAX, u64::MAX)?;
+    assert_eq!(budget.charged(), (u64::MAX, u64::MAX));
+    debt.measure(1, 1)?;
+    assert_eq!(budget.charged(), (1, 1));
+    assert!(ordinary(&budget, 1, 0).is_err());
+    drop(debt);
+    assert_eq!(budget.charged(), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn failed_measurement_keeps_its_closure_and_other_ownership() -> Result<(), StoreError> {
+    let budget = Arc::new(UnsettledBudget::new(u64::MAX, u64::MAX));
+    let other = budget.debt(1, u64::MAX)?;
+    let cause = Closure::Obligation(instance(9));
+    let mut unknown = budget.unmeasured(cause)?;
+    assert!(unknown.measure(2, 1).is_err());
+    assert_eq!(budget.charged(), (1, u64::MAX));
+    assert_eq!(budget.closures(), vec![cause]);
+    drop(other);
+    unknown.measure(2, 1)?;
+    assert_eq!(budget.charged(), (2, 1));
+    assert!(budget.closures().is_empty());
+    drop(unknown);
+    assert_eq!(budget.charged(), (0, 0));
+    Ok(())
+}
+
 /// `debt` as it was: the entry sum is assigned before the byte sum is
 /// checked, so a refused byte overflow leaves the entries charged with no
 /// `Charge` to release them.

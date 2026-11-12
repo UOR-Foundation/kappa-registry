@@ -1,8 +1,8 @@
 use super::*;
 use kappa_handler::clock_at;
 use kappa_store::{
-    BlobStore, EpochStore, ExecutionWrites, NamespaceStore, ProtocolId, SequenceStore, TagStore,
-    TagUpdate,
+    BlobStore, ClockMs, EpochStore, ExecutionWrites, NamespaceStore, ProtocolId, SequenceStore,
+    TagStore, TagUpdate,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;

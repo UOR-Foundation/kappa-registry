@@ -355,7 +355,12 @@ impl PersistentStore {
                 "compressed content exceeds {maximum} bytes"
             )));
         }
-        crate::decompress::verify_compressed(&compressed, algorithm, identity, uncompressed_size)?;
+        kappa_store::compression::verify_compressed(
+            &compressed,
+            algorithm,
+            identity,
+            uncompressed_size,
+        )?;
         self.prepare_representation(
             identity.axis(),
             Some(identity),

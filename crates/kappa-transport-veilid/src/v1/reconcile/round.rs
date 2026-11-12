@@ -1,5 +1,11 @@
 //! Reconciliation loop: periodic and watch-triggered rounds with
 //! credit-bounded concurrent fan-out across peers.
+//!
+//! Peers come from a `kappa_reconcile::PeerSource` as `PeerInfo`: the
+//! identity (`id`, a `Kappa` derived from the peer's key) is what the loop
+//! compares against its own to skip itself; the locator (`address`) is
+//! what the transport is called with. The transport is the one-call
+//! `kappa_reconcile::ReconcileTransport`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,22 +13,22 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use kappa_reconcile::{PeerInfo, PeerSource, ReconcileTransport};
 use kappa_store::ExecutionStore;
 use kappa_store::time::Clock;
 use kappa_store::traits::{BlobStore, EpochStore, NamespaceStore, TagStore};
+use kappa_types::kappa::Kappa;
 use kappa_types::page::{NamespaceFilter, PageRequest};
-
-use rekindle_types::transport::Transport;
 
 use super::peer::reconcile_peer;
 use super::report::{PeerPhase, PeerReconcileOutcome, ReconcileReport};
 use super::{MAX_CONCURRENT_PEERS, PEER_TIMEOUT};
 
-pub struct ReconcileLoop<T, S: ?Sized> {
+pub struct ReconcileLoop<T: ?Sized, S: ?Sized> {
     transport: Arc<T>,
     store: Arc<S>,
     clock: Arc<dyn Clock>,
-    self_id: String,
+    self_id: Kappa,
     interval_secs: u64,
     peer_timeout: Duration,
     max_concurrent: usize,
@@ -30,7 +36,7 @@ pub struct ReconcileLoop<T, S: ?Sized> {
 
 impl<T, S> ReconcileLoop<T, S>
 where
-    T: Transport + 'static,
+    T: ReconcileTransport + ?Sized + 'static,
     S: NamespaceStore
         + TagStore
         + EpochStore
@@ -45,7 +51,7 @@ where
         transport: Arc<T>,
         store: Arc<S>,
         clock: Arc<dyn Clock>,
-        self_id: String,
+        self_id: Kappa,
         interval_secs: u64,
     ) -> Self {
         Self {
@@ -59,19 +65,21 @@ where
         }
     }
 
-    pub fn with_peer_timeout(mut self, timeout: Duration) -> Self {
+    #[must_use]
+    pub const fn with_peer_timeout(mut self, timeout: Duration) -> Self {
         self.peer_timeout = timeout;
         self
     }
 
-    pub fn with_max_concurrent(mut self, max: usize) -> Self {
-        self.max_concurrent = max.max(1);
+    #[must_use]
+    pub const fn with_max_concurrent(mut self, max: usize) -> Self {
+        self.max_concurrent = if max == 0 { 1 } else { max };
         self
     }
 
-    /// Run one reconciliation round against all known healthy peers.
-    /// Concurrent per peer, bounded by max_concurrent.
-    pub async fn reconcile_once(&self, peers: &[PeerEntry]) -> ReconcileReport {
+    /// Run one reconciliation round against every healthy peer that is
+    /// not this node, concurrently up to `max_concurrent` at once.
+    pub async fn reconcile_once(&self, peers: &[PeerInfo]) -> ReconcileReport {
         let start = Instant::now();
         let mut report = ReconcileReport {
             peers_contacted: 0,
@@ -107,10 +115,10 @@ where
         let mut pending = 0usize;
 
         for peer in peers {
-            if peer.id == self.self_id || !peer.healthy {
+            if peer.id == self.self_id || !peer.healthy || !self.transport.is_operational() {
                 report.peers_skipped += 1;
                 report.peer_outcomes.push(PeerReconcileOutcome::begin(
-                    peer.id.clone(),
+                    peer.address.clone(),
                     PeerPhase::Skipped,
                 ));
                 continue;
@@ -133,7 +141,7 @@ where
             let transport = Arc::clone(&self.transport);
             let store = Arc::clone(&self.store);
             let clock = Arc::clone(&self.clock);
-            let peer_id = peer.id.clone();
+            let address = peer.address.clone();
             let peer_timeout = self.peer_timeout;
             let ns_list_clone: Vec<_> = ns_list
                 .iter()
@@ -145,7 +153,7 @@ where
                     transport.as_ref(),
                     store,
                     clock,
-                    &peer_id,
+                    &address,
                     &ns_list_clone,
                     peer_timeout,
                 )
@@ -254,16 +262,4 @@ where
             }
         })
     }
-}
-
-/// Peer entry for the reconciliation loop.
-#[derive(Debug, Clone)]
-pub struct PeerEntry {
-    pub id: String,
-    pub healthy: bool,
-}
-
-/// Source of peer list for the reconciliation loop.
-pub trait PeerSource: Send + Sync {
-    fn peers(&self) -> Vec<PeerEntry>;
 }

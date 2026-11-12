@@ -1,6 +1,71 @@
+//! Native redb traversal: the borrowed range over any byte-keyed table
+//! within a shared interval ([`rows`]), and the retained reader that owns
+//! its read root across calls ([`RedbCursor`]).
+
 use kappa_cursor::FallibleCursor;
+use kappa_cursor::interval::Interval;
+use kappa_store::work::{Dimension, Meter};
 use kappa_types::StoreError;
-use redb::{ReadOnlyTable, ReadableTableMetadata};
+use redb::{AccessGuard, ReadOnlyTable, ReadableTable, ReadableTableMetadata};
+
+/// The rows of one table within an interval, borrowed from the table: no
+/// mutation of the table is possible while the range or a row it yielded
+/// is held, so a mutating caller copies what it needs and drops both
+/// first. An exhausted interval holds no native range at all.
+pub(crate) enum Rows<'t, V: redb::Value + 'static> {
+    Exhausted,
+    Native(redb::Range<'t, &'static [u8], V>),
+}
+
+/// One row of [`Rows`], as redb's guards over its page.
+pub(crate) type Row<'t, V> = (AccessGuard<'t, &'static [u8]>, AccessGuard<'t, V>);
+
+impl<'t, V: redb::Value + 'static> Iterator for Rows<'t, V> {
+    type Item = Result<Row<'t, V>, StoreError>;
+
+    /// The next row in key order. A native failure stays a failure on every
+    /// later call (redb latches it), never exhaustion.
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Exhausted => None,
+            Self::Native(range) => range.next().map(|row| row.map_err(crate::error::redb)),
+        }
+    }
+}
+
+impl<V: redb::Value + 'static> DoubleEndedIterator for Rows<'_, V> {
+    /// The last remaining row in key order.
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Exhausted => None,
+            Self::Native(range) => range.next_back().map(|row| row.map_err(crate::error::redb)),
+        }
+    }
+}
+
+/// The rows of `table` within `interval`, in key order. The bytes redb
+/// copies to encode the interval's bounds (`Interval::bound_bytes`) are
+/// accounted on `unit`, the admitted unit (`Meter::admit`) whose bound
+/// includes them; an exhausted interval builds no native range and copies
+/// nothing. Examining each row, copying it and decoding it are the
+/// caller's, admitted before the row is read.
+pub(crate) fn rows<'t, V: redb::Value + 'static>(
+    table: &'t impl ReadableTable<&'static [u8], V>,
+    interval: &Interval,
+    unit: &mut dyn Meter,
+) -> Result<Rows<'t, V>, StoreError> {
+    let Some(bounds) = interval.bounds() else {
+        return Ok(Rows::Exhausted);
+    };
+    let copied = interval
+        .bound_bytes()
+        .ok_or_else(|| StoreError::Internal("native range bounds exceed u64".into()))?;
+    unit.account(Dimension::BytesAllocated, copied)?;
+    table
+        .range::<&[u8]>(bounds)
+        .map(Rows::Native)
+        .map_err(crate::error::redb)
+}
 
 /// Native range over one retained redb read root.
 ///
@@ -67,6 +132,9 @@ impl RedbCursor {
                 std::io::Error::from_raw_os_error,
             )),
             StoreError::Internal(message) => StoreError::Internal(message.clone()),
+            // A traversal whose operation's allowance refused stays refused,
+            // never relabelled a storage failure.
+            StoreError::WorkRefused(refused) => StoreError::WorkRefused(*refused),
             // redb navigation converts only I/O and corruption errors here.
             other => StoreError::Internal(other.to_string()),
         }

@@ -26,7 +26,9 @@ use super::histogram::{HistogramError, LatencyHistogram};
 use super::platform::{PlatformInfo, RunConditions, StorageInfo};
 use super::profile::Profile;
 use super::quantity::{Quantity, Work};
-use super::record::{BaselineComparison, CalibrationPoint, HarnessCoords, Severity, Source};
+use super::record::{
+    BaselineComparison, CalibrationPoint, FaultSummary, HarnessCoords, Severity, Source,
+};
 use super::reference::compare;
 use super::roofline::{RooflineClass, classes, grade};
 use super::substrate::Substrate;
@@ -107,6 +109,10 @@ pub struct CalibratedSession {
     storage: Option<StorageInfo>,
     /// Path to the `.running` marker, removed on finalize.
     running_marker: PathBuf,
+    /// The run seed stamped on every record (`bench::seed`).
+    seed: Option<u64>,
+    /// The fault summary stamped on records pushed while it is set.
+    fault: Option<FaultSummary>,
 }
 
 /// `calibration_<session>.jsonl` of every session other than `own` and
@@ -234,6 +240,8 @@ impl CalibratedSession {
             criterion_dir: criterion_dir.to_owned(),
             storage: None,
             running_marker,
+            seed: None,
+            fault: None,
         })
     }
 
@@ -241,6 +249,19 @@ impl CalibratedSession {
     /// records.
     pub fn set_storage_path(&mut self, path: &Path) {
         self.storage = StorageInfo::for_path(path);
+    }
+
+    /// Stamp `seed` on every record pushed from now on. Set once, before
+    /// the first measurement, from `bench::seed`.
+    pub const fn set_seed(&mut self, seed: u64) {
+        self.seed = Some(seed);
+    }
+
+    /// Stamp `fault` on records pushed while it is set; `None` clears it.
+    /// A fault bench sets it right before recording a measurement taken
+    /// under an injected fault and clears it after.
+    pub fn set_fault(&mut self, fault: Option<FaultSummary>) {
+        self.fault = fault;
     }
 
     pub const fn platform(&self) -> &PlatformInfo {
@@ -321,12 +342,21 @@ impl CalibratedSession {
         let mut point =
             CalibrationPoint::pending(&id, self.profile, source, work, self.platform.clone());
         point.test_id = test_id.map(str::to_owned);
-        if id
-            .operation()
-            .domains()
-            .iter()
-            .any(|d| matches!(*d, "device" | "store" | "redb" | "txn"))
-        {
+        point.seed = self.seed;
+        point.fault.clone_from(&self.fault);
+        if id.operation().domains().iter().any(|d| {
+            matches!(
+                *d,
+                "device"
+                    | "store"
+                    | "redb"
+                    | "txn"
+                    | "recovery"
+                    | "settlement"
+                    | "repair"
+                    | "reclaim"
+            )
+        }) {
             point.storage.clone_from(&self.storage);
         }
         self.recorded_ops

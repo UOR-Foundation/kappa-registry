@@ -1,10 +1,11 @@
 //! Namespace records and ownership changes inside an epoch-owned writer,
 //! and the directory claims they make in the registry.
 //!
-//! The namespace's own record (`NAMESPACE_RECORDS` in its database) is
-//! epoch state: written in the execution's transaction and recorded as
-//! `NamespaceUpdate` evidence, from which settlement projects the
-//! registry's copy. The directory itself (alias and name to identity,
+//! The namespace's own record (`NAMESPACE_RECORDS` in its database) and its
+//! metadata (`NAMESPACE_CONFIG`) are epoch state: each change is applied
+//! through the transition boundary (`transition_apply`) as `NamespaceUpdate`
+//! or typed `MetadataTransition` evidence, from which settlement projects
+//! the registry's copy. The directory itself (alias and name to identity,
 //! `NAMESPACES`) is registry state that must be unique across every
 //! namespace, so an execution reserves what it adds in one short registry
 //! transaction before it writes the namespace side
@@ -15,13 +16,16 @@
 //! creation that never commits is also found by settlement through the
 //! pending entry its claim made, and its claim released.
 
+use kappa_store::transition::RecordTransition;
+use kappa_store::work::Meter;
 use kappa_store::{
-    ClockMs, Kappa, MutationOp, NamespaceInfo, NamespaceRef, StoreError,
-    canonical::canonical_bytes, namespace::ProtocolId,
+    ClockMs, Kappa, NamespaceInfo, NamespaceRef, StoreError, canonical::canonical_bytes,
+    namespace::ProtocolId,
 };
 use redb::ReadableTable;
 
 use super::namespace::{HistoryDetail, append_history, config_key};
+use crate::transition_apply::{RedbPayload, TxnWriter};
 use crate::{
     PersistentStore,
     tables::{NAMESPACE_CONFIG, NAMESPACE_RECORDS},
@@ -33,28 +37,27 @@ mod directory;
 #[path = "namespace_directory_journal.rs"]
 mod journal;
 pub use journal::{DirectoryGuard, entry_owner};
+pub(crate) use journal::{RESOLUTION_UNIT, Reconciled, record_unit};
 
 impl PersistentStore {
+    /// Apply `record` as the namespace's record through the transition
+    /// boundary, which writes its row ([`TxnWriter::apply_namespace_record`])
+    /// and records its `NamespaceUpdate` evidence, on `meter`, the allowance
+    /// of the operation writing it.
     pub(crate) fn record_namespace_in_txn(
         &self,
         txn: &redb::WriteTransaction,
         ns: &NamespaceRef,
+        record: &NamespaceInfo,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
-        let record = Self::namespace_info_in_txn(txn, ns)?;
-        let content = kappa_store::VerifiedContent::compute(
-            kappa_store::Axis::Sha256,
-            &canonical_bytes(&record),
-        )?;
-        crate::epoch_blob::blob_put_in_txn(self, txn, ns, &content)?;
-        self.record_mutation_in_txn(
-            txn,
-            ns,
-            MutationOp::NamespaceUpdate,
-            content.kappa().clone(),
-            now,
-            None,
-        )
+        TxnWriter::new(self, txn, ns, now, meter)?
+            .apply(
+                RecordTransition::NamespaceUpdate(record.clone()),
+                RedbPayload::NoResources,
+            )
+            .map(drop)
     }
 
     /// Create `ns` under its display name within `protocol`: claim the
@@ -67,9 +70,9 @@ impl PersistentStore {
         owner: Option<&Kappa>,
         protocol: Option<&ProtocolId>,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         let uuid = *ns.id();
-        let name = ns.display_name();
         if txn
             .open_table(NAMESPACE_RECORDS)
             .map_err(crate::error::redb)?
@@ -79,32 +82,12 @@ impl PersistentStore {
         {
             return Err(StoreError::AlreadyExists(format!("namespace: {ns}")));
         }
-        self.claim_alias(&uuid, name, protocol, true)?;
-        Self::write_namespace_record(
-            txn,
-            &uuid,
-            &NamespaceInfo {
-                ns: ns.clone(),
-                name: name.to_string(),
-                owner_anchor: owner.cloned(),
-                created_at_ms: now.as_i64(),
-                aliases: vec![name.to_string()],
-                protocol: protocol.cloned(),
-                tombstoned: false,
-                last_epoch: 0,
-            },
-        )?;
-        append_history(
-            txn,
-            &uuid,
-            name,
-            &owner.map(ToString::to_string).unwrap_or_default(),
-            now.as_i64(),
-            HistoryDetail::Create {
-                protocol: protocol.map(|p| p.as_str().to_string()),
-            },
-        )?;
-        self.record_namespace_in_txn(txn, ns, now)
+        let record = NamespaceInfo::created(ns, owner, protocol, now.as_i64());
+        // The first claim also takes the identity's existence row.
+        for (index, alias) in record.aliases.iter().enumerate() {
+            self.claim_alias(&uuid, &alias.name, alias.protocol.as_ref(), index == 0)?;
+        }
+        self.record_namespace_in_txn(txn, ns, &record, now, meter)
     }
 
     /// Delete `ns`: its record is tombstoned in its own transaction, and
@@ -117,23 +100,14 @@ impl PersistentStore {
         txn: &redb::WriteTransaction,
         ns: &NamespaceRef,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         let mut record = Self::namespace_info_in_txn(txn, ns)?;
-        if record.tombstoned {
-            return Err(StoreError::Rejected("namespace is already deleted".into()));
-        }
-        self.journal_deletion(ns)?;
-        record.tombstoned = true;
-        Self::write_namespace_record(txn, ns.id(), &record)?;
-        append_history(
-            txn,
-            ns.id(),
-            ns.as_str(),
-            "",
-            now.as_i64(),
-            HistoryDetail::None,
-        )?;
-        self.record_namespace_in_txn(txn, ns, now)
+        // Every released alias is resolved by the deletion's outcome: each
+        // is journaled by its key (`journal_released`).
+        let released = record.tombstone()?;
+        self.journal_released(ns, &released)?;
+        self.record_namespace_in_txn(txn, ns, &record, now, meter)
     }
 
     pub(crate) fn namespace_info_in_txn(
@@ -152,32 +126,11 @@ impl PersistentStore {
         ns: &NamespaceRef,
         new_owner: &Kappa,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         let mut record = Self::namespace_info_in_txn(txn, ns)?;
-        if record.tombstoned {
-            return Err(StoreError::Rejected(
-                "cannot transfer a deleted namespace".into(),
-            ));
-        }
-        let old_owner = record
-            .owner_anchor
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        record.owner_anchor = Some(new_owner.clone());
-        Self::write_namespace_record(txn, ns.id(), &record)?;
-        append_history(
-            txn,
-            ns.id(),
-            ns.as_str(),
-            "",
-            now.as_i64(),
-            HistoryDetail::Transfer {
-                old_owner,
-                new_owner: new_owner.to_string(),
-            },
-        )?;
-        self.record_namespace_in_txn(txn, ns, now)
+        record.transfer(new_owner)?;
+        self.record_namespace_in_txn(txn, ns, &record, now, meter)
     }
 
     pub(crate) fn namespace_get_meta_in_txn(
@@ -197,33 +150,27 @@ impl PersistentStore {
         self.decrypt_bytes(&super::namespace::config_context(&ck), raw.value())
     }
 
-    /// Publish the canonical metadata record and commit it to the ledger.
-    fn record_metadata_in_txn(
+    /// Apply the namespace metadata `key` set to `value`, or deleted, as its
+    /// typed transition.
+    fn apply_meta_in_txn(
         &self,
         txn: &redb::WriteTransaction,
         ns: &NamespaceRef,
         key: &str,
         value: Option<&[u8]>,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
-        let record = kappa_store::epoch::MetadataRecord {
-            namespace_id: ns.id().to_vec(),
-            key: key.to_string(),
-            value: value.map(<[u8]>::to_vec),
-        };
-        let content = kappa_store::VerifiedContent::compute(
-            kappa_store::Axis::Sha256,
-            &canonical_bytes(&record),
-        )?;
-        crate::epoch_blob::blob_put_in_txn(self, txn, ns, &content)?;
-        self.record_mutation_in_txn(
-            txn,
-            ns,
-            MutationOp::MetadataUpdate,
-            content.kappa().clone(),
-            now,
-            Some(key.to_string()),
-        )
+        let writer = TxnWriter::new(self, txn, ns, now, meter)?;
+        let meta = kappa_types::content::MetadataTransition::namespace_meta(
+            *ns.id(),
+            *writer.incarnation(),
+            key.to_owned(),
+            value.map(<[u8]>::to_vec),
+        );
+        writer
+            .apply(RecordTransition::Metadata(meta), RedbPayload::NoResources)
+            .map(drop)
     }
 
     pub(crate) fn namespace_put_meta_in_txn(
@@ -233,28 +180,15 @@ impl PersistentStore {
         key: &str,
         value: &[u8],
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         if key.is_empty() {
             return Err(StoreError::Rejected(
                 "namespace metadata key must be nonempty".into(),
             ));
         }
-        let ck = config_key(ns, key);
-        let stored = self.encrypt_bytes(&super::namespace::config_context(&ck), value)?;
-        // A pin renewal replaces the value of an existing key; the pin
-        // reference it established is unchanged.
-        let replaced = txn
-            .open_table(NAMESPACE_CONFIG)
-            .map_err(crate::error::redb)?
-            .insert(ck.as_slice(), stored.as_slice())
-            .map_err(crate::error::redb)?
-            .is_some();
-        if let Some(pinned) = pinned_content(key)?
-            && !replaced
-        {
-            crate::referrers::establish(self, txn, &pinned, &crate::referrers::Referrer::pin(ns))?;
-        }
-        self.record_metadata_in_txn(txn, ns, key, Some(value), now)
+        pinned_content(key)?;
+        self.apply_meta_in_txn(txn, ns, key, Some(value), now, meter)
     }
 
     /// Deleting an absent key is a no-op and records no mutation.
@@ -264,32 +198,181 @@ impl PersistentStore {
         ns: &NamespaceRef,
         key: &str,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
-        let removed = txn
+        let held = txn
             .open_table(NAMESPACE_CONFIG)
             .map_err(crate::error::redb)?
-            .remove(config_key(ns, key).as_slice())
+            .get(config_key(ns, key).as_slice())
             .map_err(crate::error::redb)?
             .is_some();
-        if !removed {
+        if !held {
             return Ok(());
         }
-        if let Some(pinned) = pinned_content(key)? {
-            crate::referrers::release(self, txn, &pinned, &crate::referrers::Referrer::pin(ns))?;
+        self.apply_meta_in_txn(txn, ns, key, None, now, meter)
+    }
+}
+
+/// The alias history events a record change makes, derived from the record
+/// held before it (`None`: the creation) and the one after: a creation, a
+/// deletion, an ownership transfer, a rename (the alias that left, under
+/// the record's new name), and each alias added otherwise. Each is
+/// `(alias, actor, detail)`.
+fn history_events(
+    held: Option<&NamespaceInfo>,
+    info: &NamespaceInfo,
+) -> Vec<(String, String, HistoryDetail)> {
+    let protocol_of = |alias: &kappa_store::traits::namespace::NamespaceAlias| {
+        alias.protocol.as_ref().map(|p| p.as_str().to_string())
+    };
+    let Some(held) = held else {
+        return vec![(
+            info.name.clone(),
+            info.owner_anchor
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            HistoryDetail::Create {
+                protocol: info.protocol.as_ref().map(|p| p.as_str().to_string()),
+            },
+        )];
+    };
+    if info.tombstoned && !held.tombstoned {
+        return vec![(held.name.clone(), String::new(), HistoryDetail::None)];
+    }
+    let mut events = Vec::new();
+    if info.owner_anchor != held.owner_anchor {
+        events.push((
+            info.name.clone(),
+            String::new(),
+            HistoryDetail::Transfer {
+                old_owner: held
+                    .owner_anchor
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                new_owner: info
+                    .owner_anchor
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            },
+        ));
+    }
+    let renamed = info.name != held.name;
+    if renamed {
+        let old_name = held
+            .aliases
+            .iter()
+            .find(|alias| !info.aliases.contains(alias))
+            .map_or_else(|| held.name.clone(), |old| old.name.clone());
+        events.push((
+            info.name.clone(),
+            String::new(),
+            HistoryDetail::Rename { old_name },
+        ));
+    }
+    for added in info
+        .aliases
+        .iter()
+        .filter(|alias| !held.aliases.contains(alias) && !(renamed && alias.name == info.name))
+    {
+        events.push((
+            added.name.clone(),
+            String::new(),
+            HistoryDetail::AddAlias {
+                protocol: protocol_of(added),
+            },
+        ));
+    }
+    events
+}
+
+impl TxnWriter<'_> {
+    /// Hold `info` as the namespace's record and append the alias history
+    /// events the change makes (`history_events`), at this writer's time.
+    pub(crate) fn apply_namespace_record(&self, info: &NamespaceInfo) -> Result<(), StoreError> {
+        if info.ns.id() != self.ns.id() {
+            return Err(StoreError::Internal(
+                "namespace record names another namespace".into(),
+            ));
         }
-        self.record_metadata_in_txn(txn, ns, key, None, now)
+        let held = kappa_store::absent(PersistentStore::namespace_info_in_txn(self.txn, self.ns))?;
+        self.txn
+            .open_table(NAMESPACE_RECORDS)
+            .map_err(crate::error::redb)?
+            .insert(self.ns.id().as_slice(), canonical_bytes(info).as_slice())
+            .map_err(crate::error::redb)?;
+        for (alias, actor, detail) in history_events(held.as_ref(), info) {
+            append_history(
+                self.txn,
+                self.ns.id(),
+                &alias,
+                &actor,
+                self.now.as_i64(),
+                detail,
+            )?;
+        }
+        Ok(())
     }
 
-    pub(super) fn write_namespace_record(
-        txn: &redb::WriteTransaction,
-        uuid: &[u8; 16],
-        record: &NamespaceInfo,
+    /// Hold `value` under the namespace metadata `key`, or remove the key.
+    /// A pin key establishes its content reference when first set and
+    /// releases it when removed; a renewal replaces the value and keeps
+    /// the reference.
+    pub(crate) fn apply_namespace_meta(
+        &self,
+        key: &str,
+        value: Option<&[u8]>,
     ) -> Result<(), StoreError> {
-        let bytes = canonical_bytes(record);
-        txn.open_table(NAMESPACE_RECORDS)
-            .map_err(crate::error::redb)?
-            .insert(uuid.as_slice(), bytes.as_slice())
+        let (store, txn, ns) = (self.store, self.txn, self.ns);
+        let ck = config_key(ns, key);
+        let mut table = txn
+            .open_table(NAMESPACE_CONFIG)
             .map_err(crate::error::redb)?;
+        let pinned = pinned_content(key)?;
+        match value {
+            Some(value) => {
+                let stored = store.encrypt_bytes(&super::namespace::config_context(&ck), value)?;
+                let replaced = table
+                    .insert(ck.as_slice(), stored.as_slice())
+                    .map_err(crate::error::redb)?
+                    .is_some();
+                drop(table);
+                if let Some(pinned) = pinned
+                    && !replaced
+                {
+                    crate::referrers::establish(
+                        store,
+                        txn,
+                        ns,
+                        &pinned,
+                        &crate::referrers::Referrer::pin(ns),
+                    )?;
+                }
+            }
+            None => {
+                let removed = table
+                    .remove(ck.as_slice())
+                    .map_err(crate::error::redb)?
+                    .is_some();
+                drop(table);
+                if !removed {
+                    return Err(StoreError::Internal(format!(
+                        "metadata deletion names {key}, which the namespace does not hold"
+                    )));
+                }
+                if let Some(pinned) = pinned {
+                    crate::referrers::release(
+                        store,
+                        txn,
+                        ns,
+                        &pinned,
+                        &crate::referrers::Referrer::pin(ns),
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -304,8 +387,14 @@ pub fn namespace_record_in(
         .get(ns.id().as_slice())
         .map_err(crate::error::redb)?
         .ok_or_else(|| StoreError::NotFound(format!("namespace: {ns}")))?;
-    let info = super::namespace::parse_record(record.value())?;
-    if info.ns.id() != ns.id() {
+    namespace_record_of(record.value(), ns.id())
+}
+
+/// The record `bytes` holds, which must be the record of namespace `id`:
+/// the one decode of a stored namespace record, for a row already read.
+pub fn namespace_record_of(bytes: &[u8], id: &[u8; 16]) -> Result<NamespaceInfo, StoreError> {
+    let info = super::namespace::parse_record(bytes)?;
+    if info.ns.id() != id {
         return Err(StoreError::Rejected(
             "namespace record identity mismatch".into(),
         ));

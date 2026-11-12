@@ -4,15 +4,14 @@
 //! what it reserved is committed or removed against its committed record
 //! once its outcome is known (`namespace_directory_journal`).
 
-use kappa_store::{
-    ClockMs, NamespaceRef, StoreError, namespace::ProtocolId, page::MAX_ALIASES_PER_NAMESPACE,
-};
+use kappa_store::traits::namespace::NamespaceAlias;
+use kappa_store::work::Meter;
+use kappa_store::{ClockMs, NamespaceRef, StoreError, namespace::ProtocolId};
 use redb::ReadableTable;
 
-use super::journal::{clear_journal, entry_owner, journal, reserved};
-use crate::namespace::{
-    HistoryDetail, alias_key, append_history, ensure_alias_available, names_key,
-};
+use super::journal::{entry_owner, journal, reserved};
+use crate::error::CommitFailure;
+use crate::namespace::{alias_key, ensure_alias_available, names_key};
 use crate::{
     PersistentStore,
     tables::{NAMESPACE_ALIASES, NAMESPACE_NAMES, NAMESPACES},
@@ -21,8 +20,7 @@ use crate::{
 impl PersistentStore {
     /// Whether the directory holds `ns`: a settled record or a live claim.
     pub(crate) fn directory_knows(&self, ns: &NamespaceRef) -> Result<bool, StoreError> {
-        use redb::ReadableDatabase;
-        let txn = self.registry.begin_read().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_read()?;
         Ok(txn
             .open_table(NAMESPACES)
             .map_err(crate::error::redb)?
@@ -49,7 +47,7 @@ impl PersistentStore {
             .instance;
         self.mark_unsettled(&instance)?;
         let key = alias_key(name, protocol);
-        let txn = self.registry.begin_write().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_write()?;
         {
             let mut aliases = txn
                 .open_table(NAMESPACE_ALIASES)
@@ -79,38 +77,15 @@ impl PersistentStore {
                 }
             }
         }
-        journal(&txn, uuid, Some(&key))?;
-        txn.commit().map_err(crate::error::redb)
-    }
-
-    /// Release every directory claim `uuid` holds, committed or reserved,
-    /// with its journal: the claim of a creation proven never to have
-    /// committed. The namespace's settled record is projection state,
-    /// changed only by settlement (`projection`): a creation that never
-    /// committed has none.
-    pub(crate) fn release_directory_claim(&self, uuid: &[u8; 16]) -> Result<(), StoreError> {
-        let txn = self.registry.begin_write().map_err(crate::error::redb)?;
-        {
-            let mut aliases = txn
-                .open_table(NAMESPACE_ALIASES)
-                .map_err(crate::error::redb)?;
-            let mut names = txn
-                .open_table(NAMESPACE_NAMES)
-                .map_err(crate::error::redb)?;
-            let ns = crate::storage::NamespaceStorage::namespace_ref(*uuid);
-            for key in owned_index_keys(&aliases, &ns)? {
-                aliases.remove(key.as_str()).map_err(crate::error::redb)?;
-            }
-            for key in owned_index_keys(&names, &ns)? {
-                names.remove(key.as_str()).map_err(crate::error::redb)?;
-            }
-            txn.open_table(NAMESPACES)
-                .map_err(crate::error::redb)?
-                .remove(uuid.as_slice())
-                .map_err(crate::error::redb)?;
+        journal(&txn, uuid, &key)?;
+        match txn.commit() {
+            Ok(()) => Ok(()),
+            // The instance was marked pending first: a reservation and its
+            // journal that persisted are resolved against the committed
+            // record by settlement at the head, and resolve to nothing
+            // meanwhile.
+            Err(CommitFailure::Known(error) | CommitFailure::Unknown(error)) => Err(error),
         }
-        clear_journal(&txn, uuid)?;
-        txn.commit().map_err(crate::error::redb)
     }
 
     /// Reserve the rename of the committed alias `old_name` within
@@ -129,8 +104,7 @@ impl PersistentStore {
         let old_key = alias_key(old_name, protocol);
         let new_key = alias_key(new_name, protocol);
         let uuid = {
-            use redb::ReadableDatabase;
-            let read = self.registry.begin_read().map_err(crate::error::redb)?;
+            let read = self.registry.begin_read()?;
             let aliases = read
                 .open_table(NAMESPACE_ALIASES)
                 .map_err(crate::error::redb)?;
@@ -154,7 +128,7 @@ impl PersistentStore {
             .controller(&crate::storage::NamespaceStorage::namespace_ref(uuid))?
             .instance;
         self.mark_unsettled(&instance)?;
-        let registry = self.registry.begin_write().map_err(crate::error::redb)?;
+        let registry = self.registry.begin_write()?;
         {
             let mut aliases = registry
                 .open_table(NAMESPACE_ALIASES)
@@ -185,10 +159,15 @@ impl PersistentStore {
                 .insert(names_key(new_name, protocol).as_str(), value.as_slice())
                 .map_err(crate::error::redb)?;
         }
-        journal(&registry, &uuid, Some(&new_key))?;
-        journal(&registry, &uuid, Some(&old_key))?;
-        registry.commit().map_err(crate::error::redb)?;
-        Ok(uuid)
+        journal(&registry, &uuid, &new_key)?;
+        journal(&registry, &uuid, &old_key)?;
+        match registry.commit() {
+            Ok(()) => Ok(uuid),
+            // The instance was marked pending first: a reservation and its
+            // journal that persisted are resolved against the committed
+            // record by settlement at the head.
+            Err(CommitFailure::Known(error) | CommitFailure::Unknown(error)) => Err(error),
+        }
     }
 
     /// Rename the alias `old_name` within `protocol`: the registry reserves
@@ -204,37 +183,22 @@ impl PersistentStore {
         protocol: Option<&ProtocolId>,
         expected: Option<&[u8; 16]>,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<NamespaceRef, StoreError> {
         let uuid = self.reserve_rename(old_name, new_name, protocol, expected)?;
         let ns = NamespaceRef::resolved(uuid, new_name.to_string(), protocol.cloned());
         let mut record = Self::namespace_info_in_txn(txn, &ns)?;
-        if record.tombstoned {
-            return Err(StoreError::Rejected(
-                "cannot rename a deleted namespace".into(),
-            ));
-        }
-        record.aliases.retain(|alias| alias != old_name);
-        if !record.aliases.iter().any(|alias| alias == new_name) {
-            record.aliases.push(new_name.to_string());
-        }
-        record.name = new_name.to_string();
-        Self::write_namespace_record(txn, &uuid, &record)?;
-        append_history(
-            txn,
-            &uuid,
-            new_name,
-            "",
-            now.as_i64(),
-            HistoryDetail::Rename {
-                old_name: old_name.to_string(),
-            },
+        record.rename_alias(
+            &NamespaceAlias::new(old_name, protocol),
+            NamespaceAlias::new(new_name, protocol),
         )?;
-        self.record_namespace_in_txn(txn, &ns, now)?;
+        self.record_namespace_in_txn(txn, &ns, &record, now, meter)?;
         Ok(ns)
     }
 
-    /// Add an alias to `ns`, enforcing `MAX_ALIASES_PER_NAMESPACE` against
-    /// the record observed inside this transaction.
+    /// Add an alias to `ns` under the shared record rule
+    /// (`NamespaceInfo::add_alias`), against the record observed inside
+    /// this transaction.
     pub(crate) fn namespace_add_alias_in_txn(
         &self,
         txn: &redb::WriteTransaction,
@@ -242,51 +206,12 @@ impl PersistentStore {
         alias: &str,
         protocol: Option<&ProtocolId>,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         let uuid = *ns.id();
         let mut record = Self::namespace_info_in_txn(txn, ns)?;
-        if record.tombstoned {
-            return Err(StoreError::Rejected(
-                "cannot alias a deleted namespace".into(),
-            ));
-        }
-        if record.aliases.len() >= MAX_ALIASES_PER_NAMESPACE {
-            return Err(StoreError::Rejected(format!(
-                "namespace has {} aliases, max {MAX_ALIASES_PER_NAMESPACE}",
-                record.aliases.len()
-            )));
-        }
+        record.add_alias(NamespaceAlias::new(alias, protocol))?;
         self.claim_alias(&uuid, alias, protocol, false)?;
-        if !record.aliases.iter().any(|existing| existing == alias) {
-            record.aliases.push(alias.to_string());
-        }
-        Self::write_namespace_record(txn, &uuid, &record)?;
-        append_history(
-            txn,
-            &uuid,
-            alias,
-            "",
-            now.as_i64(),
-            HistoryDetail::AddAlias {
-                protocol: protocol.map(|p| p.as_str().to_string()),
-            },
-        )?;
-        self.record_namespace_in_txn(txn, ns, now)
+        self.record_namespace_in_txn(txn, ns, &record, now, meter)
     }
-}
-
-/// The keys of `table` whose entry `ns` holds, committed or reserved.
-pub(super) fn owned_index_keys(
-    table: &impl ReadableTable<&'static str, &'static [u8]>,
-    ns: &NamespaceRef,
-) -> Result<Vec<String>, StoreError> {
-    let mut keys = Vec::new();
-    for entry in table.iter().map_err(crate::error::redb)? {
-        let (key, owner) = entry.map_err(crate::error::redb)?;
-        let (uuid, _) = entry_owner(owner.value())?;
-        if uuid == *ns.id() {
-            keys.push(key.value().to_owned());
-        }
-    }
-    Ok(keys)
 }

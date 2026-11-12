@@ -251,6 +251,11 @@ fn failure(cx: &Cx, error: &RotationError) -> HandlerError {
             "ROTATION_UNRESOLVED",
             "Whether the rotation committed is unknown. The node signs nothing until it restarts; on restart it selects whichever authority the store committed and keeps both keys until then. Do not request another rotation: restart the node, then read GET /_node/authority to learn which authority is current.".to_owned(),
         ),
+        RotationError::Retained(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ROTATION_RETAINED",
+            "The rotation's governing epoch is retained unpublished: its signing coordinate is consumed, and resolving it either publishes it and installs the incoming authority or finds it terminal. The node signs nothing until then and keeps both keys. Do not request another rotation: read GET /_node/authority to learn which authority is current.".to_owned(),
+        ),
         RotationError::Diverged { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "AUTHORITY_DIVERGED",

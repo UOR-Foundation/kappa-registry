@@ -3,7 +3,8 @@
 //! An execution holds its namespace's controller active and its database
 //! writer for its whole life; executions of different namespaces proceed
 //! concurrently. Admission is refused while the namespace is fenced (a
-//! commit outcome is unknown until recovery) and while it has no admitted
+//! commit outcome is unknown until recovery), while it holds custody of a
+//! retained publication (`custody`), and while it has no admitted
 //! control-plane assignment: a namespace nobody decides for publishes
 //! nothing.
 
@@ -14,9 +15,10 @@ use kappa_store::{
     ClockMs, EpochRoot, Execution, Kappa, NamespaceRef, OperationAdmission, StoreError,
 };
 
-use super::{Creation, EpochExecution, ExecutionOwnership, PreparedEpochPublication};
+use super::{Creation, EpochExecution};
 use crate::PersistentStore;
 use crate::namespace_write::DirectoryGuard;
+use crate::registry::Standing;
 use crate::settlement::ReleaseGrant;
 use crate::storage::{Active, Opening, Publish, WriterGate};
 
@@ -25,6 +27,15 @@ use crate::storage::{Active, Opening, Publish, WriterGate};
 mod race_tests;
 
 impl kappa_store::ExecutionStore for PersistentStore {
+    fn resolve_publication(
+        &self,
+        namespace: &NamespaceRef,
+        clock: &dyn Clock,
+        meter: &mut kappa_store::work::WorkMeter,
+    ) -> Result<kappa_store::PublicationResolution, StoreError> {
+        self.resolve_retained_publication(namespace, clock, meter)
+    }
+
     fn resolve_operation(
         &self,
         namespace: &NamespaceRef,
@@ -101,14 +112,17 @@ impl PersistentStore {
                 .transaction
                 .open_table(crate::tables::BLOB_INDEX)
                 .map_err(crate::error::redb)?;
-            self.operation_from_tables(
-                execution.controller(),
-                &operations,
-                &blobs,
-                namespace,
-                &identity,
-                &request,
-            )?
+            execution.lend(|meter| {
+                self.operation_from_tables(
+                    execution.controller(),
+                    &operations,
+                    &blobs,
+                    namespace,
+                    &identity,
+                    &request,
+                    meter,
+                )
+            })?
         };
         if let Some((epoch, receipt)) = outcome {
             execution.abort()?;
@@ -239,6 +253,17 @@ impl PersistentStore {
                 "publication requires recovery after a failed commit".into(),
             ));
         }
+        // The execution's one allowance: custody check, writes, publication.
+        let mut meter = kappa_store::work::WorkMeter::new(self.publication_work);
+        // A retained publication holds the instance's next coordinate: no
+        // other epoch is admitted until resolution publishes it
+        // (`ExecutionStore::resolve_publication`). Read under the gate, the
+        // one exclusion custody is written under.
+        if let Some(record) = self.load_custody(&controller.instance, &mut meter)? {
+            return Err(StoreError::PublicationRetained(Box::new(
+                record.retained()?,
+            )));
+        }
         // A committed reassignment this controller could not install
         // leaves its authority stale: refresh from the admitted record
         // under the gate, or admit nothing.
@@ -249,24 +274,48 @@ impl PersistentStore {
         // authority; a namespace being created serves under its creation
         // plane for exactly the epoch that admits one.
         controller.plane()?;
-        self.recover_namespace_head(&controller)?;
-        // The per-namespace backlog is the durable distance from the
-        // settlement checkpoint to the head, not the pins this process
-        // happens to hold: it is the same before and after a restart.
-        let backlog = self.unsettled_backlog(&controller)?;
-        if backlog >= self.max_unsettled_epochs as u64 {
-            return Err(StoreError::CapacityExceeded(format!(
-                "namespace {namespace} has {backlog} unsettled epochs; settlement must catch up"
-            )));
-        }
+        self.recover_namespace_head(&controller, &mut meter)?;
         // An instance holding a recovery obligation has pre-restart
         // unsettled ownership recovery has not settled; it publishes
         // nothing more until settlement discharges the obligation, so its
-        // head stays where recovery captured it.
+        // head stays where recovery captured it. Refused before any
+        // pressure work: recovery owns that ownership.
         if self.obligation_held(&controller.instance) {
             return Err(StoreError::CapacityExceeded(format!(
                 "namespace {namespace} holds a recovery obligation; settlement must reach its head"
             )));
+        }
+        // The per-namespace backlog is the durable distance from the
+        // settlement checkpoint to the head, not the pins this process
+        // happens to hold: it is the same before and after a restart. At
+        // the ceiling this admission settles its own namespace in one
+        // bounded attempt that waits on nothing held elsewhere, then
+        // decides again; the gate it holds keeps the room it makes.
+        if self.unsettled_backlog(&controller)? >= self.max_unsettled_epochs as u64 {
+            // The attempt draws on the execution's own allowance, through a
+            // share capped at one recovery step (`WorkMeter::scope`): what
+            // it consumes is the execution's, and no second allowance
+            // exists inside the admission.
+            let progress = {
+                let mut work = meter.scope(&self.step_limit);
+                self.relieve_epoch_pressure(&controller, &mut work)?
+            };
+            let backlog = self.unsettled_backlog(&controller)?;
+            if backlog >= self.max_unsettled_epochs as u64 {
+                // Only a reopen recovers a registry whose commit outcome is
+                // unknown: that is not backpressure a retry can outlast.
+                if progress.requires_reopen() {
+                    return Standing::RecoveryRequired.or_unavailable();
+                }
+                return Err(StoreError::CapacityExceeded(format!(
+                    "namespace {namespace} has {backlog} unsettled epochs; {progress}"
+                )));
+            }
+            // A settled reassignment may have left the authority stale.
+            if controller.assignment_is_stale() {
+                self.install_assignment(&controller)?;
+            }
+            controller.plane()?;
         }
         let transaction = controller.db.begin_write().map_err(crate::error::redb)?;
         // Pins parked by a previous transaction that never sealed belong to
@@ -285,8 +334,9 @@ impl PersistentStore {
             .map_err(|_| StoreError::Internal("installed row set poisoned".into()))?
             .clear();
         let now = clock.now()?;
-        // MUTATION_BUFFER is written only by record_mutation_in_txn inside a
-        // write transaction that seal_epoch_in_txn drains before commit, so a
+        // MUTATION_BUFFER is written only by the transition boundary
+        // (`TxnWriter::apply`) inside a write transaction that
+        // epoch_seal drains before commit, so a
         // committed entry for this namespace is never produced by a
         // well-formed publication. It is corruption or residue; admitting
         // over it would seal those foreign mutations into this epoch.
@@ -322,17 +372,20 @@ impl PersistentStore {
             creation,
             now,
             signer_override: signer_override.cloned(),
+            clock: clock.retain(),
             failed: Cell::new(false),
             operation: None,
             deadline: None,
-            content_pins: Vec::new(),
+            meter: std::cell::RefCell::new(meter),
             authorization_reads: std::cell::RefCell::new(Vec::new()),
         })
     }
 
-    /// Committed epochs of `controller`'s namespace past its settlement
-    /// checkpoint. Read under the writer gate after head recovery, so the
-    /// controller's epoch number is the head and no commit moves it.
+    /// Committed epochs of `controller`'s namespace past a checkpoint known
+    /// committed (`admissible_checkpoint`): never fewer than the backlog,
+    /// so an uncertain checkpoint never admits more. Read under the writer
+    /// gate after head recovery, so the controller's epoch number is the
+    /// head and no commit moves it.
     fn unsettled_backlog(
         &self,
         controller: &crate::storage::NamespaceController,
@@ -340,48 +393,7 @@ impl PersistentStore {
         let head = controller
             .epoch_number
             .load(std::sync::atomic::Ordering::Acquire);
-        let checkpoint = self
-            .settled_epoch(&controller.instance)?
-            .map_or(0, |(number, _)| number);
-        Ok(head.saturating_sub(checkpoint))
-    }
-
-    pub(crate) fn prepare_epoch_transaction<'s>(
-        &'s self,
-        ownership: ExecutionOwnership<'s>,
-        transaction: redb::WriteTransaction,
-        namespace: &NamespaceRef,
-        creation: Creation,
-        now: ClockMs,
-        signer_override: Option<&Kappa>,
-    ) -> Result<PreparedEpochPublication<'s>, StoreError> {
-        let controller = std::sync::Arc::clone(ownership.active.controller());
-        self.admit_creation_assignment(&transaction, &controller, namespace, creation, now)?;
-        let sealed =
-            self.seal_epoch_in_txn(&transaction, &controller, namespace, now, signer_override)?;
-        let mut content_pins = sealed.pins;
-        {
-            let mut parked = controller
-                .writer_pins
-                .lock()
-                .map_err(|_| StoreError::Internal("writer pin set poisoned".into()))?;
-            content_pins.append(&mut parked);
-        }
-        Ok(PreparedEpochPublication {
-            store: self,
-            transaction,
-            directory: ownership.directory,
-            writer: ownership.writer,
-            active: ownership.active,
-            release: ownership.release,
-            namespace: namespace.clone(),
-            root: sealed.root,
-            predecessor: sealed.predecessor,
-            assigns: sealed.assigns,
-            now,
-            deadline: None,
-            content_pins,
-        })
+        Ok(head.saturating_sub(self.admissible_checkpoint(controller)?))
     }
 
     /// A namespace whose database admits no assignment is being created,
@@ -392,14 +404,16 @@ impl PersistentStore {
     /// is always a recorded fact of the namespace, never inferred from
     /// absence; it is refused when the storage is being created under
     /// another plane, whose creation must admit that plane itself. A
-    /// [`Creation::Explicit`] creation that wrote none is refused.
-    fn admit_creation_assignment(
+    /// [`Creation::Explicit`] creation that wrote none is refused. Called by
+    /// the seal (`prepare_epoch_transaction`), on the execution's allowance.
+    pub(super) fn admit_creation_assignment(
         &self,
         transaction: &redb::WriteTransaction,
         controller: &crate::storage::NamespaceController,
         namespace: &NamespaceRef,
         creation: Creation,
         now: ClockMs,
+        meter: &mut dyn kappa_store::work::Meter,
     ) -> Result<(), StoreError> {
         if self.namespaces.admitted_assignment(controller)?.is_some() {
             return Ok(());
@@ -436,6 +450,7 @@ impl PersistentStore {
             crate::control_plane::ASSIGNMENT_KEY,
             &kappa_store::canonical::canonical_bytes(&record),
             now,
+            meter,
         )
     }
 

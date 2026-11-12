@@ -1,10 +1,11 @@
-use redb::{ReadableDatabase, ReadableTable};
+use redb::ReadableTable;
 
 use kappa_store::canonical::{canonical_bytes, from_canonical};
 use kappa_store::error::StoreError;
 use kappa_store::namespace::{NamespaceRef, ProtocolId};
 use kappa_store::page::{NamespaceFilter, Page, PageRequest};
 use kappa_store::traits::namespace::{NamespaceInfo, NamespaceStore};
+use kappa_store::work::Meter;
 
 use crate::PersistentStore;
 use crate::projection::{Family, ProjectionRead};
@@ -23,22 +24,15 @@ pub(super) fn names_key(name: &str, protocol: Option<&ProtocolId>) -> String {
     )
 }
 
-/// The name an [`alias_key`] holds and the [`names_key`] of the same
-/// entry: an alias key is `{protocol}\0{name}`, the empty protocol being
-/// the global scope that a names key writes as `_`.
-pub(super) fn split_alias_key(key: &str) -> Result<(&str, String), StoreError> {
-    let (protocol, name) = key
+/// The [`names_key`] of the entry an [`alias_key`] names: an alias key is
+/// `{protocol}\0{name}`, the empty protocol being the global scope that a
+/// names key writes as `_`.
+pub(super) fn names_key_of(alias_key: &str) -> Result<String, StoreError> {
+    let (protocol, name) = alias_key
         .split_once('\0')
-        .ok_or_else(|| StoreError::Internal(format!("alias key {key:?} names no scope")))?;
+        .ok_or_else(|| StoreError::Internal(format!("alias key {alias_key:?} names no scope")))?;
     let scope = if protocol.is_empty() { "_" } else { protocol };
-    Ok((name, format!("{name}\0{scope}")))
-}
-
-/// The name a [`names_key`] holds.
-pub(super) fn names_key_name(key: &str) -> Result<&str, StoreError> {
-    key.split_once('\0')
-        .map(|(name, _)| name)
-        .ok_or_else(|| StoreError::Internal(format!("names key {key:?} names no scope")))
+    Ok(format!("{name}\0{scope}"))
 }
 
 /// Binary config key: `[ns_uuid:16][key_bytes]`.
@@ -67,13 +61,15 @@ pub(super) fn parse_record(data: &[u8]) -> Result<NamespaceInfo, StoreError> {
     from_canonical(data).map_err(|e| StoreError::Internal(format!("namespace record decode: {e}")))
 }
 
-/// The completed directory record of namespace `uuid`: of its instances,
-/// the one completed last holds the namespace's current record.
+/// The completed directory record of namespace `uuid`, read on `work`: of
+/// its instances, the one completed last holds the namespace's current
+/// record.
 fn completed_record(
     read: &ProjectionRead,
     uuid: &[u8; 16],
+    work: &mut dyn Meter,
 ) -> Result<Option<NamespaceInfo>, StoreError> {
-    read.get(Family::NamespaceRecord, uuid)?
+    read.get(Family::NamespaceRecord, uuid, work)?
         .into_iter()
         .max_by_key(|visible| visible.completion)
         .map(|visible| parse_record(&visible.value))
@@ -81,14 +77,16 @@ fn completed_record(
 }
 
 impl PersistentStore {
-    /// The record of `ns` as settlement last projected it: the evidence of
-    /// a namespace whose storage is gone (a lost instance's release). Lags
-    /// every commit; a namespace with storage is read by `namespace_info`.
+    /// The record of `ns` as settlement last projected it, read on `work`:
+    /// the evidence of a namespace whose storage is gone (a lost instance's
+    /// release). Lags every commit; a namespace with storage is read by
+    /// `namespace_info`. A refusal is never absence.
     pub(crate) fn settled_namespace_info(
         &self,
         ns: &NamespaceRef,
+        work: &mut dyn Meter,
     ) -> Result<NamespaceInfo, StoreError> {
-        completed_record(&self.projection()?, ns.id())?
+        completed_record(&self.projection()?, ns.id(), work)?
             .ok_or_else(|| StoreError::NotFound(format!("namespace: {ns}")))
     }
 
@@ -238,7 +236,7 @@ impl PersistentStore {
         protocol: Option<&ProtocolId>,
     ) -> Result<Option<[u8; 16]>, StoreError> {
         let key = alias_key(path, protocol);
-        let txn = self.registry.begin_read().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_read()?;
         let table = txn
             .open_table(NAMESPACE_ALIASES)
             .map_err(crate::error::redb)?;
@@ -292,7 +290,7 @@ impl NamespaceStore for PersistentStore {
         // Names come from the registry's directory; each record from its
         // namespace's own committed state, so a creation is listed as soon
         // as it is published.
-        let read = self.registry.begin_read().map_err(crate::error::redb)?;
+        let read = self.registry.begin_read()?;
         let names_table = read
             .open_table(NAMESPACE_NAMES)
             .map_err(crate::error::redb)?;

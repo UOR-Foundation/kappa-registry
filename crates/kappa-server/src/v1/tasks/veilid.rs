@@ -5,14 +5,27 @@
 
 use std::sync::Arc;
 
+use kappa_store::kappa::Kappa;
 use kappa_store::namespace::NamespaceRef;
 use kappa_store::time::Clock;
 use kappa_store::traits::KappaStore;
 use kappa_store::{StoreError, publish_if_changed};
 use kappa_transport_veilid::dispatch;
 use kappa_transport_veilid::node::KappaNode;
-use kappa_transport_veilid::reconcile::{PeerEntry, PeerSource, ReconcileLoop};
+use kappa_transport_veilid::reconcile::{
+    PeerInfo, PeerSource, ReconcileLoop, VeilidReconcileTransport,
+};
 use kappa_transport_veilid::{RecordSchema, Transport};
+
+/// The algorithm label under which a Veilid node key derives its identity
+/// anchor (`Kappa::from_key`): deterministic across nodes, so two
+/// registries name the same peer by the same identity.
+const VEILID_KEY_ALGORITHM: &str = "veilid";
+
+/// The identity anchor of a Veilid node key.
+fn peer_identity(key: &str) -> Result<Kappa, kappa_store::kappa::KappaParseError> {
+    Kappa::from_key(VEILID_KEY_ALGORITHM, key.as_bytes())
+}
 
 const DHT_META_RECORD_KEY: &str = "_veilid/dht_record_key";
 const DHT_META_WRITER_BYTES: &str = "_veilid/dht_writer_bytes";
@@ -56,14 +69,24 @@ struct RegistryPeerSource {
 }
 
 impl PeerSource for RegistryPeerSource {
-    fn peers(&self) -> Vec<PeerEntry> {
+    fn peers(&self) -> Vec<PeerInfo> {
         let registry = self.node.peers();
         let reg = registry.read();
         reg.snapshot()
             .into_iter()
-            .map(|snap| PeerEntry {
-                id: snap.key,
-                healthy: snap.has_route && !snap.circuit_open,
+            .filter_map(|snap| match peer_identity(&snap.key) {
+                Ok(id) => Some(PeerInfo {
+                    id,
+                    healthy: snap.has_route && !snap.circuit_open,
+                    address: snap.key,
+                }),
+                Err(error) => {
+                    // A key longer than the framing admits cannot be a
+                    // peer identity; the peer is not reconciled with and
+                    // the reason is logged, never a silent skip.
+                    tracing::warn!(key_len = snap.key.len(), %error, "peer key is not a valid identity");
+                    None
+                }
             })
             .collect()
     }
@@ -160,16 +183,23 @@ where
 
     // Spawn reconciliation loop with periodic tick and watch-driven trigger
     let (reconcile_shutdown_tx, reconcile_shutdown_rx) = tokio::sync::mpsc::channel(1);
-    let transport = kappa_node.transport().clone();
+    let transport = Arc::new(VeilidReconcileTransport::new(
+        kappa_node.transport().clone(),
+    ));
     let peer_source: Arc<dyn PeerSource> = Arc::new(RegistryPeerSource {
         node: kappa_node.node_arc(),
     });
+    let self_identity = peer_identity(&self_id).map_err(|error| {
+        kappa_transport_veilid::error::TransportError::Internal(format!(
+            "node key is not a valid identity: {error}"
+        ))
+    })?;
 
     let reconcile = Arc::new(ReconcileLoop::new(
         transport,
         store,
         clock,
-        self_id,
+        self_identity,
         reconcile_interval_secs,
     ));
 

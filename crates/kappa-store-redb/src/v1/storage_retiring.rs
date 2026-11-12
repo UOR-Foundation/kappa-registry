@@ -48,6 +48,17 @@ impl From<StoreError> for Recording {
     }
 }
 
+/// A record whose commit is known not to have happened is refused; one
+/// whose commit outcome is unknown may be durable.
+impl From<crate::error::CommitFailure> for Recording {
+    fn from(failure: crate::error::CommitFailure) -> Self {
+        match failure {
+            crate::error::CommitFailure::Known(error) => Self::Refused(error),
+            crate::error::CommitFailure::Unknown(error) => Self::Unknown(error),
+        }
+    }
+}
+
 impl Recording {
     /// The error, for a caller that does not change state on the outcome.
     pub(crate) fn into_error(self) -> StoreError {

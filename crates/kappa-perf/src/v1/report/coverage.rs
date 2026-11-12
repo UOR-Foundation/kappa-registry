@@ -141,6 +141,7 @@ mod tests {
         let datasets = vec![Dataset {
             name: "floors".into(),
             path: "calibration_floors.jsonl".into(),
+            run: "target".into(),
             points: vec![
                 point(
                     "osc:lat/device.fsync?size=4k",

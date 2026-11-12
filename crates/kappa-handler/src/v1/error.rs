@@ -16,7 +16,15 @@ pub const fn status_for_store_error(err: &StoreError) -> StatusCode {
         }
         StoreError::NotSupported(_) => StatusCode::NOT_IMPLEMENTED,
         // Nothing was published; the operation may be retried.
-        StoreError::DeadlineExceeded { .. } => StatusCode::GATEWAY_TIMEOUT,
+        StoreError::DeadlineExceeded { .. }
+        | StoreError::WorkRefused(kappa_store::work::WorkExhausted::Deadline) => {
+            StatusCode::GATEWAY_TIMEOUT
+        }
+        // The operation's allowance refused its next unit: retryable,
+        // never a statement about the subject.
+        StoreError::WorkRefused(kappa_store::work::WorkExhausted::Limit { .. }) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         // The outcome is unknown until the service recovers its storage;
         // an unavailable subject is undecided, never absent.
         StoreError::Unavailable(_)
@@ -28,9 +36,11 @@ pub const fn status_for_store_error(err: &StoreError) -> StatusCode {
         | StoreError::AuthorityDiverged { .. } => StatusCode::SERVICE_UNAVAILABLE,
         // The node's keys do not include the store's committed authority: a
         // server misconfiguration, not a client error.
-        StoreError::AuthorityMismatch { .. } | StoreError::AuthorityHistoryAbsent { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        // A store whose durable state this build or configuration cannot
+        // open is the same class of server failure.
+        StoreError::AuthorityMismatch { .. }
+        | StoreError::AuthorityHistoryAbsent { .. }
+        | StoreError::UpgradeRequired(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // `Io` and `Internal` are server failures. `StoreError` is
         // non-exhaustive across crates, so variants added later also remain
         // failures at the HTTP boundary until they are mapped here.

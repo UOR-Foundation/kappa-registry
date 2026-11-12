@@ -21,11 +21,10 @@
 
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase};
-
 use kappa_store::{Kappa, StoreError};
 
 use crate::PersistentStore;
+use crate::registry::Registry;
 use crate::storage::{Fence, Recording, RetirementSource};
 use crate::storage_instance::StorageInstance;
 use crate::tables::RETIRED;
@@ -146,28 +145,15 @@ pub fn write_record(
     Ok(())
 }
 
-/// Classify a retirement record's commit: a poisoned transaction was rolled
-/// back and committed nothing; any other failure may have persisted it
-/// (`redb::WriteTransaction::commit`).
-pub fn commit_outcome(result: Result<(), redb::CommitError>) -> Result<(), Recording> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(error @ redb::CommitError::TransactionPoisoned) => {
-            Err(Recording::Refused(crate::error::redb(error)))
-        }
-        Err(error) => Err(Recording::Unknown(crate::error::redb(error))),
-    }
-}
-
 /// The registry's records as the storage layer consults them when it opens
 /// storage.
 pub struct RetirementRecords {
-    pub(crate) registry: Arc<Database>,
+    pub(crate) registry: Arc<Registry>,
 }
 
 impl RetirementSource for RetirementRecords {
     fn fence(&self, instance: &StorageInstance) -> Result<Option<Fence>, StoreError> {
-        let txn = self.registry.begin_read().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_read()?;
         Ok(read_record(&txn, instance)?.map(|record| record.fence()))
     }
 }
@@ -178,19 +164,21 @@ impl PersistentStore {
         &self,
         instance: &StorageInstance,
     ) -> Result<Option<RetirementRecord>, StoreError> {
-        let txn = self.registry.begin_read().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_read()?;
         read_record(&txn, instance)
     }
 
-    /// Commit `record` for `instance` in its own registry transaction.
+    /// Commit `record` for `instance` in its own registry transaction. A
+    /// commit redb rolled back is refused; any other commit failure may
+    /// have persisted the record, and its outcome is unknown.
     pub(crate) fn commit_retirement_record(
         &self,
         instance: &StorageInstance,
         record: &RetirementRecord,
     ) -> Result<(), Recording> {
-        let txn = self.registry.begin_write().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_write()?;
         write_record(&txn, instance, record)?;
-        commit_outcome(txn.commit())
+        Ok(txn.commit()?)
     }
 
     /// Remove the record of `instance`: an intent given up before any
@@ -199,12 +187,21 @@ impl PersistentStore {
         &self,
         instance: &StorageInstance,
     ) -> Result<(), StoreError> {
-        let txn = self.registry.begin_write().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_write()?;
         txn.open_table(RETIRED)
             .map_err(crate::error::redb)?
             .remove(instance.key().as_slice())
             .map_err(crate::error::redb)?;
-        txn.commit().map_err(crate::error::redb)
+        match txn.commit() {
+            Ok(()) => Ok(()),
+            // The slot stays retiring either way. An intent that remains is
+            // resolved again by recovery, which finds no decision for it and
+            // removes it.
+            Err(
+                crate::error::CommitFailure::Known(error)
+                | crate::error::CommitFailure::Unknown(error),
+            ) => Err(error),
+        }
     }
 }
 

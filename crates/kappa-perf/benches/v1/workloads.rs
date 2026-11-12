@@ -27,6 +27,8 @@ mod index_writes;
 mod objects;
 #[path = "workloads/publish.rs"]
 mod publish;
+#[path = "workloads/reconcile.rs"]
+mod reconcile;
 #[path = "workloads/staging.rs"]
 mod staging;
 
@@ -57,6 +59,7 @@ fn run(tier: Tier) -> Result<Summary, Box<dyn std::error::Error>> {
     let fixture = Fixture::new(&device)?;
 
     index::register(&mut criterion, &mut session, tier)?;
+    reconcile::register(&mut criterion, &mut session, tier)?;
     blob_workloads(&mut criterion, &mut session, tier, &clock, &fixture)?;
     staging_workloads(&mut criterion, &mut session, tier, &clock, &fixture)?;
 

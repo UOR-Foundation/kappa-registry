@@ -15,21 +15,15 @@ pub struct MstSnapshotRequest {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MstSnapshotResponse {
     pub namespace: String,
-    /// Page ranges from the responder's MST. Each entry carries the
-    /// start key, end key, and 16-byte page digest. Empty if the
-    /// responder has no tags in this namespace.
+    /// Page ranges from the responder's MST (`MstSnapshot::to_wire`), in
+    /// tree order. Empty if the responder has no tags in this namespace.
     pub page_ranges: Vec<PageRangeWire>,
 }
 
-/// Serializable representation of a single MST page range.
-/// Carries the same data as merkle_search_tree::OwnedPageRange but
-/// with serde derives so it can cross the wire via postcard.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PageRangeWire {
-    pub start: String,
-    pub end: String,
-    pub hash: [u8; 16],
-}
+/// One MST page range on the wire: the start key, end key and 16-byte
+/// page digest. Owned by kappa-reconcile so both ends build and read it
+/// through one snapshot type.
+pub use kappa_reconcile::WirePageRange as PageRangeWire;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct DiffPullRequest {

@@ -124,3 +124,41 @@ impl From<postcard::Error> for TransportError {
         Self::CodecError(format!("postcard: {e}"))
     }
 }
+
+/// The reconciliation seam's error, as this crate classifies it.
+impl From<kappa_reconcile::TransportError> for TransportError {
+    fn from(e: kappa_reconcile::TransportError) -> Self {
+        use kappa_reconcile::TransportError as R;
+        match e {
+            R::ConnectionFailed(s) => Self::ConnectionFailed(s),
+            R::Timeout(s) => Self::Timeout(s),
+            R::PeerNotFound(s) => Self::PeerNotFound(s),
+            R::NotConfigured => Self::NotAttached,
+            R::MessageTooLarge { size, limit } => Self::PayloadTooLarge { size, max: limit },
+            R::Rejected(s) => Self::Internal(format!("peer rejected: {s}")),
+            R::Codec(s) => Self::CodecError(s),
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
+/// This crate's classification, as the reconciliation seam reports it.
+impl From<TransportError> for kappa_reconcile::TransportError {
+    fn from(e: TransportError) -> Self {
+        use kappa_reconcile::TransportError as R;
+        match e {
+            TransportError::NotAttached => R::NotConfigured,
+            TransportError::Timeout(s) => R::Timeout(s),
+            TransportError::TryAgain(s) | TransportError::CircuitOpen(s) => R::ConnectionFailed(s),
+            TransportError::PeerNotFound(s) => R::PeerNotFound(s),
+            TransportError::ConnectionFailed(s) | TransportError::RouteAllocationFailed(s) => {
+                R::ConnectionFailed(s)
+            }
+            TransportError::PayloadTooLarge { size, max } => {
+                R::MessageTooLarge { size, limit: max }
+            }
+            TransportError::DhtError(s) | TransportError::Internal(s) => R::Rejected(s),
+            TransportError::CodecError(s) => R::Codec(s),
+        }
+    }
+}

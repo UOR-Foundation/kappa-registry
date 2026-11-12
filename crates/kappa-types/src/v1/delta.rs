@@ -21,7 +21,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::capacity::{CapacityError, CapacityPool, Reservation};
 
 const BLOCK_SIZE: usize = 16;
 const THRESHOLD_PERCENT: usize = 75;
@@ -64,73 +65,73 @@ pub enum DeltaError {
     BudgetExhausted { requested: usize, available: usize },
 }
 
-/// Bytes every concurrent delta decode may hold at once. Shared by every
+/// Bytes every concurrent delta decode may hold at once.
+///
+/// The process's delta-decode [`CapacityPool`], one typed handle so a
+/// server registers and finds it as its own service. Shared by every
 /// decoder of a process, so admission is accounted across requests.
 #[derive(Debug)]
-pub struct DeltaBudget {
-    limit: usize,
-    used: AtomicUsize,
-}
+pub struct DeltaBudget(Arc<CapacityPool>);
 
 /// Bytes reserved against a [`DeltaBudget`]; released on drop. A decoded
 /// result stays reserved while its holder keeps the reservation.
 #[derive(Debug)]
-pub struct DeltaReservation {
-    budget: Arc<DeltaBudget>,
-    bytes: usize,
+pub struct DeltaReservation(Reservation);
+
+fn usize_amount(amount: u64) -> usize {
+    // Amounts are reserved from `usize` sizes, so they convert back.
+    usize::try_from(amount).unwrap_or(usize::MAX)
+}
+
+fn refused(requested: usize, error: &CapacityError) -> DeltaError {
+    let available = match error {
+        CapacityError::Exhausted { available, .. } => usize_amount(*available),
+        _ => 0,
+    };
+    DeltaError::BudgetExhausted {
+        requested,
+        available,
+    }
 }
 
 impl DeltaBudget {
-    pub const fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            used: AtomicUsize::new(0),
-        }
+    pub fn new(limit: usize) -> Self {
+        Self(Arc::new(CapacityPool::new(
+            "delta decode budget",
+            limit as u64,
+        )))
     }
 
-    pub const fn limit(&self) -> usize {
-        self.limit
+    pub fn limit(&self) -> usize {
+        usize_amount(self.0.limit())
     }
 
     pub fn used(&self) -> usize {
-        self.used.load(Ordering::Acquire)
+        usize_amount(self.0.used())
     }
 
     /// Reserve `bytes`, refusing when the budget cannot hold them.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<DeltaReservation, DeltaError> {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|total| *total <= self.limit)
-            })
-            .map_err(|used| DeltaError::BudgetExhausted {
-                requested: bytes,
-                available: self.limit.saturating_sub(used),
-            })?;
-        Ok(DeltaReservation {
-            budget: Arc::clone(self),
-            bytes,
-        })
+        self.0
+            .reserve(bytes as u64)
+            .map(DeltaReservation)
+            .map_err(|error| refused(bytes, &error))
     }
 }
 
 impl DeltaReservation {
-    pub const fn bytes(&self) -> usize {
-        self.bytes
+    pub fn bytes(&self) -> usize {
+        usize_amount(self.0.amount())
     }
 
     /// Reserve `more` bytes onto this reservation.
     pub fn grow(&mut self, more: usize) -> Result<(), DeltaError> {
-        let added = self.budget.reserve(more)?;
-        self.bytes = self.bytes.saturating_add(added.bytes);
-        // The added reservation's accounting is now carried by `self`.
-        std::mem::forget(added);
-        Ok(())
-    }
-}
-
-impl Drop for DeltaReservation {
-    fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        let added = self
+            .0
+            .pool()
+            .reserve(more as u64)
+            .map_err(|error| refused(more, &error))?;
+        self.0.merge(added).map_err(|error| refused(more, &error))
     }
 }
 

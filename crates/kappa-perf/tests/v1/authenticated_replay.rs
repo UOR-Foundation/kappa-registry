@@ -18,12 +18,18 @@ use kappa_crypto::testing::fixture_authority_from_seed;
 use kappa_handler::clock_at;
 use kappa_store::epoch_publication::{EpochPublication, EpochPublicationInput};
 use kappa_store::epoch_root::EpochRootInput;
+use kappa_store::namespace_commitment::StateInput;
 use kappa_store::{
-    BlobStore, ClockMs, EpochRoot, EpochStore, ExecutionStore, Kappa, NamespaceRef, StoreError,
-    TagStore, TagUpdate, replay_authenticated, replay_to,
+    AuthorityState, BlobStore, ClockMs, EpochRoot, EpochStore, ExecutionStore, Kappa, NamespaceRef,
+    StoreError, TagStore, TagUpdate, replay_authenticated, replay_to,
 };
 use kappa_store_memory::InMemoryStore;
 use kappa_store_memory::test_support::StoreSpec;
+use kappa_types::canonical::canonical_bytes;
+use kappa_types::merkle::StreamingTree;
+use kappa_types::state_index::{self, Node, NodeSource};
+use kappa_types::state_key;
+use kappa_types::work::WorkMeter;
 
 use crate::adversary::Adversary;
 use crate::common::{TestResult, create_ns, memory_store, redb_store};
@@ -67,7 +73,7 @@ impl Keys {
         ns: &NamespaceRef,
         target: u64,
         trusted: &Kappa,
-    ) -> Result<kappa_store::NamespaceState, StoreError> {
+    ) -> Result<kappa_store::ReplayedNamespaceState, StoreError> {
         replay_authenticated(store, ns, target, trusted, &|anchor: &Kappa| {
             self.lookup(anchor)
         })
@@ -259,6 +265,30 @@ fn key_resolution_can_withhold_but_never_substitute_authority() -> TestResult {
     Ok(())
 }
 
+/// A node source holding created index nodes.
+struct ReplayTestNodes(std::collections::BTreeMap<[u8; 32], Node>);
+
+impl ReplayTestNodes {
+    fn new() -> Self {
+        Self(std::collections::BTreeMap::new())
+    }
+
+    fn absorb(&mut self, update: &state_index::Update) {
+        for node in &update.created {
+            self.0.insert(node.hash(), *node);
+        }
+    }
+}
+
+impl NodeSource for ReplayTestNodes {
+    fn node(&self, hash: &[u8; 32]) -> Result<Node, StoreError> {
+        self.0
+            .get(hash)
+            .copied()
+            .ok_or_else(|| StoreError::NotFound(hex::encode(hash)))
+    }
+}
+
 /// A signer cannot publish under an anchor it does not derive. Authority
 /// is coherent by construction, so the attacker's key yields only the
 /// attacker's anchor; and the shared publication policy, which every backend
@@ -271,6 +301,35 @@ fn signer_that_does_not_match_the_anchor_cannot_publish() -> TestResult {
     assert_ne!(keys.attacker.anchor(), node_anchor);
 
     let ns = NamespaceRef::generate("impersonated", ClockMs::from_raw(1000))?;
+    let incarnation = [1; 16];
+    let attacker_authority = AuthorityState::new(
+        *ns.id(),
+        incarnation,
+        Some(keys.attacker.anchor().clone()),
+        ns.display_name().to_owned(),
+        None,
+        false,
+    )?;
+    let auth_bytes = canonical_bytes(&attacker_authority);
+    let (path, value) = state_key::authority_entry(&auth_bytes);
+    let mut nodes = ReplayTestNodes::new();
+    let mut meter = WorkMeter::unbounded();
+    let update = state_index::apply(
+        &nodes,
+        state_index::EMPTY,
+        &[(path, Some(value))],
+        &mut meter,
+    )?;
+    nodes.absorb(&update);
+    let history = StreamingTree::default();
+    let state_input = StateInput {
+        authority: &attacker_authority,
+        index_root: update.root,
+        index: &nodes,
+        predecessor: None,
+        history: &history,
+    };
+
     let mutations = Vec::new();
     let refused = EpochPublication::prepare(
         EpochPublicationInput {
@@ -281,8 +340,10 @@ fn signer_that_does_not_match_the_anchor_cannot_publish() -> TestResult {
             mutations: &mutations,
             now: ClockMs::from_raw(1000),
             signer_override: Some(node_anchor),
+            state: state_input,
         },
         &kappa_store::EpochAuthority::new(keys.attacker)?,
+        &mut meter,
     );
     assert!(
         matches!(refused, Err(StoreError::Conflict(_))),
@@ -368,6 +429,7 @@ fn rebuilt_backdated_chain_passes_structure_and_fails_authentication() -> TestRe
             tag_count: genuine.tag_count(),
             rotation_kappa: genuine.rotation_kappa(),
             ledger_root: genuine.ledger_root(),
+            state: genuine.state(),
         })
         .with_signature(genuine.cose_signature().clone());
         assert_ne!(rebuilt.kappa(), genuine.kappa());

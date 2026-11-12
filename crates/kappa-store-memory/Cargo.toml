@@ -28,9 +28,6 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-zstd = "0.14"
-xz2 = "0.1"
-bzip2 = "0.6"
 kappa-fixture = { workspace = true, optional = true }
 
 [features]
@@ -45,6 +42,9 @@ kappa-crypto = { workspace = true, features = ["test-util"] }
 kappa-handler = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+# Encoder for compressed-leaf fixtures; decoding is
+# `kappa_store::compression`.
+zstd = "0.14"
 
 [lints]
 workspace = true

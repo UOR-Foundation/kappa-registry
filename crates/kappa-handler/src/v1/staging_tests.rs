@@ -282,8 +282,45 @@ fn an_invariant_failure_leaves_the_projection_unresolved() -> Result<(), StoreEr
     Ok(())
 }
 
-/// Deletion records are bounded: past the bound they are dropped and the
-/// projection is unresolved until a rebuild.
+/// Advancing the oldest observer releases only obsolete deletion records.
+#[test]
+fn deletion_records_follow_the_oldest_remaining_observation() {
+    let budget = StagingBudget::new(0, 0);
+    let ns = namespace();
+    let oldest = budget.issue();
+    let first = budget.issue();
+    StagingBudget::apply(&mut budget.lock(), first.seq, &ns, "first", None);
+    let middle = budget.issue();
+    let second = budget.issue();
+    StagingBudget::apply(&mut budget.lock(), second.seq, &ns, "second", None);
+    drop(first);
+    drop(second);
+    assert_eq!(budget.lock().ended.len(), 2);
+    drop(oldest);
+    {
+        let accounts = budget.lock();
+        assert_eq!(accounts.ended.len(), 1);
+        assert!(
+            accounts
+                .ended
+                .contains_key(&(*ns.id(), "second".to_string()))
+        );
+    }
+    // The remaining deletion still prevents this observer's stale head
+    // from resurrecting the resource after the floor advances.
+    StagingBudget::apply(
+        &mut budget.lock(),
+        middle.seq,
+        &ns,
+        "second",
+        Some(&head(ResourcePhase::Open, 10)),
+    );
+    assert_eq!((budget.open_count(), budget.staged_bytes()), (0, 0));
+    drop(middle);
+    assert!(budget.lock().ended.is_empty());
+}
+
+/// Deletion records are bounded even while the oldest observation stalls.
 #[test]
 fn deletion_records_are_bounded() {
     let budget = Arc::new(StagingBudget::new(0, 0));

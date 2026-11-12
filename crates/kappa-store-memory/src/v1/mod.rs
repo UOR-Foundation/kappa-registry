@@ -28,13 +28,16 @@ mod allocation;
 pub mod availability;
 mod blob;
 mod blob_read;
+mod blob_stream;
 mod cache_layout;
 mod claims;
 mod content;
+mod content_apply;
 mod content_install;
 mod dependency;
 mod edge;
 mod epoch;
+mod epoch_read;
 mod execution;
 mod execution_reads;
 mod execution_writes;
@@ -71,15 +74,19 @@ mod tests;
 pub mod test_support;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
+use kappa_store::EpochAuthority;
+use kappa_store::traits::StoreToken;
+use kappa_types::capacity::CapacityPool;
 use kappa_types::error::StoreError;
 use kappa_types::kappa::Kappa;
 use kappa_types::namespace::NamespaceRef;
+use kappa_types::work::{WorkLimit, WorkMeter};
 
 use allocation::AllocationTable;
 use claims::{Claims, Holder};
@@ -103,16 +110,97 @@ pub struct MemoryStoreConfig {
     pub blob_root: PathBuf,
     authority: kappa_crypto::SigningAuthority,
     resource_owner: Option<Arc<dyn Send + Sync>>,
+    maintenance_handles: u64,
+    maintenance_bytes: u64,
+    publication_work: WorkLimit,
+    read_work: WorkLimit,
+    publication_retention: u64,
+    encoding_storage: u64,
+    decoded_storage: u64,
 }
 
+/// Directory handles suspended maintenance may hold open by default: four
+/// full inventory walks of the cache layout.
+pub const DEFAULT_MAINTENANCE_HANDLES: u64 = 4 * (cache_layout::DIRECTORY_DEPTH as u64 + 1);
+/// Bytes of path buffers suspended maintenance may hold by default: four
+/// walks' deferred-path allowances.
+pub const DEFAULT_MAINTENANCE_BYTES: u64 = 4 * maintenance::DEFERRED_PATH_ALLOWANCE;
+
 impl MemoryStoreConfig {
-    /// Configuration with established signing authority.
-    pub const fn new(blob_root: PathBuf, authority: kappa_crypto::SigningAuthority) -> Self {
+    /// Configuration with established signing authority and the bytes of
+    /// publication evidence the store may retain in memory.
+    ///
+    /// `publication_retention` bounds every record a signed root generates
+    /// (its encoding and its edges, held inline with their segment digests
+    /// and rows) from the moment its publication's coordinate is consumed
+    /// until the last view holding the record is dropped. It is required and
+    /// has no default: a store refuses to open without a positive bound
+    /// (`InMemoryStore::new`), and a publication whose retention does not
+    /// fit is refused before its coordinate is consumed.
+    pub const fn new(
+        blob_root: PathBuf,
+        authority: kappa_crypto::SigningAuthority,
+        publication_retention: u64,
+    ) -> Self {
         Self {
             blob_root,
             authority,
             resource_owner: None,
+            maintenance_handles: DEFAULT_MAINTENANCE_HANDLES,
+            maintenance_bytes: DEFAULT_MAINTENANCE_BYTES,
+            publication_work: WorkLimit::unbounded(),
+            read_work: WorkLimit::unbounded(),
+            publication_retention,
+            encoding_storage: kappa_types::canonical::DEFAULT_ENCODING_STORAGE,
+            decoded_storage: kappa_types::canonical::DEFAULT_DECODED_STORAGE,
         }
+    }
+
+    /// Bound the work one read operation may do: evidence examined,
+    /// decoded, allocated and hashed, signatures verified. Every read builds
+    /// one meter at this ceiling where it enters the store
+    /// ([`InMemoryStore::read_meter`]) and threads it through every read it
+    /// nests.
+    #[must_use]
+    pub const fn read_work(mut self, limit: WorkLimit) -> Self {
+        self.read_work = limit;
+        self
+    }
+
+    /// Bound the bytes of canonical encodings the store's operations may
+    /// hold live at once: prepared normalization scratch and encoded records
+    /// awaiting their storage. Positive; default
+    /// `canonical::DEFAULT_ENCODING_STORAGE`.
+    #[must_use]
+    pub const fn encoding_storage(mut self, bytes: u64) -> Self {
+        self.encoding_storage = bytes;
+        self
+    }
+
+    /// Bound decoder arenas and typed values retained by read operations.
+    #[must_use]
+    pub const fn decoded_storage(mut self, bytes: u64) -> Self {
+        self.decoded_storage = bytes;
+        self
+    }
+
+    /// Bound the work one publication's seal may do: index nodes examined,
+    /// ledger and evidence bytes encoded, allocated and hashed, signatures.
+    /// Every publication also carries its execution's deadline as the
+    /// admission deadline of that work.
+    #[must_use]
+    pub const fn publication_work(mut self, limit: WorkLimit) -> Self {
+        self.publication_work = limit;
+        self
+    }
+
+    /// Bound what suspended maintenance continuations may retain: open
+    /// directory handles, and bytes of path buffers.
+    #[must_use]
+    pub const fn maintenance_capacity(mut self, handles: u64, bytes: u64) -> Self {
+        self.maintenance_handles = handles;
+        self.maintenance_bytes = bytes;
+        self
     }
 
     /// Retain `owner` for the store's lifetime. Every handle to the store,
@@ -125,11 +213,24 @@ impl MemoryStoreConfig {
     }
 }
 
-/// One namespace: its published view and its writer gate. A slot lives as
-/// long as the store, so its gate is the namespace's only gate.
+/// One namespace: its published view, its writer gate, and its signing
+/// coordinate. A slot lives as long as the store, so its gate is the
+/// namespace's only gate.
 pub struct Slot {
     pub(crate) view: ArcSwap<NamespaceView>,
     pub(crate) gate: Arc<Gate>,
+    /// The highest epoch number of this slot whose signing coordinate is
+    /// consumed. Outside every candidate view, so no abort or failed
+    /// publication restores it: a seal reserves `head + 1` only while this
+    /// equals the head's number, and a coordinate consumed by a seal that
+    /// did not publish fences the slot against every later seal.
+    pub(crate) signed: AtomicU64,
+    /// The publication whose signing coordinate is consumed and which is not
+    /// published, with every obligation it owns (`execution::Pending`). Held
+    /// in place, so taking custody of a publication allocates nothing; its
+    /// presence fences the slot until resolution
+    /// (`ExecutionStore::resolve_publication`) publishes it.
+    pub(crate) pending: Mutex<Option<execution::Pending>>,
 }
 
 /// No epoch was sealed yet.
@@ -152,8 +253,13 @@ pub struct InMemoryStore {
     /// shared gate, so no publication signs with an authority a completed
     /// rotation retired and no rotation passes an epoch that is about to be
     /// stored.
-    pub(crate) authority: ArcSwap<kappa_store::EpochAuthority>,
+    pub(crate) authority: ArcSwap<EpochAuthority>,
     pub(crate) activation: RwLock<()>,
+    /// Set, under the exclusive activation gate, while an activation's
+    /// governing epoch is retained unpublished: the incoming authority may
+    /// still be installed, so no epoch is sealed under the outgoing one
+    /// until the activation is resolved.
+    pub(crate) activation_unresolved: AtomicBool,
     /// The latest timestamp of any epoch any namespace sealed: the lineage
     /// summary an authority transition is checked against. Raised under the
     /// shared activation gate by every publication, read under the
@@ -171,22 +277,57 @@ pub struct InMemoryStore {
     attempts: AtomicU64,
     /// Where the bounded session expiry resumes (`identity_local`).
     pub(crate) session_eviction_cursor: Mutex<Option<(NamespaceId, String)>>,
-    /// Where the bounded inventory resumes (`maintenance`).
-    pub(crate) inventory: Mutex<maintenance::InventoryWalk>,
+    /// This store instance's identity in the maintenance continuations it
+    /// returns.
+    pub(crate) instance: StoreToken,
+    /// Directory handles and path-buffer bytes maintenance continuations
+    /// retain while suspended (`maintenance`).
+    pub(crate) maintenance_handles: Arc<CapacityPool>,
+    pub(crate) maintenance_bytes: Arc<CapacityPool>,
+    /// What one publication's seal may do (`MemoryStoreConfig::publication_work`).
+    pub(crate) publication_work: WorkLimit,
+    /// The ceiling of one read operation (`MemoryStoreConfig::read_work`).
+    pub(crate) read_work: WorkLimit,
+    /// Bytes of generated publication evidence held in memory
+    /// (`MemoryStoreConfig::new`). A publication reserves its records' bound
+    /// before its coordinate is consumed; each installed record carries its
+    /// share into every view holding it.
+    pub(crate) publication_retention: Arc<CapacityPool>,
+    /// Bytes of canonical encodings operations hold live
+    /// (`MemoryStoreConfig::encoding_storage`).
+    pub(crate) encoding_storage: Arc<CapacityPool>,
+    pub(crate) decoded_storage: Arc<CapacityPool>,
 
     /// Opaque owner of the filesystem scope containing the blob root,
     /// retained for the store's lifetime (see
     /// [`MemoryStoreConfig::retaining`]). Declared last so it drops after
-    /// every other field, the allocation table included.
-    _resource_owner: Option<Arc<dyn Send + Sync>>,
+    /// every other field, the allocation table included. Maintenance walks
+    /// clone it so their open listings keep the scope alive.
+    resource_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl InMemoryStore {
     pub fn new(config: MemoryStoreConfig) -> Result<Self, StoreError> {
+        if config.publication_retention == 0 {
+            return Err(StoreError::Rejected(
+                "publication retention capacity must be positive".into(),
+            ));
+        }
+        if config.encoding_storage == 0 {
+            return Err(StoreError::Rejected(
+                "encoding storage capacity must be positive".into(),
+            ));
+        }
+        if config.decoded_storage == 0 {
+            return Err(StoreError::Rejected(
+                "decoded storage capacity must be positive".into(),
+            ));
+        }
         std::fs::create_dir_all(&config.blob_root)?;
         Ok(Self {
-            authority: ArcSwap::from_pointee(kappa_store::EpochAuthority::new(config.authority)?),
+            authority: ArcSwap::from_pointee(EpochAuthority::new(config.authority)?),
             activation: RwLock::new(()),
+            activation_unresolved: AtomicBool::new(false),
             latest_epoch_ms: AtomicI64::new(NO_EPOCH),
             slots: DashMap::new(),
             projections: Projections::default(),
@@ -197,14 +338,40 @@ impl InMemoryStore {
             incarnations: AtomicU64::new(1),
             attempts: AtomicU64::new(1),
             session_eviction_cursor: Mutex::new(None),
-            inventory: Mutex::new(maintenance::InventoryWalk::default()),
-            _resource_owner: config.resource_owner,
+            instance: StoreToken::new(),
+            maintenance_handles: Arc::new(CapacityPool::new(
+                "maintenance directory handles",
+                config.maintenance_handles,
+            )),
+            maintenance_bytes: Arc::new(CapacityPool::new(
+                "maintenance path buffers",
+                config.maintenance_bytes,
+            )),
+            publication_work: config.publication_work,
+            read_work: config.read_work,
+            publication_retention: Arc::new(CapacityPool::new(
+                "retained publication evidence",
+                config.publication_retention,
+            )),
+            encoding_storage: Arc::new(CapacityPool::new(
+                "canonical encodings",
+                config.encoding_storage,
+            )),
+            decoded_storage: Arc::new(CapacityPool::new("decoded records", config.decoded_storage)),
+            resource_owner: config.resource_owner,
         })
     }
 
     /// The anchor new epochs are signed under.
     pub fn node_anchor(&self) -> Kappa {
         self.authority.load().anchor().clone()
+    }
+
+    /// The meter of one read operation, at the configured ceiling: built
+    /// once where a read enters the store and threaded through every read
+    /// it nests, so the whole operation answers within it or is refused.
+    pub(crate) const fn read_meter(&self) -> WorkMeter {
+        WorkMeter::new(self.read_work)
     }
 
     /// The slot of `namespace`, created with a fresh incarnation on first
@@ -222,6 +389,8 @@ impl InMemoryStore {
             Arc::new(Slot {
                 view: ArcSwap::from_pointee(NamespaceView::empty(incarnation)),
                 gate: Arc::new(Gate::default()),
+                signed: AtomicU64::new(0),
+                pending: Mutex::new(None),
             })
         })))
     }

@@ -10,12 +10,16 @@ use crate::calibrate::record::CalibrationPoint;
 const PREFIX: &str = "calibration_";
 const SUFFIX: &str = ".jsonl";
 
-/// One session's dataset.
+/// One session's dataset of one run.
 #[derive(Debug)]
 pub struct Dataset {
     /// Session name (`floors`, `workloads`, `contention`, ...).
     pub name: String,
     pub path: PathBuf,
+    /// The run directory the dataset was read from. Datasets of one
+    /// session in different run directories are repetitions of the same
+    /// measurements.
+    pub run: PathBuf,
     pub points: Vec<CalibrationPoint>,
 }
 
@@ -63,13 +67,13 @@ pub fn load_all(dataset_dir: &Path) -> Result<Vec<Dataset>, ReportError> {
         let Some(name) = file_name.to_str().and_then(session_name) else {
             continue;
         };
-        datasets.push(load(name, &entry.path())?);
+        datasets.push(load(name, &entry.path(), dataset_dir)?);
     }
     datasets.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(datasets)
 }
 
-fn load(name: &str, path: &Path) -> Result<Dataset, ReportError> {
+fn load(name: &str, path: &Path, run: &Path) -> Result<Dataset, ReportError> {
     let content = std::fs::read_to_string(path).map_err(io_error(path))?;
     let mut points = Vec::new();
     for (index, line) in content.lines().enumerate() {
@@ -88,6 +92,7 @@ fn load(name: &str, path: &Path) -> Result<Dataset, ReportError> {
     Ok(Dataset {
         name: name.to_owned(),
         path: path.to_owned(),
+        run: run.to_owned(),
         points,
     })
 }
@@ -138,6 +143,10 @@ mod tests {
         let names: Vec<_> = datasets.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["floors", "workloads"]);
         assert_eq!(datasets[0].measured().count(), 1);
+        assert!(
+            datasets.iter().all(|d| d.run == dir.path()),
+            "every dataset names the run directory it came from"
+        );
 
         std::fs::write(
             dir.path().join("calibration_contention.jsonl"),

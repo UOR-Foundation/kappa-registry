@@ -3,11 +3,11 @@
 //!
 //! Their transitions (a session granted or revoked, a credential issued,
 //! rotated or deleted, the trust position moved) are epoch-governed like
-//! every other identity record: an execution writes the row into its
-//! namespace database, publishes the transition record
-//! (`kappa_types::authorization`) as content, and records `AnchorOrigin`
-//! evidence naming that record's content identity under the scope of the
-//! row (`AnchorScope::Session`, `Credential`, `Trust`).
+//! every other identity record: an execution applies the transition record
+//! (`kappa_types::authorization`) through the transition boundary
+//! (`transition_apply`), which installs it as evidence, writes the row
+//! through the helpers here with the private values its digests commit,
+//! and records its `AnchorOrigin` mutation under the row's scope.
 //!
 //! Ownership is a claim, never projection content. Before the namespace
 //! transaction commits, the writer records the admitting namespace in the
@@ -39,24 +39,24 @@
 //! is decided by the record at read time. Reads are in
 //! `identity_local_read.rs`.
 
-use redb::{ReadableDatabase, ReadableTable};
+use redb::ReadableTable;
 
-use kappa_store::VerifiedContent;
 use kappa_store::authorization::{CredentialTransition, SessionTransition};
 use kappa_store::axis::Axis;
 use kappa_store::canonical::canonical_bytes;
 use kappa_store::clock::ClockMs;
-use kappa_store::epoch::MutationOp;
 use kappa_store::error::StoreError;
 use kappa_store::identity::TrustPosition;
-use kappa_store::identity_scope::{AnchorScope, session_id};
+use kappa_store::identity_scope::session_id;
 use kappa_store::kappa::Kappa;
 use kappa_store::namespace::NamespaceRef;
+use kappa_store::transition::RecordTransition;
+use kappa_store::work::Meter;
 
 use crate::PersistentStore;
 use crate::encrypted::bound;
-use crate::epoch_blob::blob_put_in_txn;
 use crate::tables;
+use crate::transition_apply::{RedbPayload, TxnWriter};
 
 #[path = "identity_local_read.rs"]
 mod read;
@@ -183,7 +183,7 @@ impl PersistentStore {
         table: AuthorizationTable,
         key: &str,
     ) -> Result<Option<[u8; 16]>, StoreError> {
-        let rtxn = self.registry.begin_read().map_err(crate::error::redb)?;
+        let rtxn = self.registry.begin_read()?;
         rtxn.open_table(table)
             .map_err(crate::error::redb)?
             .get(key)
@@ -203,7 +203,7 @@ impl PersistentStore {
         key: &str,
         ns: &NamespaceRef,
     ) -> Result<(), StoreError> {
-        let wtxn = self.registry.begin_write().map_err(crate::error::redb)?;
+        let wtxn = self.registry.begin_write()?;
         {
             let mut rows = wtxn.open_table(table).map_err(crate::error::redb)?;
             let owner = rows
@@ -214,7 +214,7 @@ impl PersistentStore {
             match owner {
                 Some(owner) if owner == *ns.id() => {
                     drop(rows);
-                    wtxn.abort().map_err(crate::error::redb)?;
+                    wtxn.abort()?;
                     return Ok(());
                 }
                 Some(owner) => {
@@ -229,29 +229,31 @@ impl PersistentStore {
                 }
             }
         }
-        Self::commit_write(wtxn)
+        match wtxn.commit() {
+            Ok(()) => Ok(()),
+            // The namespace transaction that writes the row is refused
+            // either way. A claim that persisted names this namespace only:
+            // it authorizes nothing without the row, and this namespace's
+            // retry finds its own claim and keeps it.
+            Err(
+                crate::error::CommitFailure::Known(error)
+                | crate::error::CommitFailure::Unknown(error),
+            ) => Err(error),
+        }
     }
 
-    /// Publish the transition record and record the `AnchorOrigin` naming
-    /// its content identity under `scope`.
-    fn record_transition(
+    /// The plaintext of row `key` of the authorization `table` this
+    /// namespace's private writer holds (`private_row`), under `context`.
+    fn private_plain(
         &self,
         txn: &redb::WriteTransaction,
-        ns: &NamespaceRef,
-        scope: &AnchorScope,
-        transition: &[u8],
-        now: ClockMs,
-    ) -> Result<(), StoreError> {
-        let content = VerifiedContent::compute(Axis::Sha256, transition)?;
-        blob_put_in_txn(self, txn, ns, &content)?;
-        self.record_mutation_in_txn(
-            txn,
-            ns,
-            MutationOp::AnchorOrigin,
-            content.kappa().clone(),
-            now,
-            Some(scope.to_context()),
-        )
+        table: AuthorizationTable,
+        key: &str,
+        context: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        Self::private_row(txn, table, key)?
+            .map(|stored| self.decrypt_bytes(context, &stored))
+            .transpose()
     }
 
     pub(crate) fn session_put_in_txn(
@@ -260,6 +262,7 @@ impl PersistentStore {
         ns: &NamespaceRef,
         grant: SessionGrant<'_>,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         let SessionGrant {
             token,
@@ -269,23 +272,17 @@ impl PersistentStore {
         } = grant;
         let id = session_id(token);
         self.claim_locator(tables::ID_SESSIONS, &id, ns)?;
-        let stored = self.encrypt_bytes(
-            &session_context(&id),
-            &pack_session(anchor, expires_at_ms, metadata),
-        )?;
-        txn.open_table(tables::ID_SESSIONS)
-            .map_err(crate::error::redb)?
-            .insert(id.as_str(), stored.as_slice())
-            .map_err(crate::error::redb)?;
-        let transition =
-            SessionTransition::set(id.clone(), anchor.clone(), expires_at_ms, metadata);
-        self.record_transition(
-            txn,
-            ns,
-            &AnchorScope::Session { id },
-            &canonical_bytes(&transition),
-            now,
-        )
+        TxnWriter::new(self, txn, ns, now, meter)?
+            .apply(
+                RecordTransition::Session(SessionTransition::set(
+                    id,
+                    anchor.clone(),
+                    expires_at_ms,
+                    metadata,
+                )),
+                RedbPayload::SessionMetadata(metadata.to_vec()),
+            )
+            .map(drop)
     }
 
     /// An absent session is a no-op and records no mutation.
@@ -295,27 +292,21 @@ impl PersistentStore {
         ns: &NamespaceRef,
         token: &str,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         let id = session_id(token);
-        let removed = txn
-            .open_table(tables::ID_SESSIONS)
-            .map_err(crate::error::redb)?
-            .remove(id.as_str())
-            .map_err(crate::error::redb)?
-            .map(|value| self.decrypt_bytes(&session_context(&id), value.value()))
-            .transpose()?;
-        let Some(bytes) = removed else {
+        let Some(bytes) =
+            self.private_plain(txn, tables::ID_SESSIONS, &id, &session_context(&id))?
+        else {
             return Ok(());
         };
         let (anchor, _) = decode_anchor_from_packed(&bytes)?;
-        let transition = SessionTransition::deleted(id.clone(), anchor);
-        self.record_transition(
-            txn,
-            ns,
-            &AnchorScope::Session { id },
-            &canonical_bytes(&transition),
-            now,
-        )
+        TxnWriter::new(self, txn, ns, now, meter)?
+            .apply(
+                RecordTransition::Session(SessionTransition::deleted(id, anchor)),
+                RedbPayload::NoResources,
+            )
+            .map(drop)
     }
 
     pub(crate) fn credential_put_in_txn(
@@ -326,40 +317,35 @@ impl PersistentStore {
         anchor: &Kappa,
         secret_hash: &[u8],
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         self.claim_locator(tables::ID_CREDENTIALS, credential_id, ns)?;
         self.claim_locator(tables::ID_CREDENTIAL_GRACE, credential_id, ns)?;
-        let stored = self.encrypt_bytes(
-            &credential_context(credential_id),
-            &pack_credential(anchor, secret_hash),
-        )?;
-        txn.open_table(tables::ID_CREDENTIALS)
-            .map_err(crate::error::redb)?
-            .insert(credential_id, stored.as_slice())
-            .map_err(crate::error::redb)?;
-        txn.open_table(tables::ID_CREDENTIAL_GRACE)
-            .map_err(crate::error::redb)?
-            .remove(credential_id)
-            .map_err(crate::error::redb)?;
-        let transition =
-            CredentialTransition::set(credential_id.to_owned(), anchor.clone(), secret_hash, None);
-        self.record_transition(
-            txn,
-            ns,
-            &AnchorScope::Credential {
-                id: credential_id.to_string(),
-            },
-            &canonical_bytes(&transition),
-            now,
-        )
+        TxnWriter::new(self, txn, ns, now, meter)?
+            .apply(
+                RecordTransition::Credential(CredentialTransition::set(
+                    credential_id.to_owned(),
+                    anchor.clone(),
+                    secret_hash,
+                    None,
+                )),
+                RedbPayload::CredentialSecrets {
+                    secret_hash: secret_hash.to_vec(),
+                    grace_secret_hash: None,
+                },
+            )
+            .map(drop)
     }
 
+    /// Rotate the secret under shared policy against the protected row; the
+    /// previous secret stays valid for the grace the transition carries.
     pub(crate) fn credential_rotate_in_txn(
         &self,
         txn: &redb::WriteTransaction,
         ns: &NamespaceRef,
         rotation: CredentialRotation<'_>,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         let CredentialRotation {
             credential_id,
@@ -367,58 +353,40 @@ impl PersistentStore {
             new_secret_hash,
             grace_period_ms,
         } = rotation;
-        let grace_expires = now
-            .checked_add_physical_ms(grace_period_ms)
-            .ok_or_else(|| StoreError::Rejected("credential grace deadline overflow".into()))?
-            .as_i64();
-        let mut table = txn
-            .open_table(tables::ID_CREDENTIALS)
-            .map_err(crate::error::redb)?;
-        let bytes = {
-            let value = table
-                .get(credential_id)
-                .map_err(crate::error::redb)?
-                .ok_or_else(|| StoreError::NotFound(format!("credential {credential_id}")))?;
-            self.decrypt_bytes(&credential_context(credential_id), value.value())?
-        };
-        let (current_anchor, anchor_len) = decode_anchor_from_packed(&bytes)?;
-        if current_anchor != *expected_owner {
-            return Err(StoreError::Rejected(format!(
-                "credential {credential_id} is owned by {current_anchor}, not {expected_owner}"
-            )));
-        }
-        let old_hash = &bytes[anchor_len..];
-        let stored = self.encrypt_bytes(
-            &credential_context(credential_id),
-            &pack_credential(&current_anchor, new_secret_hash),
-        )?;
-        table
-            .insert(credential_id, stored.as_slice())
-            .map_err(crate::error::redb)?;
-        drop(table);
-        let stored_grace = self.encrypt_bytes(
-            &grace_context(credential_id),
-            &pack_grace(old_hash, grace_expires),
-        )?;
-        txn.open_table(tables::ID_CREDENTIAL_GRACE)
-            .map_err(crate::error::redb)?
-            .insert(credential_id, stored_grace.as_slice())
-            .map_err(crate::error::redb)?;
-        let transition = CredentialTransition::set(
-            credential_id.to_owned(),
-            current_anchor,
-            new_secret_hash,
-            Some((old_hash, grace_expires)),
-        );
-        self.record_transition(
+        let bytes = self.private_plain(
             txn,
-            ns,
-            &AnchorScope::Credential {
-                id: credential_id.to_string(),
-            },
-            &canonical_bytes(&transition),
+            tables::ID_CREDENTIALS,
+            credential_id,
+            &credential_context(credential_id),
+        )?;
+        let current = bytes
+            .as_deref()
+            .map(decode_anchor_from_packed)
+            .transpose()?;
+        let observed = current
+            .as_ref()
+            .zip(bytes.as_deref())
+            .map(|((anchor, length), bytes)| (anchor, &bytes[*length..]));
+        let transition = kappa_store::identity_ops::prepare_credential_rotation(
+            credential_id,
+            observed,
+            expected_owner,
+            new_secret_hash,
+            grace_period_ms,
             now,
-        )
+        )?;
+        let (_, old_hash) = observed.ok_or_else(|| {
+            StoreError::Internal("accepted credential rotation has no protected row".into())
+        })?;
+        TxnWriter::new(self, txn, ns, now, meter)?
+            .apply(
+                RecordTransition::Credential(transition),
+                RedbPayload::CredentialSecrets {
+                    secret_hash: new_secret_hash.to_vec(),
+                    grace_secret_hash: Some(old_hash.to_vec()),
+                },
+            )
+            .map(drop)
     }
 
     /// An absent credential is a no-op and records no mutation.
@@ -428,32 +396,27 @@ impl PersistentStore {
         ns: &NamespaceRef,
         credential_id: &str,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
-        let removed = txn
-            .open_table(tables::ID_CREDENTIALS)
-            .map_err(crate::error::redb)?
-            .remove(credential_id)
-            .map_err(crate::error::redb)?
-            .map(|value| self.decrypt_bytes(&credential_context(credential_id), value.value()))
-            .transpose()?;
-        txn.open_table(tables::ID_CREDENTIAL_GRACE)
-            .map_err(crate::error::redb)?
-            .remove(credential_id)
-            .map_err(crate::error::redb)?;
-        let Some(bytes) = removed else {
+        let Some(bytes) = self.private_plain(
+            txn,
+            tables::ID_CREDENTIALS,
+            credential_id,
+            &credential_context(credential_id),
+        )?
+        else {
             return Ok(());
         };
         let (anchor, _) = decode_anchor_from_packed(&bytes)?;
-        let transition = CredentialTransition::deleted(credential_id.to_owned(), anchor);
-        self.record_transition(
-            txn,
-            ns,
-            &AnchorScope::Credential {
-                id: credential_id.to_string(),
-            },
-            &canonical_bytes(&transition),
-            now,
-        )
+        TxnWriter::new(self, txn, ns, now, meter)?
+            .apply(
+                RecordTransition::Credential(CredentialTransition::deleted(
+                    credential_id.to_owned(),
+                    anchor,
+                )),
+                RedbPayload::NoResources,
+            )
+            .map(drop)
     }
 
     pub(crate) fn trust_position_put_in_txn(
@@ -462,14 +425,111 @@ impl PersistentStore {
         ns: &NamespaceRef,
         position: &TrustPosition,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         self.claim_locator(tables::ID_TRUST, TRUST_KEY, ns)?;
-        let bytes = canonical_bytes(position);
-        let stored = self.encrypt_bytes(&trust_context(), &bytes)?;
-        txn.open_table(tables::ID_TRUST)
+        TxnWriter::new(self, txn, ns, now, meter)?
+            .apply(
+                RecordTransition::Trust(position.clone()),
+                RedbPayload::NoResources,
+            )
+            .map(drop)
+    }
+}
+
+impl TxnWriter<'_> {
+    /// Encrypt `value` under `context` and hold it as row `key` of `table`.
+    fn put_authorization(
+        &self,
+        table: AuthorizationTable,
+        key: &str,
+        context: &str,
+        value: &[u8],
+    ) -> Result<(), StoreError> {
+        let stored = self.store.encrypt_bytes(context, value)?;
+        self.txn
+            .open_table(table)
             .map_err(crate::error::redb)?
-            .insert(TRUST_KEY, stored.as_slice())
+            .insert(key, stored.as_slice())
             .map_err(crate::error::redb)?;
-        self.record_transition(txn, ns, &AnchorScope::Trust, &bytes, now)
+        Ok(())
+    }
+
+    fn remove_authorization(&self, table: AuthorizationTable, key: &str) -> Result<(), StoreError> {
+        self.txn
+            .open_table(table)
+            .map_err(crate::error::redb)?
+            .remove(key)
+            .map_err(crate::error::redb)?;
+        Ok(())
+    }
+
+    /// Hold the session `session` sets, with the metadata its digest was
+    /// checked against.
+    pub(crate) fn apply_session_set(
+        &self,
+        session: &SessionTransition,
+        metadata: &[u8],
+    ) -> Result<(), StoreError> {
+        self.put_authorization(
+            tables::ID_SESSIONS,
+            &session.id,
+            &session_context(&session.id),
+            &pack_session(&session.anchor, session.expires_at_ms, metadata),
+        )
+    }
+
+    /// Remove the session `session` deletes.
+    pub(crate) fn apply_session_delete(
+        &self,
+        session: &SessionTransition,
+    ) -> Result<(), StoreError> {
+        self.remove_authorization(tables::ID_SESSIONS, &session.id)
+    }
+
+    /// Hold the credential `credential` sets with the secret hashes its
+    /// commitments were checked against: the grace secret with the grace
+    /// deadline the transition carries, or no grace row.
+    pub(crate) fn apply_credential_set(
+        &self,
+        credential: &CredentialTransition,
+        secret_hash: &[u8],
+        grace_secret_hash: Option<&[u8]>,
+    ) -> Result<(), StoreError> {
+        let id = credential.id.as_str();
+        self.put_authorization(
+            tables::ID_CREDENTIALS,
+            id,
+            &credential_context(id),
+            &pack_credential(&credential.anchor, secret_hash),
+        )?;
+        match grace_secret_hash.zip(credential.grace_expires_ms) {
+            Some((old_hash, expires)) => self.put_authorization(
+                tables::ID_CREDENTIAL_GRACE,
+                id,
+                &grace_context(id),
+                &pack_grace(old_hash, expires),
+            ),
+            None => self.remove_authorization(tables::ID_CREDENTIAL_GRACE, id),
+        }
+    }
+
+    /// Remove the credential `credential` deletes and its grace.
+    pub(crate) fn apply_credential_delete(
+        &self,
+        credential: &CredentialTransition,
+    ) -> Result<(), StoreError> {
+        self.remove_authorization(tables::ID_CREDENTIALS, &credential.id)?;
+        self.remove_authorization(tables::ID_CREDENTIAL_GRACE, &credential.id)
+    }
+
+    /// Hold `position` as the trust position.
+    pub(crate) fn apply_trust(&self, position: &TrustPosition) -> Result<(), StoreError> {
+        self.put_authorization(
+            tables::ID_TRUST,
+            TRUST_KEY,
+            &trust_context(),
+            &canonical_bytes(position),
+        )
     }
 }

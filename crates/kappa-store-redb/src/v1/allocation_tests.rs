@@ -48,13 +48,33 @@ fn creation_pins_first_and_deletion_measures_both_files() -> Result<(), Box<dyn 
     };
     write_owner_marker(dir.path(), &id, &owner, true)?;
     assert_eq!(read_owner_marker(dir.path(), &id)?, Some(owner.clone()));
-    assert!(
-        matches!(
-            write_owner_marker(dir.path(), &id, &owner, true),
-            Err(StoreError::Internal(_))
-        ),
-        "a second installer was admitted"
-    );
+    // Custody replay repeats the same installation after an aborted
+    // transaction. Exclusion is against a different owner or identity.
+    write_owner_marker(dir.path(), &id, &owner, true)?;
+    let foreign_owners = [
+        Owner {
+            instance: StorageInstance::generate([7; 16])?,
+            identity: owner.identity.clone(),
+        },
+        Owner {
+            instance: owner.instance,
+            identity: Kappa::sha256(b"different-content"),
+        },
+    ];
+    for foreign in foreign_owners {
+        assert!(
+            matches!(
+                write_owner_marker(dir.path(), &id, &foreign, true),
+                Err(StoreError::Internal(_))
+            ),
+            "a second installer was admitted"
+        );
+        assert_eq!(
+            read_owner_marker(dir.path(), &id)?,
+            Some(owner.clone()),
+            "a refused installer changed the durable owner"
+        );
+    }
     assert!(protection.claim(id)?.is_none());
     drop(pin);
     let claim = protection.claim(id)?.ok_or("no claim")?;

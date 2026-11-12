@@ -56,6 +56,13 @@ pub struct Toolchain {
     pub profile: String,
     pub opt_level: String,
     pub target: String,
+    /// The standard library source the binary compiled against, as its
+    /// build environment stated it (the flake's shells name the forked
+    /// library, `github:usrbinkat/rust/<rev>`), or `None` when the build
+    /// stated none: the toolchain's own library. `rustc` names only the
+    /// compiler's commit.
+    #[serde(default)]
+    pub std_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -92,6 +99,13 @@ pub struct PlatformInfo {
     pub rdma_devices: u32,
     pub toolchain: Toolchain,
     pub host_class: HostClass,
+    /// The source revision the binary was built from (`git rev-parse
+    /// HEAD`, with `-dirty` when the tree had uncommitted changes), or
+    /// `None` when the build ran outside a git checkout. Provenance, not
+    /// identity: a new commit on the same host is the same host, so
+    /// [`Self::same_host`] does not compare it.
+    #[serde(default)]
+    pub source_revision: Option<String>,
 }
 
 impl PlatformInfo {
@@ -148,6 +162,7 @@ impl PlatformInfo {
             rdma_devices: count_entries("/sys/class/infiniband", |_| true).unwrap_or(0),
             toolchain: Toolchain::compiled(),
             host_class,
+            source_revision: source_revision(),
         }
     }
 
@@ -269,18 +284,31 @@ fn summarize_governors(counts: &std::collections::BTreeMap<String, usize>) -> Op
     }
 }
 
+/// The source revision captured at build time (`build.rs`), `None` when
+/// the build found no git checkout.
+#[allow(
+    clippy::manual_string_new,
+    reason = "env! expands to an empty literal when the build had no checkout"
+)]
+fn source_revision() -> Option<String> {
+    let revision = env!("KAPPA_PERF_SOURCE_REVISION");
+    (!revision.is_empty()).then(|| revision.to_owned())
+}
+
 impl Toolchain {
     #[allow(
         clippy::manual_string_new,
         reason = "env! expands to an empty literal when the build had no RUSTFLAGS"
     )]
     pub fn compiled() -> Self {
+        let std_source = env!("KAPPA_PERF_STD_SOURCE");
         Self {
             rustc: env!("KAPPA_PERF_RUSTC_VERSION").to_owned(),
             rustflags: env!("KAPPA_PERF_RUSTFLAGS").to_owned(),
             profile: env!("KAPPA_PERF_PROFILE").to_owned(),
             opt_level: env!("KAPPA_PERF_OPT_LEVEL").to_owned(),
             target: env!("KAPPA_PERF_TARGET").to_owned(),
+            std_source: (!std_source.is_empty()).then(|| std_source.to_owned()),
         }
     }
 
@@ -478,7 +506,7 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn detects_the_running_host() {
+    fn detects_the_running_host() -> TestResult {
         let info = PlatformInfo::detect();
         assert!(info.logical_cpus >= 1);
         assert!(
@@ -487,12 +515,44 @@ mod tests {
             info.toolchain.rustc
         );
         assert!(!info.toolchain.profile.is_empty());
+        // Built in the flake's shell: the forked library at a full revision.
+        let std_source = info
+            .toolchain
+            .std_source
+            .as_deref()
+            .ok_or("the build ran in the flake's shell and recorded no std source")?;
+        let rev = std_source
+            .strip_prefix("github:usrbinkat/rust/")
+            .ok_or_else(|| format!("not the forked library: {std_source}"))?;
+        assert_eq!(rev.len(), 40, "{std_source}");
+        assert!(rev.bytes().all(|b| b.is_ascii_hexdigit()), "{std_source}");
+        let mut stock = info.clone();
+        stock.toolchain.std_source = None;
+        assert!(
+            !info.same_host(&stock),
+            "another standard library is another toolchain"
+        );
         if cfg!(target_os = "linux") {
             assert!(info.kernel.is_some());
             assert!(info.memory_bytes.is_some_and(|bytes| bytes > 0));
             assert!(info.cpu_model.is_some());
         }
         assert!(info.same_host(&info.clone()));
+        // Built from this checkout: a 40-hex revision, dirty or not.
+        let revision = info
+            .source_revision
+            .as_deref()
+            .ok_or("the build ran inside the kappa-registry checkout and recorded no revision")?;
+        let hash = revision.strip_suffix("-dirty").unwrap_or(revision);
+        assert_eq!(hash.len(), 40, "{revision}");
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()), "{revision}");
+        let mut other_commit = info.clone();
+        other_commit.source_revision = Some("0".repeat(40));
+        assert!(
+            info.same_host(&other_commit),
+            "a different commit on the same host is the same host"
+        );
+        Ok(())
     }
 
     #[test]

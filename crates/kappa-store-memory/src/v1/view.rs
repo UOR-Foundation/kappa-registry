@@ -25,14 +25,18 @@ use std::sync::Arc;
 use imbl::{OrdMap, OrdSet, Vector};
 use kappa_store::traits::namespace::NamespaceInfo;
 use kappa_succinct::IncrementalDigest;
-use kappa_types::clock::ClockMs;
-use kappa_types::epoch::{EpochMutation, MutationOp};
+use kappa_types::capacity::Reservation;
+use kappa_types::epoch::EpochMutation;
 use kappa_types::error::StoreError;
 use kappa_types::identity::{
     DeviceBinding, HandleRecord, IdentityAssertion, IdentityBinding, LocatorRecord, PrekeyBinding,
     Revocation, RevocationCommitment, Succession, TrustPosition, Watermark,
 };
 use kappa_types::kappa::Kappa;
+use kappa_types::merkle::StreamingTree;
+use kappa_types::namespace::LogicalIncarnation;
+use kappa_types::namespace_state::NamespaceState;
+use kappa_types::state_index::{self, Change, Node, NodeSource};
 use kappa_types::tag::TagEntry;
 
 use super::allocation::Allocation;
@@ -59,7 +63,47 @@ pub enum Representation {
         algorithm: String,
         decoded: Segments,
     },
+    /// Bytes held in the process's memory with their segment digests:
+    /// publication evidence generated from a signed root, moved here from
+    /// the record that generated it together with its retention charge.
+    Inline {
+        bytes: Arc<Held>,
+        segments: Segments,
+    },
 }
+
+/// Bytes held in the process's memory and the retention charge accounting
+/// for them, owned together: every view and reader holding the bytes holds
+/// the charge, so it is released only with the last of them.
+#[derive(Debug)]
+pub struct Held {
+    bytes: Vec<u8>,
+    /// Held for its lifetime; dropping it releases the charge.
+    _charge: Reservation,
+}
+
+impl Held {
+    pub fn new(bytes: Vec<u8>, charge: Reservation) -> Arc<Self> {
+        Arc::new(Self {
+            bytes,
+            _charge: charge,
+        })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Held bytes are equal only to themselves: two records holding equal bytes
+/// hold distinct charges.
+impl PartialEq for Held {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for Held {}
 
 /// One admitted identity: its representation and logical size.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,7 +195,14 @@ pub struct NamespaceView {
     pub latest_epoch_ms: Option<i64>,
     /// Operation identity to (epoch root, receipt identity).
     pub operations: OrdMap<[u8; 32], (Kappa, Kappa)>,
+    /// The namespace's logical content admissions: what its authenticated
+    /// state indexes under the content family, and what retirement removes.
     pub admitted: OrdMap<Kappa, Admission>,
+    /// Transition and publication evidence the namespace retains: every
+    /// record its ledgers, roots and state commitments name. Held apart from
+    /// logical admission, so storing evidence never admits content and
+    /// retiring content never releases evidence history still names.
+    pub evidence: OrdMap<Kappa, Admission>,
     /// Identity to the aliases and composites of this view selecting it.
     pub selected_by: OrdMap<Kappa, OrdSet<Kappa>>,
     /// Identity to the direct tags and epoch head of this view naming it.
@@ -159,25 +210,79 @@ pub struct NamespaceView {
     pub blob_meta: OrdMap<(Kappa, String), Vec<u8>>,
     pub authorization: Authorization,
     pub identity: IdentityRows,
+
+    // -- Authenticated state machinery --
+    /// The nodes of the authenticated current-state index, keyed by their
+    /// hash: every node of every root this namespace sealed, so a proof
+    /// against any of its published roots is served from its current view.
+    /// Views share the map structurally; a candidate writes into a clone
+    /// that shares every node it does not add.
+    pub state_nodes: OrdMap<[u8; 32], Node>,
+    /// Root of the authenticated index after the last sealed epoch.
+    /// `state_index::EMPTY` before genesis.
+    pub state_index_root: [u8; 32],
+    /// Index changes this candidate's transitions derived, in execution
+    /// order. The seal reduces them to the last value per path.
+    pub pending_state_changes: Vec<Change>,
+    /// The RFC 9162 log builder carrying the peaks of the last sealed
+    /// epoch. Sealing extends it by the epoch's mutations.
+    pub history: StreamingTree,
+    /// Emitted history nodes retained alongside the append continuation.
+    pub history_nodes: OrdMap<u64, [u8; 32]>,
+    /// The namespace-state record the last sealed epoch committed. `None`
+    /// before genesis. The next seal's `StateInput::predecessor` uses it.
+    pub committed_state: Option<NamespaceState>,
+}
+
+/// `NodeSource` over the view's retained index nodes.
+impl NodeSource for NamespaceView {
+    fn node(&self, hash: &[u8; 32]) -> Result<Node, StoreError> {
+        self.state_nodes.get(hash).copied().ok_or_else(|| {
+            StoreError::Internal(format!(
+                "state index node {} is not retained by this view",
+                hex::encode(hash)
+            ))
+        })
+    }
 }
 
 impl NamespaceView {
+    /// The logical incarnation of this namespace instance: the one accessor
+    /// every transition domain, receipt, authority record and activation
+    /// domain of the namespace takes its incarnation from. Its
+    /// representation is the counter in big-endian in bytes 8..16.
+    pub fn logical_incarnation(&self) -> LogicalIncarnation {
+        let mut bytes = [0u8; 16];
+        bytes[8..].copy_from_slice(&self.incarnation.to_be_bytes());
+        LogicalIncarnation::from_bytes(bytes)
+    }
+
+    /// The representation of [`Self::logical_incarnation`], for the
+    /// records that carry it.
+    pub fn incarnation_bytes(&self) -> [u8; 16] {
+        *self.logical_incarnation().as_bytes()
+    }
+
+    /// The bytes this view holds for `identity`: its logical admission, or
+    /// the evidence it retains under that identity.
+    pub fn held(&self, identity: &Kappa) -> Option<&Admission> {
+        self.admitted
+            .get(identity)
+            .or_else(|| self.evidence.get(identity))
+    }
+
+    /// Whether this view can serve the bytes of `identity`.
+    pub fn holds(&self, identity: &Kappa) -> bool {
+        self.held(identity).is_some()
+    }
+
     /// The view of a namespace slot before its first publication.
     pub fn empty(incarnation: u64) -> Self {
         Self {
             incarnation,
+            state_index_root: state_index::EMPTY,
             ..Self::default()
         }
-    }
-
-    /// Append a mutation to the ledger the next epoch seals.
-    pub fn record(&mut self, op: MutationOp, kappa: Kappa, now: ClockMs, context: Option<String>) {
-        self.ledger.push_back(EpochMutation {
-            op,
-            kappa,
-            timestamp_ms: now.as_i64(),
-            context,
-        });
     }
 
     /// The revision the candidate derived from this view publishes as. A

@@ -1,4 +1,5 @@
 use super::*;
+use crate::tables::REFERRERS;
 use kappa_store::ClockMs;
 
 fn namespace() -> NamespaceRef {
@@ -13,6 +14,18 @@ fn store_with_namespace() -> Result<PersistentStore, Box<dyn std::error::Error>>
         .begin_epoch_execution(&ns, &kappa_handler::clock_at(ClockMs::from_raw(1))?, None)?
         .publish()?;
     Ok(store)
+}
+
+/// Write `referrer` of `content` into the live generation as is, the way
+/// reconstruction or damage would, bypassing the writers' assertions.
+fn insert_raw(
+    txn: &redb::WriteTransaction,
+    content: &Kappa,
+    encoded: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    txn.open_multimap_table(REFERRERS)?
+        .insert(content.key_bytes().as_slice(), encoded)?;
+    Ok(())
 }
 
 #[test]
@@ -68,6 +81,9 @@ fn every_kind_roundtrips_and_malformed_identities_are_rejected() -> Result<(), S
     Ok(())
 }
 
+/// Writers assert the index state they imply; a failed assertion records
+/// divergence for the namespace, and a namespace with a recorded
+/// divergence serves no referrer read until it is repaired.
 #[test]
 fn establish_and_release_assert_the_implied_index_state() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -76,26 +92,27 @@ fn establish_and_release_assert_the_implied_index_state() -> Result<(), Box<dyn 
     let content = Kappa::sha256(b"referenced");
     let tag = Referrer::tag(&ns, "latest")?;
     let pin = Referrer::pin(&ns);
-    let diverged = || {
-        store
-            .indexes_diverged
-            .load(std::sync::atomic::Ordering::Acquire)
-    };
     let (db, _active) = store.namespace_db(&ns)?;
     let txn = db.begin_write()?;
-    establish(&store, &txn, &content, &tag)?;
-    assert!(!diverged(), "a consistent establish records no divergence");
+    establish(&store, &txn, &ns, &content, &tag)?;
+    assert!(
+        !store.divergence_recorded(ns.id()),
+        "a consistent establish records no divergence"
+    );
     assert!(matches!(
-        establish(&store, &txn, &content, &tag),
+        establish(&store, &txn, &ns, &content, &tag),
         Err(StoreError::Internal(_))
     ));
-    assert!(diverged(), "an entry already present is divergence");
-    store
-        .indexes_diverged
-        .store(false, std::sync::atomic::Ordering::Release);
-    rebuild(&txn, &content, &tag)?;
-    rebuild(&txn, &content, &pin)?;
-    rebuild(&txn, &content, &pin)?;
+    assert!(
+        store.divergence_recorded(ns.id()),
+        "an entry already present is divergence"
+    );
+    assert!(matches!(
+        store.referrers_of(&ns, &content),
+        Err(StoreError::Unavailable(_))
+    ));
+    store.clear_divergence(ns.id());
+    insert_raw(&txn, &content, &pin.encode())?;
     txn.commit()?;
     {
         assert_eq!(
@@ -118,18 +135,25 @@ fn establish_and_release_assert_the_implied_index_state() -> Result<(), Box<dyn 
         assert_eq!(cursor.size_hint(), 0);
     }
     let txn = db.begin_write()?;
-    release(&store, &txn, &content, &tag)?;
-    assert!(!diverged(), "a consistent release records no divergence");
+    release(&store, &txn, &ns, &content, &tag)?;
+    assert!(
+        !store.divergence_recorded(ns.id()),
+        "a consistent release records no divergence"
+    );
     assert!(matches!(
-        release(&store, &txn, &content, &tag),
+        release(&store, &txn, &ns, &content, &tag),
         Err(StoreError::Internal(_))
     ));
-    assert!(diverged(), "an entry already absent is divergence");
+    assert!(
+        store.divergence_recorded(ns.id()),
+        "an entry already absent is divergence"
+    );
     assert!(matches!(
-        release(&store, &txn, &content, &Referrer::tag(&ns, "absent")?),
+        release(&store, &txn, &ns, &content, &Referrer::tag(&ns, "absent")?),
         Err(StoreError::Internal(_))
     ));
     txn.commit()?;
+    store.clear_divergence(ns.id());
     let cursor = store.referrers_of(&ns, &content)?;
     assert_eq!(cursor.referrer()?, Some(&pin));
     Ok(())
@@ -149,13 +173,13 @@ fn cursor_retains_its_view_across_later_commits() -> Result<(), Box<dyn std::err
     let (db, _active) = store.namespace_db(&ns)?;
     let txn = db.begin_write()?;
     for referrer in [&first, &second, &third] {
-        establish(&store, &txn, &content, referrer)?;
+        establish(&store, &txn, &ns, &content, referrer)?;
     }
     txn.commit()?;
     let mut cursor = store.referrers_of(&ns, &content)?;
     let txn = db.begin_write()?;
-    release(&store, &txn, &content, &second)?;
-    establish(&store, &txn, &content, &Referrer::tag(&ns, "d")?)?;
+    release(&store, &txn, &ns, &content, &second)?;
+    establish(&store, &txn, &ns, &content, &Referrer::tag(&ns, "d")?)?;
     txn.commit()?;
     assert_eq!(cursor.referrer()?, Some(&first));
     assert_eq!(
@@ -190,11 +214,10 @@ fn malformed_entry_after_a_valid_one_latches_the_cursor() -> Result<(), Box<dyn 
     let (db, _active) = store.namespace_db(&ns)?;
     let txn = db.begin_write()?;
     // Kind 0 (tag) sorts before kind 3 (pin) within the namespace.
-    establish(&store, &txn, &content, &Referrer::tag(&ns, "first")?)?;
+    establish(&store, &txn, &ns, &content, &Referrer::tag(&ns, "first")?)?;
     let mut malformed = Referrer::pin(&ns).encode();
     malformed.push(0);
-    txn.open_multimap_table(REFERRERS)?
-        .insert(content.key_bytes().as_slice(), malformed.as_slice())?;
+    insert_raw(&txn, &content, &malformed)?;
     txn.commit()?;
     let mut cursor = store.referrers_of(&ns, &content)?;
     assert_eq!(cursor.referrer()?, Some(&Referrer::tag(&ns, "first")?));
@@ -219,12 +242,11 @@ fn an_entry_of_another_namespace_latches_the_cursor() -> Result<(), Box<dyn std:
     let representation = Referrer::representation(&Kappa::sha256(b"composite"));
     let (db, _active) = store.namespace_db(&ns)?;
     let txn = db.begin_write()?;
-    establish(&store, &txn, &held, &representation)?;
-    establish(&store, &txn, &held, &Referrer::tag(&ns, "own")?)?;
-    establish(&store, &txn, &foreign, &Referrer::tag(&ns, "own")?)?;
+    establish(&store, &txn, &ns, &held, &representation)?;
+    establish(&store, &txn, &ns, &held, &Referrer::tag(&ns, "own")?)?;
+    establish(&store, &txn, &ns, &foreign, &Referrer::tag(&ns, "own")?)?;
     let other = Referrer::pin(&NamespaceRef::resolved([8; 16], "other".into(), None)).encode();
-    txn.open_multimap_table(REFERRERS)?
-        .insert(foreign.key_bytes().as_slice(), other.as_slice())?;
+    insert_raw(&txn, &foreign, &other)?;
     txn.commit()?;
     let mut cursor = store.referrers_of(&ns, &held)?;
     let mut seen = Vec::new();
@@ -251,9 +273,8 @@ fn malformed_first_entry_is_rejected_at_construction() -> Result<(), Box<dyn std
     let txn = db.begin_write()?;
     let mut malformed = Referrer::tag(&ns, "x")?.encode();
     malformed[17] = 0xFF;
-    txn.open_multimap_table(REFERRERS)?
-        .insert(content.key_bytes().as_slice(), malformed.as_slice())?;
-    establish(&store, &txn, &content, &Referrer::pin(&ns))?;
+    insert_raw(&txn, &content, &malformed)?;
+    establish(&store, &txn, &ns, &content, &Referrer::pin(&ns))?;
     txn.commit()?;
     assert!(matches!(
         store.referrers_of(&ns, &content),

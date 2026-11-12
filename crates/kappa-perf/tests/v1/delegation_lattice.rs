@@ -50,7 +50,92 @@ fn empty_intersection_is_revocation() {
 
 #[test]
 fn delegation_depth_constant() {
-    assert_eq!(DELEGATION_CHAIN_MAX_DEPTH, 4);
+    assert_eq!(DELEGATION_CHAIN_MAX_DEPTH, 256);
+}
+
+fn authority_depth_contract(store: &dyn kappa_store::KappaStore) -> TestResult {
+    use kappa_crypto::{Signer, ed25519::Ed25519Signer};
+    use kappa_handler::{
+        auth::Operation,
+        authority::{Grant, authority},
+    };
+    use kappa_store::{BuiltinRelation, DelegationScope, EdgeInput, EdgeRelation, SignedPayload};
+    let clock = kappa_handler::clock_at(kappa_store::ClockMs::from_raw(1000))?;
+    let signers = (0u32..=257)
+        .map(|index| {
+            let mut seed = [0u8; 32];
+            seed[..4].copy_from_slice(&index.to_be_bytes());
+            Ed25519Signer::from_bytes(&seed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let anchors = signers
+        .iter()
+        .map(|signer| Kappa::from_key(signer.algorithm(), signer.public_key()))
+        .collect::<Result<Vec<_>, _>>()?;
+    kappa_store::namespace_ensure(store, "_root", None, None, &clock)?;
+    let ns = kappa_store::namespace_ensure(store, "depth-floor", Some(&anchors[0]), None, &clock)?;
+    let mut execution = store.begin_execution(&ns, &clock)?;
+    let mut middle = None;
+    for index in 0..257usize {
+        let scope = kappa_crypto::signed_types::sign_delegation(
+            DelegationScope {
+                delegator: anchors[index].clone(),
+                delegate: anchors[index + 1].clone(),
+                scope: vec!["read".into()],
+                namespaces: Some(vec!["depth-floor".into()]),
+                valid_from_ms: 0,
+                valid_until_ms: Some(100),
+                max_depth: u32::try_from(256 - index)?,
+                nonce: index.to_be_bytes().to_vec(),
+                cose_signature: SignedPayload::empty(),
+            },
+            &signers[index],
+        )?;
+        let edge = execution.edge_put(&EdgeInput {
+            source: scope.delegator.clone(),
+            target: scope.delegate.clone(),
+            relation: EdgeRelation::Builtin(BuiltinRelation::Delegation),
+            asserter: scope.delegator.clone(),
+            created_at_ms: 0,
+            metadata: Some(serde_json::to_vec(&scope)?),
+        })?;
+        if index == 127 {
+            middle = Some(edge);
+        }
+    }
+    execution.publish()?;
+    assert_eq!(
+        authority(store, &ns, &anchors[256], Operation::Read, 50)?,
+        Some(Grant::Delegation)
+    );
+    assert_eq!(
+        authority(store, &ns, &anchors[257], Operation::Read, 50)?,
+        None
+    );
+    assert_eq!(
+        authority(store, &ns, &anchors[256], Operation::Read, 100)?,
+        None
+    );
+    let mut execution = store.begin_execution(&ns, &clock)?;
+    execution.edge_delete(&middle.ok_or("missing middle delegation")?)?;
+    execution.publish()?;
+    assert_eq!(
+        authority(store, &ns, &anchors[256], Operation::Read, 50)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn memory_authority_honors_256_links_and_revocation() -> TestResult {
+    let fixture = kappa_store_memory::test_support::test_store()?;
+    authority_depth_contract(fixture.store())
+}
+
+#[test]
+fn persistent_authority_honors_256_links_and_revocation() -> TestResult {
+    let fixture = kappa_store_redb::test_support::persistent_store()?;
+    authority_depth_contract(fixture.store())
 }
 
 // -- PERF-IDN-006: SessionAnchor --

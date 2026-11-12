@@ -1,43 +1,27 @@
 //! Authorization rows written by an execution: sessions, credentials and
-//! the trust position. Each is an exclusive claim of the namespace that
-//! writes it (`claims`), held in that namespace's view with the revision
-//! that wrote it. Each write changes the row in the candidate, publishes
-//! the transition record (`kappa_types::authorization`) as content, and
-//! records the `AnchorOrigin` naming that record's identity under the row's
-//! scope, so the epoch is bound to exactly this transition. Sessions are
-//! keyed by `session_id(token)`, never by the token.
+//! the trust position. Each goes through the shared transition boundary
+//! (`apply_record_transition`) with its checked private payload; the
+//! boundary dispatches the row effect to the `apply_*` helpers here, which
+//! change the candidate's rows and emit nothing themselves.
 //!
-//! Every authorization key an execution writes is held under its stripe
-//! across the publication's store (`dependency`), so an execution of
-//! another namespace that decided under the row is ordered against it.
+//! Shared identity policy decides rotation against the candidate row.
+//! Native claims protect admission. Every authorization key an execution writes is
+//! held under its stripe across the publication's store (`dependency`).
 
-use kappa_store::identity_scope::{AnchorScope, session_id};
-use kappa_types::VerifiedContent;
+use kappa_store::transition::RecordTransition;
+
 use kappa_types::authorization::{CredentialTransition, SessionTransition};
-use kappa_types::axis::Axis;
-use kappa_types::canonical::canonical_bytes;
 use kappa_types::error::StoreError;
 use kappa_types::identity::TrustPosition;
 use kappa_types::kappa::Kappa;
 
+use kappa_store::identity_scope::session_id;
+
 use super::claims::ClaimKey;
-use super::execution::WriteCx;
+use super::execution::{MemoryPayload, WriteCx};
 use super::view::Row;
 
 impl WriteCx<'_> {
-    /// Publish a transition record and record the `AnchorOrigin` naming
-    /// its identity under `scope`.
-    fn record_transition(
-        &mut self,
-        scope: &AnchorScope,
-        transition: &[u8],
-    ) -> Result<(), StoreError> {
-        let content = VerifiedContent::compute(Axis::Sha256, transition)?;
-        self.publish_content(&content)?;
-        self.anchor_origin(content.kappa(), scope);
-        Ok(())
-    }
-
     /// Record the session under `token`'s derived identifier. A session
     /// already held under that identifier is replaced; either way the
     /// ledger carries the transition under the identifier, never the token.
@@ -50,29 +34,32 @@ impl WriteCx<'_> {
     ) -> Result<(), StoreError> {
         let id = session_id(token);
         self.reserve(ClaimKey::Session(id.clone()))?;
-        let revision = self.view.revision;
-        self.view.authorization.sessions.insert(
-            id.clone(),
-            Row {
-                value: (anchor.clone(), expires_at_ms, metadata.to_vec()),
-                revision,
-            },
-        );
-        let transition =
-            SessionTransition::set(id.clone(), anchor.clone(), expires_at_ms, metadata);
-        self.record_transition(&AnchorScope::Session { id }, &canonical_bytes(&transition))
+        self.apply_record_transition(
+            RecordTransition::Session(SessionTransition::set(
+                id,
+                anchor.clone(),
+                expires_at_ms,
+                metadata,
+            )),
+            MemoryPayload::SessionMetadata(metadata.to_vec()),
+        )
+        .map(drop)
     }
 
     /// A session this namespace does not hold is a no-op and records no
     /// mutation.
     pub fn session_delete(&mut self, token: &str) -> Result<(), StoreError> {
         let id = session_id(token);
-        let Some(row) = self.view.authorization.sessions.remove(&id) else {
+        let Some(row) = self.view.authorization.sessions.get(&id) else {
             return Ok(());
         };
+        let anchor = row.value.0.clone();
         self.release(ClaimKey::Session(id.clone()));
-        let transition = SessionTransition::deleted(id.clone(), row.value.0);
-        self.record_transition(&AnchorScope::Session { id }, &canonical_bytes(&transition))
+        self.apply_record_transition(
+            RecordTransition::Session(SessionTransition::deleted(id, anchor)),
+            MemoryPayload::NoResources,
+        )
+        .map(drop)
     }
 
     pub fn credential_put(
@@ -82,22 +69,19 @@ impl WriteCx<'_> {
         secret_hash: &[u8],
     ) -> Result<(), StoreError> {
         self.reserve(ClaimKey::Credential(credential_id.to_owned()))?;
-        let revision = self.view.revision;
-        self.view.authorization.credentials.insert(
-            credential_id.to_owned(),
-            Row {
-                value: (anchor.clone(), secret_hash.to_vec(), None),
-                revision,
+        self.apply_record_transition(
+            RecordTransition::Credential(CredentialTransition::set(
+                credential_id.to_owned(),
+                anchor.clone(),
+                secret_hash,
+                None,
+            )),
+            MemoryPayload::CredentialSecrets {
+                secret_hash: secret_hash.to_vec(),
+                grace_secret_hash: None,
             },
-        );
-        let transition =
-            CredentialTransition::set(credential_id.to_owned(), anchor.clone(), secret_hash, None);
-        self.record_transition(
-            &AnchorScope::Credential {
-                id: credential_id.to_owned(),
-            },
-            &canonical_bytes(&transition),
         )
+        .map(drop)
     }
 
     /// Rotate the secret; the previous one stays valid for
@@ -111,71 +95,110 @@ impl WriteCx<'_> {
         new_secret_hash: &[u8],
         grace_period_ms: u64,
     ) -> Result<(), StoreError> {
-        let grace_expires = self
-            .now
-            .checked_add_physical_ms(grace_period_ms)
-            .ok_or_else(|| StoreError::Rejected("credential grace deadline overflow".into()))?
-            .as_i64();
-        let revision = self.view.revision;
-        let row = self
-            .view
-            .authorization
-            .credentials
-            .get_mut(credential_id)
-            .ok_or_else(|| StoreError::NotFound(format!("credential {credential_id}")))?;
-        if row.value.0 != *expected_owner {
-            return Err(StoreError::Rejected(format!(
-                "credential {credential_id} is owned by {}, not {expected_owner}",
-                row.value.0
-            )));
-        }
-        let previous = std::mem::replace(&mut row.value.1, new_secret_hash.to_vec());
-        row.value.2 = Some((previous.clone(), grace_expires));
-        row.revision = revision;
-        let anchor = row.value.0.clone();
-        self.attempt_guard(ClaimKey::Credential(credential_id.to_owned()));
-        let transition = CredentialTransition::set(
-            credential_id.to_owned(),
-            anchor,
+        let row = self.view.authorization.credentials.get(credential_id);
+        let record = kappa_store::identity_ops::prepare_credential_rotation(
+            credential_id,
+            row.map(|row| (&row.value.0, row.value.1.as_slice())),
+            expected_owner,
             new_secret_hash,
-            Some((previous.as_slice(), grace_expires)),
-        );
-        self.record_transition(
-            &AnchorScope::Credential {
-                id: credential_id.to_owned(),
+            grace_period_ms,
+            self.now,
+        )?;
+        let previous_hash = row.map(|row| row.value.1.clone());
+        self.attempt_guard(ClaimKey::Credential(credential_id.to_owned()));
+        self.apply_record_transition(
+            RecordTransition::Credential(record),
+            MemoryPayload::CredentialSecrets {
+                secret_hash: new_secret_hash.to_vec(),
+                grace_secret_hash: previous_hash,
             },
-            &canonical_bytes(&transition),
         )
+        .map(drop)
     }
 
     /// A credential this namespace does not hold is a no-op and records no
     /// mutation.
     pub fn credential_delete(&mut self, credential_id: &str) -> Result<(), StoreError> {
-        let Some(row) = self.view.authorization.credentials.remove(credential_id) else {
+        let Some(row) = self.view.authorization.credentials.get(credential_id) else {
             return Ok(());
         };
+        let anchor = row.value.0.clone();
         self.release(ClaimKey::Credential(credential_id.to_owned()));
-        let transition = CredentialTransition::deleted(credential_id.to_owned(), row.value.0);
-        self.record_transition(
-            &AnchorScope::Credential {
-                id: credential_id.to_owned(),
-            },
-            &canonical_bytes(&transition),
+        self.apply_record_transition(
+            RecordTransition::Credential(CredentialTransition::deleted(
+                credential_id.to_owned(),
+                anchor,
+            )),
+            MemoryPayload::NoResources,
         )
+        .map(drop)
     }
 
     /// Set the trust position; the ledger names the identity of the
     /// position record, which is published as evidence.
     pub fn trust_position_put(&mut self, position: &TrustPosition) -> Result<(), StoreError> {
         self.reserve(ClaimKey::Trust)?;
-        let content = VerifiedContent::compute(Axis::Sha256, &canonical_bytes(position))?;
-        self.publish_content(&content)?;
+        self.apply_record_transition(
+            RecordTransition::Trust(position.clone()),
+            MemoryPayload::NoResources,
+        )
+        .map(drop)
+    }
+
+    // -- Application helpers (called only by `apply_write`) ------------------
+
+    /// Hold the session `session` sets, with the metadata its transition's
+    /// digest was checked against, at the candidate's revision.
+    pub(super) fn apply_session_set(&mut self, session: SessionTransition, metadata: Vec<u8>) {
+        let revision = self.view.revision;
+        self.view.authorization.sessions.insert(
+            session.id,
+            Row {
+                value: (session.anchor, session.expires_at_ms, metadata),
+                revision,
+            },
+        );
+    }
+
+    /// Remove the session `session` deletes.
+    pub(super) fn apply_session_delete(&mut self, session: &SessionTransition) {
+        self.view.authorization.sessions.remove(&session.id);
+    }
+
+    /// Hold the credential `credential` sets, with the secret hashes its
+    /// commitments were checked against, at the candidate's revision. The
+    /// grace secret is held with the grace deadline the transition carries.
+    pub(super) fn apply_credential_set(
+        &mut self,
+        credential: CredentialTransition,
+        secret_hash: Vec<u8>,
+        grace_secret_hash: Option<Vec<u8>>,
+    ) {
+        let revision = self.view.revision;
+        self.view.authorization.credentials.insert(
+            credential.id,
+            Row {
+                value: (
+                    credential.anchor,
+                    secret_hash,
+                    grace_secret_hash.zip(credential.grace_expires_ms),
+                ),
+                revision,
+            },
+        );
+    }
+
+    /// Remove the credential `credential` deletes.
+    pub(super) fn apply_credential_delete(&mut self, credential: &CredentialTransition) {
+        self.view.authorization.credentials.remove(&credential.id);
+    }
+
+    /// Hold `position` as the trust position at the candidate's revision.
+    pub(super) const fn apply_trust(&mut self, position: TrustPosition) {
         let revision = self.view.revision;
         self.view.authorization.trust = Some(Row {
-            value: position.clone(),
+            value: position,
             revision,
         });
-        self.anchor_origin(content.kappa(), &AnchorScope::Trust);
-        Ok(())
     }
 }

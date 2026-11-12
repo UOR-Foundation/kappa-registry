@@ -3,16 +3,110 @@ use std::sync::Arc;
 use kappa_crypto::{SigningAuthority, ed25519::Ed25519Signer};
 use kappa_store::epoch_authority::{Activation, EpochAuthority, sign_witness};
 use kappa_store::epoch_publication::{
-    EpochPublication, EpochPublicationInput, check_ledger_digests, verify_epoch_authority,
-    verify_persisted_epoch,
+    EpochCandidate, EpochPublication, EpochPublicationInput, SigningReservation,
+    admit_persisted_epoch, check_ledger_digests, verify_epoch_authority, verify_persisted_epoch,
 };
+use kappa_store::namespace_commitment::StateInput;
 use kappa_store::succession_ops::VerifiedSuccession;
+use kappa_types::merkle::StreamingTree;
+use kappa_types::state_index::{self, Node, NodeSource};
+use kappa_types::state_key;
+use kappa_types::work::{Dimension, Work, WorkLimit, WorkMeter};
 use kappa_types::{
-    ActivationDomain, EpochRoot, Kappa, NamespaceRef, SignedPayload, Succession, SuccessionReason,
-    canonical::from_canonical, clock::ClockMs, epoch::EpochMutation,
+    ActivationDomain, AuthorityState, EpochRoot, Kappa, NamespaceRef, SignedPayload, Succession,
+    SuccessionReason,
+    canonical::{canonical_bytes, from_canonical},
+    clock::ClockMs,
+    epoch::EpochMutation,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[test]
+fn retirement_retains_transition_evidence_without_retaining_payload() -> TestResult {
+    use kappa_store::transition::{PreparedTransition, RecordTransition, TransitionDomain};
+    use kappa_types::content::{ContentAdmission, ContentRetirementRecord};
+    let store = EpochAuthority::new(authority(12)?)?;
+    let namespace = NamespaceRef::deterministic("retirement-evidence");
+    let payload = Kappa::sha256(b"retirable bytes");
+    let record = RecordTransition::ContentRetire(ContentRetirementRecord::new(
+        ContentAdmission::new(*namespace.id(), [1; 16], payload.clone(), 15),
+    ));
+    let evidence = kappa_types::VerifiedContent::compute(
+        kappa_types::Axis::Sha256,
+        &record.canonical_bytes(),
+    )?;
+    let transition = PreparedTransition::bind(
+        TransitionDomain::new(
+            *namespace.id(),
+            kappa_types::LogicalIncarnation::from_bytes([1; 16]),
+        ),
+        record,
+        evidence,
+        ClockMs::from_raw(100),
+    )?;
+    let mutations = vec![transition.mutation().clone()];
+    let (auth, index_root, nodes) = build_state(&namespace, [1; 16], Some(store.anchor()))?;
+    let history = StreamingTree::default();
+    let candidate = EpochPublication::prepare(
+        EpochPublicationInput {
+            namespace: &namespace,
+            predecessor: None,
+            state_root: [0; 32],
+            tag_count: 0,
+            mutations: &mutations,
+            now: ClockMs::from_raw(100),
+            signer_override: None,
+            state: StateInput {
+                authority: &auth,
+                index_root,
+                index: &nodes,
+                predecessor: None,
+                history: &history,
+            },
+        },
+        &store,
+        &mut WorkMeter::unbounded(),
+    )?;
+    let publication = signed(candidate, &store)?;
+    assert!(
+        publication
+            .retained_links()
+            .iter()
+            .any(|(edge, _)| &edge.target == transition.evidence().kappa())
+    );
+    assert!(
+        !publication
+            .retained_links()
+            .iter()
+            .any(|(edge, _)| edge.target == payload)
+    );
+    Ok(())
+}
+
+/// Sign `candidate` at its own coordinate, as a backend does once it has
+/// recorded the coordinate consumed, and take its publication.
+fn signed(
+    mut candidate: EpochCandidate,
+    authority: &EpochAuthority,
+) -> Result<EpochPublication, kappa_types::StoreError> {
+    let reservation =
+        SigningReservation::recorded(candidate.namespace()?, candidate.epoch_number());
+    candidate.sign(authority, &reservation, &mut WorkMeter::unbounded())?;
+    candidate.into_publication(reservation).map_err(|_| {
+        kappa_types::StoreError::Internal("a signed candidate did not complete".into())
+    })
+}
+
+/// `verify_persisted_epoch` on an unbounded allowance: the admission's
+/// outcome, not its work, under test.
+fn persisted(
+    root: &EpochRoot,
+    authority: &EpochAuthority,
+    ledger: &[u8],
+) -> Result<(), kappa_types::StoreError> {
+    verify_persisted_epoch(root, authority, ledger, &mut WorkMeter::unbounded())
+}
 
 fn authority(seed: u8) -> Result<SigningAuthority, Box<dyn std::error::Error>> {
     Ok(SigningAuthority::new(Arc::new(Ed25519Signer::from_bytes(
@@ -20,14 +114,82 @@ fn authority(seed: u8) -> Result<SigningAuthority, Box<dyn std::error::Error>> {
     )?))?)
 }
 
+/// An in-memory node source for the state index: holds all created nodes.
+struct TestNodes(std::collections::BTreeMap<[u8; 32], Node>);
+
+impl TestNodes {
+    const fn new() -> Self {
+        Self(std::collections::BTreeMap::new())
+    }
+
+    fn absorb(&mut self, update: &state_index::Update) {
+        for node in &update.created {
+            self.0.insert(node.hash(), *node);
+        }
+    }
+}
+
+impl NodeSource for TestNodes {
+    fn node(&self, hash: &[u8; 32]) -> Result<Node, kappa_types::StoreError> {
+        self.0
+            .get(hash)
+            .copied()
+            .ok_or_else(|| kappa_types::StoreError::NotFound(hex::encode(hash)))
+    }
+}
+
+/// Build the authority record and state index for a namespace under
+/// test, returning everything `StateInput` needs.
+fn build_state(
+    namespace: &NamespaceRef,
+    incarnation: [u8; 16],
+    owner: Option<&Kappa>,
+) -> Result<(AuthorityState, [u8; 32], TestNodes), Box<dyn std::error::Error>> {
+    let auth = AuthorityState::new(
+        *namespace.id(),
+        incarnation,
+        owner.cloned(),
+        namespace.display_name().to_owned(),
+        None,
+        false,
+    )?;
+    let auth_bytes = canonical_bytes(&auth);
+    let (path, value) = state_key::authority_entry(&auth_bytes);
+    let mut nodes = TestNodes::new();
+    let mut meter = WorkMeter::unbounded();
+    let update = state_index::apply(
+        &nodes,
+        state_index::EMPTY,
+        &[(path, Some(value))],
+        &mut meter,
+    )?;
+    nodes.absorb(&update);
+    Ok((auth, update.root, nodes))
+}
+
+/// Prepare a publication with a correct state commitment. The state
+/// always uses a fixed incarnation and an owner derived from the
+/// store's current anchor.
 fn prepare(
     namespace: &NamespaceRef,
     predecessor: Option<&EpochRoot>,
     now: i64,
-    authority: &EpochAuthority,
+    store: &EpochAuthority,
     signer_override: Option<&Kappa>,
 ) -> Result<EpochPublication, kappa_types::StoreError> {
-    EpochPublication::prepare(
+    let incarnation = [1; 16];
+    let (auth, index_root, nodes) = build_state(namespace, incarnation, Some(store.anchor()))
+        .map_err(|error| kappa_types::StoreError::Internal(error.to_string()))?;
+    let history = StreamingTree::default();
+    let state_input = StateInput {
+        authority: &auth,
+        index_root,
+        index: &nodes,
+        predecessor: None,
+        history: &history,
+    };
+    let mut meter = WorkMeter::unbounded();
+    let candidate = EpochPublication::prepare(
         EpochPublicationInput {
             namespace,
             predecessor,
@@ -36,9 +198,12 @@ fn prepare(
             mutations: &Vec::<EpochMutation>::new(),
             now: ClockMs::from_raw(now),
             signer_override,
+            state: state_input,
         },
-        authority,
-    )
+        store,
+        &mut meter,
+    )?;
+    signed(candidate, store)
 }
 
 fn rotate(
@@ -143,12 +308,11 @@ fn persisted_epoch_requires_signed_authority_and_exact_ledger_correspondence() -
     let store = EpochAuthority::new(signer_authority.clone())?;
     let namespace = NamespaceRef::deterministic("publication");
     let publication = prepare(&namespace, None, 100, &store, None)?;
-    verify_persisted_epoch(publication.root(), &store, publication.ledger().content())?;
-    assert!(verify_persisted_epoch(publication.root(), &store, b"different ledger").is_err());
+    persisted(publication.root(), &store, publication.ledger().content())?;
+    assert!(persisted(publication.root(), &store, b"different ledger").is_err());
     let other = EpochAuthority::new(authority(13)?)?;
-    assert!(
-        verify_persisted_epoch(publication.root(), &other, publication.ledger().content()).is_err()
-    );
+    assert!(persisted(publication.root(), &other, publication.ledger().content()).is_err());
+    let forged_state = Kappa::sha256(b"forged-state-for-mutation-root-mismatch");
     let build = |mutations_root| {
         EpochRoot::build(kappa_types::epoch_root::EpochRootInput {
             namespace: &namespace,
@@ -161,16 +325,50 @@ fn persisted_epoch_requires_signed_authority_and_exact_ledger_correspondence() -
             tag_count: 4,
             rotation_kappa: None,
             ledger_root: publication.ledger().kappa(),
+            state: &forged_state,
         })
     };
-    assert!(
-        verify_persisted_epoch(&build([0; 32]), &store, publication.ledger().content()).is_err()
-    );
+    assert!(persisted(&build([0; 32]), &store, publication.ledger().content()).is_err());
     let contradictory =
         kappa_crypto::signed_types::sign_epoch(build([9; 32]), signer_authority.signer())?;
-    assert!(
-        verify_persisted_epoch(&contradictory, &store, publication.ledger().content()).is_err()
+    assert!(persisted(&contradictory, &store, publication.ledger().content()).is_err());
+    Ok(())
+}
+
+/// Admission charges the signature it verifies before verifying it: an
+/// allowance with no signature left is refused with nothing charged, and
+/// the same admission on an allowance that holds it succeeds and charges
+/// exactly one signature.
+#[test]
+fn persisted_epoch_admission_is_refused_before_it_verifies() -> TestResult {
+    let store = EpochAuthority::new(authority(12)?)?;
+    let namespace = NamespaceRef::deterministic("admission-work");
+    let publication = prepare(&namespace, None, 100, &store, None)?;
+    let mut starved = WorkMeter::new(WorkLimit::unbounded().with(Dimension::Signatures, 0));
+    let refused = admit_persisted_epoch(
+        publication.root(),
+        &store,
+        publication.ledger(),
+        &mut starved,
     );
+    assert!(
+        matches!(refused, Err(kappa_types::StoreError::WorkRefused(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        starved.used(),
+        &Work::default(),
+        "a refusal charges nothing"
+    );
+    let mut allowed = WorkMeter::new(WorkLimit::unbounded().with(Dimension::Signatures, 1));
+    let mutations = admit_persisted_epoch(
+        publication.root(),
+        &store,
+        publication.ledger(),
+        &mut allowed,
+    )?;
+    assert!(mutations.is_empty());
+    assert_eq!(allowed.used().get(Dimension::Signatures), 1);
     Ok(())
 }
 
@@ -189,7 +387,18 @@ fn ledger_digest_correspondence_is_separate_from_authority() -> TestResult {
         timestamp_ms: 100,
         context: Some("latest".into()),
     }];
-    let publication = EpochPublication::prepare(
+    let (auth, index_root, nodes) = build_state(&namespace, [1; 16], Some(store.anchor()))
+        .map_err(|error| kappa_types::StoreError::Internal(error.to_string()))?;
+    let history = StreamingTree::default();
+    let state_input = StateInput {
+        authority: &auth,
+        index_root,
+        index: &nodes,
+        predecessor: None,
+        history: &history,
+    };
+    let mut meter = WorkMeter::unbounded();
+    let candidate = EpochPublication::prepare(
         EpochPublicationInput {
             namespace: &namespace,
             predecessor: None,
@@ -198,15 +407,18 @@ fn ledger_digest_correspondence_is_separate_from_authority() -> TestResult {
             mutations: &mutations,
             now: ClockMs::from_raw(100),
             signer_override: None,
+            state: state_input,
         },
         &store,
+        &mut meter,
     )?;
+    let publication = signed(candidate, &store)?;
     let root = publication.root();
     let ledger = Kappa::compute(root.ledger_root().axis(), publication.ledger().content())?;
     let tree = kappa_types::epoch_root::mutations_merkle_root(&mutations);
     check_ledger_digests(root, &ledger, &tree)?;
     verify_epoch_authority(root, &store)?;
-    verify_persisted_epoch(root, &store, publication.ledger().content())?;
+    persisted(root, &store, publication.ledger().content())?;
     assert!(matches!(
         check_ledger_digests(root, &Kappa::sha256(b"other ledger"), &tree),
         Err(kappa_types::StoreError::Rejected(_))
@@ -237,7 +449,7 @@ fn idle_namespace_publishes_across_several_rotations() -> TestResult {
     let first = prepare(&namespace, None, 50, &at_a, None)?;
 
     let at_c = rotate(&rotate(&at_a, &b, 100)?, &c, 200)?;
-    verify_persisted_epoch(first.root(), &at_c, first.ledger().content())?;
+    persisted(first.root(), &at_c, first.ledger().content())?;
 
     let second = prepare(&namespace, Some(first.root()), 300, &at_c, None)?;
     assert_eq!(second.root().signer_anchor(), c.anchor());
@@ -256,7 +468,7 @@ fn idle_namespace_publishes_across_several_rotations() -> TestResult {
             .any(|(link, _)| &link.target == record.kappa()),
         "the path is retained with the epoch"
     );
-    verify_persisted_epoch(second.root(), &at_c, second.ledger().content())?;
+    persisted(second.root(), &at_c, second.ledger().content())?;
 
     let outgoing = [
         (a.signer().algorithm(), a.signer().public_key()),
@@ -277,6 +489,7 @@ fn idle_namespace_publishes_across_several_rotations() -> TestResult {
     assert!(third.root().rotation_kappa().is_none());
 
     // A retired key cannot author admissible history after retirement.
+    let retired_key_state = Kappa::sha256(b"retired-key-forged-epoch-state");
     let forged = kappa_crypto::signed_types::sign_epoch(
         EpochRoot::build(kappa_types::epoch_root::EpochRootInput {
             namespace: &namespace,
@@ -289,11 +502,12 @@ fn idle_namespace_publishes_across_several_rotations() -> TestResult {
             tag_count: 4,
             rotation_kappa: None,
             ledger_root: first.ledger().kappa(),
+            state: &retired_key_state,
         }),
         a.signer(),
     )?;
     assert!(matches!(
-        verify_persisted_epoch(&forged, &at_c, first.ledger().content()),
+        persisted(&forged, &at_c, first.ledger().content()),
         Err(kappa_types::StoreError::Rejected(_))
     ));
     Ok(())

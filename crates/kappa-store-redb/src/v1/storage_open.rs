@@ -13,8 +13,9 @@ use redb::{Database, ReadableDatabase};
 use kappa_store::error::StoreError;
 
 use super::{NamespaceController, NamespaceStorageInner, Opening};
+use crate::instance_record::{Kind, sync_directories};
 use crate::storage_instance::{Incarnation, StorageInstance};
-use crate::{creation_intent, tables};
+use crate::tables;
 
 impl NamespaceController {
     /// Open the controller of `id` at `root`, creating the database when
@@ -39,7 +40,7 @@ impl NamespaceController {
         // opened without creating anything; only a creation of absent
         // storage creates, and it records its intent durably first, so
         // storage a failed creation leaves behind always has an owner that
-        // recovery visits (`creation_intent`). The intent is handed off to
+        // recovery visits (`instance_record`). The intent is handed off to
         // the instance's pending marker (`mark_unsettled`), not completed
         // here: until a marker owns the instance, the intent does.
         let selected = storage.backend.as_ref().and_then(|factory| factory(&id));
@@ -53,7 +54,7 @@ impl NamespaceController {
                     (db, None)
                 } else if create {
                     let instance = StorageInstance::generate(id)?;
-                    creation_intent::record(root, &instance)?;
+                    Kind::Creating.record(root, &instance)?;
                     (db, Some(instance))
                 } else {
                     return Err(absent());
@@ -62,7 +63,7 @@ impl NamespaceController {
             None if path.exists() => (Database::open(&path).map_err(crate::error::redb)?, None),
             None if create => {
                 let instance = StorageInstance::generate(id)?;
-                creation_intent::record(root, &instance)?;
+                Kind::Creating.record(root, &instance)?;
                 std::fs::create_dir_all(&directory)?;
                 (
                     Database::create(&path).map_err(crate::error::redb)?,
@@ -123,6 +124,8 @@ impl NamespaceController {
             assignment_stale: AtomicBool::new(false),
             writer_gate: super::WriterGate::default(),
             head_recovered: AtomicBool::new(false),
+            settlement_running: AtomicBool::new(false),
+            known_settled: AtomicU64::new(0),
         })
     }
 
@@ -197,18 +200,4 @@ impl NamespaceController {
             StorageInstance::incarnation_from_row(incarnation.as_deref())?,
         ))
     }
-}
-
-/// Sync `directory` and every directory above it up to and including
-/// `root`, so the entries a creation made survive a crash.
-fn sync_directories(directory: &Path, root: &Path) -> Result<(), StoreError> {
-    let mut current = Some(directory);
-    while let Some(path) = current {
-        std::fs::File::open(path)?.sync_all()?;
-        if path == root {
-            break;
-        }
-        current = path.parent().filter(|parent| parent.starts_with(root));
-    }
-    Ok(())
 }

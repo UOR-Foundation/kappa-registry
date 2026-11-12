@@ -1,6 +1,7 @@
 //! Store-level access to namespaces and the registry: the assignment
-//! source controllers resolve their plane from, the identity locator, the
-//! open-controller lookup write helpers use, and the mutation record.
+//! source controllers resolve their plane from, the identity locator, and
+//! the open-controller lookup write helpers use. Mutations are recorded
+//! only by the transition boundary (`transition_apply`).
 //!
 //! An identity-only read finds a storage instance holding the identity
 //! without trusting any projection's absence. Candidates come from keyed
@@ -41,15 +42,14 @@
 //! answer is a consistent read, not a snapshot of all owners and not a
 //! deletion certificate.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use redb::{Database, ReadableDatabase};
 
 use kappa_store::error::StoreError;
 use kappa_store::kappa::Kappa;
 use kappa_store::namespace::NamespaceRef;
+use kappa_store::work::{Dimension, Meter, reserve_charged};
 
 use crate::content_read::ReadView;
 use crate::namespace_snapshot::InstanceAdmission;
@@ -69,8 +69,8 @@ enum Probe<T> {
     /// Its evidence could not be read.
     Unavailable(StoreError),
     /// The read refused the request on its own terms (a compressed
-    /// representation, a capacity bound): the answer, whatever the
-    /// other candidates hold.
+    /// representation, a capacity bound, the operation's work allowance):
+    /// the answer, whatever the other candidates hold.
     Refused(StoreError),
 }
 
@@ -148,15 +148,17 @@ impl PersistentStore {
     /// The settled routing projection of `ns`'s assignment: the plane and
     /// generation its last settled epoch admitted. A locator for routing
     /// a request to a node serving that plane; the controller decides
-    /// from the namespace's own record.
+    /// from the namespace's own record. Read on `work`, the operation's
+    /// meter, completely or refused.
     pub fn assigned_plane(
         &self,
         ns: &NamespaceRef,
+        work: &mut dyn Meter,
     ) -> Result<Option<(control_plane::ControlPlaneId, u64)>, StoreError> {
         // Instances of a namespace settle one after another; the one
         // completed last holds the namespace's current routing.
         self.projection()?
-            .get(Family::Assignment, ns.id())?
+            .get(Family::Assignment, ns.id(), work)?
             .into_iter()
             .max_by_key(|visible| visible.completion)
             .map(|visible| control_plane::decode_assignment(&visible.value))
@@ -164,25 +166,34 @@ impl PersistentStore {
     }
 
     /// The storage instances whose completed epochs select a
-    /// representation for `identity`, from the settled catalog. A locator
-    /// only.
+    /// representation for `identity`, from the settled catalog, read on
+    /// `work`. A locator only; a refusal is never an empty list.
     pub(crate) fn catalog_owners(
         &self,
         identity: &Kappa,
+        work: &mut dyn Meter,
     ) -> Result<Vec<StorageInstance>, StoreError> {
-        Ok(self
+        let owners = self
             .projection()?
-            .get(Family::Catalog, &identity.key_bytes())?
-            .into_iter()
-            .map(|visible| visible.instance)
-            .collect())
+            .get(Family::Catalog, &identity.key_bytes(), work)?;
+        let mut instances = Vec::new();
+        for visible in owners {
+            reserve_charged(work, &mut instances)?;
+            instances.push(visible.instance);
+        }
+        Ok(instances)
     }
 
     /// Candidates no settlement has projected yet: the storage instances
-    /// the unsettled index registers `key` under. Independent of the
-    /// pending population and of the failed-settlement population.
-    pub(crate) fn unsettled_candidates(&self, key: &DiscoveryKey) -> Vec<StorageInstance> {
-        self.unsettled_index.candidates(key)
+    /// the unsettled index registers `key` under, materialized on `work`.
+    /// Independent of the pending population and of the failed-settlement
+    /// population.
+    pub(crate) fn unsettled_candidates(
+        &self,
+        key: &DiscoveryKey,
+        work: &mut dyn Meter,
+    ) -> Result<Vec<StorageInstance>, StoreError> {
+        Ok(self.unsettled_index.candidates(key, work)?)
     }
 
     /// The result of `read` in every instance the unsettled index registers
@@ -191,20 +202,27 @@ impl PersistentStore {
     /// call (a registration is dropped only once its epoch is projected).
     /// `Unavailable` under incomplete discovery or when a candidate's
     /// evidence cannot be read: the answer is a complete list or none. A
-    /// candidate whose `read` finds nothing contributes nothing.
+    /// candidate whose `read` finds nothing contributes nothing. Candidates,
+    /// the storage each probe opens, what `read` does (on the same `work`)
+    /// and the answers' buffer are all on `work`; a refusal refuses the
+    /// list.
     pub(crate) fn every_unsettled_holder<T>(
         &self,
         key: &DiscoveryKey,
         subject: &str,
-        mut read: impl FnMut(&ReadView) -> Result<T, StoreError>,
+        work: &mut dyn Meter,
+        mut read: impl FnMut(&ReadView, &mut dyn Meter) -> Result<T, StoreError>,
     ) -> Result<Vec<T>, StoreError> {
         if let Some(refusal) = self.discovery_coverage().unavailable(subject) {
             return Err(refusal);
         }
         let mut answers = Vec::new();
-        for candidate in self.unsettled_candidates(key) {
-            match self.probe(&candidate, &mut read) {
-                Probe::Held(value) => answers.push(value),
+        for candidate in self.unsettled_candidates(key, work)? {
+            match self.probe(&candidate, work, &mut read) {
+                Probe::Held(value) => {
+                    reserve_charged(work, &mut answers)?;
+                    answers.push(value);
+                }
                 Probe::Released => {}
                 Probe::Refused(error) => return Err(error),
                 Probe::Unavailable(error) => {
@@ -219,24 +237,35 @@ impl PersistentStore {
 
     /// Run `read` over `candidate`'s held storage, inside which `read`
     /// confirms and uses the instance's committed row of the identity; the
-    /// view retains the storage for whatever `read` returns.
+    /// view retains the storage for whatever `read` returns. The storage
+    /// handle the probe opens is charged to `work` before it is opened, and
+    /// `read` runs on `work`; a refusal of either is the probe's answer.
     fn probe<T>(
         &self,
         candidate: &StorageInstance,
-        read: &mut impl FnMut(&ReadView) -> Result<T, StoreError>,
+        work: &mut dyn Meter,
+        read: &mut impl FnMut(&ReadView, &mut dyn Meter) -> Result<T, StoreError>,
     ) -> Probe<T> {
+        if let Err(refused) = work.charge(Dimension::Handles, 1) {
+            return Probe::Refused(refused.into());
+        }
         match self.admit_instance(candidate) {
-            InstanceAdmission::Held { snapshot, .. } => match read(snapshot.view()) {
+            InstanceAdmission::Held { snapshot, .. } => match read(snapshot.view(), work) {
                 Ok(value) => Probe::Held(value),
                 Err(StoreError::NotFound(_)) => Probe::Released,
                 Err(
                     error @ (StoreError::Rejected(_)
                     | StoreError::CapacityExceeded(_)
+                    | StoreError::WorkRefused(_)
                     | StoreError::NotSupported(_)),
                 ) => Probe::Refused(error),
                 Err(error) => Probe::Unavailable(error),
             },
             InstanceAdmission::Released(_) => Probe::Released,
+            // Not examined: the candidate may hold the identity.
+            InstanceAdmission::CapacityDeferred { limit } => Probe::Unavailable(
+                StoreError::CapacityExceeded(format!("{limit} namespace activities are active")),
+            ),
             InstanceAdmission::Unexplained(error) | InstanceAdmission::Unreadable(error) => {
                 Probe::Unavailable(error)
             }
@@ -245,26 +274,30 @@ impl PersistentStore {
 
     /// The result of `read` in the first candidate namespace holding a
     /// committed representation of `identity`, under the contract in the
-    /// module documentation.
+    /// module documentation. Every lookup, the record of candidates tried,
+    /// each probe and `read` itself run on `work`, the operation's meter.
     pub(crate) fn with_holder<T>(
         &self,
         identity: &Kappa,
-        mut read: impl FnMut(&ReadView) -> Result<T, StoreError>,
+        work: &mut dyn Meter,
+        mut read: impl FnMut(&ReadView, &mut dyn Meter) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let mut tried = BTreeSet::new();
+        let mut tried: Vec<StorageInstance> = Vec::new();
         let mut unavailable = None;
         let key = DiscoveryKey::Content(identity.clone());
         for stage in 0..3 {
             let candidates = if stage == 1 {
-                self.unsettled_candidates(&key)
+                self.unsettled_candidates(&key, work)?
             } else {
-                self.catalog_owners(identity)?
+                self.catalog_owners(identity, work)?
             };
             for candidate in candidates {
-                if !tried.insert(candidate) {
+                if tried.contains(&candidate) {
                     continue;
                 }
-                match self.probe(&candidate, &mut read) {
+                reserve_charged(work, &mut tried)?;
+                tried.push(candidate);
+                match self.probe(&candidate, work, &mut read) {
                     Probe::Held(value) => return Ok(value),
                     Probe::Released => {}
                     Probe::Refused(error) => return Err(error),
@@ -289,24 +322,41 @@ impl PersistentStore {
     /// in identity order, each once, by the candidates and probing of
     /// `with_holder`. `Unavailable` when discovery is incomplete or a
     /// candidate's evidence cannot be read: the list would otherwise claim
-    /// completeness it does not have.
-    pub(crate) fn holders(&self, identity: &Kappa) -> Result<Vec<[u8; 16]>, StoreError> {
+    /// completeness it does not have. Every lookup, probe and buffer runs
+    /// on `work`; a refusal refuses the list.
+    pub(crate) fn holders(
+        &self,
+        identity: &Kappa,
+        work: &mut dyn Meter,
+    ) -> Result<Vec<[u8; 16]>, StoreError> {
         if let Some(refusal) = self
             .discovery_coverage()
             .unavailable(&format!("owners of {identity}"))
         {
             return Err(refusal);
         }
-        let mut candidates: BTreeSet<StorageInstance> =
-            self.catalog_owners(identity)?.into_iter().collect();
-        candidates.extend(self.unsettled_candidates(&DiscoveryKey::Content(identity.clone())));
-        candidates.extend(self.catalog_owners(identity)?);
-        let mut holders = BTreeSet::new();
-        let mut confirm = |view: &ReadView| view.record(identity).map(drop);
+        let mut candidates = self.catalog_owners(identity, work)?;
+        let lookups = [
+            self.unsettled_candidates(&DiscoveryKey::Content(identity.clone()), work)?,
+            self.catalog_owners(identity, work)?,
+        ];
+        for found in lookups {
+            for candidate in found {
+                reserve_charged(work, &mut candidates)?;
+                candidates.push(candidate);
+            }
+        }
+        // In place: each candidate once, in instance order.
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut holders: Vec<[u8; 16]> = Vec::new();
+        let mut confirm =
+            |view: &ReadView, work: &mut dyn Meter| view.record(identity, work).map(drop);
         for candidate in candidates {
-            match self.probe(&candidate, &mut confirm) {
+            match self.probe(&candidate, work, &mut confirm) {
                 Probe::Held(()) => {
-                    holders.insert(*candidate.namespace());
+                    reserve_charged(work, &mut holders)?;
+                    holders.push(*candidate.namespace());
                 }
                 Probe::Released => {}
                 Probe::Refused(error) => return Err(error),
@@ -317,7 +367,11 @@ impl PersistentStore {
                 }
             }
         }
-        Ok(holders.into_iter().collect())
+        // In place: each namespace once, in identity order, whichever of
+        // its instances held the identity.
+        holders.sort_unstable();
+        holders.dedup();
+        Ok(holders)
     }
 
     /// The open controller of `ns`. An execution or reader holds its grant,
@@ -329,42 +383,5 @@ impl PersistentStore {
         self.namespaces
             .open_controller(ns.id())
             .ok_or_else(|| StoreError::Internal(format!("namespace {ns} has no open controller")))
-    }
-
-    /// Record a mutation inside the namespace's write transaction, with the
-    /// data write it describes. Both commit atomically.
-    pub(crate) fn record_mutation_in_txn(
-        &self,
-        txn: &redb::WriteTransaction,
-        ns: &NamespaceRef,
-        op: kappa_store::epoch::MutationOp,
-        kappa: Kappa,
-        now: kappa_store::clock::ClockMs,
-        context: Option<String>,
-    ) -> Result<(), StoreError> {
-        let mutation = kappa_store::epoch::EpochMutation {
-            op,
-            kappa,
-            timestamp_ms: now.as_i64(),
-            context,
-        };
-        self.record_time_in_txn(txn, now)?;
-        let controller = self.controller(ns)?;
-        let seq = controller
-            .mutation_seq
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| StoreError::Internal("mutation sequence exhausted".into()))?;
-        let mut key = Vec::with_capacity(24);
-        key.extend_from_slice(ns.id());
-        key.extend_from_slice(&seq.to_be_bytes());
-        let value = kappa_store::canonical::canonical_bytes(&mutation);
-        let mut mbuf = txn
-            .open_table(tables::MUTATION_BUFFER)
-            .map_err(error::redb)?;
-        mbuf.insert(key.as_slice(), value.as_slice())
-            .map_err(error::redb)?;
-        Ok(())
     }
 }

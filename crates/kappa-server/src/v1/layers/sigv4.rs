@@ -71,13 +71,7 @@ pub fn verify_request(
 
         let cred = cred_store
             .lookup_credential(&parsed.access_key, now)
-            .ok_or_else(|| {
-                s3_err(
-                    StatusCode::FORBIDDEN,
-                    "InvalidAccessKeyId",
-                    "access key not found",
-                )
-            })?;
+            .map_err(credential_error)?;
 
         let payload_hash = parts
             .headers
@@ -194,13 +188,7 @@ pub fn verify_request(
 
         let cred = cred_store
             .lookup_credential(&parsed.access_key, now)
-            .ok_or_else(|| {
-                s3_err(
-                    StatusCode::FORBIDDEN,
-                    "InvalidAccessKeyId",
-                    "access key not found",
-                )
-            })?;
+            .map_err(credential_error)?;
 
         let signing_key =
             sigv4::derive_signing_key(&cred.current_secret, &parsed.date, &region, "s3");
@@ -247,6 +235,44 @@ pub fn verify_request(
     }
 
     Ok(None)
+}
+
+fn credential_error(error: kappa_store::StoreError) -> Box<Response> {
+    match error {
+        kappa_store::StoreError::NotFound(_) => s3_err(
+            StatusCode::FORBIDDEN,
+            "InvalidAccessKeyId",
+            "access key not found",
+        ),
+        _ => s3_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "credential lookup unavailable",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_failures_are_not_reported_as_unknown_access_keys() {
+        assert_eq!(
+            credential_error(kappa_store::StoreError::NotFound("key".into())).status(),
+            StatusCode::FORBIDDEN
+        );
+        for error in [
+            kappa_store::StoreError::Unavailable("storage unavailable".into()),
+            kappa_store::StoreError::Internal("damaged row".into()),
+            kappa_store::StoreError::Rejected("credential does not match owner".into()),
+        ] {
+            assert_eq!(
+                credential_error(error).status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
 }
 
 fn s3_err(status: StatusCode, code: &str, message: &str) -> Box<Response> {

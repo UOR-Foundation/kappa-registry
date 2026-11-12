@@ -1,6 +1,6 @@
 use super::*;
 use kappa_fixture::FixtureRoot;
-use kappa_store::{EpochStore, TagStore, TagUpdate};
+use kappa_store::{ClockMs, EpochStore, TagStore, TagUpdate};
 
 use crate::test_support::{
     Fault, FaultBackend, FaultControl, OpOutcome, PersistentSpec, StorageOp,
@@ -71,8 +71,8 @@ fn fixture(name: &str) -> Result<Fixture, Box<dyn std::error::Error>> {
 }
 
 /// Commit epoch 2 of `fixture.ns`, carrying tag `operation`, with `fault`
-/// armed. Returns the expected epoch-2 root and the publication error,
-/// which must carry the exact publication coordinates.
+/// armed. Returns the epoch-2 root the publication error names, which must
+/// carry the exact publication coordinates.
 fn commit_under(fixture: &Fixture, fault: Fault) -> Result<Kappa, Box<dyn std::error::Error>> {
     let writer = fixture.store.test_writer(&fixture.ns)?;
     fixture.store.tag_put_in_txn(
@@ -83,6 +83,7 @@ fn commit_under(fixture: &Fixture, fault: Fault) -> Result<Kappa, Box<dyn std::e
             kappa: Kappa::sha256(b"operation"),
         },
         ATTEMPT,
+        &mut kappa_store::work::WorkMeter::unbounded(),
     )?;
     let prepared = fixture
         .store
@@ -90,9 +91,8 @@ fn commit_under(fixture: &Fixture, fault: Fault) -> Result<Kappa, Box<dyn std::e
     assert_eq!(
         bound(&fixture.store),
         NOW.as_i64(),
-        "a prepared but uncommitted epoch raised the bound"
+        "a prepared, unsigned epoch raised the bound"
     );
-    let expected = prepared.root().kappa().clone();
     fixture.control.arm(fault);
     let error = prepared
         .publish()
@@ -113,11 +113,17 @@ fn commit_under(fixture: &Fixture, fault: Fault) -> Result<Kappa, Box<dyn std::e
         } => {
             assert_eq!(namespace, *fixture.ns.id());
             assert_eq!(epoch_number, 2);
-            assert_eq!(*root, expected);
+            Ok(*root)
         }
-        other => return Err(format!("lost exact publication identity: {other}").into()),
+        StoreError::PublicationRetained(retained) => {
+            assert_eq!(retained.namespace, *fixture.ns.id());
+            assert_eq!(retained.epoch_number, 2);
+            retained
+                .signed_root
+                .ok_or_else(|| "commit failure lost its signed root".into())
+        }
+        other => Err(format!("lost exact publication identity: {other}").into()),
     }
-    Ok(expected)
 }
 
 /// The failed namespace is fenced: it refuses further executions, its
@@ -179,7 +185,7 @@ fn publish_empty(
 #[test]
 fn refused_commit_writes_leave_the_previous_epoch() -> TestResult {
     let fixture = fixture("refused-writes")?;
-    commit_under(&fixture, Fault::RefuseWrites)?;
+    let expected = commit_under(&fixture, Fault::RefuseWrites)?;
     let trace = fixture.control.trace();
     assert!(
         trace
@@ -199,24 +205,42 @@ fn refused_commit_writes_leave_the_previous_epoch() -> TestResult {
         !trace.iter().any(|(op, _)| *op == StorageOp::Sync),
         "the commit synchronized after its writes were refused: {trace:?}"
     );
-    let (spec, ns, baseline, directory) = finish_failed_handle(fixture)?;
-    // The open's recovery reads the fence and settles the namespace to the
-    // head redb recovered, the commit's outcome, which lifts it.
+    let (spec, ns, baseline, _) = finish_failed_handle(fixture)?;
+    // The old head proves noncommit, not permission to replace a signed
+    // candidate. Custody must survive reopen and publish that exact root.
     let reopened = spec.acquire()?.into_store();
     reopened.settle_all()?;
     assert_eq!(reopened.epoch_current(&ns)?, baseline);
-    assert!(!reopened.namespace_snapshot(&ns)?.controller().fenced());
-    assert!(
-        !crate::storage::NamespaceController::fence_path(&directory).try_exists()?,
-        "the lifted fence left its marker"
-    );
     assert!(matches!(
         reopened.tag_get_raw(&ns, "operation"),
         Err(StoreError::NotFound(_))
     ));
     assert_eq!(reopened.epoch_state(&ns)?.1, 0);
+    assert!(
+        matches!(
+            publish_empty(&reopened, &ns, LATER),
+            Err(StoreError::Conflict(_))
+        ),
+        "retained signing coordinate admitted a replacement"
+    );
+    let resolution = kappa_store::ExecutionStore::resolve_publication(
+        &reopened,
+        &ns,
+        &kappa_handler::clock_at(LATER)?,
+        &mut kappa_store::work::WorkMeter::new(reopened.publication_work),
+    )?;
+    let kappa_store::PublicationResolution::Published(resolved) = resolution else {
+        return Err("retained signed publication did not resolve".into());
+    };
+    assert_eq!(resolved.epoch_number, 2);
+    assert_eq!(resolved.root, expected);
+    assert_eq!(reopened.epoch_current(&ns)?, (2, expected));
+    assert_eq!(
+        reopened.tag_get_raw(&ns, "operation")?.kappa,
+        Kappa::sha256(b"operation")
+    );
     let published = publish_empty(&reopened, &ns, LATER)?;
-    assert_eq!(published.0, 2);
+    assert_eq!(published.0, 3);
     assert_eq!(bound(&reopened), LATER.as_i64());
     Ok(())
 }
@@ -241,7 +265,7 @@ fn unacknowledged_durable_commit_reopens_to_the_new_epoch() -> TestResult {
     let (spec, ns, _, _) = finish_failed_handle(fixture)?;
     let reopened = spec.acquire()?.into_store();
     assert_eq!(reopened.epoch_current(&ns)?, (2, expected.clone()));
-    reopened.resolve_publication(&ns, 2, &expected)?;
+    reopened.verify_committed_publication(&ns, 2, &expected)?;
     assert_eq!(
         reopened.tag_get_raw(&ns, "operation")?.kappa,
         Kappa::sha256(b"operation")
@@ -280,7 +304,7 @@ fn refused_sync_after_writes_reopens_to_the_written_epoch() -> TestResult {
     let (spec, ns, _, _) = finish_failed_handle(fixture)?;
     let reopened = spec.acquire()?.into_store();
     assert_eq!(reopened.epoch_current(&ns)?, (2, expected.clone()));
-    reopened.resolve_publication(&ns, 2, &expected)?;
+    reopened.verify_committed_publication(&ns, 2, &expected)?;
     reopened.settle_all()?;
     for number in 1..=2 {
         reopened.epoch_get(&reopened.epoch_get_by_number(&ns, number)?)?;

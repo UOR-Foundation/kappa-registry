@@ -15,6 +15,34 @@ use dcbor::prelude::*;
 
 use crate::kappa::Kappa;
 
+/// Private `SigV4` credential payload.
+///
+/// Stored only in the governed credential row; publication evidence contains
+/// its commitment, never these bytes.
+/// Rotation grace is owned by the credential row, not duplicated here.
+#[derive(Clone, CBORCodable)]
+pub struct AccessCredential {
+    #[cbor(n = 0)]
+    pub access_key_id: String,
+    #[cbor(n = 1)]
+    pub secret_access_key: String,
+    #[cbor(n = 2)]
+    pub principal_anchor: Kappa,
+    #[cbor(n = 3)]
+    pub created_ms: i64,
+}
+
+impl std::fmt::Debug for AccessCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessCredential")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field("principal_anchor", &self.principal_anchor)
+            .field("created_ms", &self.created_ms)
+            .finish()
+    }
+}
+
 /// Whether the transition set the row or deleted it.
 /// CBOR discriminants (PERMANENT): 0-1
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CBORCodable)]

@@ -15,6 +15,10 @@ use kappa_types::kappa::Kappa;
 /// Prefix of every preparation file.
 const TEMPORARY_PREFIX: &str = ".tmp";
 
+/// Directory levels the layout writes below the root (`{axis}/{aa}/{bb}`).
+/// A directory deeper than this is not the layout's.
+pub const DIRECTORY_DEPTH: usize = 3;
+
 /// What a path under the blob root is, decided from the path alone.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CacheEntry {

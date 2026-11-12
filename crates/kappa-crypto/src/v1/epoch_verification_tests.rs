@@ -14,6 +14,7 @@ fn epoch(
 ) -> Result<EpochRoot, Box<dyn std::error::Error>> {
     let anchor = Kappa::from_key(signer.algorithm(), signer.public_key())?;
     let ledger = Kappa::sha256(b"ledger");
+    let state = Kappa::sha256(b"test-state");
     Ok(sign_epoch(
         EpochRoot::build(EpochRootInput {
             namespace: &NamespaceRef::deterministic("namespace"),
@@ -26,6 +27,7 @@ fn epoch(
             tag_count: 0,
             rotation_kappa: rotation,
             ledger_root: &ledger,
+            state: &state,
         }),
         signer,
     )?)

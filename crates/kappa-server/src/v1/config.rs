@@ -8,6 +8,20 @@ pub struct ClassConfig {
     pub burst: u32,
 }
 
+/// What one maintenance step (settlement, index repair, inventory) may
+/// consume on each work dimension besides entries examined. Every limit is
+/// finite: a step stops at the first dimension it would pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceLimits {
+    pub bytes_read: u64,
+    pub bytes_decoded: u64,
+    pub bytes_allocated: u64,
+    pub bytes_hashed: u64,
+    pub signatures: u64,
+    pub handles: u64,
+    pub candidates: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
     pub read: ClassConfig,
@@ -89,10 +103,13 @@ pub struct Config {
     pub handle_verify_interval_secs: u64,
     pub handle_ttl_ms: u64,
     pub lifecycle_interval_secs: u64,
-    /// Seconds between content inventory steps.
+    /// Seconds between maintenance ticks; each tick gives every
+    /// maintenance operation one bounded step.
     pub inventory_interval_secs: u64,
-    /// Inventory entries examined per step.
+    /// Entries one maintenance step may examine.
     pub inventory_batch: usize,
+    /// What one maintenance step may consume on every other dimension.
+    pub maintenance: MaintenanceLimits,
     pub tls_client_ca: Option<String>,
     /// Maximum concurrently open CRDT collaboration rooms. Each room holds
     /// at most 16 MiB of state in memory.
@@ -214,6 +231,17 @@ impl Config {
             lifecycle_interval_secs: source.parse("KAPPA_LIFECYCLE_INTERVAL_SECS", 86400)?,
             inventory_interval_secs: source.parse("KAPPA_INVENTORY_INTERVAL_SECS", 300)?,
             inventory_batch: source.parse("KAPPA_INVENTORY_BATCH", 4096)?,
+            maintenance: MaintenanceLimits {
+                bytes_read: source.parse("KAPPA_MAINTENANCE_BYTES_READ", 256 * 1024 * 1024)?,
+                bytes_decoded: source
+                    .parse("KAPPA_MAINTENANCE_BYTES_DECODED", 256 * 1024 * 1024)?,
+                bytes_allocated: source
+                    .parse("KAPPA_MAINTENANCE_BYTES_ALLOCATED", 64 * 1024 * 1024)?,
+                bytes_hashed: source.parse("KAPPA_MAINTENANCE_BYTES_HASHED", 256 * 1024 * 1024)?,
+                signatures: source.parse("KAPPA_MAINTENANCE_SIGNATURES", 4096)?,
+                handles: source.parse("KAPPA_MAINTENANCE_HANDLES", 256)?,
+                candidates: source.parse("KAPPA_MAINTENANCE_CANDIDATES", 4096)?,
+            },
             tls_client_ca: source.text("KAPPA_TLS_CLIENT_CA"),
             crdt_max_rooms: source.parse("KAPPA_CRDT_MAX_ROOMS", 1000)?,
         })

@@ -32,6 +32,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use kappa_store::work::{Dimension, Meter, WorkExhausted};
 use kappa_store::{Kappa, StoreError};
 
 use crate::storage_instance::StorageInstance;
@@ -47,12 +48,23 @@ pub enum DiscoveryKey {
     RevocationsBy(Kappa),
     /// A watermark issued by this asserter.
     WatermarksBy(Kappa),
+    /// A succession whose old anchor is this identity.
+    SuccessorOf(Kappa),
+    /// A handle changed by an unsettled publication, including deletions.
+    Handle(String),
+    /// Handles assigned to this anchor.
+    HandlesBy(Kappa),
 }
 
 impl DiscoveryKey {
-    const fn kappa(&self) -> &Kappa {
+    fn selector(&self) -> u8 {
         match self {
-            Self::Content(kappa) | Self::RevocationsBy(kappa) | Self::WatermarksBy(kappa) => kappa,
+            Self::Content(kappa)
+            | Self::RevocationsBy(kappa)
+            | Self::WatermarksBy(kappa)
+            | Self::SuccessorOf(kappa)
+            | Self::HandlesBy(kappa) => kappa.key_bytes().last().copied().unwrap_or_default(),
+            Self::Handle(key) => blake3::hash(key.as_bytes()).as_bytes()[0],
         }
     }
 }
@@ -96,8 +108,7 @@ impl UnsettledIndex {
 
     /// The shard mutex `identity` is selected into.
     fn slot(&self, identity: &DiscoveryKey) -> &Mutex<Shard> {
-        let key = identity.kappa().key_bytes();
-        let selector = key.last().copied().unwrap_or_default();
+        let selector = identity.selector();
         &self.shards[usize::from(selector) % SHARDS]
     }
 
@@ -170,12 +181,54 @@ impl UnsettledIndex {
     }
 
     /// The storage instances holding an unsettled registration of
-    /// `identity`.
-    pub fn candidates(&self, identity: &DiscoveryKey) -> Vec<StorageInstance> {
-        self.shard(identity)
-            .get(identity)
-            .map(|owners| owners.keys().copied().collect())
-            .unwrap_or_default()
+    /// `identity`, materialized on `work`: under the shard's lock, the
+    /// candidates and the buffer holding them are charged before the buffer
+    /// is allocated, so a refusal materializes nothing.
+    pub fn candidates(
+        &self,
+        identity: &DiscoveryKey,
+        work: &mut dyn Meter,
+    ) -> Result<Vec<StorageInstance>, WorkExhausted> {
+        let shard = self.shard(identity);
+        let Some(owners) = shard.get(identity) else {
+            return Ok(Vec::new());
+        };
+        let count = owners.len() as u64;
+        let refused = || WorkExhausted::Limit {
+            dimension: Dimension::BytesAllocated,
+            limit: work.limit().limit(Dimension::BytesAllocated),
+            used: work.used().get(Dimension::BytesAllocated),
+            requested: u64::MAX,
+        };
+        let bytes = count
+            .checked_mul(std::mem::size_of::<StorageInstance>() as u64)
+            .ok_or_else(refused)?;
+        work.charge_all(&[
+            (Dimension::Candidates, count),
+            (Dimension::BytesAllocated, bytes),
+        ])?;
+        let mut candidates = Vec::with_capacity(owners.len());
+        candidates.extend(owners.keys().copied());
+        Ok(candidates)
+    }
+
+    /// Seek the next registered handle without collecting the population.
+    pub(crate) fn next_handle(&self, after: Option<&str>) -> Option<String> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let lower = after.map_or_else(
+            || Included(DiscoveryKey::Handle(String::new())),
+            |key| Excluded(DiscoveryKey::Handle(key.to_owned())),
+        );
+        self.shards
+            .iter()
+            .filter_map(|shard| {
+                let shard = shard.lock().unwrap_or_else(PoisonError::into_inner);
+                match shard.range((lower.clone(), Unbounded)).next() {
+                    Some((DiscoveryKey::Handle(key), _)) => Some(key.clone()),
+                    _ => None,
+                }
+            })
+            .min()
     }
 
     /// The identities currently registered, across every instance.
@@ -211,9 +264,42 @@ impl Drop for Registration {
 mod tests {
     use super::*;
     use crate::storage_instance::Incarnation;
+    use kappa_store::work::{WorkLimit, WorkMeter};
 
     fn instance(byte: u8) -> StorageInstance {
         StorageInstance::new([byte; 16], Incarnation::Known([byte; 16]))
+    }
+
+    /// The candidates of `key`, on a meter that admits any.
+    fn listed(
+        index: &UnsettledIndex,
+        key: &DiscoveryKey,
+    ) -> Result<Vec<StorageInstance>, WorkExhausted> {
+        index.candidates(key, &mut WorkMeter::unbounded())
+    }
+
+    /// A lookup is charged one candidate each and the buffer holding them;
+    /// a meter that cannot admit them refuses, charging nothing.
+    #[test]
+    fn candidates_are_charged_before_they_are_listed() -> Result<(), StoreError> {
+        let index = Arc::new(UnsettledIndex::new(4));
+        let a = content(b"charged");
+        let held = (
+            index.register(instance(1), vec![a.clone()])?,
+            index.register(instance(2), vec![a.clone()])?,
+        );
+        let mut meter = WorkMeter::unbounded();
+        assert_eq!(index.candidates(&a, &mut meter)?.len(), 2);
+        assert_eq!(meter.used().get(Dimension::Candidates), 2);
+        assert_eq!(
+            meter.used().get(Dimension::BytesAllocated),
+            2 * std::mem::size_of::<StorageInstance>() as u64
+        );
+        let mut short = WorkMeter::new(WorkLimit::unbounded().with(Dimension::Candidates, 1));
+        assert!(index.candidates(&a, &mut short).is_err());
+        assert_eq!(short.used(), &kappa_store::work::Work::default());
+        drop(held);
+        Ok(())
     }
 
     fn content(name: &[u8]) -> DiscoveryKey {
@@ -237,22 +323,22 @@ mod tests {
             3,
             "a refused registration holds nothing"
         );
-        assert_eq!(index.candidates(&a), vec![instance(1)]);
+        assert_eq!(listed(&index, &a)?, vec![instance(1)]);
         drop(first);
         assert_eq!(
-            index.candidates(&a),
+            listed(&index, &a)?,
             vec![instance(1)],
             "the second epoch still holds a"
         );
-        assert!(index.candidates(&b).is_empty());
+        assert!(listed(&index, &b)?.is_empty());
         drop(second);
-        assert!(index.candidates(&a).is_empty());
+        assert!(listed(&index, &a)?.is_empty());
         assert_eq!(index.held_identities(), 0);
         let both = index.register(instance(2), vec![b.clone()])?;
         let other = index.register(instance(3), vec![b.clone()])?;
-        assert_eq!(index.candidates(&b), vec![instance(2), instance(3)]);
+        assert_eq!(listed(&index, &b)?, vec![instance(2), instance(3)]);
         drop((both, other));
-        assert!(index.candidates(&content(b"absent")).is_empty());
+        assert!(listed(&index, &content(b"absent"))?.is_empty());
         Ok(())
     }
 
@@ -264,19 +350,11 @@ mod tests {
         let asserter = Kappa::sha256(b"asserter");
         let revocations = DiscoveryKey::RevocationsBy(asserter.clone());
         let held = index.register(instance(4), vec![revocations.clone()])?;
-        assert_eq!(index.candidates(&revocations), vec![instance(4)]);
-        assert!(
-            index
-                .candidates(&DiscoveryKey::Content(asserter.clone()))
-                .is_empty()
-        );
-        assert!(
-            index
-                .candidates(&DiscoveryKey::WatermarksBy(asserter))
-                .is_empty()
-        );
+        assert_eq!(listed(&index, &revocations)?, vec![instance(4)]);
+        assert!(listed(&index, &DiscoveryKey::Content(asserter.clone()))?.is_empty());
+        assert!(listed(&index, &DiscoveryKey::WatermarksBy(asserter))?.is_empty());
         drop(held);
-        assert!(index.candidates(&revocations).is_empty());
+        assert!(listed(&index, &revocations)?.is_empty());
         Ok(())
     }
 
@@ -291,9 +369,9 @@ mod tests {
         let held_old = index.register(old, vec![a.clone()])?;
         let held_new = index.register(new, vec![a.clone()])?;
         drop(held_old);
-        assert_eq!(index.candidates(&a), vec![new]);
+        assert_eq!(listed(&index, &a)?, vec![new]);
         drop(held_new);
-        assert!(index.candidates(&a).is_empty());
+        assert!(listed(&index, &a)?.is_empty());
         Ok(())
     }
 
@@ -359,9 +437,9 @@ mod tests {
             "control: the identity's shard is poisoned"
         );
         let registration = register(&index, instance(7), vec![a.clone()]).ok();
-        let answered = registration.is_some() && index.candidates(&a) == vec![instance(7)];
+        let answered = registration.is_some() && listed(&index, &a) == Ok(vec![instance(7)]);
         drop(registration);
-        answered && index.candidates(&a).is_empty() && index.held_identities() == 0
+        answered && listed(&index, &a) == Ok(Vec::new()) && index.held_identities() == 0
     }
 
     #[test]

@@ -18,11 +18,9 @@ pub use kappa_core::events::{EventLog, TagEvent};
 pub use kappa_core::gc::GcResult;
 pub use kappa_core::identity::{IdentityAssertion, Revocation, RevocationReason};
 pub use kappa_core::kappa::{kappa_from_bytes, kappa_from_value, split_kappa, verify_kappa};
-pub use kappa_core::membership::{MembershipView, PeerInfo};
 pub use kappa_core::offload::{OffloadReceipt, OffloadVerifier};
 pub use kappa_core::store::{
     Edge, EdgeQuery, EdgeRelation, EpochMutation, KappaStore, StoreError, TagEntry, TagUpdate,
 };
-pub use kappa_core::transport::PeerTransport;
 pub use kappa_core::types::*;
 pub use kappa_core::witness::{EpochWitness, WitnessReceipt};

@@ -24,6 +24,11 @@ blake3 = { workspace = true }
 hex = { workspace = true }
 dcbor = { workspace = true }
 uuid = { workspace = true }
+# The bounded decoders of `compression`, the one decoder construction
+# every backend and protocol module decodes through.
+zstd = "0.14"
+xz2 = "0.1"
+bzip2 = "0.6"
 
 [dev-dependencies]
 tempfile = { workspace = true }

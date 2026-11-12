@@ -148,12 +148,21 @@ impl AssignmentRecord {
     }
 }
 
-/// `[plane:16][generation:8 BE]`, the settled projection value.
+/// Bytes of an assignment's settled projection value.
+pub const ASSIGNMENT_BYTES: usize = 24;
+
+/// `[plane:16][generation:8 BE]`, the settled projection value: the one
+/// writer of the format, into a fixed array.
+pub fn assignment_bytes(plane: ControlPlaneId, generation: u64) -> [u8; ASSIGNMENT_BYTES] {
+    let mut bytes = [0; ASSIGNMENT_BYTES];
+    bytes[..16].copy_from_slice(&plane.0);
+    bytes[16..].copy_from_slice(&generation.to_be_bytes());
+    bytes
+}
+
+/// [`assignment_bytes`] in a vector, for callers that own one.
 pub fn encode_assignment(plane: ControlPlaneId, generation: u64) -> Vec<u8> {
-    let mut value = Vec::with_capacity(24);
-    value.extend_from_slice(&plane.0);
-    value.extend_from_slice(&generation.to_be_bytes());
-    value
+    assignment_bytes(plane, generation).to_vec()
 }
 
 pub fn decode_assignment(value: &[u8]) -> Result<(ControlPlaneId, u64), StoreError> {

@@ -27,17 +27,16 @@ pub struct MetadataRecord {
 
 /// A single mutation recorded in an epoch.
 ///
-/// The kappa identifies the object that was mutated (the content kappa
-/// a tag points to, the edge's own kappa, the assertion's kappa).
-/// The op discriminates what kind of primitive was mutated for
-/// forensic-grade audit trails. The context carries the human-readable
-/// identifier (tag name for TagSet/TagDelete, edge relation for
-/// EdgePut/EdgeDelete, None for identity mutations where the kappa
-/// IS the identifier).
+/// The kappa identifies the complete canonical evidence record of the
+/// transition (see [`MutationOp`]); the subject is decoded from that
+/// evidence, never from the kappa. The op discriminates the transition.
+/// The context carries the scope the transition derives (tag name, edge
+/// relation, metadata key, sequence name, anchor scope); it is derived
+/// from the evidence and checked against it on decode.
 ///
 /// CBOR key assignments (PERMANENT):
 ///   0: op, 1: kappa, 2: `timestamp_ms`, 3: context
-#[derive(Debug, Clone, CBORCodable, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, CBORCodable, CBORBoundedDecodable, serde::Serialize, serde::Deserialize)]
 pub struct EpochMutation {
     #[cbor(n = 0)]
     pub op: MutationOp,
@@ -55,76 +54,101 @@ pub struct EpochMutation {
 
 /// The operation that produced this mutation.
 ///
-/// Discriminates what kind of primitive was mutated. An auditor
-/// examining epoch 4,182 needs to know whether the mutation was
-/// a tag set, an edge creation, or an assertion publication.
+/// Discriminates what kind of primitive was mutated. The kappa identifies
+/// the canonical evidence record the epoch retains for that transition.
+/// Independent replay fetches the evidence by its identity and
+/// reconstructs state from every field it carries.
 ///
-/// 16 variants at CBOR discriminants 0-15. Discriminants 16+ are
-/// unassigned. Every variant has at least one store method that
-/// records it.
+/// Every variant's kappa names the complete canonical record of the
+/// transition. The context carries the human-readable locator (the tag
+/// name, the edge relation, the metadata key, the sequence name).
 ///
 /// CBOR discriminants (PERMANENT): 0-15
-#[derive(Debug, Clone, Copy, PartialEq, Eq, CBORCodable, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    CBORCodable,
+    CBORBoundedDecodable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[non_exhaustive]
 pub enum MutationOp {
+    /// A tag was set or updated. The kappa identifies the canonical
+    /// `TagEntry` evidence record (name, target, version, timestamps,
+    /// symref); the context is the tag name.
     #[cbor(n = 0)]
     TagSet,
+    /// A tag was deleted. The kappa identifies the canonical `TagEntry`
+    /// evidence record of the removed tag; the context is the tag name.
     #[cbor(n = 1)]
     TagDelete,
+    /// An edge was admitted. The kappa identifies the canonical
+    /// `EdgeInput` evidence record; the context is the relation.
     #[cbor(n = 2)]
     EdgePut,
+    /// An edge was removed from membership. The kappa identifies the
+    /// canonical `EdgeInput` evidence record; the context is the
+    /// relation.
     #[cbor(n = 3)]
     EdgeDelete,
+    /// An identity assertion was published. The kappa identifies the
+    /// canonical `IdentityAssertion` record.
     #[cbor(n = 4)]
     AssertionPublish,
+    /// A revocation was published. The kappa identifies the canonical
+    /// `Revocation` record.
     #[cbor(n = 5)]
     RevocationPublish,
+    /// An identity record was changed. The kappa identifies the canonical
+    /// evidence record of the changed row (binding, handle, device,
+    /// prekey, locator, commitment, succession, or watermark); the
+    /// context names the family and scope.
     #[cbor(n = 6)]
     AnchorOrigin,
+    /// An operation receipt was published. The kappa identifies the
+    /// canonical `OperationReceipt` record.
     #[cbor(n = 7)]
     OperationPublish,
+    /// The namespace record was updated. The kappa identifies the
+    /// canonical `NamespaceInfo` record.
     #[cbor(n = 8)]
     NamespaceUpdate,
+    /// A sequence counter advanced. The kappa identifies the canonical
+    /// `SequenceRecord`; the context is the sequence name.
     #[cbor(n = 9)]
     SequenceUpdate,
-    /// A namespace metadata key was set or deleted. The kappa identifies a
-    /// `MetadataRecord`; the context is the key.
+    /// A namespace or blob metadata key was set or deleted. The kappa
+    /// identifies the canonical `content::MetadataTransition` (namespace
+    /// instance, subject, key, value or deletion); the context is the key.
     #[cbor(n = 10)]
     MetadataUpdate,
-    /// Chunked content was installed. The kappa identifies a
-    /// `ContentCommitment` binding the content identity to its chunk size
-    /// and chunk digest root; the context is None.
+    /// Content was admitted from verified bytes or chunked preparation.
+    /// The kappa identifies the canonical `ContentAdmissionRecord` whose
+    /// evidence is verified bytes or a `ContentCommitment`.
     #[cbor(n = 11)]
     ContentPublish,
-    /// Verified bytes were bound to an identity under another digest axis.
-    /// The kappa identifies a `ContentAlias` naming the alias, its target,
-    /// and their common length; the context is None. Distinct from
-    /// `ContentPublish` so every consumer of that operation decodes only
-    /// `ContentCommitment` evidence.
+    /// Content was admitted as an alias of an identity under another
+    /// digest axis. The kappa identifies the canonical
+    /// `ContentAdmissionRecord` whose evidence is a `ContentAlias`.
     #[cbor(n = 12)]
     ContentAlias,
-    /// A composite representation was installed. The kappa identifies a
-    /// `ContentComposition` naming the composite identity, its ordered
-    /// components with their lengths, and the total; the context is None.
-    /// The binding a composite's retention of its components rests on is
-    /// therefore history, not only a store index.
+    /// Content was admitted as a composition. The kappa identifies the
+    /// canonical `ContentAdmissionRecord` whose evidence is a
+    /// `ContentComposition`.
     #[cbor(n = 13)]
     ContentCompose,
-    /// The namespace retired its admitted representation of the identity
-    /// the kappa names; the context is None. The identity itself is the
-    /// evidence: a retirement names no record. Projections settled from
-    /// the ledger (catalog, allocation ownership) release the namespace's
-    /// claim on it; the physical allocation goes only when every owner
-    /// released and nothing protects it.
+    /// The namespace retired a logical admission. The kappa identifies
+    /// the canonical `ContentRetirementRecord` naming the exact admission
+    /// removed; it stays decodable after the payload is gone.
     #[cbor(n = 14)]
     ContentRetire,
-    /// A record the execution produced was installed as content of the
-    /// namespace (`ExecutionWrites::blob_put`: a repository object, a
-    /// checkpoint, a signed record). The kappa is the record's content
-    /// identity and the record is its own evidence; the context is None.
-    /// Recorded only when the namespace did not already admit the
-    /// identity, so the ledger names every admission the namespace's
-    /// catalog and allocation ownership are settled from.
+    /// An explicit record was admitted as content of the namespace. The
+    /// kappa identifies the canonical `ContentAdmissionRecord` (verified
+    /// bytes evidence); the payload identity is inside that record.
     #[cbor(n = 15)]
     RecordPublish,
 }

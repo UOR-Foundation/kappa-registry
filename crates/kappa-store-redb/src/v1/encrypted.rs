@@ -9,6 +9,13 @@ pub(crate) fn bound(context: &str, key: &[u8]) -> String {
     format!("{context}:{}", hex::encode(key))
 }
 
+/// Bytes [`bound`] allocates for a key of `key_len` bytes: the key's hex
+/// encoding, then the context, separator and that encoding. What a metered
+/// caller charges before it builds the context.
+pub(crate) const fn bound_allocation(context: &str, key_len: usize) -> u64 {
+    (context.len() + 1 + 4 * key_len) as u64
+}
+
 pub struct TableEncryptor {
     key: AesGcmKey,
     ns_key_bytes: zeroize::Zeroizing<[u8; 32]>,

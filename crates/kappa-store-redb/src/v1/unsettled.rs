@@ -154,6 +154,52 @@ pub struct Charge {
 }
 
 impl Charge {
+    /// Replace this obligation's measurement atomically, without reserving
+    /// against its old measurement or briefly releasing its ownership.
+    /// Existing debt may exceed admission limits; arithmetic overflow still
+    /// refuses the entire update and leaves its closure intact.
+    pub(crate) fn measure(&mut self, entries: u64, bytes: u64) -> Result<(), StoreError> {
+        let mut held = self.budget.held();
+        let invalid = || StoreError::Internal("unsettled charge exceeds pool ownership".into());
+        let overflow =
+            || StoreError::CapacityExceeded("unsettled debt measurement overflow".into());
+        let next_entries = held
+            .entries
+            .checked_sub(self.entries)
+            .ok_or_else(invalid)?
+            .checked_add(entries)
+            .ok_or_else(overflow)?;
+        let next_bytes = held
+            .bytes
+            .checked_sub(self.bytes)
+            .ok_or_else(invalid)?
+            .checked_add(bytes)
+            .ok_or_else(overflow)?;
+        let closure = self
+            .closure
+            .map(|cause| {
+                let count = held.closures.get(&cause).copied().unwrap_or(0);
+                count
+                    .checked_sub(1)
+                    .map(|remaining| (cause, remaining))
+                    .ok_or_else(invalid)
+            })
+            .transpose()?;
+        held.entries = next_entries;
+        held.bytes = next_bytes;
+        if let Some((cause, remaining)) = closure {
+            if remaining == 0 {
+                held.closures.remove(&cause);
+            } else {
+                held.closures.insert(cause, remaining);
+            }
+        }
+        self.entries = entries;
+        self.bytes = bytes;
+        self.closure = None;
+        Ok(())
+    }
+
     pub(crate) const fn entries(&self) -> u64 {
         self.entries
     }

@@ -138,6 +138,58 @@ pub struct ReferenceComparison {
     pub reference_from_baseline: bool,
 }
 
+/// How an injected fault was observed to take effect. A record under a
+/// fault carries the evidence that the fault happened, never a count made
+/// up to pass the gate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Injection {
+    /// A fault injected beneath redb: the counts over the fault backend's
+    /// operation trace and the bytes a crash took back
+    /// (`kappa_store_redb::test_support::Fired`).
+    Backend {
+        performed: u64,
+        refused: u64,
+        performed_then_failed: u64,
+        lost_bytes: u64,
+    },
+    /// A fault injected on the filesystem outside the store (a directory
+    /// renamed away, a database replaced by an empty file): `observed` names
+    /// the store response that proves the fault reached it, such as
+    /// `Unavailable` on a miss while discovery is incomplete, and
+    /// `responses` counts the responses of that kind the bench received.
+    Filesystem { observed: String, responses: u64 },
+}
+
+/// What the injected fault did while a measurement ran. A measurement
+/// taken under a non-`none` `fault` condition whose summary shows nothing
+/// fired measured nothing injected, and the bench refuses to record it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FaultSummary {
+    /// The `fault` condition token the measurement was taken under.
+    pub armed: String,
+    pub injection: Injection,
+}
+
+impl FaultSummary {
+    /// Whether the injection took effect: a backend fault refused,
+    /// misreported or lost something; a filesystem fault produced at least
+    /// one store response of the named kind.
+    pub fn fired(&self) -> bool {
+        match &self.injection {
+            Injection::Backend {
+                refused,
+                performed_then_failed,
+                lost_bytes,
+                ..
+            } => *refused > 0 || *performed_then_failed > 0 || *lost_bytes > 0,
+            Injection::Filesystem {
+                observed,
+                responses,
+            } => !observed.is_empty() && *responses > 0,
+        }
+    }
+}
+
 /// How the value was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Source {
@@ -185,6 +237,14 @@ pub struct CalibrationPoint {
     pub platform: PlatformInfo,
     pub storage: Option<StorageInfo>,
     pub timestamp_ns: u64,
+    /// The run seed every deterministic choice of the session's benches
+    /// drew from (`bench::seed`): what reproduces the run. Datasets
+    /// written before seeds were recorded carry none.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// What the injected fault did, on records measured under one.
+    #[serde(default)]
+    pub fault: Option<FaultSummary>,
 }
 
 impl CalibrationPoint {
@@ -231,6 +291,8 @@ impl CalibrationPoint {
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
                 .unwrap_or(0),
+            seed: None,
+            fault: None,
         }
     }
 
@@ -286,6 +348,83 @@ mod tests {
         assert!(!line.contains('\n'));
         let recovered: CalibrationPoint = serde_json::from_str(&line)?;
         assert_eq!(recovered, point);
+        Ok(())
+    }
+
+    /// A dataset written before seeds and fault summaries existed still
+    /// loads, with neither; a record carrying both keeps them.
+    #[test]
+    fn seed_and_fault_are_optional_and_round_trip() -> TestResult {
+        let id = OscId::simple(Quantity::Lat, "recovery.open")?;
+        let mut point = CalibrationPoint::pending(
+            &id,
+            Profile::L6Graded,
+            Source::Histogram,
+            None,
+            PlatformInfo::detect(),
+        );
+        let line = point.to_jsonl()?;
+        let mut stripped: serde_json::Value = serde_json::from_str(&line)?;
+        let object = stripped.as_object_mut().ok_or("record is not an object")?;
+        assert!(object.remove("seed").is_some());
+        assert!(object.remove("fault").is_some());
+        let old: CalibrationPoint = serde_json::from_value(stripped)?;
+        assert_eq!(old.seed, None);
+        assert_eq!(old.fault, None);
+
+        point.seed = Some(0x5EED);
+        point.fault = Some(FaultSummary {
+            armed: "crash".into(),
+            injection: Injection::Backend {
+                performed: 7,
+                refused: 2,
+                performed_then_failed: 0,
+                lost_bytes: 8192,
+            },
+        });
+        let recovered: CalibrationPoint = serde_json::from_str(&point.to_jsonl()?)?;
+        assert_eq!(recovered, point);
+        assert!(recovered.fault.as_ref().is_some_and(FaultSummary::fired));
+        let quiet = FaultSummary {
+            armed: "none".into(),
+            injection: Injection::Backend {
+                performed: 3,
+                refused: 0,
+                performed_then_failed: 0,
+                lost_bytes: 0,
+            },
+        };
+        assert!(!quiet.fired(), "performed operations alone are not a fault");
+        let seen = FaultSummary {
+            armed: "lost_storage".into(),
+            injection: Injection::Filesystem {
+                observed: "Unavailable on a miss".into(),
+                responses: 3,
+            },
+        };
+        assert!(seen.fired());
+        let named_but_never_received = FaultSummary {
+            armed: "lost_storage".into(),
+            injection: Injection::Filesystem {
+                observed: "Unavailable on a miss".into(),
+                responses: 0,
+            },
+        };
+        assert!(
+            !named_but_never_received.fired(),
+            "a named response the bench never received is not evidence"
+        );
+        let unnamed = FaultSummary {
+            armed: "lost_storage".into(),
+            injection: Injection::Filesystem {
+                observed: String::new(),
+                responses: 3,
+            },
+        };
+        assert!(
+            !unnamed.fired(),
+            "responses of no named kind are not evidence"
+        );
         Ok(())
     }
 

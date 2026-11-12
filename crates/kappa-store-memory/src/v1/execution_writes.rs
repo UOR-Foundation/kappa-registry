@@ -38,10 +38,7 @@ impl ExecutionWrites for MemoryExecution<'_> {
     }
 
     fn edge_delete(&mut self, identity: &Kappa) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.edge_delete(identity);
-            Ok(())
-        })
+        self.write(|cx| cx.edge_delete(identity))
     }
 
     fn sequence_next(&mut self, name: &str) -> Result<u64, StoreError> {
@@ -94,17 +91,11 @@ impl ExecutionWrites for MemoryExecution<'_> {
     }
 
     fn binding_put(&mut self, binding: &IdentityBinding) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.binding_put(binding);
-            Ok(())
-        })
+        self.write(|cx| cx.binding_put(binding))
     }
 
     fn binding_delete(&mut self, source: &str, target: &Kappa) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.binding_delete(source, target);
-            Ok(())
-        })
+        self.write(|cx| cx.binding_delete(source, target))
     }
 
     fn assertion_put(&mut self, assertion: &IdentityAssertion) -> Result<Kappa, StoreError> {
@@ -124,21 +115,15 @@ impl ExecutionWrites for MemoryExecution<'_> {
     }
 
     fn handle_attest(&mut self, expected: &HandleRecord) -> Result<bool, StoreError> {
-        self.write(|cx| Ok(cx.handle_attest(expected)))
+        self.write(|cx| cx.handle_attest(expected))
     }
 
     fn handle_delete(&mut self, protocol: &ProtocolId, handle: &str) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.handle_delete(protocol, handle);
-            Ok(())
-        })
+        self.write(|cx| cx.handle_delete(protocol, handle))
     }
 
     fn device_binding_put(&mut self, binding: &DeviceBinding) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.device_binding_put(binding);
-            Ok(())
-        })
+        self.write(|cx| cx.device_binding_put(binding))
     }
 
     fn device_binding_revoke(
@@ -146,17 +131,11 @@ impl ExecutionWrites for MemoryExecution<'_> {
         anchor: &Kappa,
         device_key: &[u8],
     ) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.device_binding_revoke(anchor, device_key);
-            Ok(())
-        })
+        self.write(|cx| cx.device_binding_revoke(anchor, device_key))
     }
 
     fn prekey_binding_put(&mut self, binding: &PrekeyBinding) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.prekey_binding_put(binding);
-            Ok(())
-        })
+        self.write(|cx| cx.prekey_binding_put(binding))
     }
 
     fn locator_put(&mut self, record: &LocatorRecord) -> Result<(), StoreError> {
@@ -232,17 +211,11 @@ impl ExecutionWrites for MemoryExecution<'_> {
         key: &str,
         value: &[u8],
     ) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.blob_meta_put(identity, key, value);
-            Ok(())
-        })
+        self.write(|cx| cx.blob_meta_put(identity, key, value))
     }
 
     fn blob_meta_delete(&mut self, identity: &Kappa, key: &str) -> Result<(), StoreError> {
-        self.write(|cx| {
-            cx.blob_meta_delete(identity, key);
-            Ok(())
-        })
+        self.write(|cx| cx.blob_meta_delete(identity, key))
     }
 
     fn content_install(
@@ -255,7 +228,7 @@ impl ExecutionWrites for MemoryExecution<'_> {
     /// The bytes of a retired identity are released with the last view or
     /// reader holding its allocation (`allocation`).
     fn content_retire(&mut self, identity: &Kappa) -> Result<Retirement, StoreError> {
-        self.write(|cx| Ok(cx.retire(identity)))
+        self.write(|cx| cx.retire(identity))
     }
 
     fn content_compose(

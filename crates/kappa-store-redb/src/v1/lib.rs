@@ -18,6 +18,7 @@ mod blob_rows;
 mod chunk_integrity;
 mod commitments;
 pub mod config;
+mod content_admit;
 mod content_install;
 mod content_inventory;
 mod content_prepare;
@@ -25,16 +26,20 @@ mod content_read;
 mod content_reclaim;
 mod content_stream;
 pub mod control_plane;
-mod creation_intent;
 pub mod credentials;
-pub mod decompress;
+mod custody;
+mod custody_inventory;
+mod custody_resolve;
+mod derived_index;
 mod durability;
 pub mod edge;
 mod edge_write;
 pub mod encrypted;
 pub mod epoch;
 mod epoch_blob;
+mod epoch_cache;
 mod epoch_execution;
+mod epoch_seal;
 mod error;
 pub mod frame_reader;
 pub mod identity;
@@ -44,6 +49,8 @@ mod identity_local;
 mod identity_query;
 mod identity_records;
 mod identity_write;
+mod index_repair;
+mod instance_record;
 pub mod namespace;
 mod namespace_snapshot;
 mod namespace_write;
@@ -54,12 +61,14 @@ mod projection_cursor;
 mod projection_stage;
 pub mod redb_cursor;
 mod referrers;
+mod registry;
 mod representation;
 mod representation_codec;
 mod retirement_record;
 pub mod sequence;
 mod settlement;
 mod settlement_identity;
+mod state_nodes;
 pub mod storage;
 mod storage_instance;
 mod storage_retirement;
@@ -70,6 +79,7 @@ pub mod tag;
 mod tag_state;
 mod tag_write;
 mod time_state;
+mod transition_apply;
 mod unsettled;
 mod unsettled_index;
 
@@ -78,11 +88,10 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
-use redb::Database;
 
-use kappa_store::epoch_root::EpochRoot;
 use kappa_store::error::StoreError;
 use kappa_store::kappa::Kappa;
+use kappa_store::work::{Dimension, WorkLimit, WorkMeter};
 
 pub use config::PersistentStoreConfig;
 pub use content_install::PreparedContent;
@@ -105,10 +114,11 @@ pub struct PersistentStore {
     pub(crate) representation_limits: representation::RepresentationLimits,
     pub(crate) blob_encryptor: Option<std::sync::Arc<blob_encryption::BlobEncryption>>,
     pub(crate) time_authority_owned: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// The registry database: projections settled from namespace epochs,
-    /// the directory, the registry-wide authority and node-local state.
-    /// No ordinary publication writes to it.
-    pub(crate) registry: std::sync::Arc<Database>,
+    /// The registry: projections settled from namespace epochs, the
+    /// directory, the registry-wide authority and node-local state, behind
+    /// the one writer slot every registry write transaction holds
+    /// (`registry::Registry`). No ordinary publication writes to it.
+    pub(crate) registry: std::sync::Arc<registry::Registry>,
     /// The namespace databases, each owned by its controller.
     pub(crate) namespaces: storage::NamespaceStorage,
     /// The control planes this node participates in.
@@ -121,14 +131,17 @@ pub struct PersistentStore {
     /// Commitments admitted through authenticated epoch state, cached once
     /// per process (see `content_read::ReadView::resolve_commitment`).
     pub(crate) commitments: std::sync::Arc<DashMap<Kappa, kappa_store::ContentCommitment>>,
-    pub(crate) epoch_cache: DashMap<Kappa, EpochRoot>,
+    pub(crate) epoch_cache: epoch_cache::EpochCache,
     pub(crate) table_encryptor: Option<std::sync::Arc<encrypted::TableEncryptor>>,
-    pub(crate) credential_cache: Option<credentials::CredentialCache>,
     /// Current signing authority and its admitted succession history,
-    /// restored from `AUTHORITY_HISTORY` at open. Replaced only whole, by
-    /// `rotate_authority`, and only after the transition is durably
-    /// committed, so no reader ever observes an uncommitted authority.
+    /// recovered at open from the governing activation evidence the
+    /// `AUTHORITY_HISTORY` projection names. Replaced only whole, by
+    /// `rotate_authority`, and only after the governing epoch committed, so
+    /// no reader ever observes an uncommitted authority.
     pub(crate) authority: std::sync::Arc<arc_swap::ArcSwap<kappa_store::EpochAuthority>>,
+    /// Signing capability of an unresolved activation, never used by ordinary seals.
+    /// Transferred from the activation hold before its gate is released.
+    pub(crate) retained_authority: arc_swap::ArcSwapOption<kappa_store::EpochAuthority>,
     /// Orders authority installation against epoch signing. Rotation holds
     /// it exclusively from inside its registry write transaction until the
     /// committed authority is installed; sealing holds it shared while it
@@ -149,9 +162,21 @@ pub struct PersistentStore {
     /// Greatest causal time any recovered or committed namespace
     /// transaction carries (`time_state`); `i64::MIN` until one is known.
     pub(crate) committed_floor_ms: std::sync::atomic::AtomicI64,
-    /// Where the bounded inventory resumes (see
-    /// `MaintenanceStore::reclaim_unowned`).
-    pub(crate) inventory: Mutex<content_inventory::InventoryCursor>,
+    /// The identity every maintenance continuation of this open store is
+    /// scoped to; a continuation another store returned is refused before
+    /// any work.
+    pub(crate) maintenance_scope: kappa_store::traits::maintenance::StoreToken,
+    /// Storage handles suspended maintenance passes hold in their
+    /// continuations (`content_inventory`), each charged here for as long
+    /// as its continuation lives.
+    pub(crate) suspended_traversals: std::sync::Arc<kappa_store::capacity::CapacityPool>,
+    /// Bytes of canonical encodings operations hold live
+    /// (`PersistentStoreConfig::encoding_storage`).
+    pub(crate) encoding_storage: std::sync::Arc<kappa_store::capacity::CapacityPool>,
+    pub(crate) record_storage: content_read::RecordStorage,
+    /// Bytes of retained settlement preparation pending elements hold
+    /// (`PersistentStoreConfig::settlement_preparation_bytes`).
+    pub(crate) settlement_preparation: std::sync::Arc<kappa_store::capacity::CapacityPool>,
     /// Recovery's state across steps (`settlement_recovery`): the cycle
     /// over the durable records, the queue of known obligations, and the
     /// startup closing charge until the enumeration at open finishes.
@@ -161,13 +186,32 @@ pub struct PersistentStore {
     pub(crate) epoch_cursors: Mutex<settlement::EpochCursors>,
     /// Limits of every settlement read (`settlement_work`).
     pub(crate) settlement_limits: settlement::SettlementLimits,
-    /// Bytes one maintenance step reads, decodes or copies.
-    pub(crate) recovery_step_bytes: u64,
+    /// What one recovery step may do (`PersistentStoreConfig::recovery_step`):
+    /// the step at open, and the dimensions a test step leaves unbounded.
+    pub(crate) step_limit: WorkLimit,
+    /// What one publication's seal may do
+    /// (`PersistentStoreConfig::publication_work`).
+    pub(crate) publication_work: WorkLimit,
+    /// The ceiling of one read operation
+    /// (`PersistentStoreConfig::read_work`); see [`Self::read_meter`].
+    pub(crate) read_work: WorkLimit,
+    /// Largest custody record (`PersistentStoreConfig::custody_record_bytes`).
+    pub(crate) custody_record_bytes: u64,
+    /// Exact progress retained when durable custody writes fail. This owner
+    /// outlives the transaction and prevents losing returned signature bytes
+    /// on the same handle while persistence is retried.
+    pub(crate) live_custody: Mutex<
+        std::collections::BTreeMap<storage_instance::StorageInstance, custody::CustodyRecord>,
+    >,
+    /// Restart ownership of unpublished candidates, independent of the
+    /// committed-epoch settlement obligations of the same instance.
+    pub(crate) custody_debt:
+        Mutex<std::collections::BTreeMap<storage_instance::StorageInstance, unsettled::Charge>>,
     /// Bytes of projection versions settlement may hold not yet compacted.
     pub(crate) staging_capacity: u64,
-    /// The projection log entry the previous compaction step stopped at
-    /// (`projection_compact`); `None` starts from the first.
-    pub(crate) compaction_cursor: Mutex<Option<Vec<u8>>>,
+    /// Where the next compaction step starts, as the last committed step
+    /// left it (`projection_compact::CompactionCursor`).
+    pub(crate) compaction_cursor: Mutex<projection_compact::CompactionCursor>,
     /// The session identifier the previous bounded eviction stopped at
     /// (`identity_local::evict_sessions`); `None` starts from the first.
     pub(crate) session_eviction_cursor: Mutex<Option<String>>,
@@ -188,10 +232,11 @@ pub struct PersistentStore {
     /// Committed epochs one namespace may hold unsettled before its
     /// admission refuses further executions.
     pub(crate) max_unsettled_epochs: usize,
-    /// Set when a mutation found a namespace's derived index diverged from
-    /// the committed state it projects; the mutation refused to commit
-    /// (`index_diverged`). Consumed by `MaintenanceStore::repair_indexes`.
-    pub(crate) indexes_diverged: std::sync::atomic::AtomicBool,
+    /// Namespaces whose derived indexes a mutation found diverged from the
+    /// committed state they project, with the revision of each record
+    /// (`index_repair::Divergence`). A recorded namespace's indexes are
+    /// fenced until a repair started after the record completes.
+    pub(crate) divergence: Mutex<index_repair::Divergence>,
     #[cfg(test)]
     pub(crate) hooks: test_hooks::TestHooks,
     /// Owner of the filesystem scope holding `blob_root` and the databases
@@ -202,7 +247,35 @@ pub struct PersistentStore {
 
 impl PersistentStore {
     pub fn new(mut config: PersistentStoreConfig) -> Result<Self, StoreError> {
+        // Configuration and every bound derived from it are validated before
+        // anything is opened; the projection bound the registry was
+        // established under is decided before anything else is built over
+        // the registry, and an open it refuses, or whose recording fails,
+        // returns no store.
+        if config.encoding_storage == 0 {
+            return Err(StoreError::Rejected(
+                "encoding storage capacity must be positive".into(),
+            ));
+        }
+        let settlement_limits =
+            settlement::SettlementLimits::new(config.settlement_record_bytes, config.inline_limit)?;
+        let element = settlement::element_preparation_bytes(config.settlement_record_bytes)
+            .ok_or_else(|| {
+                StoreError::Rejected(
+                    "settlement record limit makes one element's preparation unrepresentable"
+                        .into(),
+                )
+            })?;
+        if config.settlement_preparation_bytes < element {
+            return Err(StoreError::Rejected(format!(
+                "settlement preparation capacity {} is below one element's bound {element}",
+                config.settlement_preparation_bytes
+            )));
+        }
+        Self::validate_settlement(&config, settlement_limits)?;
+        let record_storage = content_read::RecordStorage::new(&config)?;
         let registry = Self::open_registry(&config)?;
+        Self::establish_version_bounds(&registry, settlement_limits)?;
         allocation::precreate_shards(&config.blob_root)?;
         let representation_limits = representation::RepresentationLimits {
             inline_limit: config.inline_limit,
@@ -230,17 +303,8 @@ impl PersistentStore {
         // enumerated it: the pool is closed from before the store exists.
         let recovery =
             settlement::Recovery::starting(unsettled.unmeasured(unsettled::Closure::Startup)?);
-        let settlement_limits =
-            settlement::SettlementLimits::new(config.settlement_record_bytes, config.inline_limit)?;
-        Self::validate_settlement(&config, settlement_limits)?;
-        let recovery_budget = settlement::StepBudget {
-            entries: config.recovery_step_entries,
-            work: settlement::Work {
-                mutations: config.recovery_step_mutations,
-                bytes: config.recovery_step_bytes,
-            },
-        };
-        let mut store = Self {
+        let step_limit = config.recovery_step;
+        let store = Self {
             protection: std::sync::Arc::new(allocation::Protection::default()),
             content_durability,
             representation_limits,
@@ -253,23 +317,41 @@ impl PersistentStore {
             chunk_size: BLOB_CHUNK_SIZE,
             blob_root: config.blob_root.clone(),
             commitments: std::sync::Arc::new(DashMap::new()),
-            epoch_cache: DashMap::new(),
+            epoch_cache: epoch_cache::EpochCache::new(&record_storage.decoded)?,
             table_encryptor,
-            credential_cache: None,
             authority: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 kappa_store::EpochAuthority::new(config.authority)?,
             )),
             activation: std::sync::RwLock::new(()),
+            retained_authority: arc_swap::ArcSwapOption::empty(),
             authority_unresolved: std::sync::atomic::AtomicBool::new(false),
             latest_epoch_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             committed_floor_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
-            inventory: Mutex::new(content_inventory::InventoryCursor::default()),
+            maintenance_scope: kappa_store::traits::maintenance::StoreToken::new(),
+            suspended_traversals: std::sync::Arc::new(kappa_store::capacity::CapacityPool::new(
+                "suspended maintenance traversals",
+                config.max_suspended_traversals,
+            )),
+            encoding_storage: std::sync::Arc::new(kappa_store::capacity::CapacityPool::new(
+                "canonical encodings",
+                config.encoding_storage,
+            )),
+            record_storage,
+            settlement_preparation: std::sync::Arc::new(kappa_store::capacity::CapacityPool::new(
+                "retained settlement preparation",
+                config.settlement_preparation_bytes,
+            )),
             recovery: Mutex::new(recovery),
             epoch_cursors: Mutex::new(settlement::EpochCursors::new(config.max_epoch_cursors)),
             settlement_limits,
-            recovery_step_bytes: config.recovery_step_bytes,
+            step_limit,
+            publication_work: config.publication_work,
+            read_work: config.read_work,
+            custody_record_bytes: config.custody_record_bytes,
+            live_custody: Mutex::new(std::collections::BTreeMap::new()),
+            custody_debt: Mutex::new(std::collections::BTreeMap::new()),
             staging_capacity: config.settlement_staging_bytes,
-            compaction_cursor: Mutex::new(None),
+            compaction_cursor: Mutex::new(projection_compact::CompactionCursor::default()),
             session_eviction_cursor: Mutex::new(None),
             unsettled,
             unsettled_index: std::sync::Arc::new(unsettled_index::UnsettledIndex::new(
@@ -277,49 +359,81 @@ impl PersistentStore {
             )),
             recovery_obligations: Mutex::new(settlement::RecoveryObligations::default()),
             max_unsettled_epochs: config.max_unsettled_epochs,
-            indexes_diverged: std::sync::atomic::AtomicBool::new(false),
+            divergence: Mutex::new(index_repair::Divergence::default()),
             #[cfg(test)]
             hooks: test_hooks::TestHooks::default(),
             _resource_owner: config.resource_owner,
         };
 
-        if config.enable_credential_cache {
-            let cache = credentials::CredentialCache::load_from_store(&store)?;
-            store.credential_cache = Some(cache);
-        }
         store.recover_at_open(
             configured,
             alternates,
             require_history,
-            recovery_budget,
             config.open_inventory_entries,
         )?;
         Ok(store)
     }
 
     /// Refuse a settlement configuration under which a step could never
-    /// make progress: a step byte budget below two mutation reservations, a
-    /// mutation budget of zero, staging smaller than one step, or cursors
-    /// that could take every namespace activity grant.
+    /// make progress, before the store serves anything: a recovery step that
+    /// does not admit, on every dimension, each mandatory indivisible unit
+    /// at its maximum (an epoch, a directory resolution, a namespace record
+    /// decision, a compaction unit), or that carries a deadline, staging
+    /// smaller than one step's reads, or cursors that could take every
+    /// namespace activity grant.
     fn validate_settlement(
         config: &PersistentStoreConfig,
         limits: settlement::SettlementLimits,
     ) -> Result<(), StoreError> {
         let refuse = |detail: String| Err(StoreError::Rejected(detail));
-        if config.recovery_step_bytes < limits.minimum_step_bytes() {
+        let step = config.recovery_step;
+        if step.deadline().is_some() {
+            return refuse(
+                "recovery_step carries a deadline; a step's deadline is its caller's".into(),
+            );
+        }
+        // Every mandatory indivisible unit at its maximum: a step that
+        // cannot admit one would leave the durable work behind it waiting
+        // forever, so the store refuses to open under it instead.
+        let mandatory: [(&str, Vec<(Dimension, u64)>); 4] = [
+            ("one epoch unit", limits.epoch_unit().as_bound().to_vec()),
+            (
+                "one directory resolution",
+                namespace_write::RESOLUTION_UNIT.to_vec(),
+            ),
+            (
+                "one namespace record decision",
+                namespace_write::record_unit(limits.record_bytes()).to_vec(),
+            ),
+            (
+                "one compaction unit",
+                projection_compact::compaction_unit().as_bound().to_vec(),
+            ),
+        ];
+        for (what, unit) in mandatory {
+            if let Err(refused) = WorkMeter::new(step).admits(&unit) {
+                return refuse(format!("recovery_step does not admit {what}: {refused}"));
+            }
+        }
+        // Every projection read examines versions one admitted unit at a
+        // time: a ceiling that cannot admit one would refuse every read.
+        if config.read_work.deadline().is_some() {
+            return refuse(
+                "read_work carries a deadline; a read's deadline is its request's".into(),
+            );
+        }
+        if let Err(refused) =
+            WorkMeter::new(config.read_work).admits(&limits.selection_unit().as_bound())
+        {
             return refuse(format!(
-                "recovery_step_bytes {} is below the minimum step {}",
-                config.recovery_step_bytes,
-                limits.minimum_step_bytes()
+                "read_work does not admit one projection version: {refused}"
             ));
         }
-        if config.recovery_step_mutations == 0 || config.recovery_step_entries == 0 {
-            return refuse("recovery steps must admit at least one entry and mutation".into());
-        }
-        if config.settlement_staging_bytes < config.recovery_step_bytes {
+        let step_reads = step.limit(Dimension::BytesRead);
+        if config.settlement_staging_bytes < step_reads {
             return refuse(format!(
-                "settlement_staging_bytes {} is below one step's {}",
-                config.settlement_staging_bytes, config.recovery_step_bytes
+                "settlement_staging_bytes {} is below one step's reads {step_reads}",
+                config.settlement_staging_bytes
             ));
         }
         if config.max_epoch_cursors == 0 || config.max_epoch_cursors >= config.max_active_namespaces
@@ -330,6 +444,13 @@ impl PersistentStore {
             ));
         }
         Ok(())
+    }
+
+    /// The meter of one read operation, at the configured ceiling: built
+    /// once where a read enters the store and threaded through every read
+    /// it nests, so the whole operation answers within it or is refused.
+    pub(crate) const fn read_meter(&self) -> WorkMeter {
+        WorkMeter::new(self.read_work)
     }
 
     pub(crate) fn encode_seq_value(&self, db_key: &str, value: u64) -> Result<Vec<u8>, StoreError> {
@@ -380,23 +501,6 @@ impl PersistentStore {
         )
     }
 
-    /// Commit a registry write transaction that no namespace epoch governs.
-    ///
-    /// Its callers: the exclusive claim of an authorization key, committed
-    /// before the namespace transaction that writes the row
-    /// (`identity_local::claim_locator`); the causal time reservation
-    /// (`time_state::reserve_time`); the release of a session's claim once
-    /// its namespace row, read under that namespace's writer gate, is gone
-    /// or expired (`identity_local_read::evict_sessions`); and the S3
-    /// access-key table (`credentials`), whose create, rotate and
-    /// deactivate are written here directly and are not governed
-    /// transitions. Sessions, identity credentials and the trust position
-    /// are epoch-governed in their namespace and reach the registry only as
-    /// claims and settled projections. Content never commits through here.
-    pub(crate) fn commit_write(txn: redb::WriteTransaction) -> Result<(), StoreError> {
-        txn.commit().map_err(error::redb)
-    }
-
     /// Compute the exclusive upper bound for a prefix scan.
     /// Returns None if the prefix is all 0xFF bytes (no upper bound exists).
     pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -427,22 +531,10 @@ impl PersistentStore {
         &self.planes
     }
 
-    /// The derived index `index` disagrees with the committed state it
-    /// projects. The mutation that found it must not commit; the store
-    /// records the divergence so maintenance rebuilds the derived indexes
-    /// from authoritative state (`MaintenanceStore::repair_indexes`), after
-    /// which the mutation can be retried.
-    pub(crate) fn index_diverged(&self, index: &'static str, detail: String) -> StoreError {
-        self.indexes_diverged.store(true, Ordering::Release);
-        tracing::error!(index, %detail, "derived index diverged from committed state");
-        StoreError::Internal(detail)
-    }
-
     /// Whether a rotation's commit outcome is unknown to this handle, in
     /// which case it seals nothing until the store is reopened.
     pub fn authority_unresolved(&self) -> bool {
-        self.authority_unresolved
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.authority_unresolved.load(Ordering::SeqCst)
     }
 }
 

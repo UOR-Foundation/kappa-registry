@@ -158,8 +158,10 @@ fn first_epoch_commits_namespace_record_then_tags() -> TestResult {
     assert_eq!(root.signer_anchor(), fixture.anchor());
     assert_ne!(root.mutations_root(), &[0u8; 32]);
 
-    // The root links its ledger and the namespace record it retains. Edge
-    // pages are ordered by edge identity, so each is selected by target.
+    // The root links its ledger, the state and authority records it
+    // commits, and every transition evidence record its ledger names.
+    // Edge pages are ordered by edge identity, so each is selected by
+    // target.
     let edges = s.edge_query(
         &ns,
         &EdgeQuery {
@@ -171,35 +173,53 @@ fn first_epoch_commits_namespace_record_then_tags() -> TestResult {
         &PageRequest::first(16),
     )?;
     assert!(edges.next_after.is_none());
-    assert_eq!(
-        edges.items.len(),
-        2,
-        "ledger edge and namespace record link"
-    );
 
     let mutations = ledger(&s, &published.root)?;
     assert_eq!(mutations.len(), 3, "namespace record and two tag mutations");
     assert_eq!(mutations[0].op, MutationOp::NamespaceUpdate);
     assert!(mutations[0].context.is_none());
-    for target in [root.ledger_root(), &mutations[0].kappa] {
+    let state: kappa_types::NamespaceState = from_canonical(&s.blob_get_verified(root.state())?)?;
+    let authority: kappa_types::AuthorityState =
+        from_canonical(&s.blob_get_verified(state.authority())?)?;
+    assert!(state.names(&authority));
+    assert_eq!(authority.namespace(), ns.id());
+    let targets = [
+        root.ledger_root(),
+        root.state(),
+        state.authority(),
+        &mutations[0].kappa,
+        &mutations[1].kappa,
+        &mutations[2].kappa,
+    ];
+    assert_eq!(edges.items.len(), targets.len());
+    for target in targets {
         assert_eq!(
             edges
                 .items
                 .iter()
                 .filter(|edge| edge.target() == target)
                 .count(),
-            1
+            1,
+            "one edge retains {target}"
         );
     }
     let record: kappa_store::traits::namespace::NamespaceInfo =
         from_canonical(&s.blob_get_verified(&mutations[0].kappa)?)?;
     assert_eq!(record.ns.id(), ns.id());
-    assert_eq!(mutations[1].op, MutationOp::TagSet);
-    assert_eq!(mutations[1].context.as_deref(), Some("a"));
-    assert_eq!(mutations[1].kappa, Kappa::sha256(b"hello"));
-    assert_eq!(mutations[2].op, MutationOp::TagSet);
-    assert_eq!(mutations[2].context.as_deref(), Some("b"));
-    assert_eq!(mutations[2].kappa, Kappa::sha256(b"world"));
+    // Each tag mutation names its complete canonical entry, whose target is
+    // the tagged content.
+    for (mutation, (name, content)) in mutations[1..]
+        .iter()
+        .zip([("a", b"hello".as_slice()), ("b", b"world".as_slice())])
+    {
+        assert_eq!(mutation.op, MutationOp::TagSet);
+        assert_eq!(mutation.context.as_deref(), Some(name));
+        let entry: kappa_types::tag::TagEntry =
+            from_canonical(&s.blob_get_verified(&mutation.kappa)?)?;
+        assert_eq!(entry.name, name);
+        assert_eq!(entry.kappa, Kappa::sha256(content));
+        assert_ne!(mutation.kappa, entry.kappa, "the ledger names evidence");
+    }
     assert_eq!(mutations_merkle_root(&mutations), root.mutations_root());
 
     assert_eq!(s.epoch_current(&ns)?, (1, published.root));
@@ -252,7 +272,7 @@ fn replay_reconstructs_each_published_state() -> TestResult {
     })?;
     publish(&s, &ns, now3(), |e| e.tag_put("e", &set(b"echo")))?;
 
-    let names = |state: &kappa_store::NamespaceState| -> Vec<String> {
+    let names = |state: &kappa_store::ReplayedNamespaceState| -> Vec<String> {
         state.tags.keys().cloned().collect()
     };
     assert_eq!(
@@ -453,9 +473,10 @@ fn rotation_composes_for_idle_and_active_namespaces() -> TestResult {
     Ok(())
 }
 
-/// Executions seal with the node anchor; the override parameter of `seal`
-/// is reached here directly, through the execution's own writer. A seal
-/// under an anchor the node cannot sign for must publish nothing.
+/// Executions seal with the node anchor; the override parameter of
+/// `prepare_seal` is reached here directly, through the execution's own
+/// writer. A seal under an anchor the node cannot sign for must publish
+/// nothing and consume no coordinate.
 #[test]
 fn unrelated_signer_override_publishes_nothing() -> TestResult {
     let s = test_store()?;
@@ -465,17 +486,25 @@ fn unrelated_signer_override_publishes_nothing() -> TestResult {
 
     // The execution's candidate is dropped whatever the seal decides, so
     // nothing can publish.
+    let authority = s.authority.load_full();
+    let slot = s.slot(ns.id())?;
     let rejected = {
         let mut execution = s.open_execution(&ns, &clock_at(now())?)?;
         execution.write(|cx| {
             cx.namespace_create(None, None)?;
             cx.tag_put("d", &set(b"four"))?;
-            cx.seal(Some(&override_anchor))
+            cx.prepare_seal(&authority, Some(&override_anchor))
+                .map(drop)
         })
     };
     assert!(
         matches!(rejected, Err(StoreError::Conflict(_))),
         "a seal under a foreign anchor must be rejected as an authority conflict: {rejected:?}"
+    );
+    assert_eq!(
+        slot.signed.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a refusal before signing consumes no coordinate"
     );
     assert!(matches!(s.epoch_current(&ns), Err(StoreError::NotFound(_))));
     assert!(matches!(s.tag_get(&ns, "d"), Err(StoreError::NotFound(_))));
@@ -488,11 +517,409 @@ fn unrelated_signer_override_publishes_nothing() -> TestResult {
         e.namespace_create(None, None)?;
         e.tag_put("d", &set(b"four"))
     })?;
+    assert_eq!(published.epoch_number, 1);
     let mutations = ledger(&s, &published.root)?;
     assert_eq!(mutations.len(), 2);
     assert_eq!(mutations[0].op, MutationOp::NamespaceUpdate);
     assert_eq!(mutations[1].op, MutationOp::TagSet);
     assert_eq!(mutations[1].context.as_deref(), Some("d"));
-    assert_eq!(mutations[1].kappa, Kappa::sha256(b"four"));
+    let entry: kappa_types::tag::TagEntry =
+        from_canonical(&s.blob_get_verified(&mutations[1].kappa)?)?;
+    assert_eq!(entry.kappa, Kappa::sha256(b"four"));
+    Ok(())
+}
+
+/// A coordinate consumed by a seal that did not publish is never signed
+/// again: every later publication of the namespace is refused before it
+/// signs, and nothing it wrote becomes visible.
+#[test]
+fn a_consumed_coordinate_fences_its_namespace() -> TestResult {
+    let s = test_store()?;
+    let (ns, first) = create_with_tags(&s, "fenced", &[("x", b"one")])?;
+    let slot = s.slot(ns.id())?;
+    assert_eq!(slot.signed.load(std::sync::atomic::Ordering::Acquire), 1);
+    // Epoch 2's coordinate consumed by a seal whose publication never
+    // happened.
+    slot.signed.store(2, std::sync::atomic::Ordering::Release);
+    let refused = publish(&s, &ns, now2(), |e| e.tag_put("y", &set(b"two")));
+    assert!(
+        matches!(refused, Err(StoreError::Conflict(_))),
+        "a consumed coordinate must refuse the next seal: {refused:?}"
+    );
+    assert_eq!(s.epoch_current(&ns)?, (1, first.root));
+    assert!(matches!(s.tag_get(&ns, "y"), Err(StoreError::NotFound(_))));
+    assert_eq!(slot.signed.load(std::sync::atomic::Ordering::Acquire), 2);
+    Ok(())
+}
+
+// =========================================================================
+// Publication custody
+// =========================================================================
+
+const SIGNS: u8 = 0;
+const REFUSES: u8 = 1;
+const CORRUPTS: u8 = 2;
+const SLOW: u8 = 3;
+
+/// How long a `SLOW` signer takes: longer than the deadline the resumable
+/// custody test gives its execution.
+const SLOW_SIGNATURE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The fixture key, counting its invocations and returning a signature, a
+/// refusal, wrong signature bytes, or a signature only after
+/// [`SLOW_SIGNATURE`], as `mode` selects.
+struct Counted {
+    inner: kappa_crypto::ed25519::Ed25519Signer,
+    calls: std::sync::atomic::AtomicUsize,
+    mode: std::sync::atomic::AtomicU8,
+    advance: std::sync::Mutex<Option<std::sync::Arc<kappa_handler::clock::ControlledSource>>>,
+}
+
+impl Signer for Counted {
+    fn algorithm(&self) -> &'static str {
+        self.inner.algorithm()
+    }
+    fn public_key(&self) -> &[u8] {
+        self.inner.public_key()
+    }
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, kappa_crypto::CryptoError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.calls.fetch_add(1, SeqCst);
+        if let Some(source) = self
+            .advance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            source.set(kappa_types::clock::UnixTimeMs::from_millis(
+                1_700_000_003_000,
+            ));
+        }
+        match self.mode.load(SeqCst) {
+            REFUSES => Err(kappa_crypto::CryptoError::SigningFailed {
+                algorithm: "ed25519".into(),
+                reason: "refused by the test signer".into(),
+            }),
+            CORRUPTS => Ok(vec![0; 64]),
+            SLOW => {
+                std::thread::sleep(SLOW_SIGNATURE);
+                self.inner.sign(message)
+            }
+            _ => self.inner.sign(message),
+        }
+    }
+}
+
+/// A store whose authority signs through a `Counted` signer.
+fn counted_store()
+-> Result<(super::test_support::TestStore, std::sync::Arc<Counted>), Box<dyn std::error::Error>> {
+    let signer = std::sync::Arc::new(Counted {
+        inner: kappa_crypto::ed25519::Ed25519Signer::from_bytes(&[41; 32])?,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        mode: std::sync::atomic::AtomicU8::new(SIGNS),
+        advance: std::sync::Mutex::new(None),
+    });
+    let authority = kappa_crypto::SigningAuthority::new(
+        std::sync::Arc::clone(&signer) as std::sync::Arc<dyn Signer>
+    )?;
+    Ok((
+        super::test_support::test_store_with_authority(authority)?,
+        signer,
+    ))
+}
+
+fn set_mode(signer: &Counted, mode: u8) {
+    signer.mode.store(mode, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn calls(signer: &Counted) -> usize {
+    signer.calls.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn resolve(
+    store: &InMemoryStore,
+    ns: &NamespaceRef,
+) -> Result<kappa_store::PublicationResolution, StoreError> {
+    let limit = kappa_types::work::Dimension::ALL.into_iter().fold(
+        kappa_types::work::WorkLimit::unbounded(),
+        |limit, dimension| limit.with(dimension, 1_000_000),
+    );
+    store.resolve_publication(
+        ns,
+        &clock_at(now3())?,
+        &mut kappa_types::work::WorkMeter::new(limit),
+    )
+}
+
+/// A signer that refuses after the coordinate is consumed leaves the
+/// publication retained in its slot: the head is unchanged, the claims it
+/// reserved stay owned (another namespace cannot take its name), the
+/// namespace is fenced, unrelated namespaces still publish, and resolution
+/// never invokes the signer a second time.
+#[test]
+fn a_refused_signature_is_retained_in_custody() -> TestResult {
+    let (s, signer) = counted_store()?;
+    let (unrelated, _) = create_with_tags(&s, "unrelated", &[])?;
+    let ns = NamespaceRef::generate("custody", now())?;
+    set_mode(&signer, REFUSES);
+    let before = calls(&signer);
+    let refused = publish(&s, &ns, now(), |e| {
+        e.namespace_create(None, None)?;
+        e.tag_put("held", &set(b"retained"))
+    });
+    assert!(
+        matches!(refused, Err(StoreError::PublicationRetained(_))),
+        "a post-reservation failure is reported as retained: {refused:?}"
+    );
+    assert_eq!(calls(&signer), before + 1);
+    let slot = s.slot(ns.id())?;
+    assert!(
+        slot.pending
+            .lock()
+            .map_err(|_| "custody poisoned")?
+            .is_some(),
+        "the publication is in the slot's custody"
+    );
+    assert!(matches!(s.epoch_current(&ns), Err(StoreError::NotFound(_))));
+
+    // The name the retained publication reserved stays owned by it.
+    let rival = NamespaceRef::generate("custody", now())?;
+    assert!(
+        publish(&s, &rival, now2(), |e| e.namespace_create(None, None)).is_err(),
+        "a retained publication's claims are not released"
+    );
+    // The fenced namespace refuses; an unrelated one publishes.
+    set_mode(&signer, SIGNS);
+    assert!(publish(&s, &ns, now2(), |e| e.tag_put("next", &set(b"two"))).is_err());
+    publish(&s, &unrelated, now2(), |e| {
+        e.tag_put("free", &set(b"three"))
+    })?;
+
+    let invoked = calls(&signer);
+    assert!(matches!(
+        resolve(&s, &ns)?,
+        kappa_store::PublicationResolution::Retained(_)
+    ));
+    assert_eq!(calls(&signer), invoked, "resolution never re-signs");
+    assert!(
+        slot.pending
+            .lock()
+            .map_err(|_| "custody poisoned")?
+            .is_some()
+    );
+    Ok(())
+}
+
+/// A returned signature that fails verification is kept in custody as
+/// returned; resolution continues from it without signing again.
+#[test]
+fn a_returned_signature_is_retained_as_returned() -> TestResult {
+    let (s, signer) = counted_store()?;
+    let ns = NamespaceRef::generate("returned", now())?;
+    set_mode(&signer, CORRUPTS);
+    let refused = publish(&s, &ns, now(), |e| e.namespace_create(None, None));
+    let Err(StoreError::PublicationRetained(outcome)) = refused else {
+        return Err(format!("expected a retained publication, got {refused:?}").into());
+    };
+    let slot = s.slot(ns.id())?;
+    {
+        let custody = slot.pending.lock().map_err(|_| "custody poisoned")?;
+        let pending = custody.as_ref().ok_or("the publication is in custody")?;
+        assert_eq!(
+            pending.signed_root(),
+            outcome.signed_root,
+            "the returned root is kept"
+        );
+        assert_eq!(
+            pending.epoch().and_then(|epoch| epoch.returned_signature()),
+            Some([0u8; 64].as_slice()),
+            "the exact bytes the signer returned survive the failure"
+        );
+        assert_eq!(
+            outcome.phase,
+            kappa_types::PublicationPhase::SignatureInvalid
+        );
+        assert_eq!(
+            outcome.disposition,
+            kappa_types::RecoveryDisposition::Terminal
+        );
+    }
+    set_mode(&signer, SIGNS);
+    let invoked = calls(&signer);
+    assert!(matches!(
+        resolve(&s, &ns)?,
+        kappa_store::PublicationResolution::Retained(_)
+    ));
+    assert_eq!(calls(&signer), invoked);
+    Ok(())
+}
+
+/// A publication stopped by its deadline after the signer returned is
+/// retained resumable with the returned bytes and its retention charged.
+/// A resolution whose allowance cannot admit its first unit does no work
+/// and changes nothing; an admitted resolution forms the root from the
+/// retained bytes and publishes it without invoking the signer again.
+#[test]
+fn a_returned_signature_resumes_within_admitted_work() -> TestResult {
+    let (s, signer) = counted_store()?;
+    let ns = NamespaceRef::generate("resumed", now())?;
+    set_mode(&signer, SLOW);
+    let invoked = calls(&signer);
+    let mut execution = s.begin_execution(&ns, &clock_at(now())?)?;
+    execution.namespace_create(None, None)?;
+    execution.tag_put("held", &set(b"resumed"))?;
+    execution.set_deadline(std::time::Instant::now() + SLOW_SIGNATURE / 3);
+    let Err(StoreError::PublicationRetained(outcome)) = execution.publish() else {
+        return Err("a deadline crossed while signing must retain the publication".into());
+    };
+    assert_eq!(
+        outcome.phase,
+        kappa_types::PublicationPhase::SignatureReturned
+    );
+    assert_eq!(
+        outcome.disposition,
+        kappa_types::RecoveryDisposition::Resumable
+    );
+    assert!(outcome.signed_root.is_none(), "no root is formed yet");
+    assert_eq!(calls(&signer), invoked + 1);
+
+    let slot = s.slot(ns.id())?;
+    let returned = {
+        let custody = slot.pending.lock().map_err(|_| "custody poisoned")?;
+        let pending = custody.as_ref().ok_or("the publication is in custody")?;
+        let held = pending.retention();
+        assert!(held > 0, "the generated records' retention is reserved");
+        assert!(
+            s.publication_retention.used() >= held,
+            "the pool counts the retention custody holds"
+        );
+        assert!(
+            pending.work().get(kappa_types::work::Dimension::Signatures) > 0,
+            "the signer invocation is recorded as spent work"
+        );
+        pending
+            .epoch()
+            .and_then(|epoch| epoch.returned_signature())
+            .map(<[u8]>::to_vec)
+            .ok_or("the returned bytes are retained")?
+    };
+
+    // An allowance that cannot admit the first unit does nothing.
+    let mut short = kappa_types::work::WorkMeter::new(
+        kappa_types::work::WorkLimit::unbounded().with(kappa_types::work::Dimension::Entries, 1),
+    );
+    let kappa_store::PublicationResolution::Retained(stopped) =
+        s.resolve_publication(&ns, &clock_at(now2())?, &mut short)?
+    else {
+        return Err("an unadmitted resolution must leave the publication retained".into());
+    };
+    assert_eq!(
+        stopped.phase,
+        kappa_types::PublicationPhase::SignatureReturned
+    );
+    assert_eq!(
+        stopped.disposition,
+        kappa_types::RecoveryDisposition::Resumable
+    );
+    assert_eq!(
+        short.used().get(kappa_types::work::Dimension::Entries),
+        0,
+        "a refused unit spends nothing"
+    );
+    assert!(matches!(s.epoch_current(&ns), Err(StoreError::NotFound(_))));
+
+    // An admitted resolution publishes the root formed from the retained
+    // bytes: the signer was invoked once in all, so the published, verified
+    // root carries the bytes it returned.
+    let kappa_store::PublicationResolution::Published(published) = resolve(&s, &ns)? else {
+        return Err("an admitted resolution of a resumable publication must publish".into());
+    };
+    assert_eq!(calls(&signer), invoked + 1, "resolution never re-signs");
+    assert!(!returned.is_empty());
+    assert_eq!(published.epoch_number, 1);
+    assert_eq!(s.epoch_current(&ns)?, (1, published.root.clone()));
+    assert_eq!(s.epoch_get(&published.root)?.kappa(), &published.root);
+    assert!(
+        slot.pending
+            .lock()
+            .map_err(|_| "custody poisoned")?
+            .is_none(),
+        "a published retention leaves custody"
+    );
+    assert_eq!(
+        s.tag_get(&ns, "held")?.kappa,
+        Kappa::sha256(b"resumed"),
+        "the retained candidate is what publishes"
+    );
+    Ok(())
+}
+
+/// Resolving a namespace without a retained publication publishes nothing.
+#[test]
+fn resolving_without_custody_is_a_no_op() -> TestResult {
+    let s = test_store()?;
+    let (ns, first) = create_with_tags(&s, "settled", &[("x", b"one")])?;
+    assert!(matches!(
+        resolve(&s, &ns)?,
+        kappa_store::PublicationResolution::Clear
+    ));
+    assert_eq!(s.epoch_current(&ns)?, (1, first.root));
+    Ok(())
+}
+
+#[test]
+fn authorization_expiring_during_signing_retains_the_signed_candidate_without_publication()
+-> TestResult {
+    use kappa_handler::clock::{ControlledSource, WallClock};
+    use kappa_types::clock::{CausalTime, UnixTimeMs};
+    use std::sync::Arc;
+    let (store, signer) = counted_store()?;
+    let (ns, _) = create_with_tags(&store, "expires-during-signing", &[])?;
+    publish(&store, &ns, now2(), |execution| {
+        execution.session_put(
+            "session",
+            &Kappa::sha256(b"owner"),
+            now3().as_i64(),
+            b"metadata",
+        )
+    })?;
+    let before = store.epoch_current(&ns)?;
+    let source = Arc::new(ControlledSource::new(UnixTimeMs::from_millis(
+        1_700_000_001_500,
+    )));
+    let clock = WallClock::recovered(source.clone(), CausalTime::from_encoded(now2()));
+    let mut execution = store.begin_execution(&ns, &clock)?;
+    assert!(execution.session_get("session")?.is_some());
+    execution.tag_put("private", &set(b"expired"))?;
+    *signer.advance.lock().map_err(|_| "signer hook poisoned")? = Some(source);
+    let invoked = calls(&signer);
+    let Err(StoreError::PublicationRetained(retained)) = execution.publish() else {
+        return Err("expired signed publication must remain in custody".into());
+    };
+    assert_eq!(
+        retained.disposition,
+        kappa_types::RecoveryDisposition::Terminal
+    );
+    assert!(retained.signed_root.is_some());
+    assert_eq!(calls(&signer), invoked + 1);
+    assert_eq!(store.epoch_current(&ns)?, before);
+    assert!(matches!(
+        store.tag_get(&ns, "private"),
+        Err(StoreError::NotFound(_))
+    ));
+    let kappa_store::PublicationResolution::Retained(resolved) = resolve(&store, &ns)? else {
+        return Err("terminal custody must not publish on resolution".into());
+    };
+    assert_eq!(resolved.signed_root, retained.signed_root);
+    assert_eq!(
+        resolved.disposition,
+        kappa_types::RecoveryDisposition::Terminal
+    );
+    assert_eq!(
+        calls(&signer),
+        invoked + 1,
+        "resolution must not sign again"
+    );
+    assert_eq!(store.epoch_current(&ns)?, before);
     Ok(())
 }

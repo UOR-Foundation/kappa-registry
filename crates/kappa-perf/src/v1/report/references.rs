@@ -200,6 +200,7 @@ mod tests {
         let datasets = vec![Dataset {
             name: "floors".into(),
             path: "calibration_floors.jsonl".into(),
+            run: "target".into(),
             points: vec![
                 point("osc:bw/hash.sha256?size=64k", 1.4e8, Some(against(0.304)))?,
                 point("osc:bw/hash.blake3?size=64k", 4.0e9, Some(against(1.05)))?,
@@ -239,6 +240,7 @@ mod tests {
         let datasets = vec![Dataset {
             name: "floors".into(),
             path: "calibration_floors.jsonl".into(),
+            run: "target".into(),
             points: vec![
                 point("osc:bw/hash.sha256?size=64k", 1.4e8, None)?,
                 point("osc:bw/mem.read?size=64k", 1e10, None)?,
@@ -258,6 +260,7 @@ mod tests {
         let datasets = vec![Dataset {
             name: "floors".into(),
             path: "calibration_floors.jsonl".into(),
+            run: "target".into(),
             points: vec![
                 point("osc:bw/hash.sha256?impl=aws_lc&size=64k", 4.6e8, None)?,
                 // No production osc:bw/hash.sha256?size=64k

@@ -219,7 +219,7 @@ impl FromIterator<Capability> for CapabilitySet {
 /// Maximum delegation chain depth. A delegation with depth 0 cannot
 /// redelegate. Each redelegation decrements the depth. A chain longer
 /// than this is invalid.
-pub const DELEGATION_CHAIN_MAX_DEPTH: u32 = 4;
+pub const DELEGATION_CHAIN_MAX_DEPTH: u32 = 256;
 
 // ---------------------------------------------------------------------------
 // Delegation Chain Verification Result

@@ -27,7 +27,17 @@ const BLOB_INDEX_CONTEXT: &str = "blob_index";
 
 /// The encryption context of the row whose key bytes are `key`.
 pub fn row_context(key: &[u8]) -> String {
-    format!("{BLOB_INDEX_CONTEXT}:{}", hex::encode(key))
+    crate::encrypted::bound(BLOB_INDEX_CONTEXT, key)
+}
+
+/// Bytes [`decode_sealed`] allocates for the context of a row whose key is
+/// `key_len` bytes long, in a store with table encryption; none without.
+pub const fn row_context_allocation(encrypted: bool, key_len: usize) -> u64 {
+    if encrypted {
+        crate::encrypted::bound_allocation(BLOB_INDEX_CONTEXT, key_len)
+    } else {
+        0
+    }
 }
 
 /// Admit an access to a row under `domain`: refused once it is erased.

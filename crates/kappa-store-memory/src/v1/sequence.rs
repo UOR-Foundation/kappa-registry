@@ -3,37 +3,36 @@
 //! persistent backend records it, so the ledger carries every value issued.
 
 use kappa_store::traits::sequence::SequenceStore;
-use kappa_types::canonical::canonical_bytes;
-use kappa_types::epoch::{MutationOp, SequenceRecord};
+use kappa_store::transition::RecordTransition;
+
+use kappa_types::epoch::SequenceRecord;
 use kappa_types::error::StoreError;
 use kappa_types::namespace::NamespaceRef;
-use kappa_types::{Axis, VerifiedContent};
 
 use super::InMemoryStore;
-use super::execution::WriteCx;
+use super::execution::{MemoryPayload, WriteCx};
 use super::view::NamespaceView;
 
 impl WriteCx<'_> {
     /// Advance a namespace counter in the candidate. An exhausted counter
     /// refuses instead of wrapping.
     pub fn sequence_next(&mut self, name: &str) -> Result<u64, StoreError> {
-        let value = sequence_current_in(self.view, name)
-            .checked_add(1)
-            .ok_or_else(|| StoreError::CapacityExceeded(format!("sequence {name} exhausted")))?;
-        self.view.sequences.insert(name.to_owned(), value);
-        let evidence = canonical_bytes(&SequenceRecord {
-            namespace_id: self.ns.id().to_vec(),
-            name: name.to_owned(),
-            value,
-        });
-        let content = VerifiedContent::compute(Axis::Sha256, &evidence)?;
-        self.publish_content(&content)?;
-        self.record(
-            MutationOp::SequenceUpdate,
-            content.kappa().clone(),
-            Some(name.to_owned()),
-        );
+        let value =
+            kappa_store::traits::sequence::next_value(name, sequence_current_in(self.view, name))?;
+        self.apply_record_transition(
+            RecordTransition::Sequence(SequenceRecord {
+                namespace_id: self.ns.id().to_vec(),
+                name: name.to_owned(),
+                value,
+            }),
+            MemoryPayload::NoResources,
+        )?;
         Ok(value)
+    }
+
+    /// Hold the counter value `record` issued. Called only by `apply_write`.
+    pub(super) fn apply_sequence(&mut self, record: SequenceRecord) {
+        self.view.sequences.insert(record.name, record.value);
     }
 }
 

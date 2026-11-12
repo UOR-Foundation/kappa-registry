@@ -157,8 +157,12 @@ fn rename_updates_all_tables() -> TestResult {
     let ns = store.namespace_resolve("new", None)?;
     let info = store.namespace_info(&ns)?;
     assert_eq!(info.name, "new");
-    assert!(info.aliases.contains(&"new".to_string()));
-    assert!(!info.aliases.contains(&"old".to_string()));
+    assert!(
+        info.aliases
+            .iter()
+            .any(|alias| alias.name == "new" && alias.protocol.is_none())
+    );
+    assert!(!info.aliases.iter().any(|alias| alias.name == "old"));
     Ok(())
 }
 

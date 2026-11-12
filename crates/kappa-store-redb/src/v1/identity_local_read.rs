@@ -38,7 +38,7 @@ type CredentialRows = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// A session as an execution reads it: the row as observed, to record,
 /// and the live session it yields.
-type SessionRead = (AuthorizationRead, Option<(Kappa, Vec<u8>)>);
+type SessionRead = (Option<AuthorizationRead>, Option<(Kappa, Vec<u8>)>);
 
 /// The grace a stored row grants at `now`, or `None` once its deadline has
 /// passed.
@@ -52,7 +52,10 @@ fn unpack_grace(bytes: &[u8], now: ClockMs) -> Result<Option<(Vec<u8>, i64)>, St
         .try_into()
         .map_err(|_| StoreError::Internal("grace expires decode".into()))?;
     let grace_expires = i64::from_be_bytes(expires_bytes);
-    Ok((now.as_i64() < grace_expires).then(|| (bytes[..bytes.len() - 8].to_vec(), grace_expires)))
+    Ok(
+        kappa_store::identity_ops::credential_grace_live(grace_expires, now)
+            .then(|| (bytes[..bytes.len() - 8].to_vec(), grace_expires)),
+    )
 }
 
 impl PersistentStore {
@@ -98,6 +101,19 @@ impl PersistentStore {
             .map(|value| value.value().to_vec()))
     }
 
+    pub(super) fn private_row(
+        txn: &redb::WriteTransaction,
+        table: AuthorizationTable,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(txn
+            .open_table(table)
+            .map_err(crate::error::redb)?
+            .get(key)
+            .map_err(crate::error::redb)?
+            .map(|value| value.value().to_vec()))
+    }
+
     /// The ciphertext of `key` in `table` as its admitting namespace holds
     /// it now; `None` when absent everywhere.
     pub(crate) fn authorization_row(
@@ -125,6 +141,36 @@ impl PersistentStore {
         Ok(())
     }
 
+    /// Revalidate recorded authorization at the time of continuation, including
+    /// expiry that can change standing without any row write.
+    pub(crate) fn authorization_reads_hold_at(
+        &self,
+        reads: &[AuthorizationRead],
+        now: ClockMs,
+    ) -> Result<(), StoreError> {
+        self.authorization_reads_hold(reads)?;
+        for read in reads {
+            let Some(stored) = &read.observed else {
+                continue;
+            };
+            if redb::TableHandle::name(&read.table) == redb::TableHandle::name(&tables::ID_SESSIONS)
+                && self.decode_session(&read.key, stored, now)?.is_none()
+            {
+                return Err(StoreError::Conflict("publication session expired".into()));
+            }
+            if redb::TableHandle::name(&read.table)
+                == redb::TableHandle::name(&tables::ID_CREDENTIAL_GRACE)
+                && unpack_grace(&self.decrypt_bytes(&grace_context(&read.key), stored)?, now)?
+                    .is_none()
+            {
+                return Err(StoreError::Conflict(
+                    "publication credential grace expired".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn decode_session(
         &self,
         id: &str,
@@ -133,7 +179,7 @@ impl PersistentStore {
     ) -> Result<Option<(Kappa, Vec<u8>)>, StoreError> {
         let bytes = self.decrypt_bytes(&session_context(id), stored)?;
         let (anchor, anchor_len) = decode_anchor_from_packed(&bytes)?;
-        if now.as_i64() > session_expiry(&bytes, anchor_len)? {
+        if kappa_store::identity_ops::session_expired(session_expiry(&bytes, anchor_len)?, now) {
             return Ok(None);
         }
         Ok(Some((anchor, bytes[anchor_len + 8..].to_vec())))
@@ -152,25 +198,34 @@ impl PersistentStore {
             .ok_or_else(|| StoreError::NotFound("session expired".into()))
     }
 
-    /// The session read for an execution: the row as observed, to record,
-    /// and the live session it yields.
+    /// Read this namespace's row through its private writer; external rows
+    /// retain their committed observation for publication validation.
     pub(crate) fn session_read_for_execution(
         &self,
         token: &str,
         now: ClockMs,
+        namespace: &[u8; 16],
+        transaction: &redb::WriteTransaction,
     ) -> Result<SessionRead, StoreError> {
         let id = session_id(token);
+        if self.locate_authorization(tables::ID_SESSIONS, &id)? == Some(*namespace) {
+            let session = Self::private_row(transaction, tables::ID_SESSIONS, &id)?
+                .map(|stored| self.decode_session(&id, &stored, now))
+                .transpose()?
+                .flatten();
+            return Ok((None, session));
+        }
         let observed = self.authorization_row(tables::ID_SESSIONS, &id)?;
         let session = match &observed {
             Some(stored) => self.decode_session(&id, stored, now)?,
             None => None,
         };
         Ok((
-            AuthorizationRead {
+            Some(AuthorizationRead {
                 table: tables::ID_SESSIONS,
                 key: id,
                 observed,
-            },
+            }),
             session,
         ))
     }
@@ -217,13 +272,24 @@ impl PersistentStore {
         self.decode_credential(credential_id, &stored, grace.as_deref(), now)
     }
 
-    /// The credential read for an execution: both rows as observed, to
-    /// record, and the credential they yield.
+    /// Read current and grace rows from the private writer when this namespace
+    /// owns them; otherwise record both committed external observations.
     pub(crate) fn credential_read_for_execution(
         &self,
         credential_id: &str,
         now: ClockMs,
+        namespace: &[u8; 16],
+        transaction: &redb::WriteTransaction,
     ) -> Result<(Vec<AuthorizationRead>, Option<CredentialLookup>), StoreError> {
+        if self.locate_authorization(tables::ID_CREDENTIALS, credential_id)? == Some(*namespace) {
+            let stored = Self::private_row(transaction, tables::ID_CREDENTIALS, credential_id)?;
+            let grace = Self::private_row(transaction, tables::ID_CREDENTIAL_GRACE, credential_id)?;
+            let credential = stored
+                .as_deref()
+                .map(|stored| self.decode_credential(credential_id, stored, grace.as_deref(), now))
+                .transpose()?;
+            return Ok((Vec::new(), credential));
+        }
         let (stored, grace) = self.credential_rows(credential_id)?.unwrap_or((None, None));
         let credential = match &stored {
             Some(stored) => {
@@ -267,14 +333,23 @@ impl PersistentStore {
     /// gate is held or whose storage is missing, is kept for a later pass;
     /// a renewal admitted after the cache was settled therefore never loses
     /// its claim. The authorization outcome of each released claim was
-    /// already decided by the row's expiry; this records nothing.
-    pub(crate) fn evict_sessions(&self, now: ClockMs) -> Result<u64, StoreError> {
+    /// already decided by the row's expiry; this records nothing. Each
+    /// claim's cached session is read on `work`: a refusal after at least
+    /// one claim was decided ends the pass at the last claim fully decided,
+    /// where the next pass resumes; a refusal before any is the pass's
+    /// refusal.
+    pub(crate) fn evict_sessions(
+        &self,
+        now: ClockMs,
+        work: &mut dyn kappa_store::work::Meter,
+    ) -> Result<u64, StoreError> {
         const EVICTION_BATCH: usize = 1024;
         let mut cursor = self
             .session_eviction_cursor
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut examined = 0usize;
+        let mut stopped = false;
         let mut last = None;
         let mut candidates = Vec::new();
         {
@@ -289,20 +364,27 @@ impl PersistentStore {
                 .map_err(crate::error::redb)?
             {
                 let (key, value) = entry.map_err(crate::error::redb)?;
-                examined += 1;
                 let id = key.value().to_string();
-                last = Some(id.clone());
                 let owner = locator_namespace(value.value())?;
-                let cached = read
-                    .get(Family::Session, id.as_bytes())?
+                let cached = match read.get(Family::Session, id.as_bytes(), work) {
+                    Ok(cached) => cached,
+                    Err(StoreError::WorkRefused(_)) if examined > 0 => {
+                        stopped = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let cached = cached
                     .into_iter()
                     .filter(|visible| *visible.instance.namespace() == owner)
                     .max_by_key(|visible| visible.completion);
                 if let Some(cached) = cached
                     && self.decode_session(&id, &cached.value, now)?.is_none()
                 {
-                    candidates.push((id, owner));
+                    candidates.push((id.clone(), owner));
                 }
+                examined += 1;
+                last = Some(id);
                 if examined >= EVICTION_BATCH {
                     break;
                 }
@@ -314,7 +396,7 @@ impl PersistentStore {
                 released += 1;
             }
         }
-        *cursor = if examined < EVICTION_BATCH {
+        *cursor = if examined < EVICTION_BATCH && !stopped {
             None
         } else {
             last
@@ -361,7 +443,7 @@ impl PersistentStore {
             maintenance.finish();
             return Ok(false);
         }
-        let wtxn = self.registry.begin_write().map_err(crate::error::redb)?;
+        let wtxn = self.registry.begin_write()?;
         let released = {
             let mut claims = wtxn
                 .open_table(tables::ID_SESSIONS)
@@ -378,7 +460,15 @@ impl PersistentStore {
                 false
             }
         };
-        Self::commit_write(wtxn)?;
+        match wtxn.commit() {
+            Ok(()) => {}
+            // A claim that remains is released by a later pass, which
+            // confirms the row's expiry again under the gate.
+            Err(
+                crate::error::CommitFailure::Known(error)
+                | crate::error::CommitFailure::Unknown(error),
+            ) => return Err(error),
+        }
         maintenance.finish();
         Ok(released)
     }

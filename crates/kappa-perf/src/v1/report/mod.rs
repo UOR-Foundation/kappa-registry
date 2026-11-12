@@ -17,6 +17,7 @@ pub mod format;
 pub mod hosts;
 pub mod references;
 pub mod render;
+pub mod repetition;
 pub mod scale;
 
 use std::path::{Path, PathBuf};
@@ -59,9 +60,13 @@ pub(crate) fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> ReportErro
 /// The result artifacts the report reads.
 #[derive(Debug, Clone)]
 pub struct Inputs {
-    /// Directory holding `calibration_*.jsonl`: one run's directory, or
-    /// the cargo target directory.
-    pub dataset_dir: PathBuf,
+    /// Directories holding `calibration_*.jsonl`, one per run: a single
+    /// run's directory (or the cargo target directory), or several runs of
+    /// the same benches whose records the report aggregates across runs.
+    /// Criterion's confidence interval is within one process; an interval
+    /// over repeated processes exists only when more than one directory is
+    /// given.
+    pub dataset_dirs: Vec<PathBuf>,
     /// `results.tsv` of each succinct scale run to include.
     pub scale: Vec<PathBuf>,
 }
@@ -69,20 +74,31 @@ pub struct Inputs {
 /// Everything the report contains.
 #[derive(Debug)]
 pub struct Report {
+    /// Every session dataset of every run, in run order then session order.
     pub datasets: Vec<Dataset>,
     pub scale: Vec<ScaleRun>,
 }
 
 impl Report {
     pub fn collect(inputs: &Inputs) -> Result<Self, ReportError> {
+        let mut datasets = Vec::new();
+        for dir in &inputs.dataset_dirs {
+            datasets.extend(datasets::load_all(dir)?);
+        }
         Ok(Self {
-            datasets: datasets::load_all(&inputs.dataset_dir)?,
+            datasets,
             scale: inputs
                 .scale
                 .iter()
                 .map(|path| scale::load(path))
                 .collect::<Result<_, _>>()?,
         })
+    }
+
+    /// Records of one identifier across runs: the across-process
+    /// repetition the report aggregates (`repetition::Repetitions`).
+    pub fn repetitions(&self) -> repetition::Repetitions<'_> {
+        repetition::Repetitions::of(&self.datasets)
     }
 
     /// Test coverage and completeness of the recorded datasets.

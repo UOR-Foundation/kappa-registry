@@ -26,6 +26,10 @@ fn test_anchor() -> Kappa {
     Kappa::sha256(b"golden-vector-signer")
 }
 
+fn test_state() -> Kappa {
+    Kappa::sha256(b"golden-vector-namespace-state")
+}
+
 // -- PERF-EPO-006: golden vectors --
 
 #[test]
@@ -41,6 +45,7 @@ fn epoch_root_canonical_bytes_deterministic() {
         tag_count: 42,
         rotation_kappa: None,
         ledger_root: &Kappa::sha256(b"golden-ledger"),
+        state: &test_state(),
     });
 
     let bytes_a = root.to_bytes();
@@ -65,6 +70,7 @@ fn signable_form_excludes_cose_signature() {
         tag_count: 0,
         rotation_kappa: None,
         ledger_root: &Kappa::sha256(&canonical_bytes(&Vec::<EpochMutation>::new())),
+        state: &test_state(),
     });
 
     let unsigned_signable = root.signable_bytes();
@@ -97,6 +103,7 @@ fn epoch_root_roundtrip_preserves_all_fields() -> TestResult {
         tag_count: 1000,
         rotation_kappa: Some(&rotation),
         ledger_root: &Kappa::sha256(b"ledger"),
+        state: &test_state(),
     })
     .with_signature(SignedPayload::from_cose_bytes(vec![0xDE, 0xAD]));
 
@@ -134,6 +141,7 @@ fn build_verified_derives_roots_consistently() {
         timestamp: test_clock(),
         signer_anchor: &test_anchor(),
         rotation_kappa: None,
+        state: &test_state(),
     });
 
     // State digest is from StateDigest accumulator
@@ -169,6 +177,7 @@ fn chain_prev_identifier_links_correctly() {
         tag_count: 0,
         rotation_kappa: None,
         ledger_root: &ledger,
+        state: &test_state(),
     });
 
     let epoch2 = EpochRoot::build(EpochRootInput {
@@ -182,6 +191,7 @@ fn chain_prev_identifier_links_correctly() {
         tag_count: 0,
         rotation_kappa: None,
         ledger_root: &ledger,
+        state: &test_state(),
     });
 
     assert!(epoch1.prev_identifier().is_none());
@@ -206,6 +216,7 @@ fn single_field_mutation_changes_kappa() {
         tag_count: 0,
         rotation_kappa: None,
         ledger_root: &ledger,
+        state: &test_state(),
     });
 
     // Changing epoch_number
@@ -222,6 +233,7 @@ fn single_field_mutation_changes_kappa() {
             tag_count: 0,
             rotation_kappa: None,
             ledger_root: &ledger,
+            state: &test_state(),
         }
     });
     assert_ne!(base.kappa(), mutated.kappa());
@@ -240,6 +252,7 @@ fn single_field_mutation_changes_kappa() {
             tag_count: 0,
             rotation_kappa: None,
             ledger_root: &ledger,
+            state: &test_state(),
         }
     });
     assert_ne!(base.kappa(), mutated2.kappa());
@@ -258,6 +271,7 @@ fn single_field_mutation_changes_kappa() {
             tag_count: 0,
             rotation_kappa: None,
             ledger_root: &ledger,
+            state: &test_state(),
         }
     });
     assert_ne!(base.kappa(), mutated3.kappa());

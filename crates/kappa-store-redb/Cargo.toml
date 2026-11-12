@@ -36,9 +36,6 @@ arc-swap = { workspace = true }
 zeroize = { workspace = true }
 base64-simd = "0.8"
 crc-fast = "1"
-zstd = "0.14"
-xz2 = "0.1"
-bzip2 = "0.6"
 kappa-fixture = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -56,6 +53,11 @@ kappa-crypto = { workspace = true, features = ["test-util"] }
 kappa-handler = { workspace = true, features = ["test-util"] }
 kappa-store-memory = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+# Encoders for compressed-admission fixtures; decoding is
+# `kappa_store::compression`.
+zstd = "0.14"
+xz2 = "0.1"
+bzip2 = "0.6"
 
 [lints]
 workspace = true

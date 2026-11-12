@@ -186,8 +186,14 @@ struct Observation<'a> {
 impl Drop for Observation<'_> {
     fn drop(&mut self) {
         let mut accounts = self.budget.lock();
+        let previous_floor = accounts.inflight.first().copied();
         accounts.inflight.remove(&self.seq);
-        accounts.prune();
+        // Only advancing the oldest observation can make deletion records
+        // obsolete. Later completions must not repeatedly scan every record
+        // retained by a stalled observer while holding the accounts lock.
+        if accounts.inflight.first().copied() != previous_floor {
+            accounts.prune();
+        }
     }
 }
 

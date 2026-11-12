@@ -271,6 +271,10 @@ pub struct AllocationTable {
 }
 
 impl AllocationTable {
+    pub(crate) fn preparation_owner(&self) -> Arc<dyn Send + Sync> {
+        self.shared.clone()
+    }
+
     /// The table of the cache at `root`, retaining `owner` (the filesystem
     /// scope containing `root`) for as long as any allocation or owed file
     /// remains.
@@ -407,6 +411,14 @@ impl AllocationTable {
             .filter(|record| record.state != State::Live)
             .count();
         (owed, state.owed)
+    }
+
+    /// Whether a removal attempt is waiting: an abandoned file of an ended
+    /// registry, or a record whose removal ticket is queued. Read under the
+    /// locks `discharge` takes, so a caller charges an attempt only when
+    /// one will be made.
+    pub fn owes(&self) -> bool {
+        !abandoned_lock().is_empty() || !self.shared.registry.lock().pending.is_empty()
     }
 
     /// Attempt at most `limit` removals, abandoned files of ended

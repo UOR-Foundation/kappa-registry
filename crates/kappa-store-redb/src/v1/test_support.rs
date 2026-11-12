@@ -33,7 +33,6 @@ pub struct PersistentSpec {
     db_file: String,
     encryption_key: Option<[u8; 32]>,
     fsync: bool,
-    credential_cache: bool,
     backend: Option<BackendFactory>,
     namespace_backend: Option<crate::storage::NamespaceBackend>,
 }
@@ -57,7 +56,6 @@ impl PersistentSpec {
             db_file: "store.redb".into(),
             encryption_key: None,
             fsync: true,
-            credential_cache: false,
             backend: None,
             namespace_backend: None,
         }
@@ -131,12 +129,6 @@ impl PersistentSpec {
         self
     }
 
-    #[must_use]
-    pub const fn credential_cache(mut self, enabled: bool) -> Self {
-        self.credential_cache = enabled;
-        self
-    }
-
     /// Store the database through `backend` instead of the file backend.
     #[must_use]
     pub fn backend(mut self, backend: BackendFactory) -> Self {
@@ -164,7 +156,6 @@ impl PersistentSpec {
         }
         config.encryption_key = self.encryption_key;
         config.fsync = self.fsync;
-        config.enable_credential_cache = self.credential_cache;
         if let Some(backend) = self.backend {
             config.backend = Some(Box::new(move || backend()));
         }
@@ -229,199 +220,14 @@ mod writer;
 #[cfg(test)]
 pub(crate) use writer::{TestWriter, controller_for_tests, retirement_principal};
 
-/// A storage failure the [`FaultBackend`] injects while armed.
-///
-/// redb 4.3 buffers page and header writes and hands them to the backend
-/// inside `flush`, which then calls `sync_data`; the ordinary one-phase
-/// durable commit flushes once, after switching the primary header slot.
-/// Each fault therefore lands at a distinct, known point of that commit:
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fault {
-    /// Refuse every write before it modifies the file. Armed before a
-    /// commit, the new header never reaches the file: the transaction is
-    /// not persisted, though the writer only learns that its commit failed.
-    RefuseWrites,
-    /// Fail `sync_data` without synchronizing. The writes preceding it
-    /// already reached the file and may persist; the outcome is unknown.
-    FailSyncBefore,
-    /// Synchronize, then report failure. The transaction is durable while
-    /// the writer is told its commit failed.
-    FailSyncAfter,
-    /// Refuse `set_len` before resizing the file.
-    RefuseSetLen,
-}
+/// Fault injection beneath redb (`fault`): the backend, its control, the
+/// faults, the crash model and the trace it records.
+#[path = "test_support/fault.rs"]
+pub mod fault;
+pub use fault::{
+    Fault, FaultBackend, FaultControl, Fired, Loss, OpOutcome, Role, SECTOR, StorageOp,
+};
 
-/// One storage operation the [`FaultBackend`] received.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StorageOp {
-    Write { offset: u64, len: usize },
-    Sync,
-    SetLen(u64),
-}
-
-/// What became of a [`StorageOp`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OpOutcome {
-    Performed,
-    /// Refused before any effect on the file.
-    Refused,
-    /// Performed, then reported as failed.
-    PerformedThenFailed,
-}
-
-#[derive(Default)]
-struct FaultState {
-    armed: Option<Fault>,
-    trace: Vec<(StorageOp, OpOutcome)>,
-}
-
-/// The switch and the operation trace of a [`FaultBackend`]. A fault stays
-/// armed until disarmed, so a failed handle's teardown meets it too.
-#[derive(Clone, Default)]
-pub struct FaultControl(Arc<std::sync::Mutex<FaultState>>);
-
-impl FaultControl {
-    fn state(&self) -> std::sync::MutexGuard<'_, FaultState> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Arm `fault` and start a fresh trace.
-    pub fn arm(&self, fault: Fault) {
-        let mut state = self.state();
-        state.armed = Some(fault);
-        state.trace.clear();
-    }
-
-    pub fn disarm(&self) {
-        self.state().armed = None;
-    }
-
-    /// Every operation since the last [`FaultControl::arm`], in order.
-    pub fn trace(&self) -> Vec<(StorageOp, OpOutcome)> {
-        self.state().trace.clone()
-    }
-
-    /// Decide `op` under the armed fault, run `effect` unless refused, and
-    /// record the outcome.
-    fn apply(
-        &self,
-        op: StorageOp,
-        effect: impl FnOnce() -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
-        let armed = self.state().armed;
-        let (before, after) = match (armed, op) {
-            (Some(Fault::RefuseWrites), StorageOp::Write { .. })
-            | (Some(Fault::FailSyncBefore), StorageOp::Sync)
-            | (Some(Fault::RefuseSetLen), StorageOp::SetLen(_)) => (true, false),
-            (Some(Fault::FailSyncAfter), StorageOp::Sync) => (false, true),
-            _ => (false, false),
-        };
-        if before {
-            self.state().trace.push((op, OpOutcome::Refused));
-            return Err(std::io::Error::other(format!(
-                "injected {armed:?} at {op:?}"
-            )));
-        }
-        let result = effect();
-        let outcome = match (&result, after) {
-            (Err(_), _) => return result,
-            (Ok(()), true) => OpOutcome::PerformedThenFailed,
-            (Ok(()), false) => OpOutcome::Performed,
-        };
-        self.state().trace.push((op, outcome));
-        if after {
-            return Err(std::io::Error::other(format!(
-                "injected {armed:?} after {op:?}"
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// File storage with deterministic, armable failure injection and an
-/// operation trace.
-///
-/// Every backend a factory makes shares the file and the
-/// control, so reacquiring the same spec reopens the same database.
-pub struct FaultBackend {
-    file: Arc<std::sync::Mutex<std::fs::File>>,
-    control: FaultControl,
-}
-
-impl FaultBackend {
-    /// A factory over the database file at `path`, created if absent, and
-    /// the control of every backend it makes.
-    pub fn factory(path: &Path) -> Result<(BackendFactory, FaultControl), SetupError> {
-        let file = Arc::new(std::sync::Mutex::new(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)?,
-        ));
-        let control = FaultControl::default();
-        let shared = control.clone();
-        let factory: BackendFactory = Arc::new(move || {
-            Box::new(Self {
-                file: Arc::clone(&file),
-                control: shared.clone(),
-            })
-        });
-        Ok((factory, control))
-    }
-
-    fn file(&self) -> std::io::Result<std::sync::MutexGuard<'_, std::fs::File>> {
-        self.file
-            .lock()
-            .map_err(|_| std::io::Error::other("file lock poisoned"))
-    }
-}
-
-impl std::fmt::Debug for FaultBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FaultBackend")
-            .field("armed", &self.control.state().armed)
-            .finish_non_exhaustive()
-    }
-}
-
-impl redb::StorageBackend for FaultBackend {
-    fn len(&self) -> std::io::Result<u64> {
-        Ok(self.file()?.metadata()?.len())
-    }
-
-    fn read(&self, offset: u64, output: &mut [u8]) -> std::io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = self.file()?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(output)
-    }
-
-    fn write(&self, offset: u64, input: &[u8]) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom, Write};
-        self.control.apply(
-            StorageOp::Write {
-                offset,
-                len: input.len(),
-            },
-            || {
-                let mut file = self.file()?;
-                file.seek(SeekFrom::Start(offset))?;
-                file.write_all(input)
-            },
-        )
-    }
-
-    fn set_len(&self, length: u64) -> std::io::Result<()> {
-        self.control
-            .apply(StorageOp::SetLen(length), || self.file()?.set_len(length))
-    }
-
-    fn sync_data(&self) -> std::io::Result<()> {
-        self.control
-            .apply(StorageOp::Sync, || self.file()?.sync_all())
-    }
-}
+#[cfg(test)]
+#[path = "test_support/fault_tests.rs"]
+mod fault_tests;

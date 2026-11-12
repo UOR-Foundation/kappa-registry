@@ -174,6 +174,7 @@ fn failed_commit_leaves_the_transaction_committable_and_a_retry_publishes() -> T
     let fixture = fixture()?;
     let content: &[u8] = b"retried";
     let (id, members) = fixture.staged(&[content])?;
+    let before = fixture.store.epoch_current(&fixture.namespace)?;
     let now = at(1_700_000_002_000);
 
     let mut failing = fixture
@@ -185,11 +186,14 @@ fn failed_commit_leaves_the_transaction_committable_and_a_retry_publishes() -> T
     failing.set_deadline(expired);
     let mut work = commit_transaction(asserter(), id.clone(), members.clone(), now);
     assert!(matches!(work(&mut *failing)?, Outcome::Publish(_)));
-    assert!(matches!(
-        failing.publish(),
-        Err(StoreError::DeadlineExceeded { .. })
-    ));
+    let outcome = failing.publish();
+    assert!(
+        matches!(&outcome, Err(StoreError::DeadlineExceeded { namespace, .. })
+            if namespace == fixture.namespace.id()),
+        "expired execution must report its namespace deadline: {outcome:?}"
+    );
 
+    assert_eq!(fixture.store.epoch_current(&fixture.namespace)?, before);
     assert!(!fixture.pinned(&members[0])?);
     assert!(fixture.open(&id)?);
     assert_eq!(fixture.store.blob_get(&members[0])?, content);
@@ -201,7 +205,8 @@ fn failed_commit_leaves_the_transaction_committable_and_a_retry_publishes() -> T
         return Err("a retried commit must publish".into());
     };
     assert_eq!(promoted, vec![members[0].to_string()]);
-    retry.publish()?;
+    let published = retry.publish()?;
+    assert_eq!(published.epoch_number, before.0 + 1);
     assert!(fixture.pinned(&members[0])?);
     assert!(!fixture.open(&id)?);
     fixture.close()

@@ -1,12 +1,15 @@
 //! Edge records, content, and indexes in an execution-owned transaction.
 
+use crate::transition_apply::{RedbPayload, TxnWriter};
 use crate::{
     PersistentStore,
     epoch_blob::blob_put_in_txn,
     tables::{EDGE_ASR, EDGE_FWD, EDGE_REL, EDGE_REV, EDGES},
 };
+use kappa_store::transition::RecordTransition;
+use kappa_store::work::Meter;
 use kappa_store::{
-    Axis, ClockMs, EdgeInput, Kappa, MutationOp, NamespaceRef, StoreError, VerifiedContent,
+    Axis, ClockMs, EdgeInput, Kappa, NamespaceRef, StoreError, VerifiedContent,
     canonical::{canonical_bytes, from_canonical},
 };
 use redb::ReadableTable;
@@ -49,6 +52,7 @@ impl PersistentStore {
         crate::referrers::establish(
             self,
             txn,
+            ns,
             content.kappa(),
             &crate::referrers::Referrer::edge_record(ns, content.kappa()),
         )?;
@@ -56,6 +60,7 @@ impl PersistentStore {
             crate::referrers::establish(
                 self,
                 txn,
+                ns,
                 &input.target,
                 &crate::referrers::Referrer::edge_target(ns, content.kappa()),
             )?;
@@ -75,57 +80,121 @@ impl PersistentStore {
         Ok(true)
     }
 
+    /// The edge `identity` of `ns` as `txn` holds it.
+    fn edge_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        ns: &NamespaceRef,
+        identity: &Kappa,
+    ) -> Result<Option<EdgeInput>, StoreError> {
+        let key = ns_key(ns, &identity.key_bytes());
+        txn.open_table(EDGES)
+            .map_err(crate::error::redb)?
+            .get(key.as_slice())
+            .map_err(crate::error::redb)?
+            .map(|value| {
+                self.decrypt_bytes(&crate::encrypted::bound("edge", &key), value.value())
+                    .and_then(|bytes| Ok(from_canonical(&bytes)?))
+            })
+            .transpose()
+    }
+
+    /// Put `input` as an edge of `ns`. An edge the namespace already holds
+    /// is kept and records no mutation.
     pub(crate) fn edge_mutation_put_in_txn(
         &self,
         txn: &redb::WriteTransaction,
         ns: &NamespaceRef,
         input: &EdgeInput,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<Kappa, StoreError> {
-        let content = VerifiedContent::compute(Axis::Sha256, &canonical_bytes(input))?;
-        if self.edge_put_in_txn(txn, ns, input, &content)? {
-            self.record_mutation_in_txn(
-                txn,
-                ns,
-                MutationOp::EdgePut,
-                content.kappa().clone(),
-                now,
-                Some(input.relation.to_string()),
-            )?;
+        let identity = Kappa::sha256(&canonical_bytes(input));
+        if self.edge_in_txn(txn, ns, &identity)?.is_some() {
+            return Ok(identity);
         }
-        Ok(content.kappa().clone())
+        TxnWriter::new(self, txn, ns, now, meter)?.apply(
+            RecordTransition::EdgePut(input.clone()),
+            RedbPayload::NoResources,
+        )
     }
 
+    /// An edge `ns` does not hold is a no-op and records no mutation.
     pub(crate) fn edge_delete_in_txn(
         &self,
         txn: &redb::WriteTransaction,
         ns: &NamespaceRef,
         identity: &Kappa,
         now: ClockMs,
+        meter: &mut dyn Meter,
     ) -> Result<(), StoreError> {
-        let raw = identity.key_bytes();
-        let key = ns_key(ns, &raw);
-        let input: EdgeInput = {
-            let mut records = txn.open_table(EDGES).map_err(crate::error::redb)?;
-            let input = match records.get(key.as_slice()).map_err(crate::error::redb)? {
-                Some(value) => from_canonical(
-                    &self.decrypt_bytes(&crate::encrypted::bound("edge", &key), value.value())?,
-                )?,
-                None => return Ok(()),
-            };
-            records.remove(key.as_slice()).map_err(crate::error::redb)?;
-            input
+        let Some(input) = self.edge_in_txn(txn, ns, identity)? else {
+            return Ok(());
         };
+        TxnWriter::new(self, txn, ns, now, meter)?
+            .apply(
+                RecordTransition::EdgeDelete(input),
+                RedbPayload::NoResources,
+            )
+            .map(drop)
+    }
+}
+
+impl TxnWriter<'_> {
+    /// Hold the edge whose evidence is `identity`, with its indexes and
+    /// references. The evidence itself was installed by the boundary.
+    pub(crate) fn apply_edge_put(
+        &self,
+        identity: &Kappa,
+        input: &EdgeInput,
+    ) -> Result<(), StoreError> {
+        let content = VerifiedContent::compute(Axis::Sha256, &canonical_bytes(input))?;
+        if content.kappa() != identity {
+            return Err(StoreError::Internal(
+                "edge evidence differs from its record".into(),
+            ));
+        }
+        if !self
+            .store
+            .edge_put_in_txn(self.txn, self.ns, input, &content)?
+        {
+            return Err(StoreError::Internal(format!(
+                "edge {identity} applied twice"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Remove the edge `identity`, which must be the edge `input`, with its
+    /// indexes and references.
+    pub(crate) fn apply_edge_delete(
+        &self,
+        identity: &Kappa,
+        input: &EdgeInput,
+    ) -> Result<(), StoreError> {
+        let (store, txn, ns) = (self.store, self.txn, self.ns);
+        if store.edge_in_txn(txn, ns, identity)?.as_ref() != Some(input) {
+            return Err(StoreError::Internal(format!(
+                "edge deletion names {identity}, which the namespace does not hold"
+            )));
+        }
+        let raw = identity.key_bytes();
+        txn.open_table(EDGES)
+            .map_err(crate::error::redb)?
+            .remove(ns_key(ns, &raw).as_slice())
+            .map_err(crate::error::redb)?;
         crate::referrers::release(
-            self,
+            store,
             txn,
+            ns,
             identity,
             &crate::referrers::Referrer::edge_record(ns, identity),
         )?;
         if input.relation.gc_reachable() {
             crate::referrers::release(
-                self,
+                store,
                 txn,
+                ns,
                 &input.target,
                 &crate::referrers::Referrer::edge_target(ns, identity),
             )?;
@@ -142,13 +211,6 @@ impl PersistentStore {
                 .remove(key.as_slice(), raw.as_slice())
                 .map_err(crate::error::redb)?;
         }
-        self.record_mutation_in_txn(
-            txn,
-            ns,
-            MutationOp::EdgeDelete,
-            identity.clone(),
-            now,
-            Some(input.relation.to_string()),
-        )
+        Ok(())
     }
 }

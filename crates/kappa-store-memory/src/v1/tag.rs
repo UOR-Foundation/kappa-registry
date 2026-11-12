@@ -1,18 +1,24 @@
 //! Tags of a namespace view: writes against the candidate, reads against
 //! a published or candidate view. The digest, count, references and ledger
 //! move together because they share one view.
+//!
+//! The domain methods prepare each tag transition against the candidate;
+//! the application boundary (`WriteCx::apply_write`) applies it through
+//! `apply_tag_set` and `apply_tag_delete`, which change the row, the
+//! digest and the references and emit nothing themselves.
 
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use kappa_store::traits::tag::TagStore;
-use kappa_types::epoch::MutationOp;
+use kappa_store::transition::RecordTransition;
+
 use kappa_types::error::StoreError;
 use kappa_types::namespace::NamespaceRef;
 use kappa_types::page::{Page, PageRequest};
 use kappa_types::tag::{TagEntry, TagUpdate};
 
 use super::InMemoryStore;
-use super::execution::WriteCx;
+use super::execution::{MemoryPayload, WriteCx};
 use super::view::NamespaceView;
 
 impl WriteCx<'_> {
@@ -25,7 +31,10 @@ impl WriteCx<'_> {
             update,
             self.now,
         )?;
-        self.apply_tag(old.as_ref(), entry.clone())?;
+        self.apply_record_transition(
+            RecordTransition::TagSet(entry.clone()),
+            MemoryPayload::NoResources,
+        )?;
         Ok(entry)
     }
 
@@ -33,19 +42,13 @@ impl WriteCx<'_> {
         let removed = self
             .view
             .tags
-            .remove(name)
+            .get(name)
+            .cloned()
             .ok_or_else(|| StoreError::NotFound(format!("{}/{name}", self.ns)))?;
-        self.view.digest.remove_tag(name, &removed.kappa);
-        if removed.symref.is_none() && !self.view.release(&removed.kappa) {
-            return Err(StoreError::Internal(format!(
-                "reference index lacked the tag {name} being deleted"
-            )));
-        }
-        self.record(
-            MutationOp::TagDelete,
-            removed.kappa.clone(),
-            Some(name.to_string()),
-        );
+        self.apply_record_transition(
+            RecordTransition::TagDelete(removed.clone()),
+            MemoryPayload::NoResources,
+        )?;
         Ok(removed)
     }
 
@@ -68,48 +71,72 @@ impl WriteCx<'_> {
                     update,
                     self.now,
                 )
-                .map(|entry| (old, entry))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut results = Vec::with_capacity(prepared.len());
-        for (old, entry) in prepared {
-            self.apply_tag(old.as_ref(), entry.clone())?;
-            results.push(entry);
+        for entry in &prepared {
+            self.apply_record_transition(
+                RecordTransition::TagSet(entry.clone()),
+                MemoryPayload::NoResources,
+            )?;
         }
-        Ok(results)
+        Ok(prepared)
     }
 
-    fn apply_tag(&mut self, old: Option<&TagEntry>, entry: TagEntry) -> Result<(), StoreError> {
-        if let Some(old) = old {
-            self.view.digest.remove_tag(&entry.name, &old.kappa);
-        }
-        self.view.digest.insert_tag(&entry.name, &entry.kappa);
-        // A symbolic tag names a tag, not content, so only direct targets
-        // are referenced, and a direct tag reset to the same target changes
-        // nothing.
+    /// Set the tag row `entry` names: replace the previous entry in the
+    /// digest and move the direct reference from its target to the new one.
+    /// Called only by `apply_write`.
+    pub(super) fn apply_tag_set(&mut self, entry: TagEntry) -> Result<(), StoreError> {
+        let old = self.view.tags.get(&entry.name).cloned();
         let old_target = old
+            .as_ref()
             .filter(|tag| tag.symref.is_none())
             .map(|tag| tag.kappa.clone());
         let new_target = entry.symref.is_none().then(|| entry.kappa.clone());
+        if old_target != new_target
+            && let Some(previous) = &old_target
+            && !self.view.references.contains_key(previous)
+        {
+            return Err(StoreError::Internal(format!(
+                "reference index lacked the tag {} being moved",
+                entry.name
+            )));
+        }
+        if let Some(old) = &old {
+            self.view.digest.remove_tag(&entry.name, &old.kappa);
+        }
+        self.view.digest.insert_tag(&entry.name, &entry.kappa);
         if old_target != new_target {
-            if let Some(previous) = &old_target
-                && !self.view.release(previous)
-            {
-                return Err(StoreError::Internal(format!(
-                    "reference index lacked the tag {} being moved",
-                    entry.name
-                )));
+            if let Some(previous) = &old_target {
+                self.view.release(previous);
             }
             if let Some(next) = &new_target {
                 self.view.reference(next);
             }
         }
-        self.record(
-            MutationOp::TagSet,
-            entry.kappa.clone(),
-            Some(entry.name.clone()),
-        );
         self.view.tags.insert(entry.name.clone(), entry);
+        Ok(())
+    }
+
+    /// Remove exactly the tag row `entry` names, its digest contribution and
+    /// its direct reference. Called only by `apply_write`.
+    pub(super) fn apply_tag_delete(&mut self, entry: &TagEntry) -> Result<(), StoreError> {
+        if self.view.tags.get(&entry.name) != Some(entry) {
+            return Err(StoreError::Internal(format!(
+                "tag {} removal names an entry the candidate does not hold",
+                entry.name
+            )));
+        }
+        if entry.symref.is_none() && !self.view.references.contains_key(&entry.kappa) {
+            return Err(StoreError::Internal(format!(
+                "reference index lacked the tag {} being deleted",
+                entry.name
+            )));
+        }
+        self.view.tags.remove(&entry.name);
+        self.view.digest.remove_tag(&entry.name, &entry.kappa);
+        if entry.symref.is_none() {
+            self.view.release(&entry.kappa);
+        }
         Ok(())
     }
 }

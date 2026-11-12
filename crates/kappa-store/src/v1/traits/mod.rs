@@ -11,8 +11,11 @@ pub use blob::BlobStore;
 pub use edge::EdgeStore;
 pub use epoch::EpochStore;
 pub use identity::IdentityStore;
-pub use maintenance::{IndexRepair, MaintenanceStore, Reclamation};
-pub use namespace::{NamespaceInfo, NamespaceStore};
+pub use maintenance::{
+    Continuation, ContinuationScope, IndexRepair, MaintenanceOperation, MaintenanceStore, Progress,
+    Reclamation, Settlement, StoreToken,
+};
+pub use namespace::{NamespaceAlias, NamespaceInfo, NamespaceStore};
 pub use sequence::SequenceStore;
 pub use tag::TagStore;
 

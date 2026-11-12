@@ -11,12 +11,14 @@ use kappa_perf::calibrate::backfill::dataset_directory;
 use kappa_perf::report::{CoverageStatus, Dataset, Inputs, Report, references, render};
 
 const USAGE: &str = "\
-Usage: perf-report [--datasets DIR] [--scale RESULTS_TSV]... [--out FILE]
+Usage: perf-report [--datasets DIR]... [--scale RESULTS_TSV]... [--out FILE]
 
-  --datasets DIR  directory holding calibration_*.jsonl
+  --datasets DIR  directory holding calibration_*.jsonl; repeatable, one per
+                  run, so the same measurements from separate processes are
+                  aggregated across runs
                   (default: $KAPPA_PERF_DATASET_DIR, else the cargo target directory)
   --scale FILE    results.tsv of a succinct scale run; repeatable
-  --out FILE      markdown report to write (default: <datasets>/perf-report.md)
+  --out FILE      markdown report to write (default: <first datasets>/perf-report.md)
 
 Exit status: 0 every paired production path meets or exceeds its reference;
 3 the report is written and at least one production path is behind its
@@ -40,12 +42,22 @@ fn set_once(slot: &mut Option<PathBuf>, flag: &str, value: Option<String>) -> Re
 
 /// `Ok(None)` asks for usage.
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
-    let (mut datasets, mut out) = (None, None);
+    let mut out = None;
+    let mut dataset_dirs: Vec<PathBuf> = Vec::new();
     let mut scale = Vec::new();
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "-h" | "--help" => return Ok(None),
-            "--datasets" => set_once(&mut datasets, "--datasets", args.next())?,
+            "--datasets" => {
+                let dir = PathBuf::from(args.next().ok_or("--datasets needs a value")?);
+                if dataset_dirs.contains(&dir) {
+                    return Err(format!(
+                        "--datasets {} given twice: one run would count as two",
+                        dir.display()
+                    ));
+                }
+                dataset_dirs.push(dir);
+            }
             "--out" => set_once(&mut out, "--out", args.next())?,
             "--scale" => scale.push(PathBuf::from(args.next().ok_or("--scale needs a value")?)),
             other => {
@@ -55,12 +67,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
             }
         }
     }
-    let dataset_dir = datasets
-        .or_else(dataset_directory)
-        .unwrap_or_else(|| PathBuf::from("target"));
-    let out = out.unwrap_or_else(|| dataset_dir.join("perf-report.md"));
+    if dataset_dirs.is_empty() {
+        dataset_dirs.push(dataset_directory().unwrap_or_else(|| PathBuf::from("target")));
+    }
+    let out = out.unwrap_or_else(|| dataset_dirs[0].join("perf-report.md"));
     Ok(Some(Args {
-        inputs: Inputs { dataset_dir, scale },
+        inputs: Inputs {
+            dataset_dirs,
+            scale,
+        },
         out,
     }))
 }
@@ -77,9 +92,12 @@ fn run(args: &Args) -> Result<usize, Box<dyn std::error::Error>> {
     let records: usize = report.datasets.iter().map(|d| d.points.len()).sum();
     let measured: usize = report.datasets.iter().map(|d| d.measured().count()).sum();
     let failed: usize = report.datasets.iter().map(|d| d.untrusted().count()).sum();
+    let repetitions = report.repetitions();
     eprintln!(
-        "report: {} datasets, {records} records, {measured} measured, {failed} failed validation, {} scale runs",
+        "report: {} runs, {} datasets, {records} records, {measured} measured, {failed} failed validation, {} identifiers repeated across runs, {} scale runs",
+        repetitions.runs,
         report.datasets.len(),
+        repetitions.repeated.len(),
         report.scale.len()
     );
     let coverage = report.coverage();

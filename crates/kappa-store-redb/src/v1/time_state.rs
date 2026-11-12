@@ -16,10 +16,11 @@
 //! epoch it settles, restored at open, and recovery raises it from the head
 //! of every instance a restart found unsettled as it visits it.
 
-use redb::{ReadableDatabase, ReadableTable};
+use redb::ReadableTable;
 
 use kappa_store::clock::{CausalTime, ClockMs};
 use kappa_store::error::StoreError;
+use kappa_store::work::{Dimension, Meter};
 
 use crate::{
     PersistentStore, tables::EPOCH_TIME_BOUND, tables::TIME_RESERVATION, tables::TIME_STATE,
@@ -29,9 +30,12 @@ const FLOOR_KEY: &[u8] = b"committed-causal-floor";
 const RESERVATION_KEY: &[u8] = b"reserved-causal-ceiling";
 const SETTLED_EPOCH_KEY: &[u8] = b"settled-epoch-time";
 
+/// Table-encryption context label of time rows.
+const TIME_CONTEXT: &str = "time_floor";
+
 /// The AEAD context of a time row at `key`.
 fn time_context(key: &[u8]) -> String {
-    crate::encrypted::bound("time_floor", key)
+    crate::encrypted::bound(TIME_CONTEXT, key)
 }
 
 impl kappa_store::time::TimeReservationStore for PersistentStore {
@@ -54,7 +58,7 @@ impl PersistentStore {
     /// committed floor of every namespace recovered so far (the settlement
     /// pass at open recovers all of them).
     pub fn recovered_time_floor(&self) -> Result<CausalTime, StoreError> {
-        let txn = self.registry.begin_read().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_read()?;
         let table = txn
             .open_table(TIME_RESERVATION)
             .map_err(crate::error::redb)?;
@@ -71,11 +75,20 @@ impl PersistentStore {
     /// Immediate durability is required even when ordinary writes disable
     /// fsync: an issued timestamp must never outrun its restart bound.
     pub fn reserve_time(&self, ceiling: CausalTime) -> Result<(), StoreError> {
-        let mut txn = self.registry.begin_write().map_err(crate::error::redb)?;
+        let mut txn = self.registry.begin_write()?;
         txn.set_durability(redb::Durability::Immediate)
             .map_err(crate::error::redb)?;
         self.reserve_time_in_txn(&txn, ceiling)?;
-        Self::commit_write(txn)
+        match txn.commit() {
+            Ok(()) => Ok(()),
+            // The caller issues no timestamp above a ceiling not known to
+            // be durable. A ceiling that persisted only raises the restart
+            // floor, which is always safe.
+            Err(
+                crate::error::CommitFailure::Known(error)
+                | crate::error::CommitFailure::Unknown(error),
+            ) => Err(error),
+        }
     }
 
     /// Extend the reservation inside an open registry transaction; the
@@ -117,17 +130,31 @@ impl PersistentStore {
         Ok(CausalTime::from_encoded(ClockMs::from_raw(raw)))
     }
 
-    /// The committed floor recorded in a namespace database.
+    /// The committed floor recorded in a namespace database, on `work`: the
+    /// lookup, then the stored row read, its context built, its plaintext
+    /// allocated and decrypted, each charged before it runs. The 8-byte
+    /// interpretation of the plaintext allocates nothing.
     pub(crate) fn committed_floor_in(
         &self,
         txn: &redb::ReadTransaction,
+        work: &mut dyn Meter,
     ) -> Result<Option<CausalTime>, StoreError> {
+        work.charge(Dimension::Entries, 1)?;
         let table = txn.open_table(TIME_STATE).map_err(crate::error::redb)?;
-        table
-            .get(FLOOR_KEY)
-            .map_err(crate::error::redb)?
-            .map(|value| self.decode_time_floor(FLOOR_KEY, value.value()))
-            .transpose()
+        let Some(value) = table.get(FLOOR_KEY).map_err(crate::error::redb)? else {
+            return Ok(None);
+        };
+        let stored = value.value().len() as u64;
+        work.charge_all(&[
+            (Dimension::BytesRead, stored),
+            (
+                Dimension::BytesAllocated,
+                crate::encrypted::bound_allocation(TIME_CONTEXT, FLOOR_KEY.len()),
+            ),
+            (Dimension::BytesAllocated, stored),
+            (Dimension::BytesDecoded, stored),
+        ])?;
+        self.decode_time_floor(FLOOR_KEY, value.value()).map(Some)
     }
 
     fn decode_time_floor(&self, key: &[u8], stored: &[u8]) -> Result<CausalTime, StoreError> {
@@ -209,12 +236,16 @@ impl PersistentStore {
     /// time bound (`latest_epoch_ms`), at open: every epoch no pending
     /// marker names is settled, and so bounded by it.
     pub(crate) fn restore_settled_epoch_time(&self) -> Result<(), StoreError> {
-        let txn = self.registry.begin_read().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_read()?;
         let table = txn
             .open_table(EPOCH_TIME_BOUND)
             .map_err(crate::error::redb)?;
         if let Some(value) = table.get(SETTLED_EPOCH_KEY).map_err(crate::error::redb)? {
             let settled = self.decode_time_floor(SETTLED_EPOCH_KEY, value.value())?;
+            // Settled instances no longer have pending markers for recovery
+            // to visit. Their durable epoch bound must therefore restore the
+            // causal issuance floor as well as the authority rotation bound.
+            self.raise_committed_floor(settled.encoded());
             self.latest_epoch_ms.fetch_max(
                 settled.encoded().as_i64(),
                 std::sync::atomic::Ordering::SeqCst,

@@ -21,26 +21,49 @@
 //! family's rows mean, and which family a consumer reads, is decided by the
 //! typed adapters beside this module; no consumer opens the version tables.
 //!
+//! Key framing is [`key`]'s, visibility [`visibility`]'s, selection the one
+//! reduction of [`reduce`]. Every read runs on its caller's meter and
+//! answers completely or is refused, never partially taken for absence;
+//! output grows only through `work::reserve_charged`, before a take.
+//!
 //! Every value is a candidate or a cache, never authority: a locator is
 //! confirmed against the owning instance's namespace database, and absence
 //! from a projection is absence from settled state only.
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
-use redb::{ReadOnlyTable, ReadTransaction, ReadableDatabase};
+use redb::{ReadOnlyTable, ReadTransaction};
 
+use kappa_cursor::interval::Interval;
 use kappa_store::StoreError;
+use kappa_store::work::{Dimension, Meter, Work, reserve_charged};
 
 use crate::PersistentStore;
+use crate::redb_cursor::rows;
 use crate::storage_instance::StorageInstance;
 use crate::tables::{PROJECTION_COMPLETED, PROJECTION_INSTANCES, PROJECTION_VERSIONS, SETTLED};
 
 #[path = "projection_key.rs"]
 mod key;
 
-use key::{END, MEMBER, contains_member, unescape};
-pub use key::{VersionKey, epoch_key, logical, prefixed, split_logical, version_key, visibility};
+/// The one ordered reduction of versions, shared by committed reads and
+/// staging.
+#[path = "projection_reduce.rs"]
+pub(crate) mod reduce;
+
+/// The one decision of whether a version is visible.
+#[path = "projection_visibility.rs"]
+pub(crate) mod visibility;
+
+pub(crate) use key::zeroed;
+pub use key::{
+    END, MAX_LOG_KEY_BYTES, Version, VersionBounds, VersionKey, VersionRef, attempt_prefix,
+    attempt_prefix_len, epoch_key, key_prefix, key_prefix_len, log_key, log_key_len, logical,
+    logical_len, prefixed, prefixed_cost, split_logical, version_key, version_key_len,
+};
+use key::{MEMBER, contains_member, unescape};
+use reduce::{Delivery, Reduction, reduce_groups, undelivered};
+use visibility::visibility;
 
 /// A projected family. The discriminant is the first byte of every version
 /// key and is part of the stored format.
@@ -103,35 +126,6 @@ pub enum Family {
     RevocationCommitment = 30,
 }
 
-/// The version of a logical key one attempt wrote.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Version {
-    Put(Vec<u8>),
-    Tombstone,
-}
-
-impl Version {
-    pub(crate) fn encode(&self) -> Vec<u8> {
-        match self {
-            Self::Put(payload) => {
-                let mut out = Vec::with_capacity(1 + payload.len());
-                out.push(0);
-                out.extend_from_slice(payload);
-                out
-            }
-            Self::Tombstone => vec![1],
-        }
-    }
-
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
-        match bytes.split_first() {
-            Some((0, payload)) => Ok(Self::Put(payload.to_vec())),
-            Some((1, [])) => Ok(Self::Tombstone),
-            _ => Err(StoreError::Internal("malformed projection version".into())),
-        }
-    }
-}
-
 /// One visible row: the instance that settled it, its value and the
 /// completion sequence of the epoch that wrote it (later completions are
 /// newer state).
@@ -142,19 +136,20 @@ pub struct Visible {
     pub completion: u64,
 }
 
-/// One selected version: its escaped logical key, the visible row, and the
-/// version itself (a tombstone's row holds no value).
-type Selected = (Vec<u8>, Visible, Version);
-
 /// A visible member of a membership family: `(key, member, row)`.
 pub type ScannedMember = (Vec<u8>, Vec<u8>, Visible);
 
-/// The newest visible version of one (logical key, instance) while a
-/// selection runs: ordered by `(epoch, sequence)`.
-struct Newest {
-    order: (u64, u64),
-    completion: u64,
-    version: Version,
+/// How a committed read collects its visible groups into `found`, so no
+/// delivery is taken before its output is secured: `prepare` inspects the
+/// group's escaped logical key and whether it is a put, and secures every
+/// fallible allocation and conversion its part of the item needs
+/// (returning `None` to pass over the group); the reduction then secures
+/// room in `found`, takes the delivery, and pushes `assemble` of the
+/// prepared part and the group's row, moved out of the delivery.
+struct Collect<'a, P, T> {
+    prepare: &'a mut dyn FnMut(&[u8], bool, &mut dyn Meter) -> Result<Option<P>, StoreError>,
+    assemble: fn(P, Visible) -> T,
+    found: &'a mut Vec<T>,
 }
 
 /// Completed projection state, read in one registry read transaction.
@@ -163,21 +158,49 @@ pub struct ProjectionRead {
     completed: ReadOnlyTable<&'static [u8], &'static [u8]>,
     settled: ReadOnlyTable<&'static [u8], &'static [u8]>,
     instances: ReadOnlyTable<&'static [u8], &'static [u8]>,
-    /// Visibility decided in this read, by (instance, epoch, attempt).
-    known: RefCell<BTreeMap<(StorageInstance, u64, u32), Option<u64>>>,
+    bounds: VersionBounds,
+    unit: Work,
     txn: ReadTransaction,
 }
 
 impl PersistentStore {
     /// A read of completed projection state.
     pub(crate) fn projection(&self) -> Result<ProjectionRead, StoreError> {
-        let txn = self.registry.begin_read().map_err(crate::error::redb)?;
-        ProjectionRead::new(txn)
+        ProjectionRead::new(
+            self.registry.begin_read()?,
+            self.settlement_limits.versions(),
+            self.settlement_limits.selection_unit(),
+        )
     }
 }
 
+/// The escaped logical key of `key` in `family`, with `trailer` appended,
+/// its length (`logical_len`) charged to `work` before it is built.
+fn logical_on(
+    family: Family,
+    key: &[u8],
+    trailer: &[u8],
+    work: &mut dyn Meter,
+) -> Result<Vec<u8>, StoreError> {
+    work.charge(
+        Dimension::BytesAllocated,
+        logical_len(key, None, trailer.len())?,
+    )?;
+    logical(family, key, None, trailer)
+}
+
+/// `escaped` unescaped, its copy charged to `work` before it is made.
+fn unescape_on(escaped: &[u8], work: &mut dyn Meter) -> Result<Vec<u8>, StoreError> {
+    work.charge(Dimension::BytesAllocated, escaped.len() as u64)?;
+    unescape(escaped)
+}
+
 impl ProjectionRead {
-    pub(crate) fn new(txn: ReadTransaction) -> Result<Self, StoreError> {
+    pub(crate) fn new(
+        txn: ReadTransaction,
+        bounds: VersionBounds,
+        unit: Work,
+    ) -> Result<Self, StoreError> {
         Ok(Self {
             versions: txn
                 .open_table(PROJECTION_VERSIONS)
@@ -189,7 +212,8 @@ impl ProjectionRead {
             instances: txn
                 .open_table(PROJECTION_INSTANCES)
                 .map_err(crate::error::redb)?,
-            known: RefCell::new(BTreeMap::new()),
+            bounds,
+            unit,
             txn,
         })
     }
@@ -200,83 +224,94 @@ impl ProjectionRead {
         &self.txn
     }
 
-    /// The completion sequence of `version` when its attempt is the
-    /// completed attempt of its epoch (`visibility`).
-    fn completion(&self, version: &VersionKey) -> Result<Option<u64>, StoreError> {
-        let coordinates = (version.instance, version.epoch, version.attempt);
-        if let Some(known) = self.known.borrow().get(&coordinates) {
-            return Ok(*known);
-        }
-        let decided = visibility(&self.completed, &self.settled, &self.instances, version)?;
-        self.known.borrow_mut().insert(coordinates, decided);
-        Ok(decided)
-    }
-
-    /// The newest visible version of every (logical key, instance) whose
-    /// escaped logical key starts with `prefix`, in key order; tombstones
-    /// included, for callers that must see removals.
-    fn select(&self, prefix: &[u8]) -> Result<Vec<Selected>, StoreError> {
-        let mut newest: BTreeMap<(Vec<u8>, StorageInstance), Newest> = BTreeMap::new();
-        for entry in prefixed(&self.versions, prefix)? {
-            let (key, value) = entry.map_err(crate::error::redb)?;
-            let version = VersionKey::decode(key.value())?;
-            let Some(completion) = self.completion(&version)? else {
-                continue;
-            };
-            let order = (version.epoch, version.sequence);
-            let slot = (version.logical, version.instance);
-            if newest.get(&slot).is_some_and(|held| held.order >= order) {
-                continue;
-            }
-            newest.insert(
-                slot,
-                Newest {
-                    order,
+    /// The newest visible version of every (logical key, instance) group
+    /// whose escaped logical key starts with `prefix`, each collected by
+    /// `collect`. Complete or refused. A delivery is taken only after its
+    /// output is secured; its row moves out of it (a tombstone's row holds
+    /// no value).
+    fn select<P, T>(
+        &self,
+        prefix: &[u8],
+        work: &mut dyn Meter,
+        collect: Collect<'_, P, T>,
+    ) -> Result<(), StoreError> {
+        let mut versions = {
+            let mut unit =
+                work.admit(&[(Dimension::BytesAllocated, prefixed_cost(prefix, None)?)])?;
+            prefixed(&self.versions, prefix, None, &mut unit)?
+        };
+        let mut visible = |version: &VersionKey, unit: &mut dyn Meter| {
+            visibility(
+                &self.completed,
+                &self.settled,
+                &self.instances,
+                version,
+                unit,
+            )
+        };
+        let Collect {
+            prepare,
+            assemble,
+            found,
+        } = collect;
+        reduce_groups(
+            &mut Reduction::default(),
+            &mut versions,
+            &self.bounds,
+            &self.unit,
+            work,
+            &mut visible,
+            &mut |offered, work| {
+                let delivery = offered.as_ref().ok_or_else(undelivered)?;
+                let put = matches!(delivery.version, Version::Put(_));
+                let prepared = prepare(&delivery.logical, put, work)?;
+                if prepared.is_some() {
+                    reserve_charged(work, found)?;
+                }
+                let Delivery {
+                    instance,
                     completion,
-                    version: Version::decode(value.value())?,
-                },
-            );
-        }
-        Ok(newest
-            .into_iter()
-            .map(
-                |(
-                    (logical, instance),
-                    Newest {
-                        completion,
-                        version,
-                        ..
-                    },
-                )| {
-                    let value = match &version {
-                        Version::Put(value) => value.clone(),
+                    version,
+                    ..
+                } = offered.take().ok_or_else(undelivered)?;
+                if let Some(prepared) = prepared {
+                    let value = match version {
+                        Version::Put(value) => value,
                         Version::Tombstone => Vec::new(),
                     };
-                    (
-                        logical,
-                        Visible {
-                            instance,
-                            value,
-                            completion,
-                        },
-                        version,
-                    )
-                },
-            )
-            .collect())
+                    let row = Visible {
+                        instance,
+                        value,
+                        completion,
+                    };
+                    found.push(assemble(prepared, row));
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?
+        .complete()
     }
 
     /// The visible value of `key` in `family` from each instance holding
     /// one.
-    pub(crate) fn get(&self, family: Family, key: &[u8]) -> Result<Vec<Visible>, StoreError> {
-        let mut exact = logical(family, key, None);
-        exact.extend_from_slice(&END);
-        Ok(self
-            .select(&exact)?
-            .into_iter()
-            .filter(|(_, _, version)| matches!(version, Version::Put(_)))
-            .map(|(_, visible, _)| visible)
-            .collect())
+    pub(crate) fn get(
+        &self,
+        family: Family,
+        key: &[u8],
+        work: &mut dyn Meter,
+    ) -> Result<Vec<Visible>, StoreError> {
+        let exact = logical_on(family, key, &END, work)?;
+        let mut found = Vec::new();
+        self.select(
+            &exact,
+            work,
+            Collect {
+                prepare: &mut |_, put, _| Ok(put.then_some(())),
+                assemble: |(), row| row,
+                found: &mut found,
+            },
+        )?;
+        Ok(found)
     }
 
     /// The visible members of `key` in membership `family`, each with the
@@ -285,15 +320,26 @@ impl ProjectionRead {
         &self,
         family: Family,
         key: &[u8],
+        work: &mut dyn Meter,
     ) -> Result<Vec<(Vec<u8>, Visible)>, StoreError> {
-        let mut prefix = logical(family, key, None);
-        prefix.extend_from_slice(&MEMBER);
+        let prefix = logical_on(family, key, &MEMBER, work)?;
         let skip = prefix.len();
-        self.select(&prefix)?
-            .into_iter()
-            .filter(|(_, _, version)| matches!(version, Version::Put(_)))
-            .map(|(logical, visible, _)| Ok((unescape(&logical[skip..])?, visible)))
-            .collect()
+        let mut found = Vec::new();
+        self.select(
+            &prefix,
+            work,
+            Collect {
+                prepare: &mut |logical, put, work| {
+                    if !put {
+                        return Ok(None);
+                    }
+                    unescape_on(&logical[skip..], work).map(Some)
+                },
+                assemble: |member, row| (member, row),
+                found: &mut found,
+            },
+        )?;
+        Ok(found)
     }
 
     /// The visible members of every key of membership `family` beginning
@@ -303,95 +349,127 @@ impl ProjectionRead {
         &self,
         family: Family,
         prefix: &[u8],
+        work: &mut dyn Meter,
     ) -> Result<Vec<ScannedMember>, StoreError> {
-        let escaped = logical(family, prefix, None);
-        self.select(&escaped)?
-            .into_iter()
-            .filter(|(_, _, version)| matches!(version, Version::Put(_)))
-            .filter_map(|(logical, visible, _)| {
-                let body = &logical[1..];
-                let split = body.windows(2).position(|pair| pair == MEMBER)?;
-                Some((|| {
-                    Ok((
-                        unescape(&body[..split])?,
-                        unescape(&body[split + 2..])?,
-                        visible,
-                    ))
-                })())
-            })
-            .collect()
+        let escaped = logical_on(family, prefix, &[], work)?;
+        let mut found = Vec::new();
+        self.select(
+            &escaped,
+            work,
+            Collect {
+                prepare: &mut |logical, put, work| {
+                    let body = &logical[1..];
+                    let Some(split) = body.windows(2).position(|pair| pair == MEMBER) else {
+                        return Ok(None);
+                    };
+                    if !put {
+                        return Ok(None);
+                    }
+                    let key = unescape_on(&body[..split], work)?;
+                    let member = unescape_on(&body[split + 2..], work)?;
+                    Ok(Some((key, member)))
+                },
+                assemble: |(key, member), row| (key, member, row),
+                found: &mut found,
+            },
+        )?;
+        Ok(found)
     }
 
     /// The visible single-valued keys of `family` beginning with `prefix`
-    /// (unescaped), with their values, in key order. Range work is bounded
-    /// by the versions under the prefix, which compaction keeps to one per
-    /// key and instance.
+    /// (unescaped), with their values, in key order.
     pub(crate) fn scan(
         &self,
         family: Family,
         prefix: &[u8],
+        work: &mut dyn Meter,
     ) -> Result<Vec<(Vec<u8>, Visible)>, StoreError> {
-        let escaped = logical(family, prefix, None);
-        self.select(&escaped)?
-            .into_iter()
-            .filter(|(logical, _, version)| {
-                matches!(version, Version::Put(_)) && !contains_member(&logical[1..])
-            })
-            .map(|(logical, visible, _)| Ok((unescape(&logical[1..])?, visible)))
-            .collect()
+        let escaped = logical_on(family, prefix, &[], work)?;
+        let mut found = Vec::new();
+        self.select(
+            &escaped,
+            work,
+            Collect {
+                prepare: &mut |logical, put, work| {
+                    if !put || contains_member(&logical[1..]) {
+                        return Ok(None);
+                    }
+                    unescape_on(&logical[1..], work).map(Some)
+                },
+                assemble: |key, row| (key, row),
+                found: &mut found,
+            },
+        )?;
+        Ok(found)
     }
-}
 
-impl ProjectionRead {
     /// The first single-valued key of `family` at or after `from`
     /// (unescaped) that some instance holds a visible put of. Keys holding
-    /// only tombstones or unfinished versions are passed over; the work is
-    /// the versions between `from` and the key returned.
+    /// only tombstones or unfinished versions are passed over; each version
+    /// between `from` and the key returned is examined inside one admitted
+    /// unit by the one reduction, and the end of the family's range inside
+    /// another.
     pub(crate) fn next_key(
         &self,
         family: Family,
         from: &[u8],
+        work: &mut dyn Meter,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let start = logical(family, from, None);
-        let end = [family as u8 + 1];
-        let range = self
-            .versions
-            .range::<&[u8]>(start.as_slice()..end.as_slice())
-            .map_err(crate::error::redb)?;
-        let mut group: Option<Vec<u8>> = None;
-        let mut newest: BTreeMap<StorageInstance, ((u64, u64), bool)> = BTreeMap::new();
-        for entry in range {
-            let (key, value) = entry.map_err(crate::error::redb)?;
-            let version = VersionKey::decode(key.value())?;
+        let start = logical_on(family, from, &[], work)?;
+        let family_prefix = [family as u8];
+        // The family's interval and the copy of `start` its seek makes, then
+        // redb's copy of the bounds, which are no longer than both.
+        let construction = Interval::prefix_cost(&family_prefix)
+            .and_then(|interval| interval.checked_add(Interval::position_cost(&start)))
+            .ok_or_else(|| StoreError::Internal("projection range bound exceeds u64".into()))?;
+        let mut versions = {
+            let mut unit = work.admit(&[
+                (Dimension::BytesAllocated, construction),
+                (Dimension::BytesAllocated, construction),
+            ])?;
+            unit.account(Dimension::BytesAllocated, construction)?;
+            let interval = Interval::prefix(&family_prefix).at_or_after(&start);
+            rows(&self.versions, &interval, &mut unit)?
+        };
+        let mut visible = |version: &VersionKey, unit: &mut dyn Meter| {
             if contains_member(&version.logical[1..]) {
-                continue;
+                return Ok(None);
             }
-            if group.as_ref() != Some(&version.logical) {
-                if let Some(done) = group.take()
-                    && newest.values().any(|(_, put)| *put)
-                {
-                    return Ok(Some(unescape(&done[1..])?));
+            visibility(
+                &self.completed,
+                &self.settled,
+                &self.instances,
+                version,
+                unit,
+            )
+        };
+        // The first logical key a group of which holds a visible put: its
+        // groups are delivered in key order, so the first such delivery is
+        // the answer, and the reduction stops there. Taking a delivery
+        // allocates nothing: it moves the group's own buffers.
+        let mut found: Option<Vec<u8>> = None;
+        reduce_groups(
+            &mut Reduction::default(),
+            &mut versions,
+            &self.bounds,
+            &self.unit,
+            work,
+            &mut visible,
+            &mut |offered, _| {
+                let Delivery {
+                    logical, version, ..
+                } = offered.take().ok_or_else(undelivered)?;
+                if matches!(version, Version::Put(_)) {
+                    found = Some(logical);
+                    return Ok(ControlFlow::Break(()));
                 }
-                newest.clear();
-                group = Some(version.logical.clone());
-            }
-            if self.completion(&version)?.is_none() {
-                continue;
-            }
-            let order = (version.epoch, version.sequence);
-            if newest
-                .get(&version.instance)
-                .is_some_and(|(held, _)| *held >= order)
-            {
-                continue;
-            }
-            let put = matches!(Version::decode(value.value())?, Version::Put(_));
-            newest.insert(version.instance, (order, put));
-        }
-        match group {
-            Some(done) if newest.values().any(|(_, put)| *put) => Ok(Some(unescape(&done[1..])?)),
-            _ => Ok(None),
-        }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?
+        .complete()?;
+        found
+            .map(|logical| unescape_on(&logical[1..], work))
+            .transpose()
     }
 
     /// Versions held, an upper bound on any traversal's work.

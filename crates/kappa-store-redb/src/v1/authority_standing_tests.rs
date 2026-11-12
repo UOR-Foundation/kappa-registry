@@ -43,6 +43,87 @@ const VALID_FROM: i64 = 1000;
 /// When every succession takes effect, and the rotation's clock.
 const EFFECTIVE: i64 = 2000;
 
+/// Advance the retained production clock inside the governing signing call,
+/// after the signature has been produced but before publication can commit.
+struct ExpiringSigner {
+    signer: Ed25519Signer,
+    clock: Arc<dyn kappa_store::time::Clock>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl kappa_crypto::Signer for ExpiringSigner {
+    fn algorithm(&self) -> &'static str {
+        kappa_crypto::Signer::algorithm(&self.signer)
+    }
+
+    fn public_key(&self) -> &[u8] {
+        kappa_crypto::Signer::public_key(&self.signer)
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, kappa_crypto::CryptoError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let signature = kappa_crypto::Signer::sign(&self.signer, message)?;
+        for _ in 0..8 {
+            self.clock
+                .now()
+                .map_err(|error| kappa_crypto::CryptoError::SigningFailed {
+                    algorithm: self.algorithm().into(),
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(signature)
+    }
+}
+
+#[test]
+fn witness_expiring_inside_signing_retains_the_governing_epoch() -> TestResult {
+    use kappa_store::time::Clock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = FixtureRoot::temporary()?;
+    let store = open(&root, 1)?;
+    let (a, b) = (authority(1)?, authority(2)?);
+    let control = control(&store, VALID_FROM)?;
+    let head = store.epoch_current(&control)?;
+    let record = succession(&a, &b, EFFECTIVE)?;
+    let witnessed = kappa_store::sign_witness(
+        &Ed25519Signer::from_bytes(&WITNESS)?,
+        record.inner(),
+        &store.authority_origin(),
+        store.activation_domain(&control)?,
+        VALID_FROM,
+        Some(EFFECTIVE + 5),
+    )?;
+    let clock = clock_at(ClockMs::from_raw(EFFECTIVE))?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let incoming = SigningAuthority::new(Arc::new(ExpiringSigner {
+        signer: Ed25519Signer::from_bytes(&[2; 32])?,
+        clock: clock.retain(),
+        calls: Arc::clone(&calls),
+    }))?;
+    let outcome = store.rotate_authority(incoming, record, vec![witnessed], &control, &clock);
+    assert!(matches!(outcome, Err(AuthorityRotationError::Retained(
+        StoreError::PublicationRetained(ref retained)
+    )) if retained.disposition == kappa_store::RecoveryDisposition::Terminal));
+    assert_eq!(store.epoch_current(&control)?, head);
+    assert_eq!(&store.node_anchor(), a.anchor());
+    assert!(store.activation_intent_pending()?);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let resolved = ExecutionStore::resolve_publication(
+        &store,
+        &control,
+        &clock,
+        &mut kappa_store::work::WorkMeter::new(store.step_limit),
+    )?;
+    assert!(
+        matches!(resolved, kappa_store::PublicationResolution::Retained(ref retained)
+        if retained.disposition == kappa_store::RecoveryDisposition::Terminal)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.epoch_current(&control)?, head);
+    Ok(())
+}
+
 /// The witness by `seed` of `succession`, activating in `control`.
 fn witness(
     store: &PersistentStore,
@@ -154,12 +235,15 @@ fn a_revoked_witness_refuses_activation_before_and_after_settlement() -> TestRes
     assert!(store.pending_settlements()?.contains(issuer.id()));
     assert!(
         !store
-            .unsettled_candidates(&DiscoveryKey::RevocationsBy(revocation.asserter.clone()))
+            .unsettled_candidates(
+                &DiscoveryKey::RevocationsBy(revocation.asserter.clone()),
+                &mut kappa_store::work::WorkMeter::unbounded(),
+            )?
             .is_empty(),
         "the revocation is registered under its asserter before settlement"
     );
     assert!(matches!(
-        store.read_revocation(&identity),
+        store.read_revocation(&identity, &mut store.read_meter()),
         Err(StoreError::NotFound(_))
     ));
     refused_as_rejected(
@@ -176,7 +260,10 @@ fn a_revoked_witness_refuses_activation_before_and_after_settlement() -> TestRes
 
     store.settlement_step(u64::MAX)?;
     assert!(!store.pending_settlements()?.contains(issuer.id()));
-    assert_eq!(store.read_revocation(&identity)?, revocation);
+    assert_eq!(
+        store.read_revocation(&identity, &mut store.read_meter())?,
+        revocation
+    );
     refused_as_rejected(
         &store,
         &rotate(&store, &control, &b, again(&record, &a, &b)?, revoked)?,
@@ -218,7 +305,10 @@ fn an_unsettled_watermark_of_the_witness_refuses_activation() -> TestResult {
     assert!(store.pending_settlements()?.contains(issuer.id()));
     assert!(
         !store
-            .unsettled_candidates(&DiscoveryKey::WatermarksBy(watermark.asserter))
+            .unsettled_candidates(
+                &DiscoveryKey::WatermarksBy(watermark.asserter),
+                &mut kappa_store::work::WorkMeter::unbounded(),
+            )?
             .is_empty(),
         "the watermark is registered under its asserter before settlement"
     );

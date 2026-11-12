@@ -233,6 +233,7 @@ pub fn check_stored_nar(
         &nar_bytes,
         &narinfo.compression,
         &narinfo.nar_hash,
+        narinfo.nar_size,
         &narinfo.references,
     )
     .map_err(|error| StoreError::Rejected(format!("NAR verification failed: {error}")))?;

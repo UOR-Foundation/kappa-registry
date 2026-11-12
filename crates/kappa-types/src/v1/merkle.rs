@@ -34,6 +34,42 @@ pub fn hash_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     hasher.finalize()
 }
 
+/// Bytes [`hash_leaf`] hashes beyond the leaf: its domain separator.
+pub const LEAF_HASH_OVERHEAD: u64 = size_of::<u8>() as u64;
+
+/// Bytes [`hash_node`] hashes: its domain separator and two children.
+pub const NODE_HASH_INPUT: u64 = (size_of::<u8>() + 2 * size_of::<[u8; 32]>()) as u64;
+
+/// Internal nodes one [`StreamingTree::push`] completes at most: one per
+/// level of a tree of up to `2^64` leaves.
+pub const MAX_PUSH_CARRIES: u64 = u64::BITS as u64;
+
+/// Bytes one [`StreamingTree::push`] of a `leaf_len`-byte leaf hashed when
+/// it emitted `emitted` nodes.
+///
+/// `push` emits exactly one node per hash it computes, the leaf first and
+/// then each internal node it completes. `None` when `emitted` is not a
+/// count a push produces (zero, or more than the leaf and
+/// [`MAX_PUSH_CARRIES`]) or the total overflows.
+pub const fn push_hash_input(leaf_len: u64, emitted: u64) -> Option<u64> {
+    if emitted == 0 || emitted > MAX_PUSH_CARRIES + 1 {
+        return None;
+    }
+    let Some(internal) = (emitted - 1).checked_mul(NODE_HASH_INPUT) else {
+        return None;
+    };
+    let Some(leaf) = leaf_len.checked_add(LEAF_HASH_OVERHEAD) else {
+        return None;
+    };
+    leaf.checked_add(internal)
+}
+
+/// The most one [`StreamingTree::push`] of a leaf of at most `leaf_len`
+/// bytes hashes. `None` when it overflows.
+pub const fn push_hash_bound(leaf_len: u64) -> Option<u64> {
+    push_hash_input(leaf_len, MAX_PUSH_CARRIES + 1)
+}
+
 /// Compute the Merkle root over `leaves`.
 ///
 /// Each item is hashed with `hash_leaf`. An odd trailing node is promoted
@@ -160,6 +196,16 @@ fn mountains(leaves: u64) -> Vec<(u32, u64)> {
     result
 }
 
+/// Emission positions of the mountain peaks of a tree of `leaves` leaves,
+/// left to right: where a store that keeps the emitted nodes reads the
+/// peaks [`StreamingTree::resume`] takes.
+pub fn peak_positions(leaves: u64) -> Vec<u64> {
+    mountains(leaves)
+        .iter()
+        .map(|(height, start)| node_position(*height, start >> height))
+        .collect()
+}
+
 /// Positional inclusion proof for leaf `index` in a tree of `leaves`
 /// leaves.
 ///
@@ -215,7 +261,7 @@ pub fn bag_peaks(peaks: &[[u8; 32]]) -> Option<[u8; 32]> {
 /// Incremental builder of the `merkle_root` tree. Each `push` emits the
 /// leaf node and every internal node it completes, in position order;
 /// state is one node per set bit of the leaf count.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamingTree {
     peaks: Vec<(u32, [u8; 32])>,
     leaves: u64,
@@ -225,6 +271,30 @@ pub struct StreamingTree {
 impl StreamingTree {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The builder of a tree of `leaves` leaves whose mountain peaks, left
+    /// to right, are `peaks`: one per set bit of `leaves`, as [`Self::peaks`]
+    /// reports them. `None` when the count does not match.
+    pub fn resume(leaves: u64, peaks: &[[u8; 32]]) -> Option<Self> {
+        let mountains = mountains(leaves);
+        if mountains.len() != peaks.len() {
+            return None;
+        }
+        Some(Self {
+            peaks: mountains
+                .iter()
+                .zip(peaks)
+                .map(|((height, _), peak)| (*height, *peak))
+                .collect(),
+            leaves,
+            emitted: node_count(leaves),
+        })
+    }
+
+    /// The mountain peaks, left to right: what [`Self::resume`] takes.
+    pub fn peaks(&self) -> Vec<[u8; 32]> {
+        self.peaks.iter().map(|(_, peak)| *peak).collect()
     }
 
     /// Append a leaf. `emit` receives `(position, node)` for each node
@@ -299,6 +369,29 @@ mod streaming_tests {
         level.first().copied().unwrap_or(EMPTY_ROOT)
     }
 
+    /// The hashing a push reports from its emitted nodes is the hashing it
+    /// performs: the eighth leaf emits itself and three internal nodes.
+    #[test]
+    fn push_hash_input_follows_the_nodes_a_push_emits() -> TestResult {
+        let (tree, _) = build(&leaves(7))?;
+        let mut emitted = 0u64;
+        let leaf = b"eighth";
+        let _tree = tree.push(leaf, |_, _| {
+            emitted += 1;
+            Ok::<(), String>(())
+        })?;
+        assert_eq!(emitted, 4);
+        let leaf_len = leaf.len() as u64;
+        let expected = leaf_len + LEAF_HASH_OVERHEAD + 3 * NODE_HASH_INPUT;
+        assert_eq!(push_hash_input(leaf_len, emitted), Some(expected));
+        assert_eq!(NODE_HASH_INPUT, 65);
+        assert_eq!(push_hash_input(leaf_len, 0), None, "a push emits its leaf");
+        assert_eq!(push_hash_input(leaf_len, MAX_PUSH_CARRIES + 2), None);
+        assert!(push_hash_bound(leaf_len) >= Some(expected));
+        assert_eq!(push_hash_bound(u64::MAX), None, "overflow is refused");
+        Ok(())
+    }
+
     #[test]
     fn emission_failure_consumes_builder_at_every_carry() -> TestResult {
         // Leaf eight emits its leaf and three carries. Inject a failure
@@ -335,6 +428,50 @@ mod streaming_tests {
             })?;
         }
         Ok((tree, nodes))
+    }
+
+    /// A builder resumed from its peaks continues as the original would:
+    /// the history log of a namespace resumes at every epoch from the
+    /// peaks its last epoch retained.
+    #[test]
+    fn a_resumed_builder_continues_the_same_tree() -> TestResult {
+        for split in [0u64, 1, 2, 3, 5, 8, 13, 64] {
+            let data = leaves(split + 7);
+            let (head, _) = build(&data[..usize::try_from(split)?])?;
+            let mut resumed =
+                StreamingTree::resume(head.leaves(), &head.peaks()).ok_or("resume refused")?;
+            assert_eq!(resumed, head);
+            for leaf in &data[usize::try_from(split)?..] {
+                resumed = resumed.push(leaf, |_, _| Ok::<_, String>(()))?;
+            }
+            let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+            assert_eq!(resumed.root(), merkle_root(&refs), "split at {split}");
+        }
+        assert!(
+            StreamingTree::resume(3, &[[1; 32]]).is_none(),
+            "3 leaves have 2 peaks"
+        );
+        assert!(StreamingTree::resume(0, &[[1; 32]]).is_none());
+        Ok(())
+    }
+
+    /// The nodes stored at the peak positions are the peaks a builder
+    /// reports, so a store resumes the log from its emitted nodes alone.
+    #[test]
+    fn peak_positions_address_the_emitted_peaks() -> TestResult {
+        assert!(peak_positions(0).is_empty());
+        for count in [1u64, 2, 3, 4, 5, 7, 8, 13, 64, 100] {
+            let (tree, nodes) = build(&leaves(count))?;
+            let stored = peak_positions(count)
+                .into_iter()
+                .map(|position| stored_node(&nodes, position).copied())
+                .collect::<Option<Vec<_>>>()
+                .ok_or("peak position outside the emitted nodes")?;
+            assert_eq!(stored, tree.peaks(), "{count} leaves");
+            let resumed = StreamingTree::resume(count, &stored).ok_or("resume refused")?;
+            assert_eq!(resumed, tree, "{count} leaves");
+        }
+        Ok(())
     }
 
     #[test]

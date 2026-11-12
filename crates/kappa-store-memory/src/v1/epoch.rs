@@ -1,17 +1,21 @@
-//! Epochs of a namespace view: sealing into the candidate, the epoch
-//! number index, global lookup by root through the epoch projection, and
-//! authority rotation.
+//! Epochs of a namespace view: sealing into the candidate and authority
+//! rotation. Epoch reads are `epoch_read`.
 
-use std::sync::Arc;
+use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLockWriteGuard};
 
 use kappa_store::epoch_publication::{
-    EpochPublication, EpochPublicationInput, verify_persisted_epoch,
+    EpochCandidate, EpochPublication, EpochPublicationInput, GeneratedRecord, SigningReservation,
 };
+use kappa_store::namespace_commitment::{StateInput, seal_index};
 use kappa_store::time::Clock;
-use kappa_store::traits::epoch::EpochStore;
+use kappa_store::traits::namespace::NamespaceInfo;
 use kappa_store::{
-    Activation, AuthorityRotationError, VerifiedSuccession, WitnessEvidence, witness_standing,
+    Activation, AuthorityRotationError, EpochAuthority, VerifiedSuccession, WitnessEvidence,
+    witness_standing,
 };
+use kappa_types::capacity::Reservation;
 use kappa_types::edge::Edge;
 use kappa_types::epoch::EpochMutation;
 use kappa_types::epoch_root::EpochRoot;
@@ -19,49 +23,24 @@ use kappa_types::error::StoreError;
 use kappa_types::kappa::Kappa;
 use kappa_types::namespace::NamespaceRef;
 use kappa_types::tag::TagUpdate;
+use kappa_types::work::{Dimension, WorkMeter};
 use kappa_types::{ActivationDomain, Axis, VerifiedContent};
 
 use super::InMemoryStore;
-use super::blob_read;
 use super::execution::WriteCx;
-use super::locate::incomplete;
-use super::view::NamespaceView;
-
-/// Bytes an epoch root may hold.
-const ROOT_LIMIT: u64 = 1 << 20;
+use super::projection::Changes;
+use super::view::{Admission, NamespaceView};
 
 impl InMemoryStore {
-    /// The authenticated epoch root `kappa` of `view`, admitted against its
-    /// persisted ledger before use.
-    pub(crate) fn epoch_in(
-        &self,
-        view: &NamespaceView,
-        kappa: &Kappa,
-    ) -> Result<EpochRoot, StoreError> {
-        let bytes =
-            blob_read::verified(view, kappa, Some(ROOT_LIMIT)).map_err(|error| match error {
-                StoreError::NotFound(_) => StoreError::NotFound(format!("epoch root {kappa}")),
-                other => other,
-            })?;
-        let root =
-            EpochRoot::from_bytes(&bytes).map_err(|e| StoreError::Internal(e.to_string()))?;
-        let ledger = blob_read::verified(view, root.ledger_root(), None)?;
-        verify_persisted_epoch(&root, &self.authority.load(), &ledger)?;
-        Ok(root)
-    }
-
     /// The domain an activation published in `control` binds: the control
     /// namespace and its incarnation. Witnesses sign it.
     pub fn activation_domain(
         &self,
         control: &NamespaceRef,
     ) -> Result<ActivationDomain, StoreError> {
-        let incarnation = self.slot(control.id())?.view.load().incarnation;
-        let mut bytes = [0u8; 16];
-        bytes[8..].copy_from_slice(&incarnation.to_be_bytes());
         Ok(ActivationDomain {
             control: *control.id(),
-            incarnation: bytes,
+            incarnation: self.slot(control.id())?.view.load().incarnation_bytes(),
         })
     }
 
@@ -74,11 +53,12 @@ impl InMemoryStore {
     /// then the gate shared, so the rotation is ordered against every
     /// publication: each epoch is signed by the authority in force when it
     /// sealed, and none by an authority this call retired. Under the gate
-    /// the witnesses' standing is checked, the incoming authority is
-    /// installed, and the transition record is published in `control` as
-    /// that authority's first epoch, carrying the succession path. If that
-    /// publication fails the outgoing authority is reinstalled before the
-    /// gate is released, so no seal ever observed the incoming one.
+    /// the witnesses' standing is checked and the transition record is
+    /// published in `control` as the incoming authority's first epoch,
+    /// carrying the succession path and signed by the private candidate.
+    /// The candidate is installed only after that publication, before the
+    /// gate is released; if the publication fails nothing is installed and
+    /// no other seal ever observed the candidate.
     ///
     /// The succession must be effective by the authority clock's time and
     /// strictly after the newest epoch any namespace sealed, so every
@@ -88,9 +68,14 @@ impl InMemoryStore {
     ///
     /// # Errors
     ///
-    /// Always [`AuthorityRotationError::NotCommitted`]: this backend's
-    /// installation is the in-memory swap with its publication, and a
-    /// failure restores the outgoing authority.
+    /// [`AuthorityRotationError::NotCommitted`] for a failure before the
+    /// control namespace's signing coordinate was consumed: nothing is
+    /// installed. [`AuthorityRotationError::Retained`] once it was and the
+    /// governing publication is retained unpublished
+    /// (`StoreError::PublicationRetained`): it and its incoming authority
+    /// are in the control namespace's custody, every seal is refused until
+    /// resolution publishes it and installs the authority or finds it
+    /// terminal, and the outgoing authority stays installed meanwhile.
     pub fn rotate_authority(
         &self,
         next: kappa_crypto::SigningAuthority,
@@ -100,7 +85,13 @@ impl InMemoryStore {
         clock: &dyn Clock,
     ) -> Result<(), AuthorityRotationError> {
         self.rotate_under_gate(next, succession, witnesses, control, clock)
-            .map_err(AuthorityRotationError::NotCommitted)
+            .map_err(|error| match error {
+                StoreError::PublicationRetained(_) => AuthorityRotationError::Retained(error),
+                StoreError::PublicationIndeterminate { .. } => {
+                    AuthorityRotationError::Indeterminate(error)
+                }
+                other => AuthorityRotationError::NotCommitted(other),
+            })
     }
 
     fn rotate_under_gate(
@@ -141,6 +132,7 @@ impl InMemoryStore {
         let outgoing = self.authority.load_full();
         let (rotated, transition) =
             outgoing.rotate(next, succession, activation, execution.issued_at())?;
+        let rotated = Arc::new(rotated);
         let position = rotated.transitions().len();
         let record = VerifiedContent::compute(Axis::Sha256, &transition.to_bytes()?)?;
         execution.write(|cx| {
@@ -153,11 +145,18 @@ impl InMemoryStore {
             )
             .map(drop)
         })?;
-        self.authority.store(Arc::new(rotated));
-        if let Err(error) = execution.publish_under_activation() {
-            self.authority.store(outgoing);
-            return Err(error);
-        }
+        // The candidate signs its own governing epoch under the exclusive
+        // gate; it is installed only once that epoch is published, before
+        // the gate is released. A publication that fails before its
+        // coordinate is consumed installs nothing; one that fails after it
+        // is retained with the candidate in the control namespace's custody.
+        // Publishing the governing epoch installs `rotated` (`Pending`'s
+        // settlement) while this exclusive gate is held.
+        execution.publish_under_activation(&ActivationAuthority {
+            candidate: rotated,
+            outgoing: outgoing.anchor().clone(),
+            _gate: &gate,
+        })?;
         drop(gate);
         Ok(())
     }
@@ -166,24 +165,103 @@ impl InMemoryStore {
 /// Prefix of the control namespace's tags naming each admitted transition.
 pub const AUTHORITY_TAG_PREFIX: &str = "_authority/";
 
+/// The candidate authority of an activation, the outgoing authority it
+/// succeeds, and the exclusive activation gate it seals under. Only
+/// `rotate_under_gate` constructs one, so no other publication can seal
+/// under an authority that is not installed.
+pub struct ActivationAuthority<'a, 'g> {
+    candidate: Arc<EpochAuthority>,
+    outgoing: Kappa,
+    _gate: &'a RwLockWriteGuard<'g, ()>,
+}
+
+impl ActivationAuthority<'_, '_> {
+    /// The candidate authority, shared so a retained publication can own it.
+    pub const fn candidate(&self) -> &Arc<EpochAuthority> {
+        &self.candidate
+    }
+
+    /// The anchor of the authority the candidate succeeds: what must still
+    /// be installed when a retained activation is resolved.
+    pub const fn outgoing(&self) -> &Kappa {
+        &self.outgoing
+    }
+}
+
+/// Consume the signing coordinate `number` of `ns` in its slot's `signed`
+/// counter. Only the successor of the last consumed coordinate can be
+/// reserved, so a coordinate consumed by a seal that never published fences
+/// every later seal of the slot.
+pub fn reserve_coordinate(
+    signed: &AtomicU64,
+    ns: &NamespaceRef,
+    number: u64,
+) -> Result<SigningReservation, StoreError> {
+    let previous = number
+        .checked_sub(1)
+        .ok_or_else(|| StoreError::Internal("epoch number zero".into()))?;
+    signed
+        .compare_exchange(previous, number, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|consumed| {
+            StoreError::Conflict(format!(
+                "epoch {number} of {ns} cannot be signed: coordinates are consumed through {consumed}; the namespace is fenced"
+            ))
+        })?;
+    Ok(SigningReservation::recorded(*ns.id(), number))
+}
+
 impl WriteCx<'_> {
-    /// Seal the candidate's ledger and tag state into a signed epoch. The
-    /// ledger, root, linking edges, epoch index and head become visible
-    /// together when the candidate is stored. The records the seal produces
-    /// are admitted without recording mutations: the ledger is fixed.
-    pub fn seal(&mut self, signer_override: Option<&Kappa>) -> Result<(u64, Kappa), StoreError> {
+    /// Prepare the candidate's next epoch under `authority`, whose
+    /// protection the caller holds from before this until the candidate is
+    /// stored: apply the final index effects, build the epoch candidate, and
+    /// retain everything known before the signature (ledger, rotation path,
+    /// state and authority records, history). Every check the epoch's
+    /// completion depends on runs here, so a refusal consumes no
+    /// coordinate. Every buffer is charged to the execution's meter before
+    /// it is built.
+    pub fn prepare_seal(
+        &mut self,
+        authority: &EpochAuthority,
+        signer_override: Option<&Kappa>,
+    ) -> Result<EpochCandidate, StoreError> {
         let predecessor = self
             .view
             .epoch
             .clone()
-            .map(|kappa| self.store.epoch_in(self.view, &kappa))
+            .map(|kappa| self.store.epoch_in(self.view, &kappa, &mut *self.meter))
             .transpose()?;
+
+        self.meter.charge(
+            Dimension::BytesAllocated,
+            (self.view.ledger.len() * size_of::<EpochMutation>()) as u64,
+        )?;
         let mutations: Vec<EpochMutation> = self.view.ledger.iter().cloned().collect();
-        // Callers hold the activation gate shared, which rotation takes
-        // exclusively, so this snapshot is the authority in force for the
-        // whole seal and store.
-        let authority = self.store.authority.load();
-        let publication = EpochPublication::prepare(
+        let authority_state = NamespaceInfo::authority_state(
+            self.view.record.as_ref(),
+            *self.ns.id(),
+            self.incarnation_bytes(),
+        )?;
+        let changes = mem::take(&mut self.view.pending_state_changes);
+        let update = seal_index(
+            &*self.view,
+            self.view.state_index_root,
+            changes,
+            &authority_state,
+            self.meter,
+        )?;
+        for node in &update.created {
+            self.view.state_nodes.insert(node.hash(), *node);
+        }
+        self.view.state_index_root = update.root;
+
+        let state_input = StateInput {
+            authority: &authority_state,
+            index_root: self.view.state_index_root,
+            index: &*self.view,
+            predecessor: self.view.committed_state.as_ref(),
+            history: &self.view.history,
+        };
+        let candidate = EpochPublication::prepare(
             EpochPublicationInput {
                 namespace: self.ns,
                 predecessor: predecessor.as_ref(),
@@ -192,119 +270,138 @@ impl WriteCx<'_> {
                 mutations: &mutations,
                 now: self.now,
                 signer_override,
+                state: state_input,
             },
-            &authority,
+            authority,
+            self.meter,
         )?;
-        self.publish_content(publication.ledger())?;
-        self.publish_content(publication.root_blob())?;
-        if let Some(path) = publication.rotation_record() {
-            self.publish_content(path)?;
-        }
-        self.publish_content(publication.edge_blob())?;
-        self.view.edges.insert(Edge {
-            kappa: publication.edge_blob().kappa().clone(),
-            input: publication.edge().clone(),
-        });
-        for (link, content) in publication.retained_links() {
-            self.publish_content(content)?;
-            self.view.edges.insert(Edge {
-                kappa: content.kappa().clone(),
-                input: link.clone(),
-            });
-        }
-        let root = publication.into_root();
-        let number = root.epoch_number();
-        if self
-            .view
-            .epochs
-            .insert(number, root.kappa().clone())
-            .is_some()
-        {
+
+        // What completion changes must hold, checked now.
+        let number = candidate.epoch_number();
+        if self.view.epochs.contains_key(&number) {
             return Err(StoreError::Internal(format!(
                 "epoch {number} of {} sealed twice",
                 self.ns
             )));
         }
+        if let Some(previous) = &self.view.epoch
+            && !self.view.references.contains_key(previous)
+        {
+            return Err(StoreError::Internal(format!(
+                "reference index lacked the epoch head {previous}"
+            )));
+        }
+
+        // Everything known before the signature is retained before it.
+        self.install_evidence(candidate.ledger())?;
+        if let Some(path) = candidate.rotation_record() {
+            self.install_evidence(path)?;
+        }
+        let committed = candidate.committed();
+        self.install_evidence(committed.state_record())?;
+        self.install_evidence(committed.authority_record())?;
+        self.view.history = committed.history().clone();
+        self.view.committed_state = Some(committed.state().clone());
+        for &(position, hash) in committed.history_nodes() {
+            self.view.history_nodes.insert(position, hash);
+        }
+        admit_installation(&candidate, self.meter)?;
+        candidate.admit(self.meter)?;
+        Ok(candidate)
+    }
+
+    /// Install one record generated from the signed root into the
+    /// candidate: its bytes, moved in with `charge`, and the edge it
+    /// encodes, recording its identity in `changes` within the room
+    /// `Changes::reserve_generated` made. The caller charged the work and
+    /// split `charge` from the publication's retention before the record
+    /// left its owner.
+    pub(super) fn install_generated(
+        &mut self,
+        record: GeneratedRecord,
+        charge: Reservation,
+        base: &NamespaceView,
+        changes: &mut Changes,
+    ) {
+        let GeneratedRecord { edge, content } = record;
+        let identity = content.kappa().clone();
+        if let Some(input) = edge {
+            self.view.edges.insert(Edge {
+                kappa: identity.clone(),
+                input,
+            });
+        }
+        self.retain_generated(content, charge);
+        changes.gain_generated(base, &identity);
+    }
+
+    /// Make the signed `root` the candidate's epoch head: its epoch index
+    /// entry, the head reference that replaces its predecessor's, the latest
+    /// epoch time and the cleared ledger, with the root recorded in
+    /// `changes`. `prepare_seal` checked the index was free and the
+    /// predecessor's head reference held.
+    pub(super) fn install_head(&mut self, root: &EpochRoot, changes: &mut Changes) {
+        let number = root.epoch_number();
+        changes.gain_epoch(root.kappa());
+        self.view.epochs.insert(number, root.kappa().clone());
         let sealed_ms = root.timestamp_ms();
         self.view.latest_epoch_ms = Some(
             self.view
                 .latest_epoch_ms
                 .map_or(sealed_ms, |latest| latest.max(sealed_ms)),
         );
-        // The head reference moves with the pointer: the previous root is
-        // retained by the new root's predecessor edge, the new root by being
-        // the head.
-        if let Some(previous) = self.view.epoch.replace(root.kappa().clone())
-            && !self.view.release(&previous)
-        {
-            return Err(StoreError::Internal(format!(
-                "reference index lacked the epoch head {previous}"
-            )));
+        if let Some(previous) = self.view.epoch.replace(root.kappa().clone()) {
+            // Checked held by `prepare_seal`; the release cannot miss.
+            let released = self.view.release(&previous);
+            debug_assert!(released, "prepare_seal checked the head reference");
         }
         self.view.reference(root.kappa());
         self.view.ledger.clear();
-        Ok((number, root.kappa().clone()))
     }
 }
 
-impl EpochStore for InMemoryStore {
-    fn epoch_state(&self, ns: &NamespaceRef) -> Result<([u8; 32], u64), StoreError> {
-        // One view supplies both values.
-        let view = self.view(ns.id());
-        Ok((*view.digest.value(), view.tags.len() as u64))
-    }
+/// Bytes each installed record holds beyond its encoding: its evidence
+/// row, its edge record and the digest of its one segment.
+pub const RECORD_OVERHEAD: u64 =
+    (size_of::<Admission>() + size_of::<Edge>() + size_of::<[u8; 32]>()) as u64;
 
-    fn epoch_current(&self, ns: &NamespaceRef) -> Result<(u64, Kappa), StoreError> {
-        let view = self.view(ns.id());
-        let kappa = view
-            .epoch
-            .clone()
-            .ok_or_else(|| StoreError::NotFound(format!("epoch for {ns}")))?;
-        let root = self.epoch_in(&view, &kappa)?;
-        if root.namespace_id() != ns.id() {
-            return Err(StoreError::Internal(
-                "epoch pointer crosses namespace identity".into(),
-            ));
-        }
-        Ok((root.epoch_number(), kappa))
-    }
+/// Rows one generated record writes: its evidence row, its edge record and
+/// the edge's four index postings.
+pub const GENERATED_RECORD_ROWS: u64 = 6;
 
-    /// The candidate whose epoch index names `kappa` under the root's own
-    /// epoch number decides: one index lookup per candidate.
-    fn epoch_get(&self, kappa: &Kappa) -> Result<EpochRoot, StoreError> {
-        let mut found: Option<Result<EpochRoot, StoreError>> = None;
-        let complete = self.located(&self.projections.epochs, kappa, |_, view| {
-            if !view.admitted.contains_key(kappa) {
-                return false;
-            }
-            match self.epoch_in(view, kappa) {
-                Ok(root) if view.epochs.get(&root.epoch_number()) == Some(kappa) => {
-                    found = Some(Ok(root));
-                    true
-                }
-                Ok(_) => false,
-                Err(error) => {
-                    found = Some(Err(error));
-                    true
-                }
-            }
-        });
-        match found {
-            Some(result) => result,
-            None if complete => Err(StoreError::NotFound(format!("epoch root {kappa}"))),
-            None => Err(incomplete(&format_args!("epoch root {kappa}"))),
-        }
-    }
+/// Rows the epoch head writes: its index entry and its head reference.
+pub const HEAD_ROWS: u64 = 2;
 
-    fn epoch_get_by_number(
-        &self,
-        ns: &NamespaceRef,
-        epoch_number: u64,
-    ) -> Result<Kappa, StoreError> {
-        let view = self.view(ns.id());
-        view.epochs.get(&epoch_number).cloned().ok_or_else(|| {
-            let current = view.epochs.keys().next_back().copied().unwrap_or(0);
-            StoreError::NotFound(format!("epoch {epoch_number} of {ns} (current {current})"))
-        })
-    }
+/// Rows the receipt lookup writes.
+pub const RECEIPT_ROWS: u64 = 1;
+
+/// The retention a publication reserves before its coordinate is consumed:
+/// every generated record's bytes at their bound and its overhead.
+pub const fn retention_bound(candidate: &EpochCandidate) -> u64 {
+    (candidate.generated_records() as u64)
+        .saturating_mul(RECORD_OVERHEAD)
+        .saturating_add(candidate.generated_bytes_bound())
+}
+
+/// Admit, before the signature, the installation of what the signed root
+/// of `candidate` generates: each record's segment digests over its bytes,
+/// its overhead, and the rows it and the head write. Each installation unit
+/// charges its own work when it runs.
+fn admit_installation(candidate: &EpochCandidate, meter: &WorkMeter) -> Result<(), StoreError> {
+    let records = candidate.generated_records() as u64;
+    meter.admits(&[
+        (Dimension::BytesHashed, candidate.generated_bytes_bound()),
+        (
+            Dimension::BytesAllocated,
+            records.saturating_mul(RECORD_OVERHEAD),
+        ),
+        (
+            Dimension::Entries,
+            records
+                .saturating_mul(GENERATED_RECORD_ROWS)
+                .saturating_add(HEAD_ROWS)
+                .saturating_add(RECEIPT_ROWS),
+        ),
+    ])?;
+    Ok(())
 }

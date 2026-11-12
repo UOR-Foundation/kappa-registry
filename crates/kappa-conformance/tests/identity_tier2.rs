@@ -10,8 +10,9 @@ use kappa_core::identity::resolution;
 use kappa_core::identity::revocation::{Revocation, RevocationReason};
 use kappa_core::identity::trust::{DegradeReason, PeerRecord, TrustPosition};
 use kappa_core::identity::watermark::Watermark;
-use kappa_core::membership::MembershipState;
 use kappa_core::types::*;
+use kappa_reconcile::{MemberRecord, MemberRole, MembershipState};
+use kappa_store::Kappa;
 
 // =============================================================================
 // Group 6: Probe (12 tests)
@@ -556,7 +557,21 @@ fn federation_config_different_modes_different_bytes() {
 // Group 10: Membership (10 tests)
 // =============================================================================
 
-use kappa_core::membership::MemberRecord;
+/// A member anchored by the identity of a named key.
+fn member(
+    name: &str,
+    joined_at_ms: i64,
+    role: MemberRole,
+) -> Result<MemberRecord, Box<dyn std::error::Error>> {
+    Ok(MemberRecord {
+        anchor: Kappa::from_key("ed25519", name.as_bytes())?,
+        endpoint: format!("http://{name}:8080"),
+        joined_at_ms,
+        role,
+    })
+}
+
+type MembershipResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
 fn membership_empty() {
@@ -566,133 +581,98 @@ fn membership_empty() {
 }
 
 #[test]
-fn membership_add_voter() {
+fn membership_add_voter() -> MembershipResult {
     let mut state = MembershipState::default();
-    state.add_member(MemberRecord {
-        anchor: "sha256:node1".into(),
-        endpoint: "http://node1:8080".into(),
-        joined_at_ms: 1000,
-        role: kappa_core::membership::MemberRole::Voter,
-    });
+    state.add_member(member("node1", 1000, MemberRole::Voter)?);
     assert_eq!(state.members.len(), 1);
     assert_eq!(state.voter_count(), 1);
+    Ok(())
 }
 
 #[test]
-fn membership_add_learner_does_not_affect_quorum() {
+fn membership_add_learner_does_not_affect_quorum() -> MembershipResult {
     let mut state = MembershipState::default();
-    state.add_member(MemberRecord {
-        anchor: "sha256:learner".into(),
-        endpoint: "http://learner:8080".into(),
-        joined_at_ms: 1000,
-        role: kappa_core::membership::MemberRole::Learner,
-    });
+    state.add_member(member("learner", 1000, MemberRole::Learner)?);
     assert_eq!(state.members.len(), 1);
     assert_eq!(state.voter_count(), 0);
     assert_eq!(state.quorum_size(), 1);
+    Ok(())
 }
 
 #[test]
-fn membership_quorum_3_voters() {
+fn membership_quorum_3_voters() -> MembershipResult {
     let mut state = MembershipState::default();
-    for i in 0..3 {
-        state.add_member(MemberRecord {
-            anchor: format!("sha256:node{i}"),
-            endpoint: format!("http://node{i}:8080"),
-            joined_at_ms: i * 100,
-            role: kappa_core::membership::MemberRole::Voter,
-        });
+    for i in 0..3i64 {
+        state.add_member(member(&format!("node{i}"), i * 100, MemberRole::Voter)?);
     }
     assert_eq!(state.voter_count(), 3);
-    assert_eq!(state.quorum_size(), 2); // (3/2)+1
+    assert_eq!(state.quorum_size(), 2);
+    Ok(())
 }
 
 #[test]
-fn membership_quorum_5_voters() {
+fn membership_quorum_5_voters() -> MembershipResult {
     let mut state = MembershipState::default();
     for i in 0..5 {
-        state.add_member(MemberRecord {
-            anchor: format!("sha256:n{i}"),
-            endpoint: format!("http://n{i}:8080"),
-            joined_at_ms: 0,
-            role: kappa_core::membership::MemberRole::Voter,
-        });
+        state.add_member(member(&format!("n{i}"), 0, MemberRole::Voter)?);
     }
-    assert_eq!(state.quorum_size(), 3); // (5/2)+1
+    assert_eq!(state.quorum_size(), 3);
+    Ok(())
 }
 
 #[test]
-fn membership_remove_member() {
+fn membership_remove_member() -> MembershipResult {
     let mut state = MembershipState::default();
-    state.add_member(MemberRecord {
-        anchor: "sha256:removable".into(),
-        endpoint: "http://r:8080".into(),
-        joined_at_ms: 0,
-        role: kappa_core::membership::MemberRole::Voter,
-    });
+    let removable = member("removable", 0, MemberRole::Voter)?;
+    let anchor = removable.anchor.clone();
+    state.add_member(removable);
     assert_eq!(state.members.len(), 1);
-    state.remove_member("sha256:removable");
+    state.remove_member(&anchor);
     assert_eq!(state.members.len(), 0);
+    Ok(())
 }
 
 #[test]
-fn membership_remove_nonexistent_is_noop() {
+fn membership_remove_nonexistent_is_noop() -> MembershipResult {
     let mut state = MembershipState::default();
-    state.remove_member("sha256:ghost");
+    state.remove_member(&Kappa::from_key("ed25519", b"ghost")?);
     assert_eq!(state.members.len(), 0);
+    assert_eq!(state.epoch, 0);
+    Ok(())
 }
 
 #[test]
-fn membership_add_idempotent() {
+fn membership_add_idempotent() -> MembershipResult {
     let mut state = MembershipState::default();
-    let member = MemberRecord {
-        anchor: "sha256:idem".into(),
-        endpoint: "http://idem:8080".into(),
-        joined_at_ms: 0,
-        role: kappa_core::membership::MemberRole::Voter,
-    };
-    state.add_member(member.clone());
-    state.add_member(member);
+    let idem = member("idem", 0, MemberRole::Voter)?;
+    state.add_member(idem.clone());
+    state.add_member(idem);
     assert_eq!(state.members.len(), 1);
+    assert_eq!(state.epoch, 1);
+    Ok(())
 }
 
 #[test]
-fn membership_cbor_roundtrip() {
+fn membership_cbor_roundtrip() -> MembershipResult {
     let mut state = MembershipState::default();
-    state.add_member(MemberRecord {
-        anchor: "sha256:cbor".into(),
-        endpoint: "http://cbor:8080".into(),
-        joined_at_ms: 42,
-        role: kappa_core::membership::MemberRole::Voter,
-    });
+    let cbor = member("cbor", 42, MemberRole::Voter)?;
+    let anchor = cbor.anchor.clone();
+    state.add_member(cbor);
     let bytes = canonical_bytes(&state);
-    let decoded: MembershipState = from_canonical(&bytes).unwrap();
-    assert_eq!(decoded.members.len(), 1);
-    assert_eq!(decoded.members[0].anchor, "sha256:cbor");
+    let decoded: MembershipState = from_canonical(&bytes)?;
+    assert_eq!(decoded, state);
+    assert_eq!(decoded.members[0].anchor, anchor);
+    Ok(())
 }
 
 #[test]
-fn membership_mixed_roles() {
+fn membership_mixed_roles() -> MembershipResult {
     let mut state = MembershipState::default();
-    state.add_member(MemberRecord {
-        anchor: "sha256:v1".into(),
-        endpoint: "e".into(),
-        joined_at_ms: 0,
-        role: kappa_core::membership::MemberRole::Voter,
-    });
-    state.add_member(MemberRecord {
-        anchor: "sha256:l1".into(),
-        endpoint: "e".into(),
-        joined_at_ms: 0,
-        role: kappa_core::membership::MemberRole::Learner,
-    });
-    state.add_member(MemberRecord {
-        anchor: "sha256:v2".into(),
-        endpoint: "e".into(),
-        joined_at_ms: 0,
-        role: kappa_core::membership::MemberRole::Voter,
-    });
+    state.add_member(member("v1", 0, MemberRole::Voter)?);
+    state.add_member(member("l1", 0, MemberRole::Learner)?);
+    state.add_member(member("v2", 0, MemberRole::Voter)?);
     assert_eq!(state.members.len(), 3);
     assert_eq!(state.voter_count(), 2);
-    assert_eq!(state.quorum_size(), 2); // (2/2)+1
+    assert_eq!(state.quorum_size(), 2);
+    Ok(())
 }

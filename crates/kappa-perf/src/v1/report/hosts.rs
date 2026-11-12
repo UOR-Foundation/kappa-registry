@@ -108,6 +108,7 @@ mod tests {
         let datasets = vec![Dataset {
             name: "floors".into(),
             path: "calibration_floors.jsonl".into(),
+            run: "target".into(),
             points: vec![measured(&here), measured(&here), measured(&other)],
         }];
         let hosts = hosts(&datasets);

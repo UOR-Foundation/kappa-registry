@@ -1,9 +1,16 @@
+//! Namespace counters. Each advance is applied through the transition
+//! boundary as the canonical `SequenceRecord` naming the value issued, so
+//! the ledger carries every value.
+
 use kappa_store::error::StoreError;
 use kappa_store::namespace::NamespaceRef;
 use kappa_store::traits::sequence::SequenceStore;
+use kappa_store::transition::RecordTransition;
+use kappa_types::epoch::SequenceRecord;
 
 use crate::PersistentStore;
 use crate::tables::SEQUENCES;
+use crate::transition_apply::{RedbPayload, TxnWriter};
 use redb::ReadableTable;
 
 /// Binary sequence key: `[ns_uuid:16][name_hash:16]`.
@@ -15,9 +22,8 @@ fn seq_key(ns: &NamespaceRef, name: &str) -> Vec<u8> {
     k
 }
 
-// Reservation is `EpochExecution::sequence_next`, which increments through
-// `sequence_next_in_txn` and records `SequenceUpdate` evidence in the same
-// writer.
+// Reservation is `EpochExecution::sequence_next`, through
+// `TxnWriter::sequence_next` in the execution's writer.
 impl SequenceStore for PersistentStore {
     fn sequence_current(&self, ns: &NamespaceRef, name: &str) -> Result<u64, StoreError> {
         let snapshot = self.namespace_snapshot(ns)?;
@@ -44,31 +50,6 @@ impl PersistentStore {
         )
     }
 
-    pub(crate) fn sequence_next_in_txn(
-        &self,
-        txn: &redb::WriteTransaction,
-        ns: &NamespaceRef,
-        name: &str,
-    ) -> Result<u64, StoreError> {
-        if name.is_empty() {
-            return Err(StoreError::Rejected("sequence name is empty".into()));
-        }
-        let key = seq_key(ns, name);
-        let value;
-        {
-            let mut table = txn.open_table(SEQUENCES).map_err(crate::error::redb)?;
-            let current = self.sequence_value(&table, &key)?;
-            value = current.checked_add(1).ok_or_else(|| {
-                StoreError::CapacityExceeded(format!("sequence exhausted: {ns}:{name}"))
-            })?;
-            let encoded = self.encode_seq_value(&seq_context(&key), value)?;
-            table
-                .insert(key.as_slice(), encoded.as_slice())
-                .map_err(crate::error::redb)?;
-        }
-        Ok(value)
-    }
-
     pub(crate) fn sequence_current_in_txn(
         &self,
         txn: &redb::WriteTransaction,
@@ -77,5 +58,48 @@ impl PersistentStore {
     ) -> Result<u64, StoreError> {
         let table = txn.open_table(SEQUENCES).map_err(crate::error::redb)?;
         self.sequence_value(&table, &seq_key(ns, name))
+    }
+}
+
+impl TxnWriter<'_> {
+    /// Advance the namespace counter `name`, applied as the `Sequence`
+    /// transition naming the value issued. An exhausted counter refuses
+    /// instead of wrapping.
+    pub(crate) fn sequence_next(&self, name: &str) -> Result<u64, StoreError> {
+        let current = self
+            .store
+            .sequence_current_in_txn(self.txn, self.ns, name)?;
+        let value = kappa_store::traits::sequence::next_value(name, current)?;
+        self.apply(
+            RecordTransition::Sequence(SequenceRecord {
+                namespace_id: self.ns.id().to_vec(),
+                name: name.to_owned(),
+                value,
+            }),
+            RedbPayload::NoResources,
+        )?;
+        Ok(value)
+    }
+
+    /// Hold the counter value `record` issues, which must be the successor
+    /// of the value held. Called only by `apply`.
+    pub(crate) fn apply_sequence(&self, record: &SequenceRecord) -> Result<(), StoreError> {
+        let key = seq_key(self.ns, &record.name);
+        let mut table = self.txn.open_table(SEQUENCES).map_err(crate::error::redb)?;
+        let current = self.store.sequence_value(&table, &key)?;
+        let expected = kappa_store::traits::sequence::next_value(&record.name, current)?;
+        if record.value != expected {
+            return Err(StoreError::Internal(format!(
+                "sequence {} issues {}; its successor is {expected}",
+                record.name, record.value
+            )));
+        }
+        let encoded = self
+            .store
+            .encode_seq_value(&seq_context(&key), record.value)?;
+        table
+            .insert(key.as_slice(), encoded.as_slice())
+            .map_err(crate::error::redb)?;
+        Ok(())
     }
 }

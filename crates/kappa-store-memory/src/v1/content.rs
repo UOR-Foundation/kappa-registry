@@ -4,7 +4,9 @@
 //! content cache while hashing under every mandatory axis, outside any
 //! writer, checking its byte bound as it reads and its deadline before and
 //! after every chunk. Compressed content streams to its file under its
-//! storage identity and is then proven by decoding the file: the decoded
+//! storage identity and is then proven by decoding the file through the
+//! shared bounded decoder (`kappa_store::compression`) every read of it
+//! decodes through: the decoded
 //! stream must hash to the claimed identity under every mandatory axis and
 //! be exactly the claimed length. The segment digests of the file's bytes,
 //! and of a compressed file's decoded bytes, are computed in the same
@@ -14,15 +16,17 @@
 //! Installation, composition and retirement are in `content_install`.
 
 use std::io::{BufReader, Read, Write};
+use std::sync::Arc;
 
+use kappa_store::transition::PreparedResource;
 use kappa_store::{
     ContentIdentity, ContentPreparation, Kappa, PreparationBounds, PreparedContent, StoreError,
 };
 use kappa_types::Axis;
+use kappa_types::content::{ContentAdmissionEvidence, ContentAdmissionRecord};
 use kappa_types::kappa_streaming::streaming_compute_into;
 
 use super::InMemoryStore;
-use super::blob_read::decoder;
 use super::segments::{SegmentHasher, Segments};
 
 /// The compression of prepared content: its algorithm, the identity of the
@@ -43,6 +47,45 @@ pub struct MemoryPrepared {
     pub(crate) file: tempfile::NamedTempFile,
     pub(crate) segments: Segments,
     pub(crate) compression: Option<Compression>,
+    pub(crate) owner: Arc<dyn Send + Sync>,
+}
+
+impl MemoryPrepared {
+    pub(crate) fn validate_owner(&self, store: &InMemoryStore) -> Result<(), StoreError> {
+        if !Arc::ptr_eq(&self.owner, &store.allocations.preparation_owner()) {
+            return Err(StoreError::Rejected(
+                "content was prepared by another store instance".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Prepared content installs only into the store that prepared it, under
+/// the admission of its canonical holder (`canonical_order`) at its size.
+impl PreparedResource for Box<MemoryPrepared> {
+    type Context = InMemoryStore;
+
+    fn validate_admission(
+        &self,
+        record: &ContentAdmissionRecord,
+        store: &InMemoryStore,
+    ) -> Result<(), StoreError> {
+        self.validate_owner(store)?;
+        let admission = record.admission();
+        let holder = std::iter::once(&self.identity)
+            .chain(self.aliases.iter())
+            .min_by_key(|identity| identity.axis().discriminant());
+        if holder != Some(admission.identity())
+            || self.total_size != admission.logical_size()
+            || !matches!(record.evidence(), ContentAdmissionEvidence::VerifiedBytes)
+        {
+            return Err(StoreError::Rejected(
+                "prepared content differs from its admission".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// What streaming a request into a staging file produced.
@@ -132,7 +175,8 @@ impl InMemoryStore {
     ) -> Result<(Vec<Kappa>, Compression, Staged), StoreError> {
         let mut stored = self.stream(&[Axis::Sha256], reader, bounds)?;
         stored.file.as_file_mut().flush()?;
-        let mut decoded = decoder(algorithm, BufReader::new(stored.file.reopen()?))?;
+        let mut decoded = kappa_store::compression::Codec::of(algorithm)?
+            .decoder(BufReader::new(stored.file.reopen()?))?;
         let mut decoded_segments = SegmentHasher::default();
         let mut buffer = [0u8; 16384];
         let (proof, decoded_size) = streaming_compute_into(
@@ -197,6 +241,7 @@ impl ContentPreparation for InMemoryStore {
                     )));
                 }
                 MemoryPrepared {
+                    owner: self.allocations.preparation_owner(),
                     identity: expected,
                     aliases: staged.aliases,
                     total_size: staged.size,
@@ -208,6 +253,7 @@ impl ContentPreparation for InMemoryStore {
             ContentIdentity::Computed(axis) => {
                 let staged = self.stream(&self.axes_for(axis), reader, &bounds)?;
                 MemoryPrepared {
+                    owner: self.allocations.preparation_owner(),
                     identity: staged.identity,
                     aliases: staged.aliases,
                     total_size: staged.size,
@@ -229,6 +275,7 @@ impl ContentPreparation for InMemoryStore {
                     &bounds,
                 )?;
                 MemoryPrepared {
+                    owner: self.allocations.preparation_owner(),
                     identity,
                     aliases,
                     total_size: uncompressed_size,

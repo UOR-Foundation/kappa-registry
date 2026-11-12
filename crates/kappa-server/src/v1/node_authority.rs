@@ -176,11 +176,11 @@ impl NodeAuthority {
         }
     }
 
-    /// Every committed transition published in the control namespace.
-    fn publish_activations(&self) -> Result<(), StoreError> {
-        let control = control_namespace(&self.store)?;
-        self.store
-            .publish_activation_records(&control, self.clock.as_ref())
+    /// The store's authority history projects every activation its
+    /// control namespaces' governing epochs committed. The governing epoch
+    /// is the activation's commit; only the projection can lag it.
+    fn project_activations(&self) -> Result<(), StoreError> {
+        self.store.project_activations()
     }
 
     pub const fn identity(&self) -> &Arc<NodeIdentity> {
@@ -291,7 +291,7 @@ impl NodeAuthority {
             key_removal: residual.key_removal,
             authorization,
             revocation,
-            activation: self.publish_activations(),
+            activation: self.project_activations(),
         };
         self.record(&committed, follow_up.completion());
         drop(custody);
@@ -436,6 +436,12 @@ impl NodeAuthority {
                 // nothing signs until the next start settles.
                 return TransitionOutcome::Unresolved(RotationError::Indeterminate(error));
             }
+            Err(AuthorityRotationError::Retained(error)) => {
+                // The staged key may still become the installed one when the
+                // retained governing publication is resolved: it is kept,
+                // and nothing signs until then.
+                return TransitionOutcome::Unresolved(RotationError::Retained(error));
+            }
         }
         // Committed: the incoming authority signs from here on, whether or
         // not the key store records it yet.
@@ -462,7 +468,7 @@ impl NodeAuthority {
                 key_removal,
                 authorization,
                 revocation,
-                activation: self.publish_activations(),
+                activation: self.project_activations(),
             },
         };
         TransitionOutcome::Installed(next, rotation)

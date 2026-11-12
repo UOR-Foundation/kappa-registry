@@ -49,21 +49,22 @@ use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
 use redb::{Database, ReadableDatabase};
 
+use kappa_store::LogicalIncarnation;
 use kappa_store::error::StoreError;
 use kappa_store::kappa::Kappa;
 
 use crate::allocation::Pin;
 use crate::control_plane::{AssignmentRecord, ControlPlane, ControlPlanes, Proposal};
-use crate::storage_instance::StorageInstance;
+use crate::storage_instance::{Incarnation, StorageInstance};
 use crate::tables;
 
 #[path = "storage_handles.rs"]
 mod handles;
+pub(crate) use handles::ActivityAdmission;
 use handles::Slot;
 
 #[path = "storage_grant.rs"]
 mod grant;
-pub(crate) use grant::Maintenance;
 pub use grant::{Active, Exclusive, Maintain, Publish, Purpose, Read, Use};
 
 #[path = "storage_lifecycle.rs"]
@@ -193,9 +194,87 @@ pub struct NamespaceController {
     /// the database under the writer gate; cleared never, the controller
     /// tracks its own publications afterwards.
     pub(crate) head_recovered: AtomicBool,
+    /// Held by the one settlement attempt advancing this instance's
+    /// checkpoint (`settlement::SettlementAttempt`), from before it observes
+    /// the checkpoint until it has released what it settled.
+    pub(crate) settlement_running: AtomicBool,
+    /// A lower bound of this instance's settlement checkpoint, raised only
+    /// from a checkpoint known committed (a settlement whose commit
+    /// succeeded, or an established observation): what admission subtracts
+    /// from the head when no established read can be taken now. Never an
+    /// authority over the checkpoint itself.
+    known_settled: AtomicU64,
+}
+
+/// What a namespace's logical incarnation is taken for: every
+/// authenticated record that binds it, and every check that compares a
+/// record against the live namespace instance. Each use is one variant, so
+/// a refusal names exactly which evidence could not be bound or checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IncarnationUse {
+    /// The transition domain every write of an execution binds
+    /// (`TxnWriter`, `PreparedTransition::bind`).
+    Transition,
+    /// The authority and namespace-state records a seal commits
+    /// (`epoch_seal::prepare_seal`).
+    Seal,
+    /// The namespace-state record of a sealed transaction, compared before
+    /// its commit (`verify_sealed_transaction`).
+    SealVerification,
+    /// The namespace-state record of each settled epoch, compared before
+    /// its effects are projected (`settlement_ledger`).
+    Settlement,
+    /// The receipt of a committed operation, compared before it answers a
+    /// replayed request (`admit_operation_outcome`).
+    OperationOutcome,
+    /// The activation domain a rotation witness signs and its governing
+    /// epoch binds (`activation_domain`).
+    ActivationDomain,
+    /// The control namespace instance holding an activation's governing
+    /// evidence, compared against the domain the evidence names
+    /// (`ActivationHold::admits`, `activation_evidence`).
+    ActivationEvidence,
+}
+
+impl std::fmt::Display for IncarnationUse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Transition => "binding a namespace transition to its instance",
+            Self::Seal => "sealing the authority and namespace-state records of an epoch",
+            Self::SealVerification => {
+                "verifying the namespace-state record of a sealed transaction"
+            }
+            Self::Settlement => "settling the namespace-state record of a committed epoch",
+            Self::OperationOutcome => "answering a replayed operation from its committed receipt",
+            Self::ActivationDomain => "binding an authority activation to its control namespace",
+            Self::ActivationEvidence => {
+                "verifying the governing evidence of an authority activation"
+            }
+        })
+    }
 }
 
 impl NamespaceController {
+    /// The logical incarnation this namespace's authenticated records bind,
+    /// taken for `binding`: the one accessor every live consumer reads it
+    /// from. Its value is currently the incarnation the storage instance
+    /// records. Storage that records none (`Incarnation::Unknown`) has no
+    /// logical incarnation: refused as `Rejected`, naming the namespace,
+    /// its storage instance and the evidence that could not be bound.
+    pub(crate) fn logical_incarnation(
+        &self,
+        binding: IncarnationUse,
+    ) -> Result<LogicalIncarnation, StoreError> {
+        match self.instance.incarnation() {
+            Incarnation::Known(incarnation) => Ok(LogicalIncarnation::from_bytes(incarnation)),
+            Incarnation::Unknown => Err(StoreError::Rejected(format!(
+                "namespace {} storage instance {} records no incarnation; {binding} requires one",
+                hex::encode(self.id),
+                self.instance
+            ))),
+        }
+    }
+
     /// Directory of this namespace's storage.
     pub(crate) fn directory(root: &Path, id: &[u8; 16]) -> PathBuf {
         root.join("namespaces").join(hex::encode(id))
@@ -262,6 +341,18 @@ impl NamespaceController {
         drop(released);
     }
 
+    /// Raise the known-committed bound of this instance's checkpoint to
+    /// `epoch`, an epoch known settled and committed.
+    pub(crate) fn raise_known_settled(&self, epoch: u64) {
+        self.known_settled.fetch_max(epoch, Ordering::AcqRel);
+    }
+
+    /// The highest epoch of this instance known settled and committed; 0
+    /// when none is known.
+    pub(crate) fn known_settled(&self) -> u64 {
+        self.known_settled.load(Ordering::Acquire)
+    }
+
     /// Whether admission must refresh this controller's assignment from
     /// the admitted record before deciding anything.
     pub(crate) fn assignment_is_stale(&self) -> bool {
@@ -304,6 +395,9 @@ impl NamespaceController {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(StoreError::Io(error)),
+        }
+        if let Some(directory) = marker.parent() {
+            std::fs::File::open(directory)?.sync_all()?;
         }
         self.publication_fenced.store(false, Ordering::Release);
         Ok(())

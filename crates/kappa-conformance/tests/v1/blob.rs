@@ -85,21 +85,30 @@ fn put_get_roundtrip() -> TestResult {
 #[test]
 fn content_addressed_identity() -> TestResult {
     let f = MemoryFixture::new()?;
+    let ns = create_ns(&f.store, "blob")?;
     let v1 = VerifiedContent::compute(Axis::Sha256, b"same")?;
     let v2 = VerifiedContent::compute(Axis::Sha256, b"same")?;
     assert_eq!(*v1.kappa(), *v2.kappa());
-    let (_, first) = install(&f, b"same")?;
-    let (_, second) = install(&f, b"same")?;
+    let (first_identity, first) = install_in(&f, &ns, b"same")?;
+    let (second_identity, second) = install_in(&f, &ns, b"same")?;
+    assert_eq!(&first_identity, v1.kappa());
+    assert_eq!(first_identity, second_identity);
     assert!(first);
     assert!(!second, "the second install is idempotent");
+    assert_eq!(f.store.blob_get(&first_identity)?, b"same");
     Ok(())
 }
 
 #[test]
 fn different_content_different_kappa() -> TestResult {
     let f = MemoryFixture::new()?;
-    let (k1, _) = install(&f, b"aaa")?;
-    let (k2, _) = install(&f, b"bbb")?;
+    let ns = create_ns(&f.store, "blob")?;
+    let (k1, first) = install_in(&f, &ns, b"aaa")?;
+    let (k2, second) = install_in(&f, &ns, b"bbb")?;
+    assert!(
+        first && second,
+        "distinct content receives distinct admissions"
+    );
     assert_ne!(k1, k2);
     assert_eq!(f.store.blob_get(&k1)?, b"aaa");
     assert_eq!(f.store.blob_get(&k2)?, b"bbb");

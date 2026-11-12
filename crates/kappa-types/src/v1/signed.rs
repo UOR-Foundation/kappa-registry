@@ -101,6 +101,44 @@ impl From<&SignedPayload> for dcbor::prelude::CBOR {
     }
 }
 
+/// The same byte string: its head, then the payload's bytes, copied from
+/// the payload into the plan.
+impl dcbor::bounded::Schema for SignedPayload {
+    fn instruction(&self, index: usize) -> dcbor::bounded::encoding::Instruction<'_> {
+        use dcbor::bounded::encoding::Instruction;
+        use dcbor::bounded::{Argument, MajorType};
+        match index {
+            0 => Instruction::Head(
+                MajorType::ByteString,
+                Argument::Shortest(self.0.len() as u64),
+            ),
+            1 => Instruction::Bytes(&self.0),
+            _ => Instruction::End,
+        }
+    }
+}
+
+/// The same byte string, copied once into storage requested from the
+/// allocator and allocated fallibly at exactly its length
+/// (`dcbor::bounded::decode::copy_bytes`).
+impl dcbor::bounded::decode::BoundedDecodable for SignedPayload {
+    fn construct<A: dcbor::bounded::Allocator>(
+        node: dcbor::bounded::decode::Node<'_, '_>,
+        permits: &mut dcbor::bounded::Owned<A::Permit, A::Permit>,
+        allocator: &mut A,
+    ) -> dcbor::bounded::decode::ConstructResult<Self, A> {
+        use dcbor::bounded::decode::{Kind, copy_bytes, visit, wrong_type};
+
+        visit(allocator)?;
+        let Kind::Bytes(bytes) = node.kind() else {
+            return Err(wrong_type());
+        };
+        Ok(Self::from_cose_bytes(copy_bytes(
+            bytes, permits, allocator,
+        )?))
+    }
+}
+
 impl TryFrom<dcbor::prelude::CBOR> for SignedPayload {
     type Error = dcbor::Error;
 
@@ -232,6 +270,25 @@ mod tests {
             dcbor::prelude::CBOR::from(SignedPayload::empty()).to_cbor_data(),
             [0x40]
         );
+    }
+
+    /// The bounded encoding is the symbolic byte string at every head width,
+    /// the empty payload included.
+    #[test]
+    fn bounded_envelope_is_the_symbolic_byte_string() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for len in [0usize, 1, 23, 24, 255, 256, 65_536] {
+            let payload = SignedPayload::from_cose_bytes(vec![0x5a; len]);
+            let mut limits = dcbor::bounded::Limits::unlimited();
+            let bounded = dcbor::bounded::encode(&payload, &mut limits)
+                .map_err(|error| format!("{len} bytes: {error}"))?;
+            assert_eq!(
+                bounded.as_ref(),
+                dcbor::prelude::CBOR::from(&payload).to_cbor_data(),
+                "{len} bytes"
+            );
+        }
+        Ok(())
     }
 
     #[test]

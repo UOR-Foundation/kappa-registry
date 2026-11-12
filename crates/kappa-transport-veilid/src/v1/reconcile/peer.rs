@@ -6,12 +6,11 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
+use kappa_reconcile::{InconsistentRange, ReconcileTransport};
 use kappa_store::ExecutionStore;
 use kappa_store::time::Clock;
 use kappa_store::traits::{BlobStore, EpochStore, NamespaceStore, TagStore};
 use kappa_types::namespace::NamespaceRef;
-
-use rekindle_types::transport::Transport;
 
 use super::apply::apply_namespace_batch;
 use super::blobs::{collect_missing_blobs, fetch_missing_blobs};
@@ -19,7 +18,7 @@ use super::mst::try_mst_diff;
 use super::report::{PeerPhase, PeerReconcileOutcome};
 use super::wire::{DiffPullRequest, DiffPullResponse, EpochRootResponse, TagEntryWire};
 use super::{
-    MAX_PULL_PAGES, MAX_PULL_TAGS, PROTO_DIFF_PULL_REQ, PROTO_DIFF_PULL_RESP, PROTO_EPOCH_ROOT_REQ,
+    MAX_PULL_PAGES, PROTO_DIFF_PULL_REQ, PROTO_DIFF_PULL_RESP, PROTO_EPOCH_ROOT_REQ,
     PROTO_EPOCH_ROOT_RESP, short_id,
 };
 use crate::error::TransportError;
@@ -33,7 +32,7 @@ pub(super) async fn reconcile_peer<T, S>(
     timeout: Duration,
 ) -> PeerReconcileOutcome
 where
-    T: Transport,
+    T: ReconcileTransport + ?Sized,
     S: NamespaceStore
         + TagStore
         + EpochStore
@@ -162,16 +161,142 @@ where
     outcome
 }
 
+/// One page of the peer's tags: the named tags, or the page after
+/// `cursor`, within `timeout`. A failure is pushed to `outcome.errors`
+/// and returns `None`, ending the pull with what was received.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one request: its target, its selection, its bound and where its outcome is folded"
+)]
+async fn pull_page<T>(
+    transport: &T,
+    peer_id: &str,
+    ns_name: &str,
+    tag_names: &[String],
+    cursor: Option<&str>,
+    timeout: Duration,
+    outcome: &mut PeerReconcileOutcome,
+    what: &str,
+) -> Option<DiffPullResponse>
+where
+    T: ReconcileTransport + ?Sized,
+{
+    match tokio::time::timeout(
+        timeout,
+        pull_tags(transport, peer_id, ns_name, tag_names, cursor),
+    )
+    .await
+    {
+        Ok(Ok(page)) => {
+            outcome.pull_pages += 1;
+            outcome.tags_pulled += u32::try_from(page.tags.len()).unwrap_or(u32::MAX);
+            Some(page)
+        }
+        Ok(Err(e)) => {
+            outcome.errors.push(format!("{ns_name} {what}: {e}"));
+            None
+        }
+        Err(_) => {
+            outcome.errors.push(format!("{ns_name} {what}: timeout"));
+            None
+        }
+    }
+}
+
+/// Pull every tag of the peer inside each inconsistent range, in full:
+/// the range's start key by name (the paginated pull is exclusive of its
+/// cursor), then every following page until a tag past the range's end or
+/// the peer reports no more. Keys only the peer holds lie strictly inside
+/// a range; pulling only the local names there would never fetch them.
+/// Bounded by `MAX_PULL_PAGES` for the namespace as a whole.
+async fn pull_ranges<T>(
+    transport: &T,
+    peer_id: &str,
+    ns_name: &str,
+    ranges: &[InconsistentRange],
+    timeout: Duration,
+    outcome: &mut PeerReconcileOutcome,
+) -> Vec<TagEntryWire>
+where
+    T: ReconcileTransport + ?Sized,
+{
+    let mut received: Vec<TagEntryWire> = Vec::new();
+    let mut pages = 0usize;
+    'ranges: for range in ranges {
+        let Some(first) = pull_page(
+            transport,
+            peer_id,
+            ns_name,
+            std::slice::from_ref(&range.start),
+            None,
+            timeout,
+            outcome,
+            "range start pull",
+        )
+        .await
+        else {
+            break;
+        };
+        pages += 1;
+        received.extend(first.tags);
+        if range.start == range.end {
+            continue;
+        }
+        let mut cursor = Some(range.start.clone());
+        loop {
+            if pages >= MAX_PULL_PAGES {
+                debug!(
+                    peer = short_id(peer_id),
+                    namespace = ns_name,
+                    pages,
+                    "hit MAX_PULL_PAGES, stopping range pull"
+                );
+                break 'ranges;
+            }
+            let Some(page) = pull_page(
+                transport,
+                peer_id,
+                ns_name,
+                &[],
+                cursor.as_deref(),
+                timeout,
+                outcome,
+                "range pull",
+            )
+            .await
+            else {
+                break 'ranges;
+            };
+            pages += 1;
+            let mut past_end = false;
+            for tag in page.tags {
+                if tag.name > range.end {
+                    past_end = true;
+                    break;
+                }
+                received.push(tag);
+            }
+            if past_end || !page.truncated {
+                break;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+    received
+}
+
 /// Pull every divergent tag of one namespace from the peer, across pages.
 ///
 /// MST diff reduces bandwidth from O(N) to O(delta) by exchanging
-/// 16-byte root hashes and page range snapshots, then pulling only
-/// tag names that fall in inconsistent ranges. Falls back to full
-/// paginated pull when MST exchange fails due to: empty namespace
-/// on either side producing a degenerate MST, page range snapshot
-/// exceeding 32KB app_call limit for very large namespaces, or
-/// network timeout on the snapshot round-trip. A failed page ends the
-/// pull; the tags already received are still applied.
+/// 16-byte root hashes and page range snapshots, then pulling every peer
+/// key inside the inconsistent ranges. Falls back to a full paginated pull
+/// when the MST exchange fails: an empty namespace on either side, a page
+/// range snapshot exceeding the 32KB app_call limit, or a timeout on the
+/// snapshot round trip. A failed page ends the pull; the tags already
+/// received are still applied.
 async fn pull_namespace<T, S>(
     transport: &T,
     store: &S,
@@ -182,43 +307,20 @@ async fn pull_namespace<T, S>(
     outcome: &mut PeerReconcileOutcome,
 ) -> Vec<TagEntryWire>
 where
-    T: Transport,
+    T: ReconcileTransport + ?Sized,
     S: NamespaceStore + TagStore + ?Sized,
 {
     let mut received: Vec<TagEntryWire> = Vec::new();
     match try_mst_diff(transport, store, peer_id, ns_name, ns_ref, timeout).await {
-        Ok(tag_names) => {
+        Ok(ranges) => {
             debug!(
                 peer = short_id(peer_id),
                 namespace = ns_name,
-                inconsistent_tags = tag_names.len(),
-                "MST diff computed, pulling only inconsistent tags"
+                inconsistent_ranges = ranges.len(),
+                "MST diff computed, pulling the inconsistent ranges in full"
             );
-            for chunk in tag_names.chunks(MAX_PULL_TAGS) {
-                let page = match tokio::time::timeout(
-                    timeout,
-                    pull_tags(transport, peer_id, ns_name, chunk, None),
-                )
-                .await
-                {
-                    Ok(Ok(page)) => page,
-                    Ok(Err(e)) => {
-                        outcome
-                            .errors
-                            .push(format!("{ns_name} selective pull: {e}"));
-                        break;
-                    }
-                    Err(_) => {
-                        outcome
-                            .errors
-                            .push(format!("{ns_name} selective pull: timeout"));
-                        break;
-                    }
-                };
-                outcome.pull_pages += 1;
-                outcome.tags_pulled += page.tags.len() as u32;
-                received.extend(page.tags);
-            }
+            received
+                .extend(pull_ranges(transport, peer_id, ns_name, &ranges, timeout, outcome).await);
         }
         Err(e) => {
             debug!(
@@ -228,9 +330,9 @@ where
                 "MST diff failed, falling back to full paginated pull"
             );
             let mut cursor: Option<String> = None;
-            let mut pages = 0u32;
+            let mut pages = 0usize;
             loop {
-                if pages >= MAX_PULL_PAGES as u32 {
+                if pages >= MAX_PULL_PAGES {
                     debug!(
                         peer = short_id(peer_id),
                         namespace = ns_name,
@@ -239,29 +341,21 @@ where
                     );
                     break;
                 }
-                let page = match tokio::time::timeout(
+                let Some(page) = pull_page(
+                    transport,
+                    peer_id,
+                    ns_name,
+                    &[],
+                    cursor.as_deref(),
                     timeout,
-                    pull_tags(transport, peer_id, ns_name, &[], cursor.as_deref()),
+                    outcome,
+                    "pull page",
                 )
                 .await
-                {
-                    Ok(Ok(page)) => page,
-                    Ok(Err(e)) => {
-                        outcome
-                            .errors
-                            .push(format!("{ns_name} pull page {pages}: {e}"));
-                        break;
-                    }
-                    Err(_) => {
-                        outcome
-                            .errors
-                            .push(format!("{ns_name} pull page {pages}: timeout"));
-                        break;
-                    }
+                else {
+                    break;
                 };
                 pages += 1;
-                outcome.pull_pages += 1;
-                outcome.tags_pulled += page.tags.len() as u32;
                 received.extend(page.tags);
                 if !page.truncated {
                     break;
@@ -320,7 +414,7 @@ where
 
 // RPC helpers
 
-async fn fetch_epoch_root<T: Transport>(
+async fn fetch_epoch_root<T: ReconcileTransport + ?Sized>(
     transport: &T,
     peer_id: &str,
     namespace: &str,
@@ -350,7 +444,7 @@ async fn fetch_epoch_root<T: Transport>(
         .map_err(|e| TransportError::CodecError(format!("epoch root decode: {e}")))
 }
 
-async fn pull_tags<T: Transport>(
+async fn pull_tags<T: ReconcileTransport + ?Sized>(
     transport: &T,
     peer_id: &str,
     namespace: &str,

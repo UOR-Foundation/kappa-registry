@@ -6,7 +6,7 @@ use kappa_store::canonical::from_canonical;
 use kappa_store::resource;
 use kappa_store::{Axis, ClockMs, Kappa, NamespaceRef, ResourceKind, StoreError};
 
-use super::{Staging, bounds, computed, publish};
+use super::{bounds, computed, publish, Staging};
 
 pub fn asserter() -> Kappa {
     Kappa::sha256(b"staging tests")

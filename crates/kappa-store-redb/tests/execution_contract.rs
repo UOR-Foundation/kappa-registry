@@ -381,3 +381,100 @@ fn memory_backend_meets_the_execution_contract() -> TestResult {
 fn persistent_backend_meets_the_execution_contract() -> TestResult {
     contract(kappa_store_redb::test_support::persistent_store()?.store())
 }
+
+#[test]
+fn sequences_edges_and_versions_survive_restart_together() -> TestResult {
+    use kappa_store::traits::sequence::SequenceStore;
+    use kappa_store::version_ops::{
+        version_delete_with_marker, version_get_by_id, version_list_entries, version_put_entry,
+        versioning_put,
+    };
+    use kappa_store::versioning::VersioningState;
+    use kappa_store::{EdgeStore, PageRequest};
+    let spec = kappa_store_redb::test_support::PersistentSpec::new()
+        .in_root(&kappa_fixture::FixtureRoot::temporary()?);
+    let ns = NamespaceRef::deterministic("restart-capabilities");
+    let content = VerifiedContent::compute(Axis::Sha256, b"versioned persistent bytes")?;
+    let owner = Kappa::sha256(b"owner");
+    let edge = EdgeInput {
+        source: owner.clone(),
+        target: content.kappa().clone(),
+        relation: EdgeRelation::Builtin(BuiltinRelation::Owns),
+        asserter: owner.clone(),
+        created_at_ms: 1000,
+        metadata: None,
+    };
+    let (version, root);
+    {
+        let store = spec.clone().acquire()?;
+        let mut execution = store.begin_execution(&ns, &clock_at(ClockMs::from_raw(1000))?)?;
+        execution.namespace_create(Some(&owner), None)?;
+        execution.blob_put(&content)?;
+        versioning_put(&mut *execution, VersioningState::Enabled)?;
+        version = version_put_entry(
+            store.store(),
+            &mut *execution,
+            "object",
+            content.kappa(),
+            &owner,
+        )?;
+        for value in 1..=5 {
+            assert_eq!(execution.sequence_next("counter")?, value);
+        }
+        execution.edge_put_batch(&[edge.clone()])?;
+        root = execution.publish()?.root;
+    }
+    let store = spec.acquire()?;
+    assert_eq!(
+        store.namespace_resolve("restart-capabilities", None)?.id(),
+        ns.id()
+    );
+    assert_eq!(store.epoch_current(&ns)?.1, root);
+    assert_eq!(store.sequence_current(&ns, "counter")?, 5);
+    assert_eq!(
+        version_get_by_id(store.store(), &ns, "object", &version)?.kappa,
+        *content.kappa()
+    );
+    assert_eq!(store.blob_get(content.kappa())?, content.content());
+    for (anchor, direction) in [
+        (edge.source.clone(), kappa_store::edge::Direction::Outbound),
+        (edge.target.clone(), kappa_store::edge::Direction::Inbound),
+    ] {
+        let page = store.edge_query(
+            &ns,
+            &kappa_store::edge::EdgeQuery {
+                anchor,
+                direction,
+                relation: Some(edge.relation.clone()),
+                asserter: Some(owner.clone()),
+            },
+            &PageRequest::first(10),
+        )?;
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].target(), &edge.target);
+    }
+    let mut execution = store.begin_execution(&ns, &clock_at(ClockMs::from_raw(2000))?)?;
+    assert_eq!(execution.sequence_next("counter")?, 6);
+    execution.publish()?;
+    assert_eq!(store.sequence_current(&ns, "counter")?, 6);
+    let mut execution = store.begin_execution(&ns, &clock_at(ClockMs::from_raw(3000))?)?;
+    let marker = version_delete_with_marker(store.store(), &mut *execution, "object", None)?;
+    assert!(marker.is_delete_marker);
+    execution.publish()?;
+    assert!(matches!(
+        store.tag_get(&ns, "object"),
+        Err(StoreError::NotFound(_))
+    ));
+    let versions = version_list_entries(store.store(), &ns, "object")?;
+    assert_eq!(versions.len(), 2);
+    assert!(versions[0].is_delete_marker);
+    assert_eq!(versions[1].version_id, version);
+    let marker_id = marker.version_id.ok_or("marker omitted its version")?;
+    let mut execution = store.begin_execution(&ns, &clock_at(ClockMs::from_raw(4000))?)?;
+    let removed =
+        version_delete_with_marker(store.store(), &mut *execution, "object", Some(&marker_id))?;
+    assert!(removed.is_delete_marker);
+    execution.publish()?;
+    assert_eq!(version_list_entries(store.store(), &ns, "object")?.len(), 1);
+    Ok(())
+}

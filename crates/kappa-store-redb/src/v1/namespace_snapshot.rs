@@ -26,7 +26,7 @@ use kappa_store::{NamespaceRef, StoreError};
 use crate::PersistentStore;
 use crate::content_read::ReadView;
 use crate::retirement_record::RetirementRecord;
-use crate::storage::{Active, NamespaceController};
+use crate::storage::{Active, ActivityAdmission, NamespaceController};
 use crate::storage_instance::{Identification, StorageInstance};
 
 /// A read transaction of one namespace that holds the namespace open.
@@ -91,6 +91,11 @@ pub enum InstanceAdmission {
         snapshot: NamespaceSnapshot,
         identification: Identification,
     },
+    /// The store's `limit` activities are all held: the storage was not
+    /// examined. Neither absence nor unreadable storage; a caller that must
+    /// answer reports capacity or unavailability, and one that owns work
+    /// keeps it for a later attempt.
+    CapacityDeferred { limit: usize },
     /// No storage of the instance remains, and its retirement `record`
     /// explains why: a read treats what it held as released. A destructive
     /// decision verifies the record first
@@ -114,8 +119,11 @@ impl PersistentStore {
 
     /// What storage present for `instance` says (see the module docs).
     pub(crate) fn admit_instance(&self, instance: &StorageInstance) -> InstanceAdmission {
-        let grant = match self.namespaces.admit_read(instance.namespace()) {
-            Ok(grant) => grant,
+        let grant = match self.namespaces.try_admit_read(instance.namespace()) {
+            Ok(ActivityAdmission::Admitted(grant)) => grant,
+            Ok(ActivityAdmission::Full { limit }) => {
+                return InstanceAdmission::CapacityDeferred { limit };
+            }
             Err(StoreError::NotFound(_)) => return self.gone(instance, "missing"),
             Err(error) => return InstanceAdmission::Unreadable(error),
         };

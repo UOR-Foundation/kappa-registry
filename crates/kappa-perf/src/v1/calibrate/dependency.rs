@@ -179,6 +179,25 @@ const SEEDED_DEPS: &[(&str, &[&str])] = &[
     ("http.blob_get", &["store.blob_get"]),
     ("http.blob_put", &["store.blob_put"]),
     ("http.manifest_get", &["store.tag_get", "store.blob_get"]),
+    // Reopening runs recovery at open: it reads durable records and
+    // commits the settlement-pass flag, one durable commit at least.
+    (
+        "recovery.open",
+        &["redb.read", "redb.commit", "canonical.decode"],
+    ),
+    (
+        "settlement.step",
+        &[
+            "redb.read",
+            "redb.commit",
+            "canonical.decode",
+            "epoch.verify",
+        ],
+    ),
+    ("repair.index", &["redb.read", "redb.commit"]),
+    ("reclaim.unowned", &["device.seq_read", "redb.read"]),
+    ("reconcile.rebuild", &["hash.blake3"]),
+    ("reconcile.diff", &["hash.blake3"]),
 ];
 
 #[cfg(test)]

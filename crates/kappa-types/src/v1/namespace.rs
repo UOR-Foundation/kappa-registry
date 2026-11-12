@@ -17,23 +17,64 @@ pub struct ProtocolId(String);
 
 /// Construction error for invalid protocol identifier strings.
 #[derive(Debug, thiserror::Error)]
-#[error("invalid protocol id: must be non-empty lowercase ASCII alphanumeric plus hyphen")]
+#[error(
+    "invalid protocol id: must be 1 to {MAX_PROTOCOL_ID_BYTES} lowercase ASCII alphanumeric or hyphen bytes"
+)]
 pub struct InvalidProtocolId;
 
+/// Longest protocol identifier, a Kappa format choice: identifiers are
+/// short names of protocol surfaces, and every framed alias key, directory
+/// entry and reconciliation bound derives from this maximum.
+pub const MAX_PROTOCOL_ID_BYTES: usize = 63;
+
+/// Longest alias name, a format limit: every alias inhabits the one name
+/// domain the namespace's name belongs to, which its authority record
+/// carries within `MAX_AUTHORITY_NAME_BYTES`; the one alias validation
+/// ([`validate_alias_name`]) enforces it on every alias, so any alias can
+/// become the namespace's name.
+pub const MAX_ALIAS_NAME_BYTES: usize = crate::namespace_state::MAX_AUTHORITY_NAME_BYTES;
+
+/// Longest framed alias key ([`namespace_alias_key`]): the longest
+/// protocol, its separator, and the longest name. Every directory key and
+/// reconciliation bound derives from it.
+pub const MAX_ALIAS_KEY_BYTES: usize = MAX_PROTOCOL_ID_BYTES + 1 + MAX_ALIAS_NAME_BYTES;
+
+/// Construction error for invalid alias names.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid alias name: must be 1 to {MAX_ALIAS_NAME_BYTES} bytes and contain no NUL")]
+pub struct InvalidAliasName;
+
+/// The one validation of an alias name: non-empty, at most
+/// [`MAX_ALIAS_NAME_BYTES`], and no NUL (which frames the alias key).
+pub fn validate_alias_name(name: &str) -> Result<(), InvalidAliasName> {
+    if name.is_empty() || name.len() > MAX_ALIAS_NAME_BYTES || name.contains('\0') {
+        return Err(InvalidAliasName);
+    }
+    Ok(())
+}
+
 impl ProtocolId {
-    /// Construct a validated protocol identifier.
-    /// Accepts non-empty strings of lowercase ASCII letters, digits, and hyphens.
-    pub fn new(s: &str) -> Result<Self, InvalidProtocolId> {
-        if s.is_empty() {
-            return Err(InvalidProtocolId);
-        }
-        if s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    /// The one validation of a protocol identifier: one to
+    /// [`MAX_PROTOCOL_ID_BYTES`] lowercase ASCII letters, digits, and
+    /// hyphens. Every construction, borrowed, owned or decoded, passes
+    /// through it before it holds a value.
+    fn validate(s: &str) -> Result<(), InvalidProtocolId> {
+        if !s.is_empty()
+            && s.len() <= MAX_PROTOCOL_ID_BYTES
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         {
-            Ok(Self(s.to_string()))
+            Ok(())
         } else {
             Err(InvalidProtocolId)
         }
+    }
+
+    /// Construct a validated protocol identifier from a borrowed string,
+    /// validated before it is copied.
+    pub fn new(s: &str) -> Result<Self, InvalidProtocolId> {
+        Self::validate(s)?;
+        Ok(Self(s.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -50,14 +91,10 @@ impl std::fmt::Display for ProtocolId {
 impl TryFrom<String> for ProtocolId {
     type Error = InvalidProtocolId;
 
+    /// Construct from an owned string, validated and then kept without a
+    /// copy.
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value.is_empty()
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err(InvalidProtocolId);
-        }
+        Self::validate(&value)?;
         Ok(Self(value))
     }
 }
@@ -76,6 +113,16 @@ pub fn namespace_alias_key(name: &str, protocol: Option<&ProtocolId>) -> String 
     format!("{}\0{name}", protocol.map_or("", ProtocolId::as_str))
 }
 
+/// Bytes [`namespace_alias_key`] of `name` within `protocol` holds, computed
+/// before anything is allocated: the protocol, its separator and the name.
+/// At most [`MAX_ALIAS_KEY_BYTES`] for a valid name.
+pub fn namespace_alias_key_len(name: &str, protocol: Option<&ProtocolId>) -> usize {
+    protocol
+        .map_or(0, |protocol| protocol.as_str().len())
+        .saturating_add(1)
+        .saturating_add(name.len())
+}
+
 // dCBOR: ProtocolId encodes as a text string.
 impl From<ProtocolId> for CBOR {
     fn from(p: ProtocolId) -> Self {
@@ -91,9 +138,54 @@ impl From<&ProtocolId> for CBOR {
 
 impl TryFrom<CBOR> for ProtocolId {
     type Error = dcbor::Error;
+    /// Canonical decoding: the decoded string validated by the one
+    /// validation and kept without a copy.
     fn try_from(cbor: CBOR) -> Result<Self, dcbor::Error> {
         let s: String = cbor.try_into()?;
-        Self::new(&s).map_err(|_| dcbor::Error::WrongType)
+        Self::try_from(s).map_err(|_| dcbor::Error::WrongType)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LogicalIncarnation
+// ---------------------------------------------------------------------------
+
+/// The logical incarnation of one namespace instance: what its transition
+/// domains, admissions, receipts, authority and namespace-state records
+/// bind beside the namespace identity.
+///
+/// Opaque: no byte pattern carries meaning and none is refused. A backend
+/// issues the live value from its namespace-instance accessor, and a
+/// historical context (replay, settlement, custody) decodes it from the
+/// authenticated record it carries; every consumer compares it for exact
+/// correspondence and nothing else. It is a distinct type from any
+/// physical storage identity, so an interface taking it cannot be handed a
+/// storage identifier by mistake. Construction is unrestricted: the type
+/// marks the role of a value, it does not prove where the value came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LogicalIncarnation([u8; 16]);
+
+impl LogicalIncarnation {
+    /// The incarnation whose representation is `bytes`.
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The representation records carry.
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Whether `bytes`, an incarnation a record carries, names exactly this
+    /// incarnation.
+    pub fn names(&self, bytes: &[u8]) -> bool {
+        bytes == self.0.as_slice()
+    }
+}
+
+impl std::fmt::Display for LogicalIncarnation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&hex::encode(self.0))
     }
 }
 
@@ -290,7 +382,46 @@ mod tests {
             namespace_alias_key("a", None)
         );
         assert_eq!(namespace_alias_key("repo", Some(&protocol)), "git\0repo");
+        for (name, scope) in [("repo", Some(&protocol)), ("a\0b", None), ("", None)] {
+            assert_eq!(
+                namespace_alias_key_len(name, scope),
+                namespace_alias_key(name, scope).len(),
+                "{name:?}: the length is the framed key's"
+            );
+        }
+        let longest_protocol = ProtocolId::new(&"p".repeat(MAX_PROTOCOL_ID_BYTES))?;
+        let longest_name = "n".repeat(MAX_ALIAS_NAME_BYTES);
+        assert!(validate_alias_name(&longest_name).is_ok());
+        assert_eq!(
+            namespace_alias_key(&longest_name, Some(&longest_protocol)).len(),
+            MAX_ALIAS_KEY_BYTES,
+            "the longest valid alias frames to the key bound exactly"
+        );
         Ok(())
+    }
+
+    /// Alias names and protocol identifiers outside their format limits
+    /// are refused by the one validation of each.
+    #[test]
+    fn format_limits_are_enforced() {
+        assert!(validate_alias_name("").is_err());
+        assert!(validate_alias_name("a\0b").is_err());
+        assert!(validate_alias_name(&"n".repeat(MAX_ALIAS_NAME_BYTES + 1)).is_err());
+        assert!(ProtocolId::new(&"p".repeat(MAX_PROTOCOL_ID_BYTES + 1)).is_err());
+        assert!(ProtocolId::try_from("p".repeat(MAX_PROTOCOL_ID_BYTES + 1)).is_err());
+    }
+
+    /// Borrowed, owned and decoded construction refuse and accept exactly
+    /// the same identifiers.
+    #[test]
+    fn every_protocol_construction_shares_one_validation() {
+        for candidate in ["oci", "my-protocol-v2", "", "OCI", "a b", "a_b", "\u{e9}"] {
+            let borrowed = ProtocolId::new(candidate).is_ok();
+            let owned = ProtocolId::try_from(candidate.to_owned()).is_ok();
+            let decoded = ProtocolId::try_from(CBOR::from(candidate)).is_ok();
+            assert_eq!(borrowed, owned, "{candidate:?}");
+            assert_eq!(borrowed, decoded, "{candidate:?}");
+        }
     }
 
     #[test]
@@ -380,6 +511,27 @@ mod tests {
         let recovered: ProtocolId = cbor.try_into()?;
         assert_eq!(recovered, id);
         Ok(())
+    }
+
+    /// Every representation round-trips unchanged and corresponds only to
+    /// itself: no value is reserved or refused.
+    #[test]
+    fn logical_incarnation_is_opaque_and_exact() {
+        for bytes in [[0u8; 16], [7; 16], [0xff; 16]] {
+            let incarnation = LogicalIncarnation::from_bytes(bytes);
+            assert_eq!(incarnation.as_bytes(), &bytes);
+            assert!(incarnation.names(&bytes));
+        }
+        let incarnation = LogicalIncarnation::from_bytes([7; 16]);
+        assert!(!incarnation.names(&[8; 16]));
+        assert!(
+            !incarnation.names(&[7; 15]),
+            "a shorter value is another value"
+        );
+        assert!(
+            !incarnation.names(&[7; 17]),
+            "a longer value is another value"
+        );
     }
 
     #[test]

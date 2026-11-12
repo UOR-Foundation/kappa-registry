@@ -18,6 +18,7 @@
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
+use kappa_store::identity_ops::{credential_grace_live, session_expired};
 use kappa_store::identity_scope::session_id;
 use kappa_store::traits::identity::CredentialLookup;
 use kappa_types::clock::ClockMs;
@@ -34,9 +35,14 @@ use super::view::{CredentialRecord, NamespaceView, SessionRecord};
 /// Session rows one eviction call examines.
 pub const EVICTION_BATCH: usize = 1024;
 
-/// Whether a session whose deadline is `expires_at_ms` is expired at `now`.
-pub const fn session_expired(expires_at_ms: i64, now: ClockMs) -> bool {
-    now.as_i64() > expires_at_ms
+impl kappa_crypto::sigv4::CredentialLookup for InMemoryStore {
+    fn lookup_credential(
+        &self,
+        access_key_id: &str,
+        now: ClockMs,
+    ) -> Result<kappa_crypto::sigv4::CredentialResult, StoreError> {
+        kappa_store::identity_ops::access_key_lookup(self, access_key_id, now)
+    }
 }
 
 /// The revision of `key`'s row in `view`, if the view holds it.
@@ -55,7 +61,7 @@ fn filter_grace(row: CredentialRecord, now: ClockMs) -> CredentialLookup {
     (
         anchor,
         secret,
-        grace.filter(|(_, expires)| now.as_i64() < *expires),
+        grace.filter(|(_, expires)| credential_grace_live(*expires, now)),
     )
 }
 
@@ -236,13 +242,38 @@ impl ReadCx<'_> {
         })
     }
 
+    /// The session under `token` when it is live at the execution's time:
+    /// `(anchor, metadata)`. The row is recorded as observed, expired or
+    /// not; a live session is also recorded as the time-bounded
+    /// authorization it grants, which the publication's installation time
+    /// must still satisfy.
+    pub fn live_session(&self, token: &str) -> Option<(Kappa, Vec<u8>)> {
+        let (anchor, expires_at_ms, metadata) = self.session_row(token)?;
+        if session_expired(expires_at_ms, self.now) {
+            return None;
+        }
+        self.depend(Dependency::Live {
+            key: ClaimKey::Session(session_id(token)),
+            expires_at_ms,
+        });
+        Some((anchor, metadata))
+    }
+
     pub fn credential_row(&self, credential_id: &str) -> Option<CredentialLookup> {
         let now = self.now;
-        self.authorization(ClaimKey::Credential(credential_id.to_owned()), |view| {
-            view.authorization
-                .credentials
-                .get(credential_id)
-                .map(|row| (filter_grace(row.value.clone(), now), row.revision))
-        })
+        let credential =
+            self.authorization(ClaimKey::Credential(credential_id.to_owned()), |view| {
+                view.authorization
+                    .credentials
+                    .get(credential_id)
+                    .map(|row| (filter_grace(row.value.clone(), now), row.revision))
+            })?;
+        if let Some((_, expires_at_ms)) = &credential.2 {
+            self.depend(Dependency::Grace {
+                key: ClaimKey::Credential(credential_id.to_owned()),
+                expires_at_ms: *expires_at_ms,
+            });
+        }
+        Some(credential)
     }
 }

@@ -70,36 +70,6 @@ impl NamespaceStorage {
         &self.inner.planes
     }
 
-    /// Every namespace with storage on disk, by identity. Bounded by the
-    /// directory listing; used by the index repair, which rebuilds every
-    /// namespace's derived indexes.
-    pub(crate) fn on_disk(&self) -> Result<Vec<[u8; 16]>, StoreError> {
-        let dir = self.inner.root.join("namespaces");
-        let mut ids = Vec::new();
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
-            Err(error) => return Err(StoreError::Io(error)),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Ok(bytes) = hex::decode(&name) else {
-                continue;
-            };
-            let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) else {
-                continue;
-            };
-            if NamespaceController::database_path(&entry.path()).exists() {
-                ids.push(id);
-            }
-        }
-        ids.sort_unstable();
-        Ok(ids)
-    }
-
     /// The controller of `id` if it is open. Opening is admission's
     /// (`storage_handles`); write helpers inside an execution find it here.
     pub(crate) fn open_controller(&self, id: &[u8; 16]) -> Option<Arc<NamespaceController>> {

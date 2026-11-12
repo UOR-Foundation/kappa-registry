@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
 md-5 = "0.11"
+crc-fast = "1"
 bytes = "1"
 quick-xml = { version = "0.42", features = ["serialize"] }
 base64-simd = "0.8"

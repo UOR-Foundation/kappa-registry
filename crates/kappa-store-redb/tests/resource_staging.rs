@@ -269,8 +269,10 @@ fn exercise_repeated_components(store: &(impl Staging + ?Sized)) -> TestResult {
     let whole = [&part[..], &part[..]].concat();
     assert_eq!(assembled, Kappa::sha256(&whole));
     assert_eq!(store.blob_get(&assembled)?, whole);
+    let repair = store.repair_indexes(&kappa_store::work::WorkLimit::unbounded(), None)?;
+    assert!(repair.complete());
     assert_eq!(
-        store.repair_indexes()?,
+        repair.outcome,
         kappa_store::IndexRepair::default(),
         "a repeated component is not divergence"
     );
@@ -291,7 +293,9 @@ fn exercise_repeated_components(store: &(impl Staging + ?Sized)) -> TestResult {
         pending = retained;
     }
     assert!(pending.is_empty(), "identities never retired: {pending:?}");
-    assert_eq!(store.repair_indexes()?, kappa_store::IndexRepair::default());
+    let repair = store.repair_indexes(&kappa_store::work::WorkLimit::unbounded(), None)?;
+    assert!(repair.complete());
+    assert_eq!(repair.outcome, kappa_store::IndexRepair::default());
     Ok(())
 }
 
@@ -350,11 +354,21 @@ fn memory_resources_stage_complete_replay_and_release() -> TestResult {
 
 #[test]
 fn persistent_resources_stage_complete_replay_and_release() -> TestResult {
-    let store = kappa_store_redb::test_support::persistent_store()?;
-    exercise(store.store())?;
-    assert_eq!(
-        staging_dirs(store.blob_root())?,
-        Vec::<std::path::PathBuf>::new()
-    );
+    for encrypted in [false, true] {
+        let spec = kappa_store_redb::test_support::PersistentSpec::new()
+            .in_root(&kappa_fixture::FixtureRoot::temporary()?);
+        let spec = if encrypted {
+            spec.encryption_key([7; 32])
+        } else {
+            spec
+        };
+        let store = spec.acquire()?;
+        exercise(store.store())?;
+        assert_eq!(
+            staging_dirs(store.blob_root())?,
+            Vec::<std::path::PathBuf>::new(),
+            "encrypted={encrypted}"
+        );
+    }
     Ok(())
 }

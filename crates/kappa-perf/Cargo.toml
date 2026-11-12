@@ -28,6 +28,8 @@ sha2 = { workspace = true }
 sha3 = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
+# The run seed when `KAPPA_PERF_SEED` is absent.
+getrandom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -96,6 +98,11 @@ harness = false
 [[bench]]
 name = "http"
 path = "benches/v1/http.rs"
+harness = false
+
+[[bench]]
+name = "failure"
+path = "benches/v1/failure.rs"
 harness = false
 
 [lints]

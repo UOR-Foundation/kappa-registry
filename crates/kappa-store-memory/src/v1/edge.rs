@@ -3,19 +3,20 @@ use std::ops::Bound::{Excluded, Unbounded};
 use imbl::{OrdMap, OrdSet};
 use kappa_cursor::{KappaCursor, SliceCursor};
 use kappa_store::EdgeStore;
+use kappa_store::transition::RecordTransition;
 use kappa_types::canonical::canonical_bytes;
 use kappa_types::edge::{Direction, Edge, EdgeInput, EdgeQuery};
 use kappa_types::page::{Page, PageRequest};
-use kappa_types::{Axis, Kappa, MutationOp, NamespaceRef, StoreError, VerifiedContent};
+use kappa_types::{Axis, Kappa, NamespaceRef, StoreError};
 
 use super::InMemoryStore;
-use super::execution::WriteCx;
+use super::execution::{MemoryPayload, WriteCx};
 use super::view::NamespaceView;
 
 /// Namespace-local records and indexes, published together with the
 /// namespace view. Index keys retain complete identities; shortened hashes
 /// are never authoritative here.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct EdgeState {
     records: OrdMap<Kappa, Edge>,
     outbound: OrdMap<Kappa, OrdSet<Kappa>>,
@@ -25,6 +26,11 @@ pub struct EdgeState {
 }
 
 impl EdgeState {
+    /// The edge records: the rows every other map here indexes.
+    pub(crate) const fn records(&self) -> &OrdMap<Kappa, Edge> {
+        &self.records
+    }
+
     pub(crate) fn insert(&mut self, edge: Edge) -> bool {
         if self.records.contains_key(&edge.kappa) {
             return false;
@@ -181,36 +187,58 @@ impl EdgeState {
 }
 
 impl WriteCx<'_> {
-    /// Admit an edge's record, index it, and record `EdgePut` when the
-    /// namespace did not already hold it.
+    /// Add an edge to the namespace's membership through an `EdgePut`
+    /// transition, whose evidence is the edge's own record, unless the
+    /// namespace already holds it.
     pub fn edge_put(&mut self, input: &EdgeInput) -> Result<Kappa, StoreError> {
-        let content = VerifiedContent::compute(Axis::Sha256, &canonical_bytes(input))?;
-        self.publish_content(&content)?;
-        let edge = Edge {
-            kappa: content.kappa().clone(),
-            input: input.clone(),
-        };
-        if self.view.edges.insert(edge) {
-            self.record(
-                MutationOp::EdgePut,
-                content.kappa().clone(),
-                Some(input.relation.to_string()),
-            );
+        let kappa = Kappa::compute(Axis::Sha256, &canonical_bytes(input))?;
+        if !self.view.edges.records().contains_key(&kappa) {
+            self.apply_record_transition(
+                RecordTransition::EdgePut(input.clone()),
+                MemoryPayload::NoResources,
+            )?;
         }
-        Ok(content.kappa().clone())
+        Ok(kappa)
     }
 
     /// Remove the edge from the namespace's membership. Its record stays
-    /// admitted: the ledger that recorded the edge names it, and history is
-    /// retained; retiring the record is a separate, explicit retirement.
-    pub fn edge_delete(&mut self, identity: &Kappa) {
-        if let Some(edge) = self.view.edges.remove(identity) {
-            self.record(
-                MutationOp::EdgeDelete,
-                identity.clone(),
-                Some(edge.relation().to_string()),
-            );
+    /// retained as evidence: the ledgers that recorded the edge name it.
+    pub fn edge_delete(&mut self, identity: &Kappa) -> Result<(), StoreError> {
+        if let Some(edge) = self.view.edges.records().get(identity).cloned() {
+            self.apply_record_transition(
+                RecordTransition::EdgeDelete(edge.input),
+                MemoryPayload::NoResources,
+            )?;
         }
+        Ok(())
+    }
+
+    /// Index the edge whose record is `evidence`. Called only by
+    /// `apply_write`.
+    pub(super) fn apply_edge_put(
+        &mut self,
+        evidence: &Kappa,
+        input: EdgeInput,
+    ) -> Result<(), StoreError> {
+        if !self.view.edges.insert(Edge {
+            kappa: evidence.clone(),
+            input,
+        }) {
+            return Err(StoreError::Internal(format!(
+                "edge {evidence} added twice to one candidate"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Remove the edge whose record is `evidence` from membership. Called
+    /// only by `apply_write`.
+    pub(super) fn apply_edge_delete(&mut self, evidence: &Kappa) -> Result<(), StoreError> {
+        self.view.edges.remove(evidence).map(drop).ok_or_else(|| {
+            StoreError::Internal(format!(
+                "edge {evidence} removed from a candidate that does not hold it"
+            ))
+        })
     }
 }
 

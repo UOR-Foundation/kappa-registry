@@ -22,7 +22,7 @@ fn physical_bytes(size: usize) -> u64 {
 /// publication that regresses to waiting on it fails here instead of
 /// hanging the suite.
 fn while_blocked<T: Send + 'static>(
-    blocker: redb::WriteTransaction,
+    blocker: crate::registry::RegistryWrite,
     publication: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Box<dyn std::error::Error>> {
     let (done, completion) = mpsc::channel();

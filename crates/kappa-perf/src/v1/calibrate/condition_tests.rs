@@ -145,6 +145,47 @@ fn reference_and_multi_object_conditions_apply_to_digests_and_crypto() -> TestRe
 }
 
 #[test]
+fn outcome_interference_and_fault_conditions_apply_where_they_are_measured() -> TestResult {
+    Conditions::parse("backend=redb&durability=immediate&mutations=1&outcome=refused_capacity")?
+        .check_applicable(&["store"])?;
+    Conditions::parse("interference=gc_sweep")?.check_applicable(&["store"])?;
+    Conditions::parse("backend=redb&crash_at=namespace&fault=crash&io=fault&pending=64")?
+        .check_applicable(&["recovery"])?;
+    Conditions::parse("backend=redb&budget=8&fault=none&io=file&pending=64")?
+        .check_applicable(&["settlement"])?;
+    Conditions::parse("io=file&outcome=admitted_after_settlement")?.check_applicable(&["store"])?;
+    Conditions::parse("divergence=10&keys=100000")?.check_applicable(&["reconcile"])?;
+    for (raw, domain) in [
+        ("outcome=admitted", "recovery"),
+        ("fault=crash", "http"),
+        ("pending=1", "store"),
+        ("budget=1", "store"),
+        ("divergence=1", "store"),
+        ("interference=none", "recovery"),
+        ("crash_at=registry", "store"),
+        ("io=fault", "http"),
+    ] {
+        assert!(
+            matches!(
+                Conditions::parse(raw)?.check_applicable(&[domain]),
+                Err(ConditionError::NotApplicable { .. })
+            ),
+            "{raw} must not apply to {domain}"
+        );
+    }
+    for bad in ["outcome=ok", "fault=power_loss", "interference=1w"] {
+        assert!(
+            matches!(
+                Conditions::parse(bad),
+                Err(ConditionError::InvalidValue { .. })
+            ),
+            "{bad} must be rejected"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn superset_and_typed_accessors() -> TestResult {
     let specific = Conditions::parse("backend=redb&size=64k")?;
     let general = Conditions::parse("backend=redb")?;

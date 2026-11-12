@@ -1,4 +1,5 @@
-//! Ordered cursor trait and set-algebra combinators.
+//! Ordered cursor trait and set-algebra combinators, and the ordered byte
+//! intervals every index traversal is bounded by (`interval`).
 //!
 //! This crate defines `KappaCursor` -- the streaming iteration
 //! interface over sorted byte sequences -- and the combinators
@@ -20,6 +21,7 @@ mod empty;
 mod fallible;
 mod filtered;
 mod intersection;
+pub mod interval;
 mod once;
 mod slice;
 mod union;

@@ -93,16 +93,7 @@ where
     }
 
     let snapshot = mst.snapshot().map_err(|e| format!("mst snapshot: {e}"))?;
-
-    let page_ranges: Vec<PageRangeWire> = snapshot
-        .snapshot
-        .iter()
-        .map(|pr| PageRangeWire {
-            start: pr.start().clone(),
-            end: pr.end().clone(),
-            hash: *pr.hash().as_bytes(),
-        })
-        .collect();
+    let page_ranges: Vec<PageRangeWire> = snapshot.to_wire();
 
     encode_response(
         PROTO_MST_SNAPSHOT_RESP,

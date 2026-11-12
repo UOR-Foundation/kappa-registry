@@ -18,3 +18,10 @@ dcbor = { workspace = true }
 merkle-search-tree = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

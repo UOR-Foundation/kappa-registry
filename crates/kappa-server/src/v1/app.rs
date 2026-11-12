@@ -276,6 +276,7 @@ fn spawn_background(
             clock.clone(),
             cfg.inventory_interval_secs,
             cfg.inventory_batch,
+            cfg.maintenance,
         )),
     ];
     if !cfg.federation_peers.is_empty() {

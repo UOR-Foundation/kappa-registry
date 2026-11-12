@@ -31,6 +31,30 @@ impl Slot {
     }
 }
 
+/// Whether the store's activity capacity admitted one more activity: the
+/// admitted value, or `Full` at `limit` activities. Capacity is a condition
+/// of the store, not a failure of the namespace's storage: callers that must
+/// tell them apart (settlement, recovery, reclamation) keep the type, and
+/// callers that report it convert it at their boundary
+/// ([`Self::or_refused`]).
+pub(crate) enum ActivityAdmission<T> {
+    Admitted(T),
+    Full { limit: usize },
+}
+
+impl<T> ActivityAdmission<T> {
+    /// The admitted value, or the capacity refusal a caller reporting one
+    /// returns.
+    pub(crate) fn or_refused(self) -> Result<T, StoreError> {
+        match self {
+            Self::Admitted(value) => Ok(value),
+            Self::Full { limit } => Err(StoreError::CapacityExceeded(format!(
+                "{limit} namespace activities are active; admission refused"
+            ))),
+        }
+    }
+}
+
 /// Reserve capacity before opening storage. Every error path releases it;
 /// success transfers it into Active until the caller releases that activity.
 ///
@@ -58,22 +82,20 @@ impl ActivityReservation {
         }
     }
 
-    fn acquire(inner: &Arc<NamespaceStorageInner>) -> Result<Self, StoreError> {
-        inner
+    fn acquire(inner: &Arc<NamespaceStorageInner>) -> ActivityAdmission<Self> {
+        match inner
             .active_total
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < inner.max_active).then(|| active + 1)
-            })
-            .map_err(|_| {
-                StoreError::CapacityExceeded(format!(
-                    "{} namespace activities are active; admission refused",
-                    inner.max_active
-                ))
-            })?;
-        Ok(Self {
-            inner: Arc::clone(inner),
-            admitted: false,
-        })
+            }) {
+            Ok(_) => ActivityAdmission::Admitted(Self {
+                inner: Arc::clone(inner),
+                admitted: false,
+            }),
+            Err(_) => ActivityAdmission::Full {
+                limit: inner.max_active,
+            },
+        }
     }
 }
 
@@ -92,7 +114,22 @@ impl Drop for ActivityReservation {
 impl NamespaceStorage {
     /// Hold `id` open to read its committed state.
     pub(crate) fn admit_read(&self, id: &[u8; 16]) -> Result<Active<Read>, StoreError> {
-        self.admit(id, &Opening::Existing)
+        self.try_admit_read(id)?.or_refused()
+    }
+
+    /// Hold `id` open to read its committed state, or `Full` while the
+    /// store's activity capacity is exhausted. A lifecycle refusal and a
+    /// failure to open the storage are errors.
+    pub(crate) fn try_admit_read(
+        &self,
+        id: &[u8; 16],
+    ) -> Result<ActivityAdmission<Active<Read>>, StoreError> {
+        match self.try_admit::<Read>(id, &Opening::Existing)? {
+            ActivityAdmission::Admitted(admitted) => admitted
+                .map(ActivityAdmission::Admitted)
+                .map_err(|refusal| refusal.into_error(id)),
+            ActivityAdmission::Full { limit } => Ok(ActivityAdmission::Full { limit }),
+        }
     }
 
     /// Hold `id` open for an execution, creating its storage under
@@ -111,7 +148,10 @@ impl NamespaceStorage {
         &self,
         id: &[u8; 16],
     ) -> Result<Result<Maintenance, Refusal>, StoreError> {
-        let grant = match self.try_admit::<Maintain>(id, &Opening::Existing)? {
+        let grant = match self
+            .try_admit::<Maintain>(id, &Opening::Existing)?
+            .or_refused()?
+        {
             Ok(grant) => grant,
             Err(refusal) => return Ok(Err(refusal)),
         };
@@ -119,14 +159,18 @@ impl NamespaceStorage {
         Ok(grant.standing()?.map(|()| Maintenance::new(gate, grant)))
     }
 
-    /// Hold `id`'s writer gate for maintenance without waiting: `None`
-    /// while a writer holds it or a retirement intent holds the namespace,
-    /// both of which end on their own.
+    /// Hold `id`'s writer gate for maintenance without waiting: `None` when
+    /// the capacity or exclusion maintenance needs is not available now
+    /// (every namespace activity of the store is held, a writer holds the
+    /// gate, or a retirement intent holds the namespace), each of which
+    /// ends on its own. A lifecycle that refuses maintenance for good, and
+    /// storage that fails to open, are errors.
     pub(crate) fn try_maintain(&self, id: &[u8; 16]) -> Result<Option<Maintenance>, StoreError> {
         let grant = match self.try_admit::<Maintain>(id, &Opening::Existing)? {
-            Ok(grant) => grant,
-            Err(Refusal::Retiring) => return Ok(None),
-            Err(refusal) => return Err(refusal.into_error(id)),
+            ActivityAdmission::Full { .. } => return Ok(None),
+            ActivityAdmission::Admitted(Ok(grant)) => grant,
+            ActivityAdmission::Admitted(Err(Refusal::Retiring)) => return Ok(None),
+            ActivityAdmission::Admitted(Err(refusal)) => return Err(refusal.into_error(id)),
         };
         let Some(gate) = WriterGate::try_hold(grant.controller())? else {
             return Ok(None);
@@ -138,21 +182,29 @@ impl NamespaceStorage {
         }
     }
 
-    /// Admit an activity of `id` for `P`; a refusal is its error.
+    /// Admit an activity of `id` for `P`; a capacity or lifecycle refusal
+    /// is its error.
     fn admit<P: Purpose>(&self, id: &[u8; 16], opening: &Opening) -> Result<Active<P>, StoreError> {
         self.try_admit(id, opening)?
+            .or_refused()?
             .map_err(|refusal| refusal.into_error(id))
     }
 
     /// Admit an activity of `id` for `P` under its slot's lifecycle,
-    /// opening its storage when the slot holds none: the grant, or the
-    /// lifecycle's refusal.
+    /// opening its storage when the slot holds none: `Full` when the
+    /// store's activity capacity is exhausted (nothing opened), otherwise
+    /// the grant or the lifecycle's refusal. Three facts stay distinct:
+    /// capacity unavailable, the lifecycle refusing the purpose, and the
+    /// storage failing to open (the error).
     fn try_admit<P: Purpose>(
         &self,
         id: &[u8; 16],
         opening: &Opening,
-    ) -> Result<Result<Active<P>, Refusal>, StoreError> {
-        let mut reservation = ActivityReservation::acquire(&self.inner)?;
+    ) -> Result<ActivityAdmission<Result<Active<P>, Refusal>>, StoreError> {
+        let mut reservation = match ActivityReservation::acquire(&self.inner) {
+            ActivityAdmission::Admitted(reservation) => reservation,
+            ActivityAdmission::Full { limit } => return Ok(ActivityAdmission::Full { limit }),
+        };
         // The map guard ends here. Filesystem I/O is protected only by this
         // namespace's slot; unrelated namespaces can open concurrently.
         let slot = Arc::clone(self.inner.open.entry(*id).or_default().value());
@@ -160,13 +212,17 @@ impl NamespaceStorage {
         let stamp = self.inner.uses.fetch_add(1, Ordering::Relaxed);
         let controller = match self.opened(&mut held, id, opening, P::USE, stamp)? {
             Ok(controller) => controller,
-            Err(refusal) => return Ok(Err(refusal)),
+            Err(refusal) => return Ok(ActivityAdmission::Admitted(Err(refusal))),
         };
         reservation.admit(&controller);
         controller.last_used.store(stamp, Ordering::Release);
         drop(held);
         self.evict_idle();
-        Ok(Ok(Active::new(controller, slot, reservation)))
+        Ok(ActivityAdmission::Admitted(Ok(Active::new(
+            controller,
+            slot,
+            reservation,
+        ))))
     }
 
     /// The controller `held` serves `purpose` with, opening the storage,

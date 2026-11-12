@@ -90,6 +90,14 @@ impl WriterGate {
     }
 }
 
+impl WriterToken {
+    /// The storage instance whose publication this token owns: the one
+    /// whose durable records only its holder writes (`custody`).
+    pub(crate) fn instance(&self) -> &crate::storage_instance::StorageInstance {
+        &self.controller.instance
+    }
+}
+
 impl Drop for WriterToken {
     fn drop(&mut self) {
         let gate = &self.controller.writer_gate;

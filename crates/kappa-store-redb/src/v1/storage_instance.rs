@@ -34,6 +34,10 @@ use kappa_store::StoreError;
 /// Bytes of an incarnation.
 pub const INCARNATION_LEN: usize = 16;
 
+/// Longest instance key ([`StorageInstance::key`]): the namespace and a
+/// known incarnation.
+pub const MAX_INSTANCE_KEY_BYTES: usize = 16 + INCARNATION_LEN;
+
 /// The incarnation of a storage instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Incarnation {
@@ -109,6 +113,18 @@ impl StorageInstance {
         self.incarnation
     }
 
+    /// The known incarnation of this instance, for `purpose`: what shared
+    /// transitions, receipts and publications bind. Storage of unknown
+    /// incarnation has none, and `purpose` is refused there.
+    pub fn known_incarnation(&self, purpose: &str) -> Result<[u8; INCARNATION_LEN], StoreError> {
+        match self.incarnation {
+            Incarnation::Known(incarnation) => Ok(incarnation),
+            Incarnation::Unknown => Err(StoreError::Rejected(format!(
+                "{purpose} requires a known incarnation of {self}"
+            ))),
+        }
+    }
+
     /// How storage of instance `self` relates to `named`, the instance a
     /// record names. Symmetric.
     pub fn identify(&self, named: &Self) -> Identification {
@@ -126,14 +142,21 @@ impl StorageInstance {
         }
     }
 
-    /// The instance key: `[namespace:16]` or `[namespace:16][incarnation:16]`.
+    /// The instance key: `[namespace:16]` or `[namespace:16][incarnation:16]`,
+    /// allocated at exactly [`Self::key_len`] bytes.
     pub fn key(&self) -> Vec<u8> {
-        let mut key = Vec::with_capacity(16 + INCARNATION_LEN);
-        key.extend_from_slice(&self.namespace);
-        if let Incarnation::Known(incarnation) = &self.incarnation {
-            key.extend_from_slice(incarnation);
-        }
+        let mut key = Vec::with_capacity(usize::from(self.key_len()));
+        self.append_key(&mut key);
         key
+    }
+
+    /// Append the instance key to `out` without allocating anything else:
+    /// the one encoding of an instance key, for every key that embeds it.
+    pub fn append_key(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.namespace);
+        if let Incarnation::Known(incarnation) = &self.incarnation {
+            out.extend_from_slice(incarnation);
+        }
     }
 
     /// Bytes of [`Self::key`], as the one length byte a projection key

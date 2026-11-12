@@ -155,10 +155,14 @@ impl Owner {
 }
 
 /// Write the owner marker of `allocation`, exclusively: an allocation is
-/// installed once, by one namespace, so a marker that already exists is a
-/// second installation and is refused. The marker and its directory entry
-/// are synced when `fsync`, so it survives a crash that the row's commit
-/// survives.
+/// installed once, by one namespace, so a marker naming another installer
+/// is a second installation and is refused. A marker naming exactly
+/// `owner` is that installation's own, left by an attempt whose transaction
+/// did not commit and which a retained publication's replay installs again
+/// (`custody`). The marker and its directory entry are synced when `fsync`,
+/// so it survives a crash that the row's commit survives: a reused marker is
+/// synced exactly as a new one, since its presence says nothing about
+/// whether an earlier attempt's sync completed.
 pub fn write_owner_marker(
     blob_root: &Path,
     allocation: &AllocationId,
@@ -166,17 +170,24 @@ pub fn write_owner_marker(
     fsync: bool,
 ) -> Result<(), StoreError> {
     let path = owner_path(blob_root, allocation);
-    let mut file = private_create_new().open(&path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            StoreError::Internal(format!(
-                "allocation {} already records an installer",
-                allocation.hex()
-            ))
-        } else {
-            StoreError::Io(error)
+    let file = match private_create_new().open(&path) {
+        Ok(mut file) => {
+            std::io::Write::write_all(&mut file, &owner.encode())?;
+            file
         }
-    })?;
-    std::io::Write::write_all(&mut file, &owner.encode())?;
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match read_owner_marker(blob_root, allocation)? {
+                Some(held) if held == *owner => File::open(&path)?,
+                _ => {
+                    return Err(StoreError::Internal(format!(
+                        "allocation {} already records another installer",
+                        allocation.hex()
+                    )));
+                }
+            }
+        }
+        Err(error) => return Err(StoreError::Io(error)),
+    };
     if fsync {
         file.sync_all()?;
         if let Some(parent) = path.parent() {
@@ -186,17 +197,41 @@ pub fn write_owner_marker(
     Ok(())
 }
 
+/// The largest owner marker: a 32-byte instance key and the longest
+/// identity key, an axis discriminant and a 64-byte (SHA-512) digest.
+pub const MAX_OWNER_MARKER_BYTES: u64 = 32 + 1 + 64;
+
 /// The owner marker of `allocation`: `None` when no installation ever
-/// wrote one.
+/// wrote one. At most [`MAX_OWNER_MARKER_BYTES`] are read; a longer file
+/// is refused without being read further.
 pub fn read_owner_marker(
     blob_root: &Path,
     allocation: &AllocationId,
 ) -> Result<Option<Owner>, StoreError> {
-    match fs::read(owner_path(blob_root, allocation)) {
-        Ok(bytes) => Owner::decode(&bytes).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(StoreError::Io(error)),
+    let mut file = match File::open(owner_path(blob_root, allocation)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::Io(error)),
+    };
+    // The format has a fixed maximum. One extra byte distinguishes an
+    // oversized marker without allocating or reading the rest of the file.
+    let mut bytes = [0u8; MAX_OWNER_MARKER_BYTES as usize + 1];
+    let mut length = 0;
+    while length < bytes.len() {
+        match std::io::Read::read(&mut file, &mut bytes[length..]) {
+            Ok(0) => break,
+            Ok(read) => length += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(StoreError::Io(error)),
+        }
     }
+    if length as u64 > MAX_OWNER_MARKER_BYTES {
+        return Err(StoreError::Internal(format!(
+            "allocation {} owner marker exceeds {MAX_OWNER_MARKER_BYTES} bytes",
+            allocation.hex()
+        )));
+    }
+    Owner::decode(&bytes[..length]).map(Some)
 }
 
 /// Create every shard directory and make the whole directory chain from

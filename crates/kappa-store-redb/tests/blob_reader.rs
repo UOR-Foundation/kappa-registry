@@ -32,6 +32,12 @@ fn seeked_reads_match_original_bytes_across_loaded_and_unloaded_chunks() -> Test
         let kappa = Kappa::sha256(&content);
         assert_eq!(install(store.store(), &ns, &content)?.kappa, kappa);
         let mut reader = store.blob_open(&kappa)?;
+        assert_eq!(reader.stream_position()?, 0);
+        let mut entire = Vec::new();
+        reader.read_to_end(&mut entire)?;
+        assert_eq!(entire, store.blob_get(&kappa)?);
+        assert_eq!(entire, content);
+        assert!(store.blob_open(&Kappa::sha256(b"missing reader")).is_err());
         for position in [
             13,
             BLOB_CHUNK_SIZE + 29,

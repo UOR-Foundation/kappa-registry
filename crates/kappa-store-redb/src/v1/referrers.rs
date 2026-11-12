@@ -19,30 +19,27 @@
 //! entries may be unreachable from every namespace root. Absence alone never
 //! authorizes physical reclamation.
 //!
-//! Authoritative mutations use [`establish`] and [`release`], which assert
-//! the index state the mutation implies and report divergence as an
-//! internal error. The owning execution latches that error and refuses to
-//! publish; a caller must never commit a transaction over it.
-//! A divergence is recorded on the store (`PersistentStore::index_diverged`)
-//! and repaired by maintenance (`MaintenanceStore::repair_indexes`).
-//! Reconstruction (`PersistentStore::rebuild_referrers`, in
-//! `referrers_rebuild.rs`) empties the index and re-derives every entry
-//! with [`rebuild`], which is idempotent.
+//! Authoritative mutations use [`establish`] and [`release`]
+//! (`derived_index`), which assert the index state the mutation implies
+//! and report divergence as an internal error. The owning execution
+//! latches that error and refuses to publish; a caller must never commit a
+//! transaction over it. A divergence is recorded for the namespace
+//! (`PersistentStore::index_diverged`), fences its indexes, and is repaired
+//! by maintenance through a private generation (`index_repair`).
 
 use kappa_cursor::FallibleCursor;
 use kappa_store::{Kappa, NamespaceRef, StoreError};
 use redb::ReadableTableMetadata;
 
 use crate::PersistentStore;
+use crate::derived_index::Generation;
 use crate::namespace_snapshot::NamespaceSnapshot;
-use crate::tables::REFERRERS;
+
+pub use crate::derived_index::{establish, release};
 
 #[cfg(test)]
 #[path = "referrers_tests.rs"]
 mod tests;
-
-#[path = "referrers_rebuild.rs"]
-mod reconstruction;
 
 /// A committed reference to content, with the identity of its source.
 ///
@@ -236,73 +233,6 @@ impl Referrer {
     }
 }
 
-/// Record a reference an authoritative mutation creates. The entry must
-/// not already exist: a present entry means the index has diverged from
-/// the committed state it projects, and the mutation must not commit over
-/// that divergence.
-pub fn establish(
-    store: &PersistentStore,
-    txn: &redb::WriteTransaction,
-    content: &Kappa,
-    referrer: &Referrer,
-) -> Result<(), StoreError> {
-    let key = content.key_bytes();
-    let value = referrer.encode();
-    let present = txn
-        .open_multimap_table(REFERRERS)
-        .map_err(crate::error::redb)?
-        .insert(key.as_slice(), value.as_slice())
-        .map_err(crate::error::redb)?;
-    if present {
-        return Err(store.index_diverged(
-            "REFERRERS",
-            format!("referrer index already held {referrer:?} for {content}"),
-        ));
-    }
-    Ok(())
-}
-
-/// Remove a reference an authoritative mutation retires. The entry must
-/// exist: an absent entry means the index has diverged.
-pub fn release(
-    store: &PersistentStore,
-    txn: &redb::WriteTransaction,
-    content: &Kappa,
-    referrer: &Referrer,
-) -> Result<(), StoreError> {
-    let key = content.key_bytes();
-    let value = referrer.encode();
-    let existed = txn
-        .open_multimap_table(REFERRERS)
-        .map_err(crate::error::redb)?
-        .remove(key.as_slice(), value.as_slice())
-        .map_err(crate::error::redb)?;
-    if !existed {
-        return Err(store.index_diverged(
-            "REFERRERS",
-            format!("referrer index lacked {referrer:?} for {content}"),
-        ));
-    }
-    Ok(())
-}
-
-/// Insert during reconstruction from epoch state. Idempotent: an entry
-/// already present is the expected outcome of replaying a reference that
-/// an earlier pass already indexed.
-pub fn rebuild(
-    txn: &redb::WriteTransaction,
-    content: &Kappa,
-    referrer: &Referrer,
-) -> Result<(), StoreError> {
-    let key = content.key_bytes();
-    let value = referrer.encode();
-    txn.open_multimap_table(REFERRERS)
-        .map_err(crate::error::redb)?
-        .insert(key.as_slice(), value.as_slice())
-        .map_err(crate::error::redb)?;
-    Ok(())
-}
-
 impl PersistentStore {
     /// The committed references to `content` as `ns`'s index holds them,
     /// over a read view retained for the cursor's lifetime: the inspection
@@ -310,13 +240,16 @@ impl PersistentStore {
     /// collector's report, tests). The index is per namespace: a
     /// representation's referrers are those of the namespace that admitted
     /// it. Absence of entries never authorizes reclamation by itself; see
-    /// the module documentation.
+    /// the module documentation. Unavailable while the namespace's indexes
+    /// are known divergent: a list read from them could omit a referrer.
     pub fn referrers_of(
         &self,
         ns: &NamespaceRef,
         content: &Kappa,
     ) -> Result<ReferrerCursor, StoreError> {
-        ReferrerCursor::new(self.namespace_snapshot(ns)?, content)
+        let snapshot = self.namespace_snapshot(ns)?;
+        let generation = self.trusted_snapshot_generation(&snapshot)?;
+        ReferrerCursor::new(snapshot, generation, content)
     }
 }
 
@@ -343,8 +276,12 @@ pub struct ReferrerCursor {
 }
 
 impl ReferrerCursor {
-    fn new(snapshot: NamespaceSnapshot, content: &Kappa) -> Result<Self, StoreError> {
-        let table = snapshot.multimap(REFERRERS)?;
+    fn new(
+        snapshot: NamespaceSnapshot,
+        generation: Generation,
+        content: &Kappa,
+    ) -> Result<Self, StoreError> {
+        let table = snapshot.multimap(generation.referrers())?;
         let key = content.key_bytes();
         let values = table.get(key.as_slice()).map_err(crate::error::redb)?;
         // The multimap's total entry count is a conservative bound on one

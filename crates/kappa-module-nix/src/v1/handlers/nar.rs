@@ -205,6 +205,7 @@ fn deferred_verification(
         content,
         &narinfo.compression,
         &narinfo.nar_hash,
+        narinfo.nar_size,
         &narinfo.references,
     ) {
         Ok(()) => {

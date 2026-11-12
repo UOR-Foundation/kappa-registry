@@ -258,6 +258,7 @@ fn epoch_signing(c: &mut Criterion, s: &mut CalibratedSession) -> BenchResult {
         tag_count: 1_000,
         rotation_kappa: None,
         ledger_root: &ledger,
+        state: &Kappa::sha256(b"crypto-bench-namespace-state"),
     });
     let signed_root = signed_types::sign_epoch(root.clone(), &signer)?;
     let failure = Failure::default();

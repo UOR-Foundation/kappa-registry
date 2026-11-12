@@ -82,7 +82,7 @@ impl PersistentStore {
         };
         let controller = Arc::clone(active.controller());
         let writer = WriterGate::acquire(&active)?;
-        self.recover_namespace_head(&controller)?;
+        self.recover_namespace_head(&controller, &mut self.read_meter())?;
         let txn = controller.db.begin_write().map_err(crate::error::redb)?;
         controller
             .mutation_seq
@@ -94,18 +94,25 @@ impl PersistentStore {
         })
     }
 
-    /// Seal `writer`'s transaction as `ns`'s next epoch, not yet published:
-    /// the stage a schedule drops, inspects or faults before its commit.
-    /// The one test construction of an execution's ownership.
+    /// Prepare `writer`'s transaction as `ns`'s next epoch under the
+    /// installed authority, unsigned and unpublished: the stage a schedule
+    /// drops, inspects or faults before its commit, which consumes no
+    /// coordinate when dropped. The one test construction of an
+    /// execution's ownership.
     pub(crate) fn prepare_test_writer(
         &self,
         writer: TestWriter,
         ns: &NamespaceRef,
         now: ClockMs,
-    ) -> Result<crate::epoch_execution::PreparedEpochPublication<'_>, StoreError> {
+    ) -> Result<
+        crate::epoch_execution::PreparedEpochPublication<'_, crate::epoch::SharedAuthority<'_>>,
+        StoreError,
+    > {
         let controller = Arc::clone(writer.active.controller());
+        let guard = self.shared_authority()?;
         self.prepare_epoch_transaction(
             crate::epoch_execution::ExecutionOwnership {
+                guard,
                 // The seam writes through the transaction directly and
                 // reserves nothing in the directory.
                 directory: crate::namespace_write::DirectoryGuard::new(self, controller),
@@ -114,13 +121,59 @@ impl PersistentStore {
                 release: None,
             },
             writer.txn,
+            crate::epoch_execution::Preparation {
+                namespace: ns,
+                // `test_writer` creates a missing namespace under the local
+                // plane, as a plain execution does.
+                creation: crate::epoch_execution::Creation::LocalDefault,
+                now,
+                signer_override: None,
+                deadline: None,
+                // The allowance an execution of this store is admitted with.
+                meter: kappa_store::work::WorkMeter::new(self.publication_work),
+                reads: Vec::new(),
+                clock: Arc::new(kappa_handler::clock_at(now)?),
+            },
+        )
+        .map_err(|(error, _)| error)
+    }
+
+    /// Prepare and sign `writer`'s transaction as `ns`'s next epoch, its
+    /// custody stored and its records installed, without deciding or
+    /// committing it: the seam that shows a signed root binds only the
+    /// transaction it was sealed in. The writer stays usable; the custody
+    /// record it leaves is the test's to ignore.
+    pub(crate) fn sign_test_writer(
+        &self,
+        writer: &TestWriter,
+        ns: &NamespaceRef,
+        now: ClockMs,
+    ) -> Result<kappa_store::EpochRoot, StoreError> {
+        let guard = self.shared_authority()?;
+        let authority = self.sealing_authority(None)?;
+        let mut meter = kappa_store::work::WorkMeter::unbounded();
+        let (preparation, _) = self.prepare_seal(
+            &writer.txn,
+            writer.active.controller(),
             ns,
-            // `test_writer` creates a missing namespace under the local
-            // plane, as a plain execution does.
-            crate::epoch_execution::Creation::LocalDefault,
             now,
             None,
-        )
+            None,
+            &authority,
+            &mut meter,
+        )?;
+        let completion = self.complete_seal(
+            &writer.writer,
+            &writer.txn,
+            ns,
+            preparation,
+            &authority,
+            None,
+            Vec::new(),
+            &mut meter,
+        )?;
+        drop(guard);
+        Ok(completion.root)
     }
 
     /// Seal and publish `writer`'s transaction as `ns`'s next epoch.
@@ -201,20 +254,28 @@ impl PersistentStore {
         at: ClockMs,
     ) -> Result<VerifiedRetirement, StoreError> {
         let head = self
-            .settled_epoch(instance)?
+            .established_checkpoint(instance)?
             .map(|(epoch_number, root)| ObservedHead { epoch_number, root });
         self.retire_for_test(governing, instance, Disposition::ReleaseLost, head, at)
     }
 
-    /// `resolve_epoch_publication` over `ns`'s controller.
-    pub(crate) fn resolve_publication(
+    /// `resolve_epoch_publication` over `ns`'s controller, under the
+    /// installed authority.
+    pub(crate) fn verify_committed_publication(
         &self,
         ns: &NamespaceRef,
         number: u64,
         identity: &Kappa,
     ) -> Result<(), StoreError> {
         let snapshot = self.namespace_snapshot(ns)?;
-        self.resolve_epoch_publication(snapshot.controller(), ns, number, identity)
+        self.resolve_epoch_publication(
+            snapshot.controller(),
+            ns,
+            number,
+            identity,
+            None,
+            &mut kappa_store::work::WorkMeter::unbounded(),
+        )
     }
 }
 

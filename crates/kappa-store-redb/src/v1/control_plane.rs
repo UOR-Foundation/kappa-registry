@@ -59,7 +59,7 @@ impl ControlPlaneId {
 
 /// Identity of a node in a plane's membership.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, CBORCodable)]
-pub struct NodeId(#[cbor(n = 0)] pub String);
+pub struct NodeId(pub String);
 
 /// The members of a plane under one configuration generation.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -19,10 +19,6 @@ use kappa_types::identity::{
 };
 use kappa_types::kappa::Kappa;
 
-#[cfg(test)]
-#[path = "succession_watermark_tests.rs"]
-mod succession_watermark_tests;
-
 // =========================================================================
 // VerifiedSuccession
 // =========================================================================
@@ -88,10 +84,6 @@ pub fn succession_put<E: ExecutionWrites + ?Sized>(
     execution: &mut E,
     verified: &VerifiedSuccession,
 ) -> Result<Kappa, StoreError> {
-    let succession = verified.inner();
-    if succession.old_anchor == succession.new_anchor {
-        return Err(StoreError::Rejected("cannot succeed to self".into()));
-    }
     execution.succession_put(&verified.inner)
 }
 
@@ -182,40 +174,39 @@ pub fn succession_put_with_default_watermark<E: ExecutionWrites + ?Sized>(
 // Succession (read-only)
 // =========================================================================
 
-/// Anchors from `anchor` to its head: the origin followed by at most
-/// `SUCCESSION_CHAIN_MAX` successors, the bound every backend's
-/// `succession_chain_get` and `verify_succession_chain` enforce.
-fn walk_chain<S: IdentityStore + ?Sized>(
-    store: &S,
+/// Walk at most `SUCCESSION_CHAIN_MAX` links, rejecting any repeated anchor.
+///
+/// The adapter supplies a successor and its output value from one protected
+/// view. Absence terminates the walk; storage errors propagate unchanged.
+/// The origin is not an output link.
+pub fn walk_chain<T>(
     anchor: &Kappa,
-) -> Result<Vec<Kappa>, StoreError> {
-    let mut chain = vec![anchor.clone()];
+    mut successor: impl FnMut(&Kappa) -> Result<Option<(Kappa, T)>, StoreError>,
+) -> Result<Vec<T>, StoreError> {
+    let mut chain = Vec::new();
     let mut current = anchor.clone();
     let mut visited = HashSet::new();
     visited.insert(current.key_bytes());
 
     loop {
-        match store.succession_get(&current) {
-            Ok(next) => {
+        match successor(&current)? {
+            Some((next, value)) => {
                 let next_key = next.key_bytes();
                 if visited.contains(&next_key) {
                     return Err(StoreError::Rejected(format!(
                         "succession cycle detected at {next}"
                     )));
                 }
-                // `chain` holds the origin plus every successor so far, so
-                // its length minus one is the number of links already walked.
-                if chain.len() > SUCCESSION_CHAIN_MAX {
+                if chain.len() >= SUCCESSION_CHAIN_MAX {
                     return Err(StoreError::CapacityExceeded(format!(
                         "succession chain exceeds {SUCCESSION_CHAIN_MAX} links"
                     )));
                 }
                 visited.insert(next_key);
-                chain.push(next.clone());
+                chain.push(value);
                 current = next;
             }
-            Err(StoreError::NotFound(_)) => return Ok(chain),
-            Err(e) => return Err(e),
+            None => return Ok(chain),
         }
     }
 }
@@ -224,7 +215,7 @@ pub fn succession_resolve<S: IdentityStore + ?Sized>(
     store: &S,
     anchor: &Kappa,
 ) -> Result<Kappa, StoreError> {
-    let chain = walk_chain(store, anchor)?;
+    let chain = succession_chain(store, anchor)?;
     chain
         .into_iter()
         .last()
@@ -235,7 +226,12 @@ pub fn succession_chain<S: IdentityStore + ?Sized>(
     store: &S,
     anchor: &Kappa,
 ) -> Result<Vec<Kappa>, StoreError> {
-    walk_chain(store, anchor)
+    let mut chain = vec![anchor.clone()];
+    chain.extend(walk_chain(anchor, |current| {
+        crate::absent(store.succession_get(current))
+            .map(|next| next.map(|next| (next.clone(), next)))
+    })?);
+    Ok(chain)
 }
 
 /// Verify a succession chain from an anchor to its head.
@@ -321,4 +317,61 @@ where
         anchor.clone(),
         links,
     ))
+}
+
+#[cfg(test)]
+#[path = "succession_watermark_tests.rs"]
+mod succession_watermark_tests;
+
+#[cfg(test)]
+mod traversal_tests {
+    use super::*;
+
+    #[test]
+    fn tail_cycle_is_rejected() {
+        let anchors: Vec<_> = (0u8..3).map(|n| Kappa::sha256(&[n])).collect();
+        let result = walk_chain(&anchors[0], |current| {
+            let next = if current == &anchors[0] {
+                &anchors[1]
+            } else if current == &anchors[1] {
+                &anchors[2]
+            } else {
+                &anchors[1]
+            };
+            Ok(Some((next.clone(), ())))
+        });
+        assert!(matches!(result, Err(StoreError::Rejected(_))));
+    }
+
+    #[test]
+    fn exact_limit_terminates_but_one_more_link_is_refused() -> Result<(), StoreError> {
+        let anchors: Vec<_> = (0..SUCCESSION_CHAIN_MAX + 2)
+            .map(|n| Kappa::sha256(&n.to_be_bytes()))
+            .collect();
+        for length in [SUCCESSION_CHAIN_MAX, SUCCESSION_CHAIN_MAX + 1] {
+            let mut position = 0;
+            let result = walk_chain(&anchors[0], |current| {
+                assert_eq!(current, &anchors[position]);
+                if position == length {
+                    return Ok(None);
+                }
+                position += 1;
+                Ok(Some((anchors[position].clone(), position)))
+            });
+            if length == SUCCESSION_CHAIN_MAX {
+                assert_eq!(result?, (1..=length).collect::<Vec<_>>());
+            } else {
+                assert!(matches!(result, Err(StoreError::CapacityExceeded(_))));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn storage_failure_is_not_chain_termination() {
+        let result = walk_chain::<()>(&Kappa::sha256(b"origin"), |_| {
+            Err(StoreError::Unavailable("unreadable successor".into()))
+        });
+        assert!(matches!(result, Err(StoreError::Unavailable(_))));
+    }
 }

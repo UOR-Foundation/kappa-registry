@@ -5,7 +5,7 @@
 //! request addressing the upload, including a replay of its completed
 //! outcome, is checked against the key the upload was created for. Each
 //! part is prepared outside the writer and staged in its slot in one
-//! epoch, with its MD5 as the member receipt so the ETag the client echoes
+//! epoch, with MD5 and CRC checksums in the member receipt so the ETag the client echoes
 //! back is validated against committed state.
 //!
 //! Completion validates the client's part list (ascending, matching ETags,
@@ -14,8 +14,8 @@
 //! parts the client's ETags named are the parts the generation holds: a
 //! concurrent part replacement is serialized by the store's writer either
 //! before this execution (and is what it validates) or after it (and is
-//! refused, admission having closed). The composite ETag (MD5 of the part
-//! count) is computed from that same membership and recorded in the
+//! refused, admission having closed). The composite ETag (MD5 of the
+//! concatenated part MD5s, followed by the part count) is recorded in the
 //! completion binding, so a retry replays it from committed state. The
 //! assembly, the object's tag and its metadata publish in one epoch.
 
@@ -89,7 +89,10 @@ async fn resolve_upload(
         Ok::<_, StoreError>(resource)
     })
     .await
-    .map_err(|_| no_such_upload())
+    .map_err(|error| match error {
+        HandlerError::Store(StoreError::NotFound(_)) => no_such_upload(),
+        error => error,
+    })
 }
 
 /// CreateMultipartUpload. The first write to a missing bucket creates it in
@@ -150,11 +153,16 @@ pub async fn upload_part(
     let id = upload_id(cx)?;
     let data = kappa_handler::read_body(body, super::max_object_body(cx)).await?;
     let resource = resolve_upload(cx, &ns, &key, &id).await?;
-    let md5: [u8; 16] = md5::Md5::digest(&data).into();
     // Reserved from preparation until the stage publishes. The work holds
     // the reservation, so it is returned on the worker after `execute`
     // projected the staged total, never by a dropped request.
     let admission = kappa_handler::staging_budget(cx)?.admit_bytes(data.len() as u64)?;
+    let receipt = blocking({
+        let data = data.clone();
+        move || Ok::<_, StoreError>(super::multipart_list::part_receipt(&data))
+    })
+    .await?;
+    let etag = part_etag(super::multipart_list::part_md5(&receipt)?);
     let prepared = prepare_body(
         cx,
         ContentIdentity::Computed(kappa_store::Axis::Sha256),
@@ -174,9 +182,9 @@ pub async fn upload_part(
                 &resource_id,
                 kappa_handler::take_prepared(&prepared)?,
                 number,
-                Some(md5.to_vec()),
+                Some(receipt.clone()),
             )?;
-            Ok(Outcome::Publish(part_etag(&md5)))
+            Ok(Outcome::Publish(etag.clone()))
         }),
     )
     .await?;
@@ -211,6 +219,8 @@ fn select_parts<'a>(
         ));
     }
     let mut selected = Vec::with_capacity(requested.len());
+    let mut ordered: Vec<_> = members.iter().collect();
+    ordered.sort_unstable_by_key(|member| member.coordinate.position);
     let mut digest = md5::Md5::new();
     let mut previous = 0u64;
     for (index, (number, etag)) in requested.iter().enumerate() {
@@ -224,16 +234,17 @@ fn select_parts<'a>(
         if number <= previous {
             return Err(invalid("InvalidPartOrder", "parts must be ascending"));
         }
-        let member = members
-            .iter()
-            .find(|m| m.coordinate.position == number)
-            .ok_or_else(|| invalid("InvalidPart", &format!("missing part {number}")))?;
+        let index_in_members = ordered
+            .binary_search_by_key(&number, |member| member.coordinate.position)
+            .map_err(|_| invalid("InvalidPart", &format!("missing part {number}")))?;
+        let member = ordered[index_in_members];
         let receipt = member
             .coordinate
             .receipt
             .as_deref()
             .ok_or_else(|| HandlerError::internal("multipart member without an MD5 receipt"))?;
-        if part_etag(receipt).trim_matches('"') != etag.trim_matches('"') {
+        let md5 = super::multipart_list::part_md5(receipt)?;
+        if part_etag(md5).trim_matches('"') != etag.trim_matches('"') {
             return Err(invalid(
                 "InvalidPart",
                 &format!("ETag mismatch for part {number}"),
@@ -245,7 +256,7 @@ fn select_parts<'a>(
                 "nonfinal part is smaller than 5 MiB",
             ));
         }
-        digest.update(receipt);
+        digest.update(md5);
         selected.push(member);
         previous = number;
     }
@@ -308,6 +319,7 @@ pub async fn complete(
             // operation identity binds the completing execution below.
             let asserter = principal(cx);
             let phase = kappa_handler::execute_phase(cx, WriteTarget::existing(ns.clone()), {
+                let client_parts = client_parts.clone();
                 let resource_id = resource_id.clone();
                 let request = request.clone();
                 move |execution| {
@@ -387,6 +399,19 @@ pub async fn complete(
                 WriteTarget::existing(ns.clone()),
                 &body_bytes,
                 move |execution| {
+                    let head = resource::resolve_in(execution, &resource_id)?
+                        .ok_or_else(no_such_upload)?
+                        .head;
+                    let selected = if head.phase == kappa_store::ResourcePhase::Completed {
+                        Vec::new()
+                    } else {
+                        let members = resource::members_in(execution, &head)?;
+                        select_parts(&members, &client_parts)?
+                            .0
+                            .into_iter()
+                            .cloned()
+                            .collect()
+                    };
                     let completed = resource::complete(
                         execution,
                         &asserter,
@@ -400,6 +425,12 @@ pub async fn complete(
                     if completed.replayed {
                         return Ok(Outcome::Discard(receipt_text(&completed.binding)?));
                     }
+                    super::multipart_list::persist_manifest(
+                        execution,
+                        &completed.installed.kappa,
+                        &asserter,
+                        &selected,
+                    )?;
                     execution.tag_put(
                         &object_key,
                         &TagUpdate::Set {

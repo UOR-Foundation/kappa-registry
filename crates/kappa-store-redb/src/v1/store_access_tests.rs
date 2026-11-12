@@ -68,11 +68,31 @@ fn assert_located(
     );
     let root = store.epoch_get(&store.epoch_current(ns)?.1)?;
     let ledger: Vec<EpochMutation> = from_canonical(&store.blob_get(root.ledger_root())?)?;
+    // Ledger identities name transition evidence, not its admitted payload.
+    // Resolve that evidence through the same public identity-only boundary
+    // and independently verify its address and namespace/content binding.
+    let mut admitted = false;
+    for mutation in ledger
+        .iter()
+        .filter(|mutation| mutation.op == kappa_store::epoch::MutationOp::RecordPublish)
+    {
+        let evidence = store.blob_get(&mutation.kappa)?;
+        let verified = VerifiedContent::verify(&mutation.kappa, &evidence)?;
+        let record: kappa_types::content::ContentAdmissionRecord =
+            from_canonical(verified.content())?;
+        if record.admission().identity() == content.kappa() {
+            assert_eq!(record.admission().namespace(), ns.id());
+            assert_eq!(record.admission().logical_size(), bytes.len() as u64);
+            assert!(matches!(
+                record.evidence(),
+                kappa_types::content::ContentAdmissionEvidence::VerifiedBytes
+            ));
+            admitted = true;
+        }
+    }
     assert!(
-        ledger
-            .iter()
-            .any(|mutation| &mutation.kappa == content.kappa()),
-        "the head's ledger names the published record"
+        admitted,
+        "the head's ledger must authenticate the published record's admission"
     );
     Ok(())
 }
@@ -151,16 +171,25 @@ fn unsettled_candidates_do_not_grow_with_the_pending_population() -> TestResult 
         store.pending_settlements()?.len() >= namespaces.len(),
         "control: every namespace is unsettled"
     );
-    assert!(
-        store
-            .unsettled_candidates(&DiscoveryKey::Content(absent.kappa().clone()))
-            .is_empty()
-    );
+    assert!(store
+        .unsettled_candidates(
+            &DiscoveryKey::Content(absent.kappa().clone()),
+            &mut kappa_store::work::WorkMeter::unbounded(),
+        )?
+        .is_empty());
     assert_eq!(
-        store.unsettled_candidates(&DiscoveryKey::Content(content.kappa().clone())),
+        store.unsettled_candidates(
+            &DiscoveryKey::Content(content.kappa().clone()),
+            &mut kappa_store::work::WorkMeter::unbounded(),
+        )?,
         vec![holder_instance]
     );
-    assert!(store.catalog_owners(content.kappa())?.is_empty());
+    assert!(store
+        .catalog_owners(
+            content.kappa(),
+            &mut kappa_store::work::WorkMeter::unbounded()
+        )?
+        .is_empty());
     assert_eq!(store.blob_get(content.kappa())?, bytes);
     assert!(matches!(
         store.blob_get(absent.kappa()),
@@ -169,12 +198,18 @@ fn unsettled_candidates_do_not_grow_with_the_pending_population() -> TestResult 
     store.settlement_step(u64::MAX)?;
     assert!(
         store
-            .unsettled_candidates(&DiscoveryKey::Content(content.kappa().clone()))
+            .unsettled_candidates(
+                &DiscoveryKey::Content(content.kappa().clone()),
+                &mut kappa_store::work::WorkMeter::unbounded(),
+            )?
             .is_empty(),
         "settlement released the registration"
     );
     assert_eq!(
-        store.catalog_owners(content.kappa())?,
+        store.catalog_owners(
+            content.kappa(),
+            &mut kappa_store::work::WorkMeter::unbounded()
+        )?,
         vec![holder_instance]
     );
     assert_eq!(store.blob_get(content.kappa())?, bytes);
@@ -203,7 +238,13 @@ fn an_owner_with_missing_storage_is_unavailable_until_its_retirement_is_recorded
     publish(&store, &ns, &bytes)?;
     let content = VerifiedContent::compute(Axis::Sha256, &bytes)?;
     store.settlement_step(u64::MAX)?;
-    assert_eq!(store.catalog_owners(content.kappa())?, vec![instance]);
+    assert_eq!(
+        store.catalog_owners(
+            content.kappa(),
+            &mut kappa_store::work::WorkMeter::unbounded()
+        )?,
+        vec![instance]
+    );
     assert!(
         store.namespaces.open_controller(ns.id()).is_none(),
         "control: the settled, idle controller was evicted"

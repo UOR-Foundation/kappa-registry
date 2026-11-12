@@ -272,6 +272,14 @@ pub enum AuthorityRotationError {
     /// it is reopened and its persisted history selects the authority.
     #[error("authority rotation outcome unknown: {0}")]
     Indeterminate(#[source] StoreError),
+    /// The governing publication's signing coordinate was consumed and the
+    /// publication is known unpublished: it is retained
+    /// (`StoreError::PublicationRetained`), the outgoing authority stays
+    /// installed, and no epoch is sealed under either authority until
+    /// resolution publishes it and installs the incoming one, or finds it
+    /// terminal.
+    #[error("authority rotation retained unpublished: {0}")]
+    Retained(#[source] StoreError),
 }
 
 /// Public verification material of one authority.
@@ -634,15 +642,27 @@ impl EpochAuthority {
     }
 }
 
-/// Succession evidence for an epoch moving from one authority to another
-/// through `transitions`: its records and their canonical path content.
-pub struct PathEvidence<'a> {
+/// Owned succession evidence for an epoch whose signer changed.
+///
+/// It holds the records of the path through the transitions and the keys
+/// that verify them, so an epoch candidate retains it across every
+/// resumption of its signing without deriving it again.
+#[derive(Clone, Debug)]
+pub struct PathEvidence {
     links: Vec<Succession>,
-    outgoing: Vec<(&'a str, &'a [u8])>,
+    outgoing: Vec<AuthorityKey>,
 }
 
-impl<'a> PathEvidence<'a> {
-    pub fn new(transitions: &'a [AuthorityTransition]) -> Self {
+impl PathEvidence {
+    /// The most bytes the evidence of a `links`-link path holds: each link's
+    /// canonical record at its admitted maximum and its outgoing key at its
+    /// maximum.
+    pub const fn bound(links: usize) -> u64 {
+        (links as u64)
+            .saturating_mul((MAX_RECORD_BYTES + MAX_ALGORITHM_BYTES + MAX_PUBLIC_KEY_BYTES) as u64)
+    }
+
+    pub fn new(transitions: &[AuthorityTransition]) -> Self {
         Self {
             links: transitions
                 .iter()
@@ -650,25 +670,52 @@ impl<'a> PathEvidence<'a> {
                 .collect(),
             outgoing: transitions
                 .iter()
-                .map(|transition| {
-                    (
-                        transition.outgoing.algorithm(),
-                        transition.outgoing.public_key(),
-                    )
-                })
+                .map(|transition| transition.outgoing.clone())
                 .collect(),
         }
     }
 
-    pub fn path(&self) -> SuccessionPath<'_> {
+    /// How many successions the path holds.
+    pub const fn len(&self) -> usize {
+        self.links.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.links.is_empty()
+    }
+
+    /// The `(algorithm, public key)` of each link's outgoing authority, in
+    /// path order: what a `SuccessionPath` borrows.
+    pub fn keys(&self) -> Vec<(&str, &[u8])> {
+        self.outgoing
+            .iter()
+            .map(|key| (key.algorithm(), key.public_key()))
+            .collect()
+    }
+
+    /// The path over `keys`, which must be `self.keys()`.
+    pub fn path<'a>(&'a self, keys: &'a [(&'a str, &'a [u8])]) -> SuccessionPath<'a> {
         SuccessionPath {
             links: &self.links,
-            outgoing: &self.outgoing,
+            outgoing: keys,
         }
     }
 
+    /// The canonical path content an epoch's `rotation_kappa` names.
     pub fn content(&self) -> Vec<u8> {
         succession_path_bytes(&self.links)
+    }
+
+    /// Bytes the evidence holds: each link's canonical record and each
+    /// outgoing key's algorithm and public key.
+    pub fn held_bytes(&self, content: &[u8]) -> u64 {
+        self.outgoing
+            .iter()
+            .fold(content.len() as u64, |total, key| {
+                total
+                    .saturating_add(key.algorithm().len() as u64)
+                    .saturating_add(key.public_key().len() as u64)
+            })
     }
 }
 

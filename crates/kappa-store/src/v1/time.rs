@@ -18,6 +18,10 @@ use std::sync::{
 /// Stores call `now` after acquiring their writer, so issuance order is
 /// publication order.
 pub trait Clock: Send + Sync {
+    /// Retain the same authority for publication after admission returns.
+    /// Implementations must share issuance state and durable ownership.
+    fn retain(&self) -> Arc<dyn Clock>;
+
     /// Issue a strictly increasing causal timestamp.
     ///
     /// # Errors

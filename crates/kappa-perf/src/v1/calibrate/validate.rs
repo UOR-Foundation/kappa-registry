@@ -411,6 +411,50 @@ pub fn rules() -> Vec<Rule> {
             Agree::AllExcept(vec!["threads"]),
             "rate scales superlinearly with threads: the single-thread case was contended or the parallel case skipped work",
         ),
+        // A refusal that costs more than the work it refuses is
+        // amplification: under overload the store would do more per
+        // refused request than per admitted one, which is the failure
+        // admission control exists to prevent.
+        rule(
+            "refused_le_admitted",
+            Error,
+            sel(Lat, Any, &[Present("outcome"), Ne("outcome", "admitted")]),
+            Le,
+            1.0,
+            sel(Lat, SameAsSubject, &[Eq("outcome", "admitted")]),
+            Agree::AllExcept(vec!["outcome"]),
+            "a refused call costs more than the same call admitted: the refusal is decided after the work, not before it",
+        ),
+        // Recovery at open commits the settlement-pass flag through redb:
+        // at least one durable commit, hence at least one fdatasync.
+        rule(
+            "recovery_open_ge_fdatasync",
+            Error,
+            sel(Lat, Exact("recovery.open"), &[Eq("backend", "redb")]),
+            Ge,
+            1.0,
+            sel(Lat, Exact("device.fdatasync"), &[]),
+            keys(&[]),
+            "reopening completes faster than one fdatasync: recovery at open did not commit",
+        ),
+        // PERF-SYS-008 (MUST): p99 of a foreground operation stays within
+        // 2x its quiescent p99 while an unrelated concern runs on the same
+        // store. Tail against tail; a measurement without a distribution
+        // is not compared.
+        rule(
+            "interference_p99_le_2x_quiescent",
+            Error,
+            tail(
+                Lat,
+                Any,
+                &[Present("interference"), Ne("interference", "none")],
+            ),
+            Le,
+            2.0,
+            tail(Lat, SameAsSubject, &[Eq("interference", "none")]),
+            Agree::AllExcept(vec!["interference"]),
+            "p99 under interference exceeds twice the quiescent p99: the unrelated concern reaches the foreground path",
+        ),
     ];
     for axis in [
         "sha256",

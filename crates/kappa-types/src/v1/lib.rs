@@ -9,6 +9,7 @@ pub mod availability;
 pub mod axis;
 pub mod bundle;
 pub mod canonical;
+pub mod capacity;
 pub mod chunks;
 pub mod clock;
 pub mod content;
@@ -26,12 +27,14 @@ pub mod kappa_streaming;
 pub mod merkle;
 pub mod merkle_index;
 pub mod namespace;
+pub mod namespace_state;
 pub mod offload;
 pub mod operation;
 pub mod page;
 pub mod path;
 pub mod resource;
 pub mod retirement;
+pub mod retirement_evidence;
 pub mod retirement_request;
 pub mod rotation_witness;
 pub mod sequence;
@@ -40,23 +43,29 @@ pub mod sha3_256;
 pub mod sha512;
 pub mod signed;
 pub mod state_digest;
+pub mod state_index;
+pub mod state_key;
 pub mod tag;
 pub mod threshold;
 pub mod time_attestation;
-pub mod transport;
 pub mod upload;
 pub mod verified;
 pub mod version;
 pub mod versioning;
 mod wire_map;
 pub mod witness;
+pub mod work;
 
 // -- Top-level re-exports for ergonomic use -----------------------------------
 
 pub use axis::Axis;
 pub use canonical::{CanonicalError, canonical_bytes, from_canonical};
+pub use capacity::{CapacityError, CapacityPool, Reservation};
 pub use clock::ClockMs;
-pub use content::ContentCommitment;
+pub use content::{
+    ContentAdmission, ContentAdmissionEvidence, ContentAdmissionRecord, ContentCommitment,
+    ContentRetirementRecord, MetadataSubject, MetadataTransition,
+};
 pub use delegation::{
     Capability, CapabilitySet, DELEGATION_CHAIN_MAX_DEPTH, DelegationScope,
     DelegationScopeSignable, EffectiveAuthority,
@@ -66,8 +75,10 @@ pub use edge::{
     semantic,
 };
 pub use epoch::{EpochMutation, MutationOp};
-pub use epoch_root::{EpochRoot, EpochRootData, EpochRootError, EpochRootInput};
-pub use error::StoreError;
+pub use epoch_root::{
+    EPOCH_FORMAT_STATE, EpochRoot, EpochRootData, EpochRootError, EpochRootInput,
+};
+pub use error::{PublicationPhase, RecoveryDisposition, RetainedPublication, StoreError};
 pub use identity::{
     AbsenceProof, AnchorKappa, BindingMethod, DEFAULT_ROTATION_GRACE_MS, DegradeReason,
     DeviceBinding, EntityKind, HandleRecord, IdentityAssertion, IdentityBinding,
@@ -85,7 +96,8 @@ pub use kappa::{
 pub use kappa_streaming::{
     IncrementalHasher, streaming_compute_into, streaming_compute_kappa, streaming_compute_multi,
 };
-pub use namespace::{InvalidProtocolId, NamespaceRef, ProtocolId};
+pub use namespace::{InvalidProtocolId, LogicalIncarnation, NamespaceRef, ProtocolId};
+pub use namespace_state::{AuthorityState, NAMESPACE_STATE_VERSION, NamespaceState};
 pub use operation::OperationReceipt;
 pub use page::{MAX_ALIASES_PER_NAMESPACE, NamespaceFilter, Page, PageRequest};
 pub use resource::{
@@ -93,6 +105,9 @@ pub use resource::{
     ResourcePhase, ResourceSelection, SelectedMember,
 };
 pub use retirement::{Disposition, ObservedHead, RETIREMENT_DECISION_VERSION, RetirementDecision};
+pub use retirement_evidence::{
+    DelegationLink, MAX_EVIDENCE_EPOCHS, RETIREMENT_EVIDENCE_VERSION, RetirementEvidence,
+};
 pub use retirement_request::RetirementRequest;
 pub use rotation_witness::{
     ActivationDomain, ROTATION_WITNESS_BASIS, ROTATION_WITNESS_FACET, RotationWitness,
@@ -106,3 +121,4 @@ pub use time_attestation::TimeAttestation;
 pub use upload::{IngestResult, PartReceipt, UploadId};
 pub use verified::{StreamingVerificationProof, VerifiedContent};
 pub use versioning::{DeleteResult, VersionEntry, VersioningState};
+pub use work::{Dimension, Work, WorkExhausted, WorkLimit, WorkMeter};

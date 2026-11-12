@@ -5,12 +5,14 @@
 //! the logic in NixOS/nix src/libstore/references.cc: scan for the
 //! bare hash part only, not the /nix/store/ prefix or the name suffix.
 //!
-//! `decompress_and_verify` combines decompression, NarHash verification,
-//! and reference scanning into a single pipeline that rejects corrupted
-//! or misrepresented narinfo on ingest.
+//! `decompress_and_verify` combines bounded streaming decompression,
+//! NarSize and NarHash verification, and reference scanning into a single
+//! pipeline that rejects corrupted or misrepresented narinfo on ingest.
 
 use std::collections::HashSet;
+use std::io::Read;
 
+use kappa_store::compression::Codec;
 use sha2::{Digest, Sha256};
 
 const STORE_PATH_HASH_LEN: usize = 32;
@@ -27,6 +29,12 @@ pub enum VerifyError {
         narinfo: Vec<String>,
         scanned: Vec<String>,
     },
+
+    #[error("NarSize mismatch: narinfo declares {declared} bytes, NAR decodes to {decoded}")]
+    NarSizeMismatch { declared: u64, decoded: u64 },
+
+    #[error("NarSize mismatch: narinfo declares {declared} bytes, NAR decodes past them")]
+    NarTooLong { declared: u64 },
 
     #[error("decompression error: {0}")]
     Decompression(String),
@@ -111,71 +119,13 @@ pub fn scan_references_chunked(
     (main_found, new_tail)
 }
 
-/// Decompress bytes according to the compression algorithm name.
-///
-/// # Errors
-///
-/// Returns `VerifyError::UnsupportedCompression` for unknown algorithms.
-/// Returns `VerifyError::Decompression` for corrupt compressed data.
-fn decompress(data: &[u8], compression: &str) -> Result<Vec<u8>, VerifyError> {
-    match compression {
-        "none" => Ok(data.to_vec()),
-        "zstd" => zstd::decode_all(std::io::Cursor::new(data))
-            .map_err(|e| VerifyError::Decompression(format!("zstd: {e}"))),
-        "xz" | "lzma" => {
-            use std::io::Read;
-            let mut decoder = xz2::read::XzDecoder::new(data);
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|e| VerifyError::Decompression(format!("xz: {e}")))?;
-            Ok(out)
-        }
-        "bzip2" => {
-            use std::io::Read;
-            let mut decoder = bzip2::read::BzDecoder::new(data);
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|e| VerifyError::Decompression(format!("bzip2: {e}")))?;
-            Ok(out)
-        }
-        other => Err(VerifyError::UnsupportedCompression(other.to_string())),
-    }
-}
+/// Bytes of decoded NAR examined per step.
+const DECODE_CHUNK: usize = 64 * 1024;
 
-/// Decompress a NAR blob, verify NarHash, and scan for references.
-///
-/// This is the ingest verification pipeline. It ensures:
-/// 1. The compressed NAR decompresses successfully
-/// 2. SHA-256 of the decompressed NAR matches `expected_nar_hash`
-/// 3. Every store path hash claimed in `claimed_references` appears
-///    in the decompressed NAR byte stream
-///
-/// # Errors
-///
-/// Returns `VerifyError::NarHashMismatch` if the computed hash differs.
-/// Returns `VerifyError::ReferencesMismatch` if a claimed reference
-/// hash is not found in the decompressed NAR.
-/// Returns `VerifyError::Decompression` if decompression fails.
-pub fn decompress_and_verify(
-    compressed_data: &[u8],
-    compression: &str,
-    expected_nar_hash: &str,
-    claimed_references: &[String],
-) -> Result<(), VerifyError> {
-    let decompressed = decompress(compressed_data, compression)?;
-
-    let hash_bytes = Sha256::digest(&decompressed);
-    let computed_hash = format!("sha256:{}", nix_derivation::nixbase32::encode(&hash_bytes));
-    if computed_hash != expected_nar_hash {
-        return Err(VerifyError::NarHashMismatch {
-            expected: expected_nar_hash.to_string(),
-            computed: computed_hash,
-        });
-    }
-
-    let mut claimed_hashes: Vec<String> = claimed_references
+/// The 32-character hash parts of the store path basenames in
+/// `references`, sorted and deduplicated.
+fn claimed_hashes(references: &[String]) -> Vec<String> {
+    let mut hashes: Vec<String> = references
         .iter()
         .filter_map(|basename| {
             if basename.len() > STORE_PATH_HASH_LEN
@@ -187,16 +137,105 @@ pub fn decompress_and_verify(
             }
         })
         .collect();
-    claimed_hashes.sort();
-    claimed_hashes.dedup();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
 
-    let candidate_strs: Vec<&str> = claimed_hashes.iter().map(|s| s.as_str()).collect();
-    let scanned = scan_references(&decompressed, &candidate_strs);
+/// Decompress a NAR blob, verify NarSize and NarHash, and scan for
+/// references.
+///
+/// This is the ingest verification pipeline. The NAR is decoded through
+/// the shared bounded decoder (`kappa_store::compression`), the one the
+/// store admits and reads compressed content through, one chunk at a time
+/// and never held whole; at most one byte past `expected_nar_size` is ever
+/// decoded. It ensures:
+/// 1. The compressed NAR decompresses successfully within the decoder
+///    memory bound
+/// 2. It decodes to exactly `expected_nar_size` bytes
+/// 3. SHA-256 of the decompressed NAR matches `expected_nar_hash`
+/// 4. Every store path hash claimed in `claimed_references` appears
+///    in the decompressed NAR byte stream, including across chunk
+///    boundaries
+///
+/// # Errors
+///
+/// Returns `VerifyError::UnsupportedCompression` for an algorithm no
+/// shared decoder decodes.
+/// Returns `VerifyError::Decompression` if decompression fails.
+/// Returns `VerifyError::NarTooLong` or `VerifyError::NarSizeMismatch` if
+/// the decoded size differs from `expected_nar_size`.
+/// Returns `VerifyError::NarHashMismatch` if the computed hash differs.
+/// Returns `VerifyError::ReferencesMismatch` if a claimed reference
+/// hash is not found in the decompressed NAR.
+pub fn decompress_and_verify(
+    compressed_data: &[u8],
+    compression: &str,
+    expected_nar_hash: &str,
+    expected_nar_size: u64,
+    claimed_references: &[String],
+) -> Result<(), VerifyError> {
+    let codec = Codec::of(compression)
+        .map_err(|_| VerifyError::UnsupportedCompression(compression.to_string()))?;
+    let decoder = codec
+        .decoder(compressed_data)
+        .map_err(|error| VerifyError::Decompression(format!("{compression}: {error}")))?;
+    let claimed = claimed_hashes(claimed_references);
+    let candidates: Vec<&str> = claimed.iter().map(String::as_str).collect();
 
-    for claimed in &claimed_hashes {
-        if !scanned.contains(claimed) {
+    let mut hasher = Sha256::new();
+    let mut scanned: Vec<String> = Vec::new();
+    let mut tail: Vec<u8> = Vec::new();
+    let mut decoded = 0u64;
+    let mut bounded = decoder.take(expected_nar_size.saturating_add(1));
+    let mut chunk = vec![0u8; DECODE_CHUNK];
+    loop {
+        let read = match bounded.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(VerifyError::Decompression(format!(
+                    "{compression}: {error}"
+                )));
+            }
+        };
+        decoded += read as u64;
+        if decoded > expected_nar_size {
+            return Err(VerifyError::NarTooLong {
+                declared: expected_nar_size,
+            });
+        }
+        let piece = &chunk[..read];
+        hasher.update(piece);
+        let (found, next) = scan_references_chunked(piece, &tail, &candidates);
+        scanned.extend(found);
+        tail = next;
+    }
+    if decoded != expected_nar_size {
+        return Err(VerifyError::NarSizeMismatch {
+            declared: expected_nar_size,
+            decoded,
+        });
+    }
+
+    let computed_hash = format!(
+        "sha256:{}",
+        nix_derivation::nixbase32::encode(&hasher.finalize())
+    );
+    if computed_hash != expected_nar_hash {
+        return Err(VerifyError::NarHashMismatch {
+            expected: expected_nar_hash.to_string(),
+            computed: computed_hash,
+        });
+    }
+
+    scanned.sort();
+    scanned.dedup();
+    for hash in &claimed {
+        if !scanned.contains(hash) {
             return Err(VerifyError::ReferencesMismatch {
-                narinfo: claimed_hashes.clone(),
+                narinfo: claimed,
                 scanned,
             });
         }
@@ -255,25 +294,73 @@ mod tests {
         assert_eq!(found2, vec![hash]);
     }
 
-    #[test]
-    fn decompress_none_returns_input() {
-        let data = b"test data";
-        let result = decompress(data, "none").unwrap();
-        assert_eq!(result, data);
+    fn nar_hash(nar: &[u8]) -> String {
+        format!(
+            "sha256:{}",
+            nix_derivation::nixbase32::encode(&Sha256::digest(nar))
+        )
+    }
+
+    /// A NAR naming `hash` at an offset that straddles the first decode
+    /// chunk boundary.
+    fn straddling_nar(hash: &str) -> Vec<u8> {
+        let mut nar = vec![b'.'; DECODE_CHUNK - 10];
+        nar.extend_from_slice(format!("/nix/store/{hash}-dep").as_bytes());
+        nar.extend_from_slice(&[b'.'; 4096]);
+        nar
     }
 
     #[test]
-    fn decompress_zstd_roundtrip() {
-        let original = b"test data for zstd compression roundtrip";
-        let compressed = zstd::encode_all(std::io::Cursor::new(original.as_slice()), 3).unwrap();
-        let decompressed = decompress(&compressed, "zstd").unwrap();
-        assert_eq!(decompressed, original);
+    fn stored_and_zstd_nars_verify_with_a_reference_across_chunks() {
+        let hash = "r5sjd57x0r07bwgipryaxqdkx1gglhiy";
+        let nar = straddling_nar(hash);
+        let references = vec![format!("{hash}-dep")];
+        let compressed = zstd::encode_all(std::io::Cursor::new(nar.as_slice()), 3).unwrap();
+        for (algorithm, data) in [("none", nar.clone()), ("zstd", compressed)] {
+            decompress_and_verify(
+                &data,
+                algorithm,
+                &nar_hash(&nar),
+                nar.len() as u64,
+                &references,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_nar_of_another_size_than_declared_is_refused() {
+        let nar = b"nar bytes of a declared size".to_vec();
+        let declared = nar.len() as u64;
+        assert!(matches!(
+            decompress_and_verify(&nar, "none", &nar_hash(&nar), declared - 1, &[]),
+            Err(VerifyError::NarTooLong { declared: d }) if d == declared - 1
+        ));
+        assert!(matches!(
+            decompress_and_verify(&nar, "none", &nar_hash(&nar), declared + 1, &[]),
+            Err(VerifyError::NarSizeMismatch { declared: d, decoded })
+                if d == declared + 1 && decoded == declared
+        ));
+    }
+
+    #[test]
+    fn a_missing_claimed_reference_and_a_wrong_hash_are_refused() {
+        let nar = b"a nar that references nothing".to_vec();
+        let claimed = vec!["r5sjd57x0r07bwgipryaxqdkx1gglhiy-dep".to_string()];
+        assert!(matches!(
+            decompress_and_verify(&nar, "none", &nar_hash(&nar), nar.len() as u64, &claimed),
+            Err(VerifyError::ReferencesMismatch { .. })
+        ));
+        assert!(matches!(
+            decompress_and_verify(&nar, "none", &nar_hash(b"other"), nar.len() as u64, &[]),
+            Err(VerifyError::NarHashMismatch { .. })
+        ));
     }
 
     #[test]
     fn rejects_unsupported_compression() {
         assert!(matches!(
-            decompress(b"data", "lz4"),
+            decompress_and_verify(b"data", "lz4", &nar_hash(b"data"), 4, &[]),
             Err(VerifyError::UnsupportedCompression(_))
         ));
     }

@@ -5,7 +5,7 @@
 
 mod support;
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 use kappa_fixture::FixtureRoot;
 use kappa_store::{BlobStore, ContentIdentity, Kappa, StoreError};
@@ -125,5 +125,45 @@ fn compressed_dedup_cannot_replace_an_existing_immutable_blob() -> TestResult {
     let mut read = Vec::new();
     retained.read_to_end(&mut read)?;
     assert_eq!(read, content);
+    Ok(())
+}
+
+#[test]
+fn xz_and_bzip2_preserve_encoded_and_decoded_content_across_reopen() -> TestResult {
+    let content = b"persistent compressed representation with verified plaintext";
+    let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+    xz.write_all(content)?;
+    let mut bzip2 = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    bzip2.write_all(content)?;
+    for (algorithm, encoded) in [("xz", xz.finish()?), ("bzip2", bzip2.finish()?)] {
+        let spec = PersistentSpec::new().in_root(&FixtureRoot::temporary()?);
+        let key = Kappa::sha256(content);
+        {
+            let store = spec.clone().acquire()?;
+            let ns = create(store.store(), algorithm)?;
+            assert!(!store.blob_exists(&key)?);
+            install_prepared(
+                store.store(),
+                &ns,
+                compressed(&key, algorithm, content.len() as u64),
+                &encoded,
+            )?;
+            assert!(store.blob_exists(&key)?);
+            assert_eq!(store.blob_get_decompressed(&key)?, content);
+        }
+        let store = spec.acquire()?;
+        assert!(store.blob_exists(&key)?);
+        assert_eq!(store.blob_size(&key)?, content.len() as u64);
+        assert_eq!(
+            store.blob_get_compressed(&key)?,
+            (encoded, algorithm.into())
+        );
+        assert_eq!(store.blob_get_decompressed(&key)?, content);
+        assert!(
+            store
+                .blob_get_decompressed(&Kappa::sha256(b"absent"))
+                .is_err()
+        );
+    }
     Ok(())
 }

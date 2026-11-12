@@ -43,16 +43,6 @@ pub fn verify_delegation_chain(
     let mut remaining_depth = DELEGATION_CHAIN_MAX_DEPTH;
 
     for (i, scope) in scopes.iter().enumerate() {
-        if scope.is_expired(now_ms) {
-            return Err(StoreError::Rejected(format!("delegation link {i} expired")));
-        }
-
-        if scope.max_depth == 0 && i < scopes.len() - 1 {
-            return Err(StoreError::Rejected(format!(
-                "delegation link {i} has max_depth 0 but chain continues"
-            )));
-        }
-
         let signable = scope.signable_bytes();
         let valid =
             signature_verifier(&scope.delegator, &signable, scope.cose_signature.as_bytes())
@@ -137,4 +127,132 @@ pub fn verify_authenticated_delegation_chain(
             Ok(true)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kappa_types::{Capability, CapabilitySet, DelegationScope, SignedPayload};
+
+    fn chain(length: u32) -> Vec<DelegationScope> {
+        (0..length)
+            .map(|index| DelegationScope {
+                delegator: Kappa::sha256(&index.to_be_bytes()),
+                delegate: Kappa::sha256(&(index + 1).to_be_bytes()),
+                scope: vec!["read".into()],
+                namespaces: Some(vec!["project/".into()]),
+                valid_from_ms: 10,
+                valid_until_ms: Some(100),
+                max_depth: length - index - 1,
+                nonce: index.to_be_bytes().to_vec(),
+                cose_signature: SignedPayload::empty(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn depth_256_verifies_every_link_and_depth_257_is_refused_before_signatures()
+    -> Result<(), StoreError> {
+        let capabilities = CapabilitySet::from_iter([Capability::Read]);
+        let calls = std::cell::Cell::new(0usize);
+        let verifier = |_: &Kappa, _: &[u8], _: &[u8]| {
+            calls.set(calls.get() + 1);
+            Ok(true)
+        };
+        let scopes = chain(256);
+        let authority = verify_delegation_chain(&scopes, &capabilities, 50, &verifier)?;
+        assert_eq!(calls.get(), 256);
+        assert_eq!(authority.chain_length, 256);
+        assert_eq!(authority.remaining_depth, 0);
+        assert_eq!(authority.delegate, Kappa::sha256(&256u32.to_be_bytes()));
+        assert_eq!(authority.capabilities, capabilities);
+        assert_eq!(authority.scope, ["project/"]);
+        calls.set(0);
+        assert!(verify_delegation_chain(&chain(257), &capabilities, 50, &verifier).is_err());
+        assert_eq!(calls.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn deep_chain_rejects_expiry_disconnection_cycles_and_exhausted_depth() {
+        let capabilities = CapabilitySet::from_iter([Capability::Read]);
+        let scopes = chain(256);
+        assert!(verify_delegation_chain(&scopes, &capabilities, 100, &|_, _, _| Ok(true)).is_err());
+        for index in [0, 127, 254] {
+            let mut invalid = scopes.clone();
+            invalid[index].max_depth = 0;
+            assert!(
+                verify_delegation_chain(&invalid, &capabilities, 50, &|_, _, _| Ok(true)).is_err()
+            );
+        }
+        let mut invalid = scopes.clone();
+        invalid[255].delegator = Kappa::sha256(b"unconnected");
+        assert!(verify_delegation_chain(&invalid, &capabilities, 50, &|_, _, _| Ok(true)).is_err());
+        invalid = scopes.clone();
+        invalid[255].delegate = scopes[0].delegator.clone();
+        assert!(verify_delegation_chain(&invalid, &capabilities, 50, &|_, _, _| Ok(true)).is_err());
+        assert!(
+            verify_delegation_chain(&scopes, &capabilities, 50, &|anchor, _, _| {
+                Ok(*anchor != scopes[255].delegator)
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn authenticated_depth_256_requires_every_anchor_bound_signature()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use kappa_crypto::{Signer, ed25519::Ed25519Signer};
+        let signers = (0u32..=256)
+            .map(|index| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&index.to_be_bytes());
+                Ed25519Signer::from_bytes(&seed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let anchors = signers
+            .iter()
+            .map(|signer| Kappa::from_key(signer.algorithm(), signer.public_key()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let keys: std::collections::HashMap<_, _> = anchors
+            .iter()
+            .cloned()
+            .zip(
+                signers
+                    .iter()
+                    .map(|signer| (signer.algorithm().to_owned(), signer.public_key().to_vec())),
+            )
+            .collect();
+        let mut scopes = chain(256);
+        for (index, scope) in scopes.iter_mut().enumerate() {
+            scope.delegator = anchors[index].clone();
+            scope.delegate = anchors[index + 1].clone();
+            *scope = kappa_crypto::signed_types::sign_delegation(scope.clone(), &signers[index])?;
+        }
+        let capabilities = CapabilitySet::from_iter([Capability::Read]);
+        let resolve = |anchor: &Kappa| keys.get(anchor).cloned();
+        let authority =
+            verify_authenticated_delegation_chain(&scopes, &capabilities, 50, &resolve)?;
+        assert_eq!(authority.delegate, anchors[256]);
+        assert_eq!(authority.chain_length, 256);
+        for index in [0, 127, 255] {
+            let mut tampered = scopes.clone();
+            tampered[index].nonce.push(1);
+            assert!(
+                verify_authenticated_delegation_chain(&tampered, &capabilities, 50, &resolve)
+                    .is_err()
+            );
+        }
+        assert!(
+            verify_authenticated_delegation_chain(&scopes, &capabilities, 50, &|anchor| {
+                if *anchor == anchors[255] {
+                    None
+                } else {
+                    resolve(anchor)
+                }
+            })
+            .is_err()
+        );
+        Ok(())
+    }
 }

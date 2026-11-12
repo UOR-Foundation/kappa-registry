@@ -149,6 +149,22 @@ pub fn classes() -> Vec<RooflineClass> {
                 Unit,
             )],
         },
+        // Recovery at open commits once through redb: its floor is the
+        // device sync of that commit. A settlement step may settle
+        // nothing and commit nothing, so it is validated (Warn rules) but
+        // not graded.
+        RooflineClass {
+            name: "maintenance",
+            subject_ops: &["recovery.open"],
+            subject_quantities: &[Lat],
+            terms: vec![term(
+                Lat,
+                Exact("device.fdatasync"),
+                &[],
+                &[("backend", "redb")],
+                Unit,
+            )],
+        },
         RooflineClass {
             name: "index_seek",
             subject_ops: &["index.seek"],

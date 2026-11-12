@@ -8,10 +8,12 @@ use kappa_store::epoch_root::EpochRoot;
 use kappa_store::error::StoreError;
 use kappa_store::kappa::Kappa;
 use kappa_store::namespace::NamespaceRef;
+use kappa_store::work::Meter;
 
 use super::{epoch_idx_key, pointer_context};
 use crate::PersistentStore;
-use crate::storage::NamespaceController;
+use crate::authority::ActivationHold;
+use crate::storage::{IncarnationUse, NamespaceController};
 use crate::tables::{BLOB_INDEX, EPOCH_CURRENT, EPOCH_INDEX, MUTATION_BUFFER};
 
 impl PersistentStore {
@@ -41,7 +43,9 @@ impl PersistentStore {
         controller: &NamespaceController,
         ns: &NamespaceRef,
         root: &EpochRoot,
-    ) -> Result<(), StoreError> {
+        activation: Option<&ActivationHold<'_>>,
+        work: &mut dyn Meter,
+    ) -> Result<EpochRoot, StoreError> {
         if root.namespace_id() != ns.id() || controller.id != *ns.id() {
             return Err(StoreError::Conflict(
                 "epoch execution namespace mismatch".into(),
@@ -98,17 +102,30 @@ impl PersistentStore {
             ));
         }
         let blobs = txn.open_table(BLOB_INDEX).map_err(crate::error::redb)?;
-        self.read_view_for(controller)
-            .epoch_root_from_index(&blobs, identity)?;
-        Ok(())
+        let view = self.sealing_view(controller, activation);
+        let verified_root = view.epoch_root_from_index(&blobs, identity, work)?;
+        let decoded = view.namespace_state_from_index(&blobs, root.state(), work)?;
+        let state = decoded.value();
+        let incarnation = controller.logical_incarnation(IncarnationUse::SealVerification)?;
+        if state.namespace() != ns.id() || !incarnation.names(state.incarnation()) {
+            return Err(StoreError::Conflict(
+                "sealed state namespace instance mismatch".into(),
+            ));
+        }
+        Ok(verified_root)
     }
 
+    /// Whether the epoch `number` of `ns` committed as `identity`, admitted
+    /// under the installed authority, or under the candidate of the
+    /// `activation` that sealed it, read on `work`.
     pub(crate) fn resolve_epoch_publication(
         &self,
         controller: &NamespaceController,
         ns: &NamespaceRef,
         number: u64,
         identity: &Kappa,
+        activation: Option<&ActivationHold<'_>>,
+        work: &mut dyn Meter,
     ) -> Result<(), StoreError> {
         let txn = controller.db.begin_read().map_err(crate::error::redb)?;
         let epochs = txn.open_table(EPOCH_INDEX).map_err(crate::error::redb)?;
@@ -124,8 +141,8 @@ impl PersistentStore {
         }
         let blobs = txn.open_table(BLOB_INDEX).map_err(crate::error::redb)?;
         let root = self
-            .read_view_for(controller)
-            .epoch_root_from_index(&blobs, identity)?;
+            .sealing_view(controller, activation)
+            .epoch_root_from_index(&blobs, identity, work)?;
         if root.namespace_id() != ns.id() || root.epoch_number() != number {
             return Err(StoreError::Conflict(
                 "epoch publication coordinates differ".into(),

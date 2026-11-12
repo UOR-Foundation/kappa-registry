@@ -11,7 +11,18 @@
 //! never precedes its effects, readers see an epoch's projections whole or
 //! not at all (`projection`), and an attempt interrupted by an error or a
 //! restart is abandoned for a new one whose versions alone can complete.
-//! No request waits on the registry writer.
+//!
+//! Every trigger of settlement (recovery and explicit maintenance through
+//! `settle_namespace`, a retirement through the same, and admission at its
+//! namespace's epoch ceiling through `relieve_epoch_pressure`) runs the one
+//! consuming epoch operation ([`PersistentStore::settle_epoch_in`]) under
+//! the instance's [`SettlementAttempt`], acquired before the checkpoint is
+//! observed. Only a commit known to have happened releases an epoch's
+//! ownership; a checkpoint authorizes a release, a discharge or a reduction
+//! of admitted backlog only when established (`settlement_pending`). No
+//! publication waits on a registry writer or settlement attempt held
+//! elsewhere: admission takes both without waiting, and is refused at its
+//! ceiling when either is held.
 //!
 //! Discovery is durable and proportional to the unsettled population, not
 //! the namespace population: before its commit, under its writer gate, a
@@ -31,9 +42,10 @@
 //!   parked on the controller keyed by epoch number and released when that
 //!   epoch settles, so an allocation admitted but not yet projected is
 //!   never unprotected, and its identities are registered for discovery
-//!   (`unsettled_index`); admission refuses a namespace holding
-//!   `max_unsettled_epochs` parked epochs, and any publication whose pins
-//!   would exceed the node-wide `unsettled` budget of entries and bytes
+//!   (`unsettled_index`); a namespace at `max_unsettled_epochs` unsettled
+//!   epochs is admitted only once its admission settles enough of them in
+//!   one bounded attempt, and any publication whose pins would exceed the
+//!   node-wide `unsettled` budget of entries and bytes is refused
 //!   (backpressure, never discard);
 //! - after a restart those pins and registrations are gone, so recovery
 //!   (`settlement_recovery`) reconstructs them in bounded steps: opening
@@ -48,9 +60,10 @@
 //!   allocations.
 //!
 //! The head a namespace is settled to is read from its database
-//! (`EPOCH_CURRENT`, the one source of the epoch number); settlement takes
+//! (`EPOCH_CURRENT`, the one source of the epoch number); maintenance takes
 //! the namespace's writer gate only to remove its pending entry, never to
-//! apply effects, so it never delays publication.
+//! apply effects. Admission pressure applies effects under the gate its own
+//! publication already holds.
 //!
 //! Projections settled here (`projection::Family`): the content catalog,
 //! allocation ownership, epoch root locators, control-plane routing, the
@@ -64,19 +77,23 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use kappa_store::StoreError;
+use kappa_store::work::Meter;
 
 use crate::PersistentStore;
+use crate::error::CommitFailure;
+use crate::projection_stage::{STAGED_BYTES, counter};
+use crate::registry::RegistryWrite;
 use crate::storage::{NamespaceController, NamespaceStorage};
 use crate::storage_instance::StorageInstance;
+use crate::tables::PROJECTION_COUNTERS;
 use crate::unsettled::{Charge, Closure, UnsettledBudget};
 use crate::unsettled_index::Registration;
 
 #[path = "settlement_apply.rs"]
 mod apply;
-#[path = "settlement_cbor.rs"]
-mod cbor;
 #[path = "settlement_cursors.rs"]
 mod cursors;
 #[path = "settlement_driver.rs"]
@@ -100,13 +117,112 @@ mod work;
 #[path = "settlement_slice_tests.rs"]
 mod slice_tests;
 
+#[cfg(test)]
+#[path = "settlement_pressure_tests.rs"]
+mod pressure_tests;
+
 pub use cursors::EpochCursors;
-pub use recovery::{Recovery, StepBudget};
+pub(crate) use pending::{MAX_CHECKPOINT_BYTES, decode_checkpoint};
+pub use recovery::Recovery;
 pub use release::ReleaseGrant;
-pub use work::{SettlementLimits, Work};
+#[cfg(test)]
+pub(crate) use work::EPOCH_SIGNATURES;
+pub use work::SettlementLimits;
+pub(crate) use work::{default_preparation_bytes, element_preparation_bytes};
 
 use apply::Apply;
-use cursors::Purpose;
+use cursors::{EpochRead, Purpose};
+
+/// Why settlement stopped without advancing an epoch: each is a resource
+/// unavailable now, never a failure of the epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlementStop {
+    /// The work allowance does not admit the next unit.
+    Budget,
+    /// Every epoch cursor of the store is held.
+    CursorCapacity,
+    /// Every namespace activity of the store is held.
+    ActivityCapacity,
+    /// Projection staging has no headroom for one more ledger element
+    /// until compaction folds completed epochs.
+    StagingCapacity,
+    /// Another transaction holds the registry writer.
+    RegistryBusy,
+    /// Another settlement attempt holds the instance.
+    AttemptBusy,
+    /// Another compaction step holds the compaction cursor.
+    CompactionBusy,
+    /// A registry commit of this handle has an unknown outcome: no
+    /// settlement advances on this handle until a reopen recovers what
+    /// persisted.
+    RegistryRecoveryRequired,
+}
+
+impl std::fmt::Display for SettlementStop {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Budget => "the work allowance is spent",
+            Self::CursorCapacity => "every settlement cursor is held",
+            Self::ActivityCapacity => "every namespace activity is held",
+            Self::StagingCapacity => "projection staging is full until compaction folds it",
+            Self::RegistryBusy => "the registry writer is held",
+            Self::AttemptBusy => "another settlement attempt holds the namespace",
+            Self::CompactionBusy => "another compaction step holds the compaction cursor",
+            Self::RegistryRecoveryRequired => {
+                "a registry commit's outcome is unknown; reopen the store to recover it"
+            }
+        })
+    }
+}
+
+/// What one run of the consuming epoch operation did to its epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochStep {
+    /// The epoch's projections and checkpoint committed, and its parked
+    /// ownership is released.
+    Completed,
+    /// Part of the epoch was read and staged, committed with its cursor's
+    /// position; the resource named stopped the next element (the meter,
+    /// or staging without room for the element's versions).
+    Partial(SettlementStop),
+    /// Nothing was read: the resource named was unavailable.
+    Deferred(SettlementStop),
+}
+
+/// The one settlement attempt advancing an instance's checkpoint: held
+/// from before the checkpoint is observed until what the attempt settled
+/// is released. Acquired without waiting; constructed only here, so the
+/// consuming epoch operation, which requires one, is reachable only under
+/// it.
+pub(crate) struct SettlementAttempt {
+    controller: Arc<NamespaceController>,
+}
+
+impl SettlementAttempt {
+    /// The attempt of `controller`'s instance, or `None` while another
+    /// holds it.
+    fn try_acquire(controller: &Arc<NamespaceController>) -> Option<Self> {
+        controller
+            .settlement_running
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        Some(Self {
+            controller: Arc::clone(controller),
+        })
+    }
+
+    pub(crate) const fn controller(&self) -> &Arc<NamespaceController> {
+        &self.controller
+    }
+}
+
+impl Drop for SettlementAttempt {
+    fn drop(&mut self) {
+        self.controller
+            .settlement_running
+            .store(false, Ordering::Release);
+    }
+}
 
 /// A storage instance recovery found holding pre-restart unsettled
 /// ownership it has not yet settled: what accounts for that ownership and
@@ -274,105 +390,170 @@ impl RecoveryObligations {
 }
 
 impl PersistentStore {
-    /// Advance the settlement of epoch `epoch` of `controller`'s instance
-    /// within `work`, in one registry write transaction: the effects read
-    /// in this step are staged under the epoch's attempt in progress, and
-    /// once the epoch is read and verified its attempt is completed with
-    /// the `SETTLED` checkpoint in the same transaction, so a reader sees
-    /// all of the epoch's projections or none. `None` while the epoch is
-    /// not yet verified; `Some(true)` once completed.
+    /// Whether projection staging has any capacity left, read before a
+    /// registry transaction is acquired, so a step that would only wait for
+    /// compaction does not take the writer. Each element is admitted against
+    /// what its own versions stage (`settlement_apply`), inside the
+    /// transaction.
+    pub(super) fn staging_headroom(&self) -> Result<bool, StoreError> {
+        Ok(self.projection_staged()?.bytes < self.staging_capacity)
+    }
+
+    /// Advance the settlement of epoch `epoch` of `attempt`'s instance
+    /// within `work`, in `txn`, the registry transaction its caller
+    /// acquired: the one settlement of an epoch every trigger runs.
     ///
-    /// The epoch must follow the checkpoint: settlement of an instance is
-    /// sequential. A transaction that fails to commit discards the epoch's
-    /// cursor, whose position would otherwise be ahead of what it staged;
-    /// the epoch is read again under a new attempt.
-    pub(super) fn settle_epoch(
+    /// `epoch` is the successor of the checkpoint the attempt established:
+    /// settlement of an instance is sequential, and `Apply::complete`
+    /// refuses any other. The effects read are staged under the epoch's
+    /// attempt in progress, each element whole or not at all; once the
+    /// epoch is read and verified its attempt is completed with the
+    /// `SETTLED` checkpoint in the same transaction, so a reader sees all of
+    /// the epoch's projections or none. Staging with no capacity left
+    /// defers before anything is read; an element whose versions do not fit
+    /// what is left stays pending in its cursor, and the step commits what
+    /// it staged before it (`Partial`).
+    ///
+    /// The epoch's cursor stays checked out (`EpochReadGuard`) until the
+    /// commit's outcome is known: only a known commit returns it, with its
+    /// pending element and that element's retained preparation, for the
+    /// next step. A read error, an abort and a commit that does not complete
+    /// drop it with everything it retained, so no position or preparation
+    /// ahead of what committed is ever kept; the epoch is read again under a
+    /// new attempt, and its parked ownership stays. An unknown commit
+    /// outcome also leaves the registry recovery-required (`Registry`), so
+    /// this handle never treats the checkpoint it may have written as
+    /// committed. Only a commit known to have happened raises the instance's
+    /// known-settled bound and releases the epoch's ownership; an assignment
+    /// that then cannot be inspected or installed leaves the controller
+    /// stale, which admission refreshes or refuses, and never reports the
+    /// committed epoch unsettled.
+    pub(super) fn settle_epoch_in(
         &self,
-        controller: &Arc<NamespaceController>,
+        attempt: &SettlementAttempt,
         epoch: u64,
-        work: &mut Work,
-    ) -> Result<Option<bool>, StoreError> {
+        txn: RegistryWrite,
+        work: &mut dyn Meter,
+    ) -> Result<EpochStep, StoreError> {
+        let controller = attempt.controller();
         let instance = controller.instance;
-        // A step that could not stage one more mutation waits for
-        // compaction to fold completed epochs, rather than failing midway
-        // and losing its cursor.
-        let staged = self.projection_staged()?;
-        if staged
-            .bytes
-            .checked_add(self.settlement_limits.mutation_quantum())
-            .is_none_or(|needed| needed > self.staging_capacity)
-        {
-            tracing::debug!(
-                instance = %instance,
-                epoch,
-                staged_bytes = staged.bytes,
-                staged_entries = staged.entries,
-                capacity = self.staging_capacity,
-                "settlement waits for projection compaction"
-            );
-            return Ok(None);
+        let staged = {
+            let counters = txn
+                .open_table(PROJECTION_COUNTERS)
+                .map_err(crate::error::redb)?;
+            counter(&counters, STAGED_BYTES)?
+        };
+        if staged >= self.staging_capacity {
+            txn.abort()?;
+            return Ok(EpochStep::Deferred(SettlementStop::StagingCapacity));
         }
-        let txn = self.registry.begin_write().map_err(crate::error::redb)?;
-        let completed = {
-            let mut apply = Apply::new(&txn, instance, epoch, self.staging_capacity);
-            let read = self.read_epoch(&instance, epoch, Purpose::Settle, work, &mut apply);
+        // A read error drops the guard, and with it the checked-out cursor:
+        // no position ahead of what committed is kept.
+        let (step, read) = {
+            let mut apply = Apply::new(
+                &txn,
+                instance,
+                epoch,
+                self.staging_capacity,
+                self.settlement_limits,
+                &self.encoding_storage,
+                &self.settlement_preparation,
+            );
+            let read = self.read_epoch(&instance, epoch, Purpose::Settle, work, &mut apply)?;
             // The verified epoch's time joins the durable bound of settled
             // epoch times with its checkpoint, so a restart that finds no
             // marker for it still bounds rotation by it.
-            match read.and_then(|root| {
-                root.map(|root| {
-                    apply.complete(root.kappa())?;
-                    self.raise_settled_epoch_time_in_txn(&txn, root.timestamp_ms())
-                })
-                .transpose()
-            }) {
-                Ok(completed) => completed.is_some(),
-                Err(error) => {
-                    self.forget_cursor(&instance, Purpose::Settle);
-                    return Err(error);
+            let step = match read.outcome() {
+                EpochRead::Verified(root) => {
+                    apply.complete(root.kappa(), work)?;
+                    self.raise_settled_epoch_time_in_txn(&txn, root.timestamp_ms())?;
+                    EpochStep::Completed
+                }
+                EpochRead::Pending(stop) => EpochStep::Partial(*stop),
+                EpochRead::Deferred(stop) => EpochStep::Deferred(*stop),
+            };
+            (step, read)
+        };
+        if let EpochStep::Deferred(_) = step {
+            // No cursor was opened or resumed: nothing was staged.
+            txn.abort()?;
+            drop(read);
+            return Ok(step);
+        }
+        match txn.commit() {
+            Ok(()) => read.committed()?,
+            Err(CommitFailure::Known(error)) => {
+                drop(read);
+                return Err(error);
+            }
+            // The registry is recovery-required from this commit on: a
+            // condition of the registry, not of this instance's storage, so
+            // it defers rather than failing the instance. The cursor goes,
+            // the parked ownership stays, and a reopen recovers what
+            // persisted.
+            Err(CommitFailure::Unknown(error)) => {
+                drop(read);
+                tracing::error!(
+                    instance = %instance,
+                    epoch,
+                    %error,
+                    "settlement commit outcome unknown; the registry requires recovery"
+                );
+                return Ok(EpochStep::Deferred(
+                    SettlementStop::RegistryRecoveryRequired,
+                ));
+            }
+        }
+        if let EpochStep::Partial(_) = step {
+            return Ok(step);
+        }
+        match self.settled_assignment_changed(controller, epoch, work) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(error) = self.install_assignment(controller) {
+                    controller.set_assignment_stale(true);
+                    tracing::error!(
+                        namespace = %hex::encode(controller.id),
+                        epoch,
+                        %error,
+                        "settled assignment not installed on the open controller; refresh owed"
+                    );
                 }
             }
-        };
-        if let Err(error) = txn.commit() {
-            self.forget_cursor(&instance, Purpose::Settle);
-            return Err(crate::error::redb(error));
-        }
-        if !completed {
-            return Ok(None);
-        }
-        if self.settled_assignment_changed(controller, epoch)? {
-            // A settled reassignment the controller could not install
-            // leaves it stale (`install_assignment` marks it); the epoch
-            // is settled regardless, and the next admission refreshes or
-            // refuses.
-            if let Err(error) = self.install_assignment(controller) {
+            Err(error) => {
+                controller.set_assignment_stale(true);
                 tracing::error!(
                     namespace = %hex::encode(controller.id),
+                    epoch,
                     %error,
-                    "settled assignment not installed on the open controller"
+                    "settled assignment not inspected; refresh owed"
                 );
             }
         }
+        controller.raise_known_settled(epoch);
         // The parked pins, their charge on the unsettled budget and the
         // epoch's discovery registration drop together, after the
-        // completed projection that replaces them is visible. Retired
+        // completed projection that replaces them is committed. Retired
         // allocations are reclaimed when compaction folds the completed
         // owner tombstones (`projection_compact`), and by the inventory
         // sweep otherwise.
         controller.release_settled(epoch);
-        Ok(Some(true))
+        Ok(EpochStep::Completed)
     }
 
     /// Whether the completed projection of `controller`'s namespace names
     /// an assignment generation other than the one its controller serves:
-    /// the epoch just completed admitted a reassignment.
+    /// the epoch just completed admitted a reassignment. Read on `work`, the
+    /// settlement step's meter; a refusal leaves the controller stale, as
+    /// any failure to inspect does.
     fn settled_assignment_changed(
         &self,
         controller: &Arc<NamespaceController>,
         epoch: u64,
+        work: &mut dyn Meter,
     ) -> Result<bool, StoreError> {
         let Some((_, generation)) =
-            self.assigned_plane(&NamespaceStorage::namespace_ref(controller.id))?
+            self.assigned_plane(&NamespaceStorage::namespace_ref(controller.id), work)?
         else {
             return Ok(false);
         };

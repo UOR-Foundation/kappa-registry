@@ -44,7 +44,11 @@ impl ExecutionReads for EpochExecution<'_> {
             .open_table(crate::tables::BLOB_META)
             .map_err(crate::error::redb)
             .and_then(|table| {
-                crate::epoch_blob::blob_meta_from_table(self.store, &table, identity, key)
+                self.lend(|meter| {
+                    crate::epoch_blob::blob_meta_from_table(
+                        self.store, &table, identity, key, meter,
+                    )
+                })
             });
         self.admit_result(kappa_store::absent(result))
     }
@@ -244,20 +248,12 @@ impl ExecutionWrites for EpochExecution<'_> {
         key: &str,
         value: &[u8],
     ) -> Result<(), StoreError> {
-        self.ensure_active()?;
-        let result = crate::epoch_blob::blob_meta_put_in_txn(
-            self.store,
-            &self.transaction,
-            identity,
-            key,
-            value,
-        );
-        self.admit_result(result)
+        self.with_writer(|writer| writer.admit_blob_meta(identity, key, Some(value)))
     }
+    /// Deleting metadata this namespace does not hold is a no-op and
+    /// records no mutation.
     fn blob_meta_delete(&mut self, identity: &Kappa, key: &str) -> Result<(), StoreError> {
-        self.ensure_active()?;
-        let result = crate::epoch_blob::blob_meta_delete_in_txn(&self.transaction, identity, key);
-        self.admit_result(result)
+        self.with_writer(|writer| writer.admit_blob_meta(identity, key, None))
     }
     fn content_install(
         &mut self,
@@ -290,6 +286,7 @@ impl ExecutionWrites for EpochExecution<'_> {
 impl Execution for EpochExecution<'_> {
     fn set_deadline(&mut self, deadline: Instant) {
         self.deadline = Some(deadline);
+        self.meter.get_mut().tighten_deadline(deadline);
     }
     fn publish(self: Box<Self>) -> Result<Published, StoreError> {
         let (epoch_number, root) = Self::publish(*self)?;

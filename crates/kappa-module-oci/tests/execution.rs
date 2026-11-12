@@ -3,7 +3,8 @@
 
 mod support;
 
-use kappa_store::{Kappa, MutationOp};
+use kappa_store::canonical::from_canonical;
+use kappa_store::{Kappa, MutationOp, TagEntry};
 use support::{MANIFEST_TYPE, Registry, TestResult, manifest};
 
 #[tokio::test]
@@ -52,16 +53,29 @@ async fn manifest_and_tag_publish_in_one_epoch() -> TestResult {
     // One epoch carries the repository's reference to the manifest
     // (`_blob/{digest}`, which makes it retrievable by digest) and the tag.
     let ledger = registry.ledger(&ns, after)?;
-    let tag_sets: Vec<_> = ledger
+    let mut tag_sets = Vec::new();
+    for mutation in ledger
         .iter()
         .filter(|mutation| mutation.op == MutationOp::TagSet)
-        .map(|mutation| (mutation.context.as_deref(), &mutation.kappa))
-        .collect();
+    {
+        // The ledger names immutable tag evidence, not the target content.
+        // Verify that evidence and its scope before checking the target.
+        let evidence = registry.store.blob_get_verified(&mutation.kappa)?;
+        let entry: TagEntry = from_canonical(&evidence)?;
+        assert_eq!(mutation.context.as_deref(), Some(entry.name.as_str()));
+        assert_eq!(entry.version, 1);
+        assert!(entry.symref.is_none());
+        tag_sets.push((entry.name, entry.kappa));
+    }
     let reference = format!("_blob/{digest}");
     assert_eq!(
         tag_sets,
-        vec![(Some(reference.as_str()), &digest), (Some("v2"), &digest)]
+        vec![
+            (reference.clone(), digest.clone()),
+            ("v2".into(), digest.clone())
+        ]
     );
+    assert_eq!(registry.tag(&ns, &reference)?, Some(digest.clone()));
     assert_eq!(registry.store.blob_get(&digest)?, second);
     assert_eq!(registry.tag(&ns, "v2")?, Some(digest));
     Ok(())

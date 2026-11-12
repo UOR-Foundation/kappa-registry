@@ -95,7 +95,26 @@ pub trait CredentialLookup: Send + Sync {
         &self,
         access_key_id: &str,
         now: kappa_types::clock::ClockMs,
-    ) -> Option<CredentialResult>;
+    ) -> Result<CredentialResult, kappa_types::StoreError>;
+}
+
+/// Generate independent access-key and signing-secret material. Persistence
+/// and rotation authority belong to the shared governed credential operation.
+pub fn generate_access_key() -> Result<(String, String), crate::CryptoError> {
+    let mut id = [0u8; 10];
+    let mut secret = Zeroizing::new([0u8; 30]);
+    getrandom::fill(&mut id).map_err(|error| crate::CryptoError::SigningFailed {
+        algorithm: "sigv4".into(),
+        reason: error.to_string(),
+    })?;
+    getrandom::fill(secret.as_mut()).map_err(|error| crate::CryptoError::SigningFailed {
+        algorithm: "sigv4".into(),
+        reason: error.to_string(),
+    })?;
+    Ok((
+        format!("KAPPA{}", hex::encode(id).to_uppercase()),
+        hex::encode(secret.as_ref()),
+    ))
 }
 
 #[derive(Debug, Clone)]

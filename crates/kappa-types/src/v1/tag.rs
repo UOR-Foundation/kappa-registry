@@ -7,7 +7,7 @@ use crate::kappa::Kappa;
 /// CBOR key assignments (PERMANENT):
 ///   0: name, 1: kappa, 2: version, 3: `created_at_ms`,
 ///   4: `updated_at_ms`, 5: symref
-#[derive(Debug, Clone, CBORCodable, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, CBORCodable, serde::Serialize, serde::Deserialize)]
 pub struct TagEntry {
     #[cbor(n = 0)]
     pub name: String,

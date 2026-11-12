@@ -189,7 +189,17 @@ impl IdentityAssertion {
 
 /// Why a key succession occurred.
 /// CBOR discriminants (PERMANENT): 0-2
-#[derive(Debug, Clone, Copy, PartialEq, Eq, CBORCodable, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    CBORCodable,
+    CBORBoundedEncodable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[non_exhaustive]
 pub enum SuccessionReason {
     #[cbor(n = 0)]
@@ -222,7 +232,16 @@ impl SuccessionReason {
 /// A key succession record linking an old anchor to a new one.
 /// Dual `COSE_Sign1`: both old and new keys sign the same payload.
 /// CBOR key assignments (PERMANENT): 0-7
-#[derive(Debug, Clone, PartialEq, Eq, CBORCodable, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    CBORCodable,
+    CBORBoundedEncodable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Succession {
     #[cbor(n = 0)]
     pub old_anchor: Kappa,

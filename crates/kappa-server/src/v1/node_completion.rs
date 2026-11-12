@@ -14,8 +14,10 @@
 //! - **revocation**: no retired authority's `_root` capability or issued
 //!   delegation remains published, so nothing a retired key granted still
 //!   authorizes.
-//! - **activation**: every committed authority transition, with its
-//!   witnesses, is published in the control namespace's epoch history.
+//! - **activation**: the store's authority history projects every
+//!   transition whose governing epoch, with its witnesses, committed in a
+//!   control namespace. The governing epoch is the activation itself; the
+//!   projection is what can lag it and what reconciliation completes.
 //!
 //! [`crate::node_authority::NodeAuthority`] records the latest outcome of
 //! each, readiness requires all five, and every reconciliation retries the

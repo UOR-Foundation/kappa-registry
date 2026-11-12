@@ -26,6 +26,18 @@ pub fn activity_released() {
 
 type Hook = Arc<dyn Fn() + Send + Sync>;
 
+/// The outcome the next registry commit reports in place of its own
+/// (`Registry::inject_commit_fault`): both schedules of a commit whose
+/// outcome redb leaves unknown, run through the production classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitFault {
+    /// The transaction commits; its caller is told the outcome is unknown.
+    PersistedUnknown,
+    /// The transaction is rolled back; its caller is told the outcome is
+    /// unknown.
+    AbortedUnknown,
+}
+
 /// A point in a commit path where a test may pause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Point {
@@ -33,8 +45,8 @@ pub enum Point {
     /// or not; the shared activation gate is held and the published-time
     /// bound is not yet raised.
     AfterEpochCommit,
-    /// A rotation holds the database writer and has not yet requested the
-    /// exclusive activation gate.
+    /// A rotation holds its control namespace's writer and has not yet
+    /// requested the exclusive activation gate.
     RotationWriterHeld,
     /// A rotation holds the database writer and the exclusive activation
     /// gate, has found every witness standing, and has not committed.
@@ -52,9 +64,22 @@ pub struct TestHooks {
     /// While set, installing a committed assignment on its controller
     /// fails, as a plane this node stops serving would make it fail.
     refuse_assignment_refresh: std::sync::atomic::AtomicBool,
+    /// While set, an activation's governing epoch is refused at the last
+    /// point before its commit: a known noncommit.
+    refuse_activation_commit: std::sync::atomic::AtomicBool,
 }
 
 impl TestHooks {
+    pub fn refuse_activation_commit(&self, refuse: bool) {
+        self.refuse_activation_commit
+            .store(refuse, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn activation_commit_refused(&self) -> bool {
+        self.refuse_activation_commit
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn refuse_assignment_refresh(&self, refuse: bool) {
         self.refuse_assignment_refresh
             .store(refuse, std::sync::atomic::Ordering::Release);

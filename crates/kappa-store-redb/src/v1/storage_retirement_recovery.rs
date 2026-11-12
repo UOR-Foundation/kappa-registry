@@ -4,14 +4,12 @@
 
 use std::ops::Bound;
 
-use redb::ReadableDatabase;
-
 use kappa_store::StoreError;
 use kappa_store::governed_retirement::verify_retirement;
 
 use super::RetirementCompletion;
 use crate::PersistentStore;
-use crate::creation_intent;
+use crate::instance_record::Kind;
 use crate::retirement_record::RetirementRecord;
 use crate::storage::{NamespaceStorage, Recording, StorageEvidence};
 use crate::storage_instance::{Incarnation, StorageInstance};
@@ -25,7 +23,7 @@ impl PersistentStore {
         cursor: Option<&StorageInstance>,
         limit: usize,
     ) -> Result<Vec<StorageInstance>, StoreError> {
-        let txn = self.registry.begin_read().map_err(crate::error::redb)?;
+        let txn = self.registry.begin_read()?;
         let table = txn.open_table(RETIRED).map_err(crate::error::redb)?;
         let lower = cursor.map(StorageInstance::key);
         let start = lower.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
@@ -98,7 +96,7 @@ impl PersistentStore {
         // nothing is decided, and the next cycle retries.
         let found = decided.unwrap_or(RetirementCompletion::Retained);
         if found != RetirementCompletion::Retained {
-            creation_intent::complete(self.namespaces.root(), instance)?;
+            Kind::Creating.complete(self.namespaces.root(), instance)?;
         }
         if found == RetirementCompletion::Removed {
             tracing::warn!(
@@ -148,7 +146,7 @@ impl PersistentStore {
             return Ok(RetirementCompletion::Abandoned);
         };
         self.release_present(intent, instance, &verified, governing)?;
-        creation_intent::complete(self.namespaces.root(), instance)?;
+        Kind::Creating.complete(self.namespaces.root(), instance)?;
         Ok(RetirementCompletion::Removed)
     }
 }

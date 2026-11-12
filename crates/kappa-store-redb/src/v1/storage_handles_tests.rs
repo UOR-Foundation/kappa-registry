@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Barrier};
 
-use super::ActivityReservation;
+use super::{ActivityAdmission, ActivityReservation};
 use crate::storage::fixture::{create, storage};
 use crate::storage::{Opening, Recording};
 use kappa_store::StoreError;
@@ -20,7 +20,7 @@ fn concurrent_reservations_cannot_exceed_capacity() -> Result<(), Box<dyn std::e
                     let reservation = ActivityReservation::acquire(&storage.inner);
                     // Every attempt finishes before any successful reservation drops.
                     acquired.wait();
-                    usize::from(reservation.is_ok())
+                    usize::from(matches!(reservation, ActivityAdmission::Admitted(_)))
                 })
             })
             .collect();

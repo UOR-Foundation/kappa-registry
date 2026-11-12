@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use kappa_cursor::FallibleCursor;
 use kappa_handler::clock_at;
+use kappa_store::work::{Dimension, WorkLimit, WorkMeter};
 use kappa_store::{
     BlobStore, ClockMs, EpochStore, Kappa, MaintenanceStore, NamespaceRef, StoreError, TagStore,
     TagUpdate,
@@ -13,6 +14,7 @@ use kappa_store::{
 use super::{ACTIVITY_RELEASE, Point};
 use crate::control_plane::{AssignmentRecord, Guarantee, Guarantees};
 use crate::referrers::{Referrer, Source};
+use crate::settlement::EPOCH_SIGNATURES;
 use crate::{PersistentStore, PersistentStoreConfig};
 
 #[path = "namespace_backpressure_tests.rs"]
@@ -68,11 +70,16 @@ fn write(store: &PersistentStore, ns: &NamespaceRef, time: i64) -> Result<(), St
 fn drain_settlement(store: &PersistentStore, ns: &NamespaceRef) -> TestResult {
     const MUTATIONS: u64 = 16;
     let active = store.namespace_snapshot(ns)?;
+    // Every signature one epoch read verifies: the root's at its completion
+    // and the ledger's at its verification.
+    let signatures = EPOCH_SIGNATURES;
     for _ in 0..64 {
-        let mut work = crate::settlement::Work {
-            mutations: MUTATIONS,
-            bytes: 256 * 1024 * 1024,
-        };
+        let mut work = WorkMeter::new(
+            store
+                .step_limit
+                .with(Dimension::Entries, MUTATIONS)
+                .with(Dimension::Signatures, MUTATIONS * signatures),
+        );
         let settled = store.settle_namespace(active.controller(), &mut work)?;
         assert!(
             settled.examined <= MUTATIONS && settled.applied <= settled.examined,
@@ -91,7 +98,12 @@ fn drain_settlement(store: &PersistentStore, ns: &NamespaceRef) -> TestResult {
             // A maintenance step compacts after it settles: completed
             // retirements release their allocations there.
             for _ in 0..64 {
-                if store.compact_projection(64)?.complete {
+                let mut work = WorkMeter::new(WorkLimit::unbounded().with(Dimension::Entries, 64));
+                if store
+                    .compact_projection(&mut work)?
+                    .or_unavailable()?
+                    .complete
+                {
                     return Ok(());
                 }
             }
@@ -173,11 +185,17 @@ fn process_death_after_commit_before_settlement_recovers_content() -> TestResult
     assert_eq!(store.tag_get_raw(&ns, "payload")?.kappa, identity);
     // Reclamation must not trust projection absence left by the dead child.
     assert_eq!(store.blob_get_in(&ns, &identity)?, bytes);
+    let limit =
+        kappa_store::work::WorkLimit::unbounded().with(kappa_store::work::Dimension::Entries, 8);
     let mut completed = false;
-    for _ in 0..1024 {
-        if store.reclaim_unowned(8)?.complete {
-            completed = true;
-            break;
+    let mut carried = None;
+    for _ in 0..4096 {
+        match store.reclaim_unowned(&limit, carried)?.continuation {
+            None => {
+                completed = true;
+                break;
+            }
+            Some(continuation) => carried = Some(continuation),
         }
     }
     assert!(

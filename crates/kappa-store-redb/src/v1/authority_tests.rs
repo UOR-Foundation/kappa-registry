@@ -372,3 +372,72 @@ fn unresolved_authority_refuses_execution_publication() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn reopen_preserves_unpublished_activation_and_its_offered_signer() -> TestResult {
+    let root = FixtureRoot::temporary()?;
+    let store = open(&root, 1)?;
+    let outgoing = authority(1)?;
+    let incoming = authority(2)?;
+    let control = control(&store, 1000)?;
+    let instance = store.namespace_snapshot(&control)?.controller().instance;
+    store.hooks.refuse_activation_commit(true);
+    let outcome = rotation(
+        &store,
+        &control,
+        &incoming,
+        succession(&outgoing, &incoming, 2000)?,
+        2000,
+    )?;
+    assert!(matches!(outcome, Err(AuthorityRotationError::Retained(_))));
+    assert_eq!(
+        store
+            .retained_authority
+            .load_full()
+            .ok_or("incoming signer lost before restart")?
+            .anchor(),
+        incoming.anchor(),
+    );
+    assert!(store.activation_intent_pending()?);
+    drop(store);
+
+    let reopened = PersistentSpec::new()
+        .in_root(&root)
+        .authority(outgoing.clone())
+        .alternates(vec![incoming.clone()])
+        .acquire()?
+        .into_store();
+    assert!(reopened.activation_intent_pending()?);
+    assert!(reopened.authority_unresolved());
+    assert_eq!(&reopened.node_anchor(), outgoing.anchor());
+    let pending = reopened
+        .retained_authority
+        .load_full()
+        .ok_or("incoming signer lost")?;
+    assert_eq!(pending.anchor(), incoming.anchor());
+    assert!(reopened.holds_custody(&instance)?);
+    assert!(matches!(
+        reopened.project_activations(),
+        Err(StoreError::AuthorityUnresolved { .. })
+    ));
+    assert!(reopened.activation_intent_pending()?);
+    let resolution = ExecutionStore::resolve_publication(
+        &reopened,
+        &control,
+        &clock_at(ClockMs::from_raw(3000))?,
+        &mut kappa_store::work::WorkMeter::new(reopened.step_limit),
+    )?;
+    let kappa_store::PublicationResolution::Published(published) = resolution else {
+        return Err("retained governing epoch did not publish".into());
+    };
+    assert_eq!(
+        reopened.epoch_current(&control)?,
+        (published.epoch_number, published.root)
+    );
+    assert_eq!(&reopened.node_anchor(), incoming.anchor());
+    assert!(!reopened.authority_unresolved());
+    assert!(!reopened.holds_custody(&instance)?);
+    assert!(!reopened.activation_intent_pending()?);
+    authenticated_replay_matches(&reopened, &control)?;
+    Ok(())
+}

@@ -14,6 +14,7 @@
 
 use std::time::{Duration, Instant};
 
+use kappa_types::work::{Dimension, Meter};
 use kappa_types::{Kappa, NamespaceRef, StoreError, VerifiedContent};
 use redb::ReadableTable;
 
@@ -32,19 +33,43 @@ mod tests;
 /// Bound on establishing durability for an external internal record.
 pub const INTERNAL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Per-blob metadata from any table view, read or write transaction.
+/// Table-encryption context of `BLOB_META` values.
+const BLOB_META_CONTEXT: &str = "blob_meta";
+
+/// Per-blob metadata from any table view, read or write transaction, on
+/// `work`: the row key (`meta_key`: the identity's key, then the row key
+/// built from it) and its lookup charged before the lookup; the value's
+/// read, its decryption context (`bound`) and its decryption charged at
+/// the stored length before decrypting.
 pub fn blob_meta_from_table(
     store: &PersistentStore,
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     kappa: &Kappa,
     key: &str,
+    work: &mut dyn Meter,
 ) -> Result<Vec<u8>, StoreError> {
+    let row_len = kappa.key_len() + 1 + key.len();
+    work.charge_all(&[
+        (Dimension::BytesAllocated, kappa.key_len() as u64),
+        (Dimension::BytesAllocated, row_len as u64),
+        (Dimension::Entries, 1),
+    ])?;
     let row = meta_key(kappa, key);
     let guard = table
         .get(row.as_slice())
         .map_err(crate::error::redb)?
         .ok_or_else(|| StoreError::NotFound(format!("meta {kappa}:{key}")))?;
-    store.decrypt_bytes(&bound("blob_meta", &row), guard.value())
+    let stored = guard.value().len() as u64;
+    work.charge_all(&[
+        (Dimension::BytesRead, stored),
+        (Dimension::BytesDecoded, stored),
+        (Dimension::BytesAllocated, stored),
+        (
+            Dimension::BytesAllocated,
+            crate::encrypted::bound_allocation(BLOB_META_CONTEXT, row_len),
+        ),
+    ])?;
+    store.decrypt_bytes(&bound(BLOB_META_CONTEXT, &row), guard.value())
 }
 
 pub fn blob_meta_put_in_txn(
@@ -55,7 +80,7 @@ pub fn blob_meta_put_in_txn(
     value: &[u8],
 ) -> Result<(), StoreError> {
     let row = meta_key(kappa, key);
-    let stored = store.encrypt_bytes(&bound("blob_meta", &row), value)?;
+    let stored = store.encrypt_bytes(&bound(BLOB_META_CONTEXT, &row), value)?;
     txn.open_table(BLOB_META)
         .map_err(crate::error::redb)?
         .insert(row.as_slice(), stored.as_slice())

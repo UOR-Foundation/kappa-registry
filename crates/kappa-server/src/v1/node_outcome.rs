@@ -80,8 +80,9 @@ pub enum Precommit {
     Store(#[source] StoreError),
 }
 
-/// Why a rotation did not complete. Every variant but `Indeterminate`
-/// leaves the outgoing authority live; see each for the key store.
+/// Why a rotation did not complete. Every variant but `Indeterminate` and
+/// `Retained` leaves the outgoing authority live; see each for the key
+/// store.
 #[derive(Debug, thiserror::Error)]
 pub enum RotationError {
     /// The key store's lifecycle could not be taken; nothing was attempted.
@@ -128,6 +129,14 @@ pub enum RotationError {
         "store rotation outcome unknown: {0}; the staged key is retained and the next start settles to the committed authority"
     )]
     Indeterminate(#[source] StoreError),
+    /// The governing publication's coordinate was consumed and it is known
+    /// unpublished: the store retains it, and either authority may end up
+    /// installed when it is resolved. The staged key is retained and no
+    /// authority signs meanwhile.
+    #[error(
+        "store rotation retained unpublished: {0}; the staged key is retained until the governing publication is resolved"
+    )]
+    Retained(#[source] StoreError),
 }
 
 fn residual_state(residual: &Residual) -> String {
@@ -150,8 +159,8 @@ impl RotationError {
             | Self::NotCommitted { residual, .. } => {
                 Some((residual.custody.is_ok(), residual.key_removal.is_ok()))
             }
-            // Both keys are retained until a restart selects one.
-            Self::Indeterminate(_) => Some((false, false)),
+            // Both keys are retained until the outcome selects one.
+            Self::Indeterminate(_) | Self::Retained(_) => Some((false, false)),
             Self::KeyStore(_) | Self::Unavailable(_) | Self::Diverged { .. } => None,
         }
     }

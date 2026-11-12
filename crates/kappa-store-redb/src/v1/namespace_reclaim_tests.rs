@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use kappa_handler::clock_at;
+use kappa_store::work::{Dimension, WorkLimit};
 use kappa_store::{BlobStore, ClockMs, Kappa, MaintenanceStore, NamespaceRef, StoreError};
 
 use super::{TestResult, WATCHDOG, create, create_owned, drain_settlement, open, publish_blob};
@@ -21,17 +22,96 @@ use crate::test_support::retirement_principal;
 use crate::unsettled::Parked;
 use crate::{PersistentStore, PersistentStoreConfig};
 
-/// One complete inventory pass; the accumulated figures.
+/// Eight inventory entries per step.
+fn step_limit() -> WorkLimit {
+    WorkLimit::unbounded().with(Dimension::Entries, 8)
+}
+
+/// One complete inventory pass, its continuation carried between bounded
+/// steps; the accumulated figures.
 fn inventory_pass(store: &PersistentStore) -> TestResult<kappa_store::Reclamation> {
     let mut total = kappa_store::Reclamation::default();
-    for _ in 0..1024 {
-        let step = store.reclaim_unowned(8)?;
-        total.accumulate(&step);
-        if step.complete {
-            return Ok(total);
+    let mut carried = None;
+    for _ in 0..4096 {
+        let step = store.reclaim_unowned(&step_limit(), carried)?;
+        assert!(
+            step.consumed.get(Dimension::Entries) <= 8,
+            "within the limit"
+        );
+        total.accumulate(&step.outcome);
+        match step.continuation {
+            None => return Ok(total),
+            Some(continuation) => carried = Some(continuation),
         }
     }
     Err("bounded inventory did not complete on a tiny fixture".into())
+}
+
+/// A suspended pass holds its open shard stream in its continuation,
+/// charged to the store's pool of suspended traversals; dropping the
+/// continuation closes the stream and releases the charge, and a pass that
+/// cannot reserve one refuses to open a shard.
+#[test]
+fn a_suspended_pass_charges_its_stream_and_cancellation_releases_it() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut config = PersistentStoreConfig::new(
+        root.path().join("blobs"),
+        root.path().join("store.redb"),
+        kappa_crypto::testing::fixture_authority(1)?,
+    );
+    config.max_suspended_traversals = 1;
+    let store = PersistentStore::new(config)?;
+    orphan(&store, 8)?;
+    let one = WorkLimit::unbounded().with(Dimension::Entries, 1);
+    let paused = store.reclaim_unowned(&one, None)?;
+    let continuation = paused.continuation.ok_or("one entry suspends the pass")?;
+    assert_eq!(
+        store.suspended_traversals.used(),
+        1,
+        "the open stream is charged"
+    );
+    assert!(
+        matches!(
+            store.reclaim_unowned(&step_limit(), None),
+            Err(StoreError::CapacityExceeded(_))
+        ),
+        "a second suspended stream exceeds the pool"
+    );
+    drop(continuation);
+    assert_eq!(
+        store.suspended_traversals.used(),
+        0,
+        "cancellation released it"
+    );
+    inventory_pass(&store)?;
+    assert_eq!(
+        store.suspended_traversals.used(),
+        0,
+        "a finished pass holds none"
+    );
+    Ok(())
+}
+
+/// An owner marker longer than any marker the installer writes is refused
+/// without being read further, and the allocation it names is protected.
+#[test]
+fn an_oversized_owner_marker_is_refused_and_protects_its_allocation() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let store = open(root.path())?;
+    let allocation = AllocationId::generate()?;
+    let path = crate::allocation::allocation_path(&store.blob_root, &allocation);
+    std::fs::write(&path, b"payload")?;
+    let marker = crate::allocation::owner_path(&store.blob_root, &allocation);
+    let oversized = usize::try_from(crate::allocation::MAX_OWNER_MARKER_BYTES)? + 1;
+    std::fs::write(&marker, vec![0u8; oversized])?;
+    assert!(matches!(
+        crate::allocation::read_owner_marker(&store.blob_root, &allocation),
+        Err(StoreError::Internal(_))
+    ));
+    let pass = inventory_pass(&store)?;
+    assert_eq!(pass.files, 0, "{pass:?}");
+    assert!(path.exists(), "an unreadable marker never releases");
+    Ok(())
 }
 
 /// The inventory entries `allocation` has on disk: its payload, its

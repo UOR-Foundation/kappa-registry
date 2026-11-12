@@ -74,8 +74,22 @@ pub const ALLOCATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("all
 // rebuildable from the namespace's committed state. A representation row
 // is the namespace's own, so its retirement consults only this index;
 // physical sharing between namespaces is at the allocation level.
+// Generation zero of the index (`derived_index`).
 pub const REFERRERS: MultimapTableDefinition<&[u8], &[u8]> =
     MultimapTableDefinition::new("referrers_v1");
+
+// Generation one of `REFERRERS` and `ALLOCATIONS`: the other physical copy
+// a repair reconstructs privately and then makes live (`derived_index`).
+pub const REFERRERS_G1: MultimapTableDefinition<&[u8], &[u8]> =
+    MultimapTableDefinition::new("referrers_g1");
+pub const ALLOCATIONS_G1: TableDefinition<&[u8], &[u8]> = TableDefinition::new("allocations_g1");
+
+// State of the derived indexes: key = b"live", value = [generation:1], the
+// generation readers and writers use; key = b"repair", value = the active
+// repair's phase and progress (`derived_index::Repair`), committed with
+// each chunk of reconstructed entries.
+pub const DERIVED_STATE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("derived_index_state_v1");
 
 // Committed causal floor of this namespace: key = b"committed-causal-floor",
 // encrypted value = big-endian i64 of the latest time any of its mutations
@@ -149,6 +163,8 @@ pub(crate) fn create_namespace_tables(
         MUTATION_BUFFER,
         LIVE_TAG_STATE,
         ALLOCATIONS,
+        ALLOCATIONS_G1,
+        DERIVED_STATE,
         TIME_STATE,
         ID_BINDINGS,
         ID_ASSERTIONS,
@@ -179,6 +195,7 @@ pub(crate) fn create_namespace_tables(
         EDGE_REL,
         EDGE_ASR,
         REFERRERS,
+        REFERRERS_G1,
         ID_ASSERTION_ASSERTER_IDX,
         ID_REVOCATION_ASSERTER_IDX,
         ID_WATERMARK_ASSERTER_IDX,
@@ -188,7 +205,7 @@ pub(crate) fn create_namespace_tables(
     txn.open_multimap_table(ID_BINDING_SRC_IDX)?;
     txn.open_multimap_table(ID_ASSERTION_SUBJECT_IDX)?;
     txn.open_multimap_table(ID_HANDLE_ANCHOR_IDX)?;
-    Ok(())
+    crate::state_nodes::create_tables(txn)
 }
 
 // =============================================================================
@@ -274,6 +291,12 @@ pub const SETTLEMENT_PASS: TableDefinition<&[u8], &[u8]> =
 // verified release from storage that is merely missing.
 pub const RETIRED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("retired_namespaces_v1");
 
+// Namespaces whose derived indexes have a repair started and not finished:
+// key = ns_uuid, value = (). Written before the namespace's repair state,
+// removed after it, so a restart resumes every repair whose fence is
+// durable in its namespace (`index_repair`).
+pub const INDEX_REPAIRS: TableDefinition<&[u8], ()> = TableDefinition::new("index_repairs_v1");
+
 // =============================================================================
 // Registry database: directory
 // =============================================================================
@@ -312,13 +335,23 @@ pub const NAMESPACE_NAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("
 // Registry database: registry-wide authority and node-local state
 // =============================================================================
 
-// Epoch signing authority history. Key 0: the origin authority's
-// length-prefixed (algorithm, public key). Key n >= 1: the n-th admitted
-// transition (canonical succession record, outgoing key, incoming key),
-// re-verified on every open. Written in the same transaction that activates
-// the transition.
+// Epoch signing authority history, a projection of the governing evidence.
+// Key 0: the origin authority's length-prefixed (algorithm, public key).
+// Key n >= 1: the n-th admitted transition (canonical succession record,
+// outgoing key, incoming key, activation), written after the governing
+// epoch that publishes it under `_authority/{n}` in its control namespace
+// committed, and re-verified against that evidence on every open.
 pub const AUTHORITY_HISTORY: TableDefinition<u64, &[u8]> =
     TableDefinition::new("authority_history_v1");
+
+// The activation in progress: key = b"pending", encrypted value =
+// [position:8 BE][control:16][incarnation:16][record identity key bytes].
+// Written before the governing epoch is published and removed with the
+// history row that projects it, or once the epoch is known not to have
+// committed; a restart resolves one left behind from the control
+// namespace's evidence (`authority_evidence`).
+pub const ACTIVATION_INTENT: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("activation_intent_v1");
 
 // Registry-wide reserved causal ceiling: key = b"reserved-causal-ceiling",
 // encrypted value = big-endian i64. Every issued timestamp is below a
@@ -344,9 +377,6 @@ pub const BINDING_RECORDS: TableDefinition<&[u8], &[u8]> =
 // Compression records: uncompressed kappa key_bytes -> [storage_kappa_key_bytes | algo | uncompressed_size:8]
 pub const COMPRESSION_RECORDS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("compression_records_v1");
-
-// Credential store (used by layers/sigv4.rs)
-pub const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
 
 // -- Identity records shared across namespaces -------------------------------
 
@@ -431,13 +461,13 @@ pub(crate) fn create_registry_tables(txn: &redb::WriteTransaction) -> Result<(),
         RETIRED,
         TIME_RESERVATION,
         EPOCH_TIME_BOUND,
+        ACTIVATION_INTENT,
         BINDING_RECORDS,
         COMPRESSION_RECORDS,
     ] {
         txn.open_table(table)?;
     }
     for table in [
-        CREDENTIALS,
         ID_SESSIONS,
         ID_CREDENTIALS,
         ID_CREDENTIAL_GRACE,
@@ -448,6 +478,7 @@ pub(crate) fn create_registry_tables(txn: &redb::WriteTransaction) -> Result<(),
         txn.open_table(table)?;
     }
     txn.open_table(NAMESPACES)?;
+    txn.open_table(INDEX_REPAIRS)?;
     txn.open_table(DIRECTORY_JOURNAL)?;
     txn.open_table(AUTHORITY_HISTORY)?;
     Ok(())

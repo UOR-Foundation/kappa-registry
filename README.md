@@ -791,7 +791,7 @@ curl -X POST \
 ```
 
 Seventeen relation types: `owns`, `composed-of`, `assertion`, `revocation`,
-`capability`, `recovery-share`, `epoch-root`, `akd-tree-node`,
+`capability`, `recovery-share`, `epoch-root`, `directory-record`,
 `chunk-manifest`, `witness-receipt`, `offload-receipt`, `derived-from`,
 `certified-by`, `evidence-provenance`, `section-of`, `refers-to`,
 `delegation`.
@@ -1155,12 +1155,23 @@ All configuration is via environment variables.
 
 ### Storage
 
+The Rust v1 store configurations also expose record-decoding capacity:
+`PersistentStoreConfig::settlement_read_bytes` bounds retained raw record
+buffers and chunk scratch. Its `None` default is derived at store construction
+from the final cursor count and record limit. `settlement_decoded_bytes`
+bounds decoder arenas and retained typed records (default 64 MiB).
+`MemoryStoreConfig::decoded_storage(bytes)` configures the corresponding
+decoded-record pool for the memory backend. These are library configuration
+fields, not environment variables. Capacity reservations follow retained
+values; dropping a value releases capacity without refunding consumed work.
+
 | Variable | Default | Description |
 |---|---|---|
 | `KAPPA_MAX_BLOB_SIZE` | `268435456` | Maximum blob size (256 MiB) |
 | `KAPPA_UPLOAD_TIMEOUT` | `3600` | Upload session timeout (seconds) |
 | `KAPPA_MAX_TRANSACTIONS` | `64` | Maximum concurrent transactions |
 | `KAPPA_MAX_STAGING_BYTES` | `268435456` | Global staging byte limit (256 MiB) |
+| `KAPPA_MAX_DELTA_BYTES` | `268435456` | Bytes all in-flight delta decodes (git packs, bundles) may hold at once (256 MiB) |
 | `KAPPA_SIGNING_ALGORITHM` | `ed25519` | Node signing key algorithm |
 | `KAPPA_FSYNC` | `true` | fsync on blob write |
 | `KAPPA_DISK_PRESSURE_THRESHOLD_MB` | `1024` | Reject writes below this free space |
@@ -1326,7 +1337,9 @@ kappa-module-s3         S3 ListObjectsV2, XML encoding
 kappa-module-nix        Nix narinfo codec, NAR verification, key format
 kappa-module-identity   identity HTTP endpoints, handle registry
 kappa-module-atproto    MST, CAR, TID, CID, commits, XRPC, sessions, firehose
-kappa-akd               append-only key directory for absence proofs
+kappa-transparency      authenticated identity directory: Merkle map and
+                        append-only log bound to signed epochs; membership,
+                        absence, three-state history and audit proofs
 kappa-conformance       conformance tests, compile-fail tests
 kappa-reconcile         RBSR set reconciliation
 kappa-transport-veilid  Veilid transport for federation
