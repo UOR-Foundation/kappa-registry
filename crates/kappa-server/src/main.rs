@@ -361,9 +361,10 @@ async fn main() {
     let mut builder = Router::builder().compression(Compression::off());
 
     // The router refuses state-changing cross-origin browser requests. The
-    // identity page writes to /passkey/ from its own origin, so those routes
-    // are exempt here and the CORS layer admits only the configured identity
-    // origins; each write is also authenticated by its WebAuthn ceremony.
+    // identity page writes to /passkey/ and /prism/ from its own origin, so
+    // those routes are exempt here and the CORS layer admits only the
+    // configured identity origins; each passkey write is also authenticated
+    // by its WebAuthn ceremony, and mailbox messages are sealed.
     #[cfg(feature = "passkey")]
     {
         builder = builder.origin_policy(
@@ -526,7 +527,8 @@ async fn main() {
         }
         builder = kappa_module_identity::register(builder);
     }
-    // -- Passkey and recovery key records (prism/identity/2) --
+    // -- Passkey and recovery key records (prism/identity/2) and the Prism
+    //    mailbox (prism/identity/3) --
     // The namespace is owned by the node anchor so the generic /v2/ routes
     // cannot write it; without a node identity the routes are not served.
     #[cfg(feature = "passkey")]

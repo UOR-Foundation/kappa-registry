@@ -1,9 +1,10 @@
 //! CORS handling. OPTIONS preflight bypasses auth/ratelimit.
 //! Actual requests get Access-Control-Allow-Origin and Expose-Headers.
 //!
-//! `/passkey/` has its own policy (prism/identity/1): reads are public with
-//! `*`, and writes are allowed only from the configured identity origins, so
-//! no other page can drive a registration or revocation from a browser.
+//! `/passkey/` and the Prism mailbox `/prism/` have their own policy
+//! (prism/identity/1 and /3): reads are public with `*`, and writes are
+//! allowed only from the configured identity origins, so no other page can
+//! drive a registration, a revocation or a mailbox post from a browser.
 
 use http::HeaderValue;
 use topcoat::context::Cx;
@@ -29,10 +30,8 @@ pub fn cors_layer<'a>(cx: &'a Cx, body: Body, next: Next<'a>) -> topcoat::router
         let method = topcoat::router::request::method(cx).clone();
         let origin = topcoat::router::request::headers(cx).get("origin").cloned();
 
-        if topcoat::router::request::uri(cx)
-            .path()
-            .starts_with("/passkey/")
-        {
+        let path = topcoat::router::request::uri(cx).path();
+        if path.starts_with("/passkey/") || path.starts_with("/prism/") {
             return passkey_cors(cx, body, next, method, origin).await;
         }
 
@@ -110,7 +109,7 @@ async fn passkey_cors<'a>(
         // here. Clients without an Origin header carry no ambient
         // credentials and pass, as they do through the router's check.
         let mut response = Response::new(Body::from(
-            r#"{"error":"origin","message":"only an identity origin may write passkey records from a browser"}"#,
+            r#"{"error":"origin","message":"only an identity origin may write identity records from a browser"}"#,
         ));
         *response.status_mut() = StatusCode::FORBIDDEN;
         response

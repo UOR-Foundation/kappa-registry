@@ -1105,6 +1105,25 @@ KAPPA_RATELIMIT_WRITE_PERIOD_MS=1000 \
 ./scripts/service.sh --start
 ```
 
+### Prism mailbox (prism/identity/3)
+
+A Prism id (stitch's Prism id, afflom/stitch) keeps no record in the
+registry. Its devices leave opaque messages under names only their holders
+can derive: a recovery escrow under its recovery code's locator, and sealed
+sync messages under a private boundary key's sync topic. The registry stores
+and returns the bytes and reads none of them.
+
+| Route | |
+| --- | --- |
+| `POST /prism/topic/{topic}` | Keeps the request body (1 byte to 1 MiB) under the topic: `201` new, `200` already kept |
+| `GET /prism/topic/{topic}` | `{"topic", "messages"}`: the newest 64 distinct messages, base64url, oldest first; `404` none |
+
+A topic is `<scheme>:<64 lowercase hex>` (`sha256:`, `prism-sync:`,
+`prism-rendezvous:`). Indexes live in the reserved namespace
+`kappa/identity/prism`, owned by the node anchor; each index is a blob of
+message kappas named by one tag, and appends race through the tag's version.
+The CORS policy, origin check and bearer exemption are the passkey routes'.
+
 ---
 
 ## Federation
@@ -1221,7 +1240,7 @@ All configuration is via environment variables.
 | `KAPPA_HANDLE_VERIFY_INTERVAL_SECS` | `3600` | Handle re-verification interval |
 | `KAPPA_HANDLE_TTL_MS` | `86400000` | Handle verification TTL (24h) |
 | `KAPPA_PDS_HOSTNAME` | (unset) | AT Protocol PDS hostname for requestCrawl |
-| `KAPPA_PASSKEY_ORIGINS` | (unset) | Identity origins for `/passkey/` (comma-separated; https, or `http://localhost` for development) |
+| `KAPPA_PASSKEY_ORIGINS` | (unset) | Identity origins for `/passkey/` and `/prism/` (comma-separated; https, or `http://localhost` for development) |
 
 ### Rate limiting
 
@@ -1265,7 +1284,7 @@ All three must pass with zero warnings before any commit.
 | `git` | yes | Git smart HTTP protocol |
 | `s3` | yes | S3-compatible API |
 | `nix` | yes | Nix binary cache protocol |
-| `passkey` | yes | Passkey key records (prism/identity/1) |
+| `passkey` | yes | Passkey key records (prism/identity/1, /2) and the Prism mailbox (prism/identity/3) |
 | `atproto` | **no** | AT Protocol XRPC endpoints |
 | `veilid` | no | Veilid transport for federation |
 
@@ -1318,7 +1337,8 @@ kappa-module-git        Git smart HTTP: pack ingest/gen, refs, hooks, LFS
 kappa-module-s3         S3 ListObjectsV2, XML encoding
 kappa-module-nix        Nix narinfo codec, NAR verification, key format
 kappa-module-identity   identity HTTP endpoints, handle registry
-kappa-module-passkey    passkey key records: WebAuthn checks, /passkey/ routes
+kappa-module-passkey    passkey key records: WebAuthn checks, /passkey/ routes;
+                        Prism mailbox, /prism/topic/ routes
 kappa-module-atproto    MST, CAR, TID, CID, commits, XRPC, sessions, firehose
 kappa-akd               append-only key directory for absence proofs
 kappa-conformance       conformance tests, compile-fail tests

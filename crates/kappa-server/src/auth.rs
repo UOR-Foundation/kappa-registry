@@ -441,7 +441,7 @@ fn cap_permits(edge: &Edge, op: OpClass) -> bool {
 /// Bearer token authentication middleware.
 ///
 /// Checks the Authorization header for a valid Bearer token.
-/// Exempt paths (/_status, /v2/, /v2/_health/*, /passkey/*) bypass auth.
+/// Exempt paths (/_status, /v2/, /v2/_health/*, /passkey/*, /prism/*) bypass auth.
 /// When auth_required is false or the token list is empty, all
 /// requests pass (permissive default for backward compatibility).
 ///
@@ -484,14 +484,17 @@ impl BearerAuth {
                 asserter: "anonymous".to_string(),
             });
         }
-        // Exempt paths: health, status, version check, and the passkey
-        // routes, which browsers call with no token: each write there is
-        // authenticated by its own WebAuthn ceremony or signature instead.
+        // Exempt paths: health, status, version check, the passkey routes,
+        // which browsers call with no token (each write there is
+        // authenticated by its own WebAuthn ceremony or signature instead),
+        // and the Prism mailbox, whose messages are sealed and whose topic
+        // names only their holders can derive.
         if path == "/_status"
             || path == "/v2/"
             || path == "/v2"
             || path.starts_with("/v2/_health/")
             || path.starts_with("/passkey/")
+            || path.starts_with("/prism/")
         {
             return Ok(AuthIdentity {
                 asserter: "anonymous".to_string(),

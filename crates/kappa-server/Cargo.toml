@@ -57,6 +57,7 @@ kappa-module-passkey = { path = "../kappa-module-passkey", optional = true }
 gix-hash = { version = "0.23", features = ["sha1"], optional = true }
 
 [dev-dependencies]
+base64 = "0.22"
 reqwest = { version = "0.13", features = ["blocking", "json", "rustls"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
@@ -79,6 +80,10 @@ kappa-module-passkey = { path = "../kappa-module-passkey", features = ["testing"
 [[test]]
 name = "passkey_http"
 path = "tests/integration/passkey_http.rs"
+
+[[test]]
+name = "prism_mailbox_http"
+path = "tests/integration/prism_mailbox_http.rs"
 
 [[test]]
 name = "nix_e2e"

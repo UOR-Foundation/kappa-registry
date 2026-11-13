@@ -1,6 +1,6 @@
 //! Typed failures of the passkey routes.
 //!
-//! Every failure has a stable code from prism/identity/2, an HTTP status and
+//! Every failure has a stable code from prism/identity/2 or /3, an HTTP status and
 //! one sentence for the reader. The body is `{"error": code, "message": ...}`.
 
 use kappa_core::StoreError;
@@ -37,6 +37,8 @@ pub enum PasskeyError {
     UnknownCredential,
     #[error("no key is registered for this account")]
     UnknownAccount,
+    #[error("this topic holds no messages")]
+    UnknownTopic,
     #[error("the registry could not read or write its store")]
     Store(#[from] StoreError),
 }
@@ -58,6 +60,7 @@ impl PasskeyError {
             Self::Revoked => "revoked",
             Self::Rate => "rate",
             Self::UnknownAccount => "account",
+            Self::UnknownTopic => "topic",
             Self::Store(_) => "store",
         }
     }
@@ -74,7 +77,9 @@ impl PasskeyError {
             Self::Exists => StatusCode::CONFLICT,
             Self::Revoked => StatusCode::GONE,
             Self::Rate => StatusCode::TOO_MANY_REQUESTS,
-            Self::UnknownCredential | Self::UnknownAccount => StatusCode::NOT_FOUND,
+            Self::UnknownCredential | Self::UnknownAccount | Self::UnknownTopic => {
+                StatusCode::NOT_FOUND
+            }
             Self::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

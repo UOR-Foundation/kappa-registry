@@ -118,6 +118,9 @@ const ROUTES: &[&str] = &[
     "get|/passkey/credential/{credential}|passkey_credential|Key record for a credential (404 unknown, 410 revoked)|Passkey|credential:path!|-|j",
     "get|/passkey/account/{account}|passkey_account|Every key record of an account|Passkey|account:path!|-|j",
     "post|/passkey/revoke|passkey_revoke|Revoke a key on an assertion by a live key of the account|Passkey||j|j",
+    // Prism mailbox (prism/identity/3)
+    "post|/prism/topic/{topic}|prism_topic_post|Keep an opaque message under a topic (201 new, 200 already kept)|Passkey|topic:path!|b|j",
+    "get|/prism/topic/{topic}|prism_topic_get|The newest messages of a topic, base64url, oldest first (404 none)|Passkey|topic:path!|-|j",
     // Cluster
     "get|/cluster/members|cluster_members|List cluster members|System||-|j",
     "get|/cluster/status|cluster_status|Cluster status|System||-|j",
@@ -428,6 +431,8 @@ mod tests {
             ("/passkey/credential/{credential}", "get"),
             ("/passkey/account/{account}", "get"),
             ("/passkey/revoke", "post"),
+            ("/prism/topic/{topic}", "post"),
+            ("/prism/topic/{topic}", "get"),
         ] {
             assert!(
                 paths[path][method].is_object(),

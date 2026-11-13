@@ -13,6 +13,7 @@ use crate::testing::{Authenticator, Ceremony, RecoveryKey, AT, UP};
 use crate::webauthn::Assertion;
 use crate::{PasskeyConfig, PasskeyError, PasskeyState};
 
+mod mailbox;
 mod recovery;
 
 /// An expected error code and the ceremony change that must produce it.

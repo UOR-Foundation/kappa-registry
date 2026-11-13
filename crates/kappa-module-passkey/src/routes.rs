@@ -1,4 +1,4 @@
-//! HTTP routes under `/passkey/`.
+//! HTTP routes under `/passkey/` and the Prism mailbox under `/prism/topic/`.
 //!
 //! Thin: decode the body, run the service call off the async executor, and
 //! turn a `PasskeyError` into its typed JSON response.
@@ -6,6 +6,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use kappa_core::store::KappaStore;
 use topcoat::context::{app_context, Cx};
 use topcoat::router::request::headers;
@@ -15,6 +17,7 @@ use topcoat::router::{
 };
 
 use crate::error::PasskeyError;
+use crate::mailbox;
 use crate::service::{self, Recovery, Registration, Revocation};
 use crate::PasskeyState;
 
@@ -207,6 +210,65 @@ fn revoke_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
+fn topic_post_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let topic = path_param(cx, "topic");
+        let message = match to_bytes(body, mailbox::MAX_MESSAGE_BYTES).await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(_) => {
+                return failure(
+                    cx,
+                    &PasskeyError::Request(format!(
+                        "a message is at most {} bytes",
+                        mailbox::MAX_MESSAGE_BYTES
+                    )),
+                )
+            }
+        };
+        let name = topic.clone();
+        let result = blocking(cx, move |store, state| {
+            mailbox::post(store, &state.mailbox, &name, &message)
+        })
+        .await;
+        match result {
+            Ok(newly) => json(
+                cx,
+                if newly {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                serde_json::json!({ "topic": topic, "newly": newly }).to_string(),
+            ),
+            Err(e) => failure(cx, &e),
+        }
+    })
+}
+
+fn topic_get_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        drop(body);
+        let topic = path_param(cx, "topic");
+        let name = topic.clone();
+        let result = blocking(cx, move |store, state| {
+            mailbox::messages(store, &state.mailbox, &name)
+        })
+        .await;
+        match result {
+            Ok(messages) => {
+                let encoded: Vec<String> =
+                    messages.iter().map(|m| URL_SAFE_NO_PAD.encode(m)).collect();
+                json(
+                    cx,
+                    StatusCode::OK,
+                    serde_json::json!({ "topic": topic, "messages": encoded }).to_string(),
+                )
+            }
+            Err(e) => failure(cx, &e),
+        }
+    })
+}
+
 /// CORS preflight target. The server's CORS layer answers preflights for
 /// `/passkey/` before this runs; the route exists because the router answers
 /// a method no route accepts with 405 before any path layer sees it.
@@ -217,17 +279,18 @@ fn preflight_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
-/// Paths of every `/passkey/` route, for the server's router policies.
-pub const PATHS: [&str; 6] = [
+/// Paths of every `/passkey/` and `/prism/` route, for the server's router policies.
+pub const PATHS: [&str; 7] = [
     "/passkey/challenge",
     "/passkey/register",
     "/passkey/recovery",
     "/passkey/credential/{credential}",
     "/passkey/account/{account}",
     "/passkey/revoke",
+    "/prism/topic/{topic}",
 ];
 
-/// Register the `/passkey/` routes. The server must also put an
+/// Register the `/passkey/` and `/prism/` routes. The server must also put an
 /// `Arc<PasskeyState>` in the app context.
 pub fn register(builder: RouterBuilder) -> RouterBuilder {
     let builder = PATHS.into_iter().fold(builder, |builder, path| {
@@ -267,5 +330,15 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
             Method::POST,
             Cow::Borrowed(Path::new("/passkey/revoke")),
             revoke_handler,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            Cow::Borrowed(Path::new("/prism/topic/{topic}")),
+            topic_post_handler,
+        ))
+        .route(RouteFn::new(
+            Method::GET,
+            Cow::Borrowed(Path::new("/prism/topic/{topic}")),
+            topic_get_handler,
         ))
 }

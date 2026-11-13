@@ -1,4 +1,5 @@
-//! Passkey and recovery key records for prism/identity/2.
+//! Passkey and recovery key records for prism/identity/2, and the Prism
+//! mailbox for prism/identity/3.
 //!
 //! A Prism account is a set of keys: passkeys on devices, and recovery keys
 //! the owner keeps outside them. This module stores the public halves,
@@ -13,11 +14,16 @@
 //!   GET  /passkey/credential/{credential}   - the key record for a credential
 //!   GET  /passkey/account/{account}         - every key record of an account
 //!   POST /passkey/revoke                    - revoke a key on a signed request
+//!   POST /prism/topic/{topic}               - keep an opaque message under a topic
+//!   GET  /prism/topic/{topic}               - the newest messages of a topic
 //!
+//! prism/identity/3 (stitch's Prism id) keeps no record here: its devices
+//! use only the mailbox (see `mailbox`).
 //! The contract is identity/PROTOCOL.md in UOR-Foundation/template.
 
 pub mod config;
 pub mod error;
+pub mod mailbox;
 pub mod records;
 mod routes;
 pub mod service;
@@ -41,15 +47,17 @@ pub use routes::{register, PATHS};
 pub const PASSKEY_NAMESPACE: &str = "kappa/identity/passkey";
 
 /// Everything the routes share: accepted origins, outstanding challenges
-/// and the resolved namespace.
+/// and the resolved namespaces.
 pub struct PasskeyState {
     pub config: PasskeyConfig,
     pub challenges: service::Challenges,
     pub namespace: NamespaceRef,
+    /// The Prism mailbox's indexes (`mailbox::MAILBOX_NAMESPACE`).
+    pub mailbox: NamespaceRef,
 }
 
 impl PasskeyState {
-    /// Resolve (creating on first start) the passkey namespace, owned by
+    /// Resolve (creating on first start) the passkey and mailbox namespaces, owned by
     /// `owner`, the node's anchor. The owner must not be "anonymous": with
     /// bearer auth off every caller is "anonymous", and an owner match would
     /// open the namespace to the generic routes.
@@ -64,10 +72,12 @@ impl PasskeyState {
             ));
         }
         let namespace = store.namespace_resolve_or_create(PASSKEY_NAMESPACE, owner, None)?;
+        let mailbox = store.namespace_resolve_or_create(mailbox::MAILBOX_NAMESPACE, owner, None)?;
         Ok(Self {
             config,
             challenges: service::Challenges::default(),
             namespace,
+            mailbox,
         })
     }
 }
