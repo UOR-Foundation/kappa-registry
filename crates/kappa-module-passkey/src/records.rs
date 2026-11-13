@@ -19,17 +19,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::PasskeyError;
 use crate::webauthn::Assertion;
 
-/// Records written now name keys by kappa. key/1 records (base64url key IDs)
-/// stay readable and keep signing: a reader picks the key ID rule by spec.
-pub const KEY_SPEC: &str = "prism/identity/key/2";
+pub const KEY_SPEC: &str = "prism/identity/key/1";
 pub const REVOCATION_SPEC: &str = "prism/identity/revocation/1";
 
-/// The longest binding chain a key may sit at the end of. Every device added
-/// and every recovery adds one binding, so the bound is generous: it exists
-/// only so a reader's work stays finite, never to retire an account.
-pub const MAX_CHAIN: usize = 32;
+/// The longest binding chain a key may sit at the end of.
+pub const MAX_CHAIN: usize = 5;
 
-/// A key record as prism/identity/2 defines it. Field order is the
+/// A key record as prism/identity/1 defines it. Field order is the
 /// protocol's, and serde_json keeps it, so the stored bytes read as written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyRecord {

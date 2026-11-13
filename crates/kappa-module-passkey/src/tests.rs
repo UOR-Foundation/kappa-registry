@@ -8,13 +8,12 @@ use kappa_core::store::memory::{InMemoryStore, MemoryStoreConfig};
 use kappa_core::store::KappaStore;
 
 use crate::records::KeyRecord;
-use crate::service::{self, Recovery, Registration, Revocation};
-use crate::testing::{Authenticator, Ceremony, RecoveryKey, AT, UP};
+use crate::service::{self, Registration, Revocation};
+use crate::testing::{Authenticator, Ceremony, AT, UP};
 use crate::webauthn::Assertion;
 use crate::{PasskeyConfig, PasskeyError, PasskeyState};
 
 mod mailbox;
-mod recovery;
 
 /// An expected error code and the ceremony change that must produce it.
 type Case<'a> = (&'static str, Box<dyn Fn(&mut Ceremony) + 'a>);
@@ -97,43 +96,6 @@ impl Fixture {
         self.register_body(body)
     }
 
-    fn recovery(
-        &self,
-        recovery: &RecoveryKey,
-        account: &str,
-        binding: Assertion,
-    ) -> Result<KeyRecord, PasskeyError> {
-        self.recovery_body(recovery.recovery(account, &binding), Some(ORIGIN))
-    }
-
-    fn recovery_body(
-        &self,
-        body: serde_json::Value,
-        origin: Option<&str>,
-    ) -> Result<KeyRecord, PasskeyError> {
-        let request: Recovery =
-            serde_json::from_value(body).expect("the body is a recovery request");
-        service::recovery(
-            &self.store,
-            &self.state.namespace,
-            &self.state.config,
-            request,
-            origin,
-            NOW,
-        )
-    }
-
-    /// Add `recovery` to `account`, bound by the passkey `binder`.
-    fn add_recovery(
-        &self,
-        recovery: &RecoveryKey,
-        account: &str,
-        binder: &Authenticator,
-    ) -> Result<KeyRecord, PasskeyError> {
-        let message = format!("prism/identity/bind/1\n{account}\n{}", recovery.key());
-        self.recovery(recovery, account, binder.assert(&message, ORIGIN, |_| {}))
-    }
-
     fn revoke(&self, account: &str, key: &str, assertion: Assertion) -> Result<bool, PasskeyError> {
         let request = Revocation {
             account: account.into(),
@@ -177,8 +139,6 @@ fn first_key_is_its_own_account_and_reads_back() {
     let auth = Authenticator::p256();
     let record = f.register(&auth).expect("register the first key");
     assert_eq!(record.key, auth.key());
-    assert!(record.key.starts_with("sha256:") && record.key.len() == 71);
-    assert_eq!(record.spec, "prism/identity/key/2");
     assert_eq!(record.account, auth.key());
     assert_eq!(record.origin, ORIGIN);
     assert_eq!(record.binding, None);
@@ -338,14 +298,14 @@ fn binding_checks_fail_closed_with_their_codes() {
 }
 
 #[test]
-fn a_binding_chain_has_a_finite_bound() {
+fn a_binding_chain_is_at_most_five_long() {
     let f = fixture();
     let mut binder = Authenticator::p256();
     let account = f.register(&binder).unwrap().account;
-    for _ in 0..crate::records::MAX_CHAIN {
+    for _ in 0..5 {
         let next = Authenticator::p256();
         f.bind(&next, &account, &binder)
-            .expect("chains up to the bound bind");
+            .expect("chains up to five bind");
         binder = next;
     }
     assert_eq!(

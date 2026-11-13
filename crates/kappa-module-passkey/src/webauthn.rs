@@ -1,21 +1,17 @@
-//! WebAuthn and recovery-key checks for prism/identity/2.
+//! WebAuthn checks for prism/identity/1.
 //!
 //! The browser hands over the raw ceremony outputs unchanged. Registration is
 //! checked against a challenge the registry issued; assertions are checked
 //! against a message the verifier rebuilds, with the protocol's six checks in
 //! order. Signatures are verified by `p256` (ES256) and `rsa` (RS256); the
 //! CBOR the authenticator wrote (attestation object, COSE key) is read by
-//! `ciborium`. A recovery key (EdDSA, Ed25519) is not a passkey: it signs the
-//! protocol message itself, with no client data or authenticator data, and
-//! is checked by kappa-core's strict Ed25519 verifier. Nothing here trusts a
-//! field the signer did not sign without saying why.
+//! `ciborium`. Nothing here trusts a field the authenticator did not sign
+//! without saying why.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ciborium::Value;
-use kappa_core::crypto::ed25519::Ed25519Verifier;
-use kappa_core::crypto::Verifier as _;
-use kappa_core::kappa::{sha256_raw, KappaLabel};
+use kappa_core::kappa::sha256_raw;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{IdentityOrigin, PasskeyConfig};
@@ -24,14 +20,6 @@ use crate::error::PasskeyError;
 /// COSE algorithm identifiers the protocol accepts.
 pub const ES256: i64 = -7;
 pub const RS256: i64 = -257;
-/// A recovery key: Ed25519, held by the account's owner outside any device.
-pub const EDDSA: i64 = -8;
-
-/// DER prefix of an Ed25519 SubjectPublicKeyInfo (RFC 8410): the 32-byte
-/// public key follows it, and nothing else.
-const ED25519_SPKI_PREFIX: [u8; 12] = [
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-];
 
 const FLAG_UP: u8 = 0x01;
 const FLAG_UV: u8 = 0x04;
@@ -48,61 +36,20 @@ pub fn unb64u(field: &str, text: &str) -> Result<Vec<u8>, PasskeyError> {
         .map_err(|_| PasskeyError::Request(format!("{field} is not base64url")))
 }
 
-/// Key ID: the UORC object address (kappa) of the key, `sha256:<64 hex>`
-/// over its DER SubjectPublicKeyInfo.
+/// Key ID: `b64u(SHA-256(spki))`.
 pub fn key_id(spki: &[u8]) -> String {
-    KappaLabel::sha256(spki).to_string()
-}
-
-/// Key ID as prism/identity/1 wrote it, `b64u(SHA-256(spki))`. Records
-/// written under key/1 keep it, so readers still accept it.
-pub fn legacy_key_id(spki: &[u8]) -> String {
     b64u(&sha256_raw(spki))
 }
 
-/// One signature over a protocol message, every field base64url. A passkey's
-/// is a WebAuthn assertion and carries client data and authenticator data; a
-/// recovery key's is a bare Ed25519 signature and carries neither.
+/// One WebAuthn assertion, every field base64url as the protocol writes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assertion {
     pub credential: String,
-    #[serde(
-        rename = "clientDataJSON",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub client_data_json: Option<String>,
-    #[serde(
-        rename = "authenticatorData",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub authenticator_data: Option<String>,
+    #[serde(rename = "clientDataJSON")]
+    pub client_data_json: String,
+    #[serde(rename = "authenticatorData")]
+    pub authenticator_data: String,
     pub signature: String,
-}
-
-/// The 32-byte Ed25519 public key inside `spki`, refusing any other SPKI.
-pub fn ed25519_public_key(spki: &[u8]) -> Result<[u8; 32], PasskeyError> {
-    let not_ed25519 = || PasskeyError::Key("spki is not an Ed25519 public key".into());
-    let rest = spki
-        .strip_prefix(ED25519_SPKI_PREFIX.as_slice())
-        .ok_or_else(not_ed25519)?;
-    rest.try_into().map_err(|_| not_ed25519())
-}
-
-/// The recovery-key check: a strict Ed25519 signature over `message` itself.
-/// A recovery signature that carries WebAuthn fields is malformed, so a
-/// passkey assertion can never be read as one.
-fn check_recovery(spki: &[u8], message: &[u8], assertion: &Assertion) -> Result<(), PasskeyError> {
-    if assertion.client_data_json.is_some() || assertion.authenticator_data.is_some() {
-        return Err(PasskeyError::Signature);
-    }
-    let public_key = ed25519_public_key(spki)?;
-    let signature = unb64u("signature", &assertion.signature)?;
-    match Ed25519Verifier.verify(&public_key, message, &signature) {
-        Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(PasskeyError::Signature),
-    }
 }
 
 #[derive(Deserialize)]
@@ -218,7 +165,6 @@ pub fn check_created(
 }
 
 /// The six assertion checks for `message`, under the key (`alg`, `spki`).
-/// A recovery key's signature is checked by `check_recovery` instead.
 pub fn check_assertion(
     config: &PasskeyConfig,
     alg: i64,
@@ -226,17 +172,8 @@ pub fn check_assertion(
     message: &[u8],
     assertion: &Assertion,
 ) -> Result<(), PasskeyError> {
-    if alg == EDDSA {
-        return check_recovery(spki, message, assertion);
-    }
-    let (Some(client_data_json), Some(authenticator_data)) = (
-        assertion.client_data_json.as_deref(),
-        assertion.authenticator_data.as_deref(),
-    ) else {
-        return Err(PasskeyError::Signature);
-    };
-    let client_json = unb64u("clientDataJSON", client_data_json)?;
-    let authenticator = unb64u("authenticatorData", authenticator_data)?;
+    let client_json = unb64u("clientDataJSON", &assertion.client_data_json)?;
+    let authenticator = unb64u("authenticatorData", &assertion.authenticator_data)?;
     let signature = unb64u("signature", &assertion.signature)?;
     let data = client_data(&client_json)?;
     if data.kind != "webauthn.get" || data.challenge != b64u(&sha256_raw(message)) {

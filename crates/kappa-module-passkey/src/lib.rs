@@ -1,8 +1,7 @@
-//! Passkey and recovery key records for prism/identity/2, and the Prism
-//! mailbox for prism/identity/3.
+//! Passkey key records for prism/identity/1, and the Prism mailbox for
+//! prism/identity/3.
 //!
-//! A Prism account is a set of keys: passkeys on devices, and recovery keys
-//! the owner keeps outside them. This module stores the public halves,
+//! A Prism account is a passkey. This module stores the public half,
 //! content addressed, after checking the WebAuthn ceremony that made it, and
 //! serves it to anyone. It cannot forge an account: every reader checks the
 //! key ID against the key and every signature for itself.
@@ -10,7 +9,6 @@
 //! Endpoints:
 //!   POST /passkey/challenge                 - issue a single-use challenge
 //!   POST /passkey/register                  - register a passkey (new account or bound device)
-//!   POST /passkey/recovery                  - add a recovery key to an account
 //!   GET  /passkey/credential/{credential}   - the key record for a credential
 //!   GET  /passkey/account/{account}         - every key record of an account
 //!   POST /passkey/revoke                    - revoke a key on a signed request
@@ -19,6 +17,7 @@
 //!
 //! prism/identity/3 (stitch's Prism id) keeps no record here: its devices
 //! use only the mailbox (see `mailbox`).
+//!
 //! The contract is identity/PROTOCOL.md in UOR-Foundation/template.
 
 pub mod config;

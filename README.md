@@ -1060,22 +1060,18 @@ Narrowing invariant: redelegation may only narrow scope, shorten TTL,
 and decrement depth. Depth is enforced at creation and evaluation.
 Revoking a delegation cascades to all downstream delegates.
 
-### Passkeys and recovery keys (prism/identity/2)
+### Passkeys (prism/identity/1)
 
-A Prism account is a set of keys: passkeys, whose private keys stay in each
-device's secure hardware, and recovery keys, whose private keys the owner
-keeps outside every device as a recovery code. The registry stores the public
-halves after checking the ceremony or signature that added them. The contract
-is `identity/PROTOCOL.md` in UOR-Foundation/template. Key ID is the kappa
-`sha256:<hex>` of the key's DER SPKI; an account is the key ID of its first
-passkey. IDs written under prism/identity/1 (`base64url(SHA-256(spki))`)
-stay valid.
+A Prism account is a passkey: its private key stays in the device's secure
+hardware, and the registry stores the public half after checking the WebAuthn
+ceremony that made it. The contract is `identity/PROTOCOL.md` in
+UOR-Foundation/template. Key ID is `base64url(SHA-256(spki))`; an account is
+the key ID of its first passkey.
 
 | Route | Does |
 |---|---|
 | `POST /passkey/challenge` | `{"challenge", "expires"}`: 32 random bytes, single use, 120 s |
-| `POST /passkey/register` | Registers a passkey: a new account, or a device bound by a bind assertion from a live key of the account (a passkey or a recovery key) |
-| `POST /passkey/recovery` | `{"spki"}` starts an account whose first key is an Ed25519 recovery key; `{"account", "spki", "binding"}` adds one bound by a live key of the account. Its credential is its raw public key |
+| `POST /passkey/register` | Registers a passkey: a new account, or a device bound by a bind assertion from a live key of the account |
 | `GET /passkey/credential/{credential}` | The key record; `404` unknown, `410` revoked |
 | `GET /passkey/account/{account}` | `{"account", "keys", "revoked"}` |
 | `POST /passkey/revoke` | `{"account", "key", "assertion"}`: revokes a key on a signed request |
@@ -1085,10 +1081,7 @@ Registration checks the client data type and a challenge the registry issued
 `KAPPA_PASSKEY_ORIGINS`, the rpId hash, the UP, UV and AT flags, that the
 attested credential ID and COSE key are the ones named, and, for a bound
 device, the bind assertion. ES256 (`p256`) and RS256 (`rsa`, 2048 bits and
-up) are accepted; `ciborium` reads the attestation object. A recovery key
-(EdDSA, `-8`) signs the protocol message itself, with no client or
-authenticator data, and is checked with kappa-core's strict Ed25519
-verifier. Errors are
+up) are accepted; `ciborium` reads the attestation object. Errors are
 `{"error": code, "message"}` with the protocol's codes.
 
 Records live in the reserved namespace `kappa/identity/passkey`, owned by the
@@ -1284,7 +1277,7 @@ All three must pass with zero warnings before any commit.
 | `git` | yes | Git smart HTTP protocol |
 | `s3` | yes | S3-compatible API |
 | `nix` | yes | Nix binary cache protocol |
-| `passkey` | yes | Passkey key records (prism/identity/1, /2) and the Prism mailbox (prism/identity/3) |
+| `passkey` | yes | Passkey key records (prism/identity/1) and the Prism mailbox (prism/identity/3) |
 | `atproto` | **no** | AT Protocol XRPC endpoints |
 | `veilid` | no | Veilid transport for federation |
 

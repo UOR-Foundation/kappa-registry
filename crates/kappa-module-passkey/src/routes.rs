@@ -10,7 +10,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use kappa_core::store::KappaStore;
 use topcoat::context::{app_context, Cx};
-use topcoat::router::request::headers;
 use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
     raw_path_params, to_bytes, Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
@@ -18,7 +17,7 @@ use topcoat::router::{
 
 use crate::error::PasskeyError;
 use crate::mailbox;
-use crate::service::{self, Recovery, Registration, Revocation};
+use crate::service::{self, Registration, Revocation};
 use crate::PasskeyState;
 
 /// Largest request body a passkey route reads. A registration is a few KiB.
@@ -101,41 +100,6 @@ fn register_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 &state.config,
                 &state.challenges,
                 request,
-                service::now_ms(),
-            )
-        })
-        .await;
-        match result {
-            Ok(record) => json(
-                cx,
-                StatusCode::CREATED,
-                serde_json::json!({ "key": record.key, "account": record.account, "record": record })
-                    .to_string(),
-            ),
-            Err(e) => failure(cx, &e),
-        }
-    })
-}
-
-fn recovery_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
-    Box::pin(async move {
-        // The browser's Origin, which a first recovery key records. The
-        // server's origin policy has already refused any other browser.
-        let origin = headers(cx)
-            .get("origin")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let request: Recovery = match read_json(body).await {
-            Ok(r) => r,
-            Err(e) => return failure(cx, &e),
-        };
-        let result = blocking(cx, move |store, state| {
-            service::recovery(
-                store,
-                &state.namespace,
-                &state.config,
-                request,
-                origin.as_deref(),
                 service::now_ms(),
             )
         })
@@ -280,10 +244,9 @@ fn preflight_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 /// Paths of every `/passkey/` and `/prism/` route, for the server's router policies.
-pub const PATHS: [&str; 7] = [
+pub const PATHS: [&str; 6] = [
     "/passkey/challenge",
     "/passkey/register",
-    "/passkey/recovery",
     "/passkey/credential/{credential}",
     "/passkey/account/{account}",
     "/passkey/revoke",
@@ -310,11 +273,6 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
             Method::POST,
             Cow::Borrowed(Path::new("/passkey/register")),
             register_handler,
-        ))
-        .route(RouteFn::new(
-            Method::POST,
-            Cow::Borrowed(Path::new("/passkey/recovery")),
-            recovery_handler,
         ))
         .route(RouteFn::new(
             Method::GET,
