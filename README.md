@@ -1075,7 +1075,7 @@ stay valid.
 |---|---|
 | `POST /passkey/challenge` | `{"challenge", "expires"}`: 32 random bytes, single use, 120 s |
 | `POST /passkey/register` | Registers a passkey: a new account, or a device bound by a bind assertion from a live key of the account (a passkey or a recovery key) |
-| `POST /passkey/recovery` | `{"account", "spki", "binding"}`: adds an Ed25519 recovery key bound by a live key of the account; its credential is its raw public key |
+| `POST /passkey/recovery` | `{"spki"}` starts an account whose first key is an Ed25519 recovery key; `{"account", "spki", "binding"}` adds one bound by a live key of the account. Its credential is its raw public key |
 | `GET /passkey/credential/{credential}` | The key record; `404` unknown, `410` revoked |
 | `GET /passkey/account/{account}` | `{"account", "keys", "revoked"}` |
 | `POST /passkey/revoke` | `{"account", "key", "assertion"}`: revokes a key on a signed request |

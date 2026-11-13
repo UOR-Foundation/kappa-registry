@@ -86,13 +86,16 @@ pub struct BindingRequest {
     pub assertion: Assertion,
 }
 
-/// A recovery key to add to `account`: its Ed25519 SPKI and a bind
-/// assertion over its key ID by a live key of the account.
+/// A recovery key: its Ed25519 SPKI and either nothing else, to start a new
+/// account with it as the first key, or an `account` and a bind assertion
+/// over its key ID by a live key of that account.
 #[derive(Debug, Deserialize)]
 pub struct Recovery {
-    pub account: String,
+    #[serde(default)]
+    pub account: Option<String>,
     pub spki: String,
-    pub binding: Assertion,
+    #[serde(default)]
+    pub binding: Option<Assertion>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,33 +239,60 @@ pub fn register(
     Ok(record)
 }
 
-/// Add a recovery key to an account. The owner keeps its private half
-/// outside every device (the recovery code); with it they bind a passkey on
-/// a new device, or revoke a lost one, when no device of theirs is at hand.
-/// Its credential is its raw 32-byte public key in base64url, so the code
-/// alone finds its record. It is bound like any key, by a live key of the
-/// account, and records the identity origin its binder was made on.
+/// Add a recovery key. The owner keeps its private half outside every
+/// device (the recovery code); with it they bind a passkey on a new device,
+/// or revoke a lost one, when no device of theirs is at hand. Its credential
+/// is its raw 32-byte public key in base64url, so the code alone finds its
+/// record.
+///
+/// With no binding it starts a new account as that account's first key, so
+/// an account made this way never depended on any device: the sign-in page
+/// makes it, then binds the device's passkey to it with no extra prompt.
+/// Nothing is proved by possession here, and nothing needs to be: the key ID
+/// is the key's hash, so whoever writes the record first can only name a key
+/// whose private half they may not hold, and an account no one can sign for
+/// grants nothing. The first key's origin is the identity origin the browser
+/// sent (`origin`), which must be one this registry accepts. With a binding,
+/// it is bound like any key, by a live key of the account, and takes its
+/// binder's origin.
 pub fn recovery(
     store: &dyn KappaStore,
     ns: &NamespaceRef,
     config: &PasskeyConfig,
     request: Recovery,
+    origin: Option<&str>,
     now: u64,
 ) -> Result<KeyRecord, PasskeyError> {
     let spki = webauthn::unb64u("spki", &request.spki)?;
     let public_key = webauthn::ed25519_public_key(&spki)?;
     let key = webauthn::key_id(&spki);
-    let binder = binder(store, ns, config, &request.account, &key, &request.binding)?;
+    let (account, origin, binding) = match (request.account, request.binding) {
+        (None, None) => {
+            let accepted = origin
+                .and_then(|o| config.origin(o))
+                .ok_or(PasskeyError::Origin)?;
+            (key.clone(), accepted.origin.clone(), None)
+        }
+        (Some(account), Some(assertion)) => {
+            let binder = binder(store, ns, config, &account, &key, &assertion)?;
+            (account, binder.origin, Some(assertion))
+        }
+        _ => {
+            return Err(PasskeyError::Request(
+                "a recovery key names both an account and a binding, or neither".into(),
+            ))
+        }
+    };
     let record = KeyRecord {
         spec: KEY_SPEC.to_string(),
         key,
-        account: request.account,
+        account,
         credential: webauthn::b64u(&public_key),
         alg: EDDSA,
         spki: request.spki,
-        origin: binder.origin,
+        origin,
         created: now,
-        binding: Some(request.binding),
+        binding,
     };
     records::insert(store, ns, &record)?;
     Ok(record)

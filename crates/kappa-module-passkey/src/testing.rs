@@ -294,6 +294,11 @@ impl RecoveryKey {
     pub fn recovery(&self, account: &str, binding: &Assertion) -> serde_json::Value {
         json!({ "account": account, "spki": b64u(&self.spki), "binding": binding })
     }
+
+    /// A `/passkey/recovery` body starting a new account with this key.
+    pub fn genesis(&self) -> serde_json::Value {
+        json!({ "spki": b64u(&self.spki) })
+    }
 }
 
 impl Default for RecoveryKey {

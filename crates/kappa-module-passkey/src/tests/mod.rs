@@ -102,13 +102,22 @@ impl Fixture {
         account: &str,
         binding: Assertion,
     ) -> Result<KeyRecord, PasskeyError> {
-        let request: Recovery = serde_json::from_value(recovery.recovery(account, &binding))
-            .expect("the body is a recovery request");
+        self.recovery_body(recovery.recovery(account, &binding), Some(ORIGIN))
+    }
+
+    fn recovery_body(
+        &self,
+        body: serde_json::Value,
+        origin: Option<&str>,
+    ) -> Result<KeyRecord, PasskeyError> {
+        let request: Recovery =
+            serde_json::from_value(body).expect("the body is a recovery request");
         service::recovery(
             &self.store,
             &self.state.namespace,
             &self.state.config,
             request,
+            origin,
             NOW,
         )
     }

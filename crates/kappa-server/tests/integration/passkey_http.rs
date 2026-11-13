@@ -218,6 +218,14 @@ fn a_recovery_key_recovers_an_account_on_a_new_device() {
         format!("{base}/passkey/credential/{}", lost.credential_id()),
     );
     assert_eq!(status, 410, "lost device lookup: {gone}");
+
+    // A recovery key can also be a new account's first key, the identity
+    // origin the browser sent recorded as its origin.
+    let root = RecoveryKey::new();
+    let (status, started) = post(&c, format!("{base}/passkey/recovery"), &root.genesis());
+    assert_eq!(status, 201, "first recovery key: {started}");
+    assert_eq!(started["account"], root.key());
+    assert_eq!(started["record"]["origin"], ORIGIN);
 }
 
 #[test]

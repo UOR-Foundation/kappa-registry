@@ -1,8 +1,8 @@
 //! Recovery keys: an account outlives every device it was made on.
 
-use super::{code, fixture, NOW, ORIGIN};
+use super::{code, fixture, ORIGIN};
 use crate::records::KeyRecord;
-use crate::service::{self, Recovery};
+use crate::service;
 use crate::testing::{Authenticator, RecoveryKey};
 
 #[test]
@@ -80,9 +80,7 @@ fn recovery_checks_fail_closed_with_their_codes() {
         ),
     );
     body["spki"] = serde_json::Value::String(crate::webauthn::b64u(&first.spki));
-    let request: Recovery = serde_json::from_value(body).unwrap();
-    let refused = service::recovery(&f.store, &f.state.namespace, &f.state.config, request, NOW);
-    assert_eq!(code(refused), "key");
+    assert_eq!(code(f.recovery_body(body, Some(ORIGIN))), "key");
 
     f.add_recovery(&recovery, &account, &first).unwrap();
     assert_eq!(code(f.add_recovery(&recovery, &account, &first)), "exists");
@@ -116,4 +114,41 @@ fn identity_1_account_ids_are_still_accepted() {
     ] {
         assert_eq!(code(service::check_id("account", bad)), "request", "{bad}");
     }
+}
+
+#[test]
+fn a_recovery_key_can_be_an_accounts_first_key() {
+    let f = fixture();
+    let root = RecoveryKey::new();
+    let record = f
+        .recovery_body(root.genesis(), Some(ORIGIN))
+        .expect("a recovery key starts an account");
+    assert_eq!(record.account, root.key());
+    assert_eq!(record.key, root.key());
+    assert_eq!(record.binding, None);
+    assert_eq!(record.origin, ORIGIN);
+
+    // The device's passkey joins with no prompt beyond its own creation.
+    let device = Authenticator::p256();
+    let account = record.account;
+    let message = format!("prism/identity/bind/1\n{account}\n{}", device.key());
+    let bound = f
+        .bind_with(&device, &account, root.assert(&message))
+        .expect("the first key binds the device");
+    assert_eq!(bound.account, account);
+
+    // A first key needs an identity origin, and a half-bound request is malformed.
+    let other = RecoveryKey::new();
+    assert_eq!(code(f.recovery_body(other.genesis(), None)), "origin");
+    assert_eq!(
+        code(f.recovery_body(other.genesis(), Some("https://evil.example"))),
+        "origin"
+    );
+    let mut half = other.genesis();
+    half["account"] = serde_json::Value::String(account.clone());
+    assert_eq!(code(f.recovery_body(half, Some(ORIGIN))), "request");
+    assert_eq!(
+        code(f.recovery_body(root.genesis(), Some(ORIGIN))),
+        "exists"
+    );
 }

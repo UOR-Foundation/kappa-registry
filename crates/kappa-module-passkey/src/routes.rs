@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use kappa_core::store::KappaStore;
 use topcoat::context::{app_context, Cx};
+use topcoat::router::request::headers;
 use topcoat::router::response::{IntoResponse, Response};
 use topcoat::router::{
     raw_path_params, to_bytes, Body, Method, Path, RouteFn, RouteFuture, RouterBuilder, StatusCode,
@@ -115,6 +116,12 @@ fn register_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 
 fn recovery_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
+        // The browser's Origin, which a first recovery key records. The
+        // server's origin policy has already refused any other browser.
+        let origin = headers(cx)
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let request: Recovery = match read_json(body).await {
             Ok(r) => r,
             Err(e) => return failure(cx, &e),
@@ -125,6 +132,7 @@ fn recovery_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
                 &state.namespace,
                 &state.config,
                 request,
+                origin.as_deref(),
                 service::now_ms(),
             )
         })
