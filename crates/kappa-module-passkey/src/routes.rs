@@ -14,7 +14,7 @@ use topcoat::router::{
 };
 
 use crate::error::PasskeyError;
-use crate::service::{self, Registration, Revocation};
+use crate::service::{self, Recovery, Registration, Revocation};
 use crate::PasskeyState;
 
 /// Largest request body a passkey route reads. A registration is a few KiB.
@@ -113,6 +113,34 @@ fn register_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
     })
 }
 
+fn recovery_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
+    Box::pin(async move {
+        let request: Recovery = match read_json(body).await {
+            Ok(r) => r,
+            Err(e) => return failure(cx, &e),
+        };
+        let result = blocking(cx, move |store, state| {
+            service::recovery(
+                store,
+                &state.namespace,
+                &state.config,
+                request,
+                service::now_ms(),
+            )
+        })
+        .await;
+        match result {
+            Ok(record) => json(
+                cx,
+                StatusCode::CREATED,
+                serde_json::json!({ "key": record.key, "account": record.account, "record": record })
+                    .to_string(),
+            ),
+            Err(e) => failure(cx, &e),
+        }
+    })
+}
+
 fn credential_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
     Box::pin(async move {
         drop(body);
@@ -182,9 +210,10 @@ fn preflight_handler(cx: &Cx, body: Body) -> RouteFuture<'_> {
 }
 
 /// Paths of every `/passkey/` route, for the server's router policies.
-pub const PATHS: [&str; 5] = [
+pub const PATHS: [&str; 6] = [
     "/passkey/challenge",
     "/passkey/register",
+    "/passkey/recovery",
     "/passkey/credential/{credential}",
     "/passkey/account/{account}",
     "/passkey/revoke",
@@ -210,6 +239,11 @@ pub fn register(builder: RouterBuilder) -> RouterBuilder {
             Method::POST,
             Cow::Borrowed(Path::new("/passkey/register")),
             register_handler,
+        ))
+        .route(RouteFn::new(
+            Method::POST,
+            Cow::Borrowed(Path::new("/passkey/recovery")),
+            recovery_handler,
         ))
         .route(RouteFn::new(
             Method::GET,

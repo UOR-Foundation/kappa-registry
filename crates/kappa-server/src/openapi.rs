@@ -111,9 +111,10 @@ const ROUTES: &[&str] = &[
     "post|/identity/succession|identity_succession_put|Create identity succession|Identity||j|j",
     "get|/identity/succession/{anchor}/chain|identity_succession_chain|Full succession chain|Identity|anchor:path!|-|j",
     "get|/identity/succession/{anchor}|identity_succession_resolve|Resolve to current anchor|Identity|anchor:path!|-|j",
-    // Passkeys (prism/identity/1)
+    // Passkeys and recovery keys (prism/identity/2)
     "post|/passkey/challenge|passkey_challenge|Issue a single-use WebAuthn challenge|Passkey||-|j",
     "post|/passkey/register|passkey_register|Register a passkey after verifying its WebAuthn ceremony|Passkey||j|j",
+    "post|/passkey/recovery|passkey_recovery|Add a recovery key bound by a live key of the account|Passkey||j|j",
     "get|/passkey/credential/{credential}|passkey_credential|Key record for a credential (404 unknown, 410 revoked)|Passkey|credential:path!|-|j",
     "get|/passkey/account/{account}|passkey_account|Every key record of an account|Passkey|account:path!|-|j",
     "post|/passkey/revoke|passkey_revoke|Revoke a key on an assertion by a live key of the account|Passkey||j|j",
@@ -423,6 +424,7 @@ mod tests {
         for (path, method) in [
             ("/passkey/challenge", "post"),
             ("/passkey/register", "post"),
+            ("/passkey/recovery", "post"),
             ("/passkey/credential/{credential}", "get"),
             ("/passkey/account/{account}", "get"),
             ("/passkey/revoke", "post"),

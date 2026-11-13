@@ -3650,6 +3650,7 @@ dependencies = [
  "base64 0.22.1",
  "ciborium",
  "dashmap 6.2.1",
+ "ed25519-dalek 3.0.0",
  "getrandom 0.4.3",
  "kappa-core",
  "p256 0.14.0",

@@ -1,7 +1,9 @@
 //! A software authenticator for tests: real P-256 and RSA keys producing
 //! WebAuthn-shaped outputs (client data, authenticator data, attestation
-//! object with fmt "none", DER and PKCS#1 signatures). Built only for tests
-//! and the `testing` feature, never in a release binary.
+//! object with fmt "none", DER and PKCS#1 signatures), and a recovery key
+//! (Ed25519) producing bare signatures as the sign-in page does from a
+//! recovery code. Built only for tests and the `testing` feature, never in a
+//! release binary.
 
 use ciborium::Value;
 use kappa_core::kappa::sha256_raw;
@@ -237,9 +239,65 @@ impl Authenticator {
         signed.extend_from_slice(&sha256_raw(&client_data));
         Assertion {
             credential: self.credential_id(),
-            client_data_json: b64u(&client_data),
-            authenticator_data: b64u(&auth),
+            client_data_json: Some(b64u(&client_data)),
+            authenticator_data: Some(b64u(&auth)),
             signature: b64u(&self.sign(&signed)),
         }
+    }
+}
+
+/// A recovery key, as the sign-in page makes one for a recovery code.
+pub struct RecoveryKey {
+    pub spki: Vec<u8>,
+    public_key: [u8; 32],
+    key: ed25519_dalek::SigningKey,
+}
+
+impl RecoveryKey {
+    pub fn new() -> Self {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("the OS random source is available in tests");
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let public_key = key.verifying_key().to_bytes();
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(&public_key);
+        Self {
+            spki,
+            public_key,
+            key,
+        }
+    }
+
+    pub fn key(&self) -> String {
+        key_id(&self.spki)
+    }
+
+    /// Its credential: the raw public key in base64url.
+    pub fn credential_id(&self) -> String {
+        b64u(&self.public_key)
+    }
+
+    /// A bare Ed25519 signature over `message`.
+    pub fn assert(&self, message: &str) -> Assertion {
+        use ed25519_dalek::Signer as _;
+        Assertion {
+            credential: self.credential_id(),
+            client_data_json: None,
+            authenticator_data: None,
+            signature: b64u(&self.key.sign(message.as_bytes()).to_bytes()),
+        }
+    }
+
+    /// A `/passkey/recovery` body adding this key to `account`, bound by `binding`.
+    pub fn recovery(&self, account: &str, binding: &Assertion) -> serde_json::Value {
+        json!({ "account": account, "spki": b64u(&self.spki), "binding": binding })
+    }
+}
+
+impl Default for RecoveryKey {
+    fn default() -> Self {
+        Self::new()
     }
 }

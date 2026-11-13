@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Passkey (WebAuthn) key records for prism/identity/1."
+description = "Passkey (WebAuthn) and recovery key records for prism/identity/2."
 
 [lib]
 name = "kappa_module_passkey"
@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [features]
 # Builds WebAuthn-shaped test vectors (real P-256 and RSA signatures) for the
 # server's integration tests. Never enabled in a release build.
-testing = ["dep:rand_core", "dep:rand_core_06"]
+testing = ["dep:rand_core", "dep:rand_core_06", "dep:ed25519-dalek"]
 
 [dependencies]
 kappa-core = { workspace = true }
@@ -33,8 +33,10 @@ base64 = "0.22"
 thiserror = { workspace = true }
 rand_core = { workspace = true, optional = true }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"], optional = true }
+ed25519-dalek = { workspace = true, optional = true }
 
 [dev-dependencies]
+ed25519-dalek = { workspace = true }
 tempfile = { workspace = true }
 rand_core = { workspace = true }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }

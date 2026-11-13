@@ -1,6 +1,6 @@
 //! Typed failures of the passkey routes.
 //!
-//! Every failure has a stable code from prism/identity/1, an HTTP status and
+//! Every failure has a stable code from prism/identity/2, an HTTP status and
 //! one sentence for the reader. The body is `{"error": code, "message": ...}`.
 
 use kappa_core::StoreError;

@@ -1,12 +1,13 @@
-//! Integration tests for the /passkey/ routes (prism/identity/1), through
+//! Integration tests for the /passkey/ routes (prism/identity/2), through
 //! the real server binary: register a first key, bind a second, read both,
-//! revoke one; plus the CORS policy and namespace isolation.
+//! revoke one; recover an account with a recovery key; plus the CORS policy
+//! and namespace isolation.
 
 mod helpers;
 #[allow(unused_imports)]
 use helpers::*;
 
-use kappa_module_passkey::testing::Authenticator;
+use kappa_module_passkey::testing::{Authenticator, RecoveryKey};
 use kappa_module_passkey::webauthn::Assertion;
 
 const ORIGIN: &str = "http://localhost:8790";
@@ -114,7 +115,7 @@ fn register_bind_read_and_revoke() {
         assert_eq!(status, 200, "credential lookup: {record}");
         assert_eq!(record["key"], auth.key());
         assert_eq!(record["account"], account);
-        assert_eq!(record["spec"], "prism/identity/key/1");
+        assert_eq!(record["spec"], "prism/identity/key/2");
         assert_eq!(allow.as_deref(), Some("*"));
     }
 
@@ -158,6 +159,65 @@ fn register_bind_read_and_revoke() {
     );
     assert_eq!(status, 400, "replay: {replay}");
     assert_eq!(replay["error"], "challenge");
+}
+
+#[test]
+fn a_recovery_key_recovers_an_account_on_a_new_device() {
+    let (_guard, base, _tmp) = passkey_server();
+    let c = client();
+    let lost = Authenticator::p256();
+    let (status, created) = post(
+        &c,
+        format!("{base}/passkey/register"),
+        &lost.register(&challenge(&c, &base), ORIGIN, |_| {}),
+    );
+    assert_eq!(status, 201, "register: {created}");
+    let account = lost.key();
+
+    let recovery = RecoveryKey::new();
+    let bind = lost.assert(
+        &format!("prism/identity/bind/1\n{account}\n{}", recovery.key()),
+        ORIGIN,
+        |_| {},
+    );
+    let (status, added) = post(
+        &c,
+        format!("{base}/passkey/recovery"),
+        &recovery.recovery(&account, &bind),
+    );
+    assert_eq!(status, 201, "recovery key: {added}");
+    assert_eq!(added["key"], recovery.key());
+    let (status, record, _) = get(
+        &c,
+        format!("{base}/passkey/credential/{}", recovery.credential_id()),
+    );
+    assert_eq!(status, 200, "recovery lookup: {record}");
+    assert_eq!(record["account"], account);
+    assert_eq!(record["alg"], -8);
+
+    let new = Authenticator::p256();
+    let bind = recovery.assert(&format!("prism/identity/bind/1\n{account}\n{}", new.key()));
+    let body = with_binding(
+        new.register(&challenge(&c, &base), ORIGIN, |_| {}),
+        &account,
+        &bind,
+    );
+    let (status, bound) = post(&c, format!("{base}/passkey/register"), &body);
+    assert_eq!(status, 201, "recovered device: {bound}");
+    assert_eq!(bound["account"], account);
+
+    let revoke = recovery.assert(&format!(
+        "prism/identity/revoke/1\n{account}\n{}",
+        lost.key()
+    ));
+    let body = serde_json::json!({ "account": account, "key": lost.key(), "assertion": revoke });
+    let (status, revoked) = post(&c, format!("{base}/passkey/revoke"), &body);
+    assert_eq!(status, 200, "revoke lost device: {revoked}");
+    let (status, gone, _) = get(
+        &c,
+        format!("{base}/passkey/credential/{}", lost.credential_id()),
+    );
+    assert_eq!(status, 410, "lost device lookup: {gone}");
 }
 
 #[test]

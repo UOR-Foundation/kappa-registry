@@ -526,7 +526,7 @@ async fn main() {
         }
         builder = kappa_module_identity::register(builder);
     }
-    // -- Passkey key records (prism/identity/1) --
+    // -- Passkey and recovery key records (prism/identity/2) --
     // The namespace is owned by the node anchor so the generic /v2/ routes
     // cannot write it; without a node identity the routes are not served.
     #[cfg(feature = "passkey")]

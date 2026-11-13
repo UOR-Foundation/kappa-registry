@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::config::PasskeyConfig;
 use crate::error::PasskeyError;
 use crate::records::{self, KeyRecord, Stored, KEY_SPEC, MAX_CHAIN, REVOCATION_SPEC};
-use crate::webauthn::{self, Assertion, Created};
+use crate::webauthn::{self, Assertion, Created, EDDSA};
 
 /// How long an issued challenge stays usable.
 pub const CHALLENGE_TTL_MS: u64 = 120_000;
@@ -86,6 +86,15 @@ pub struct BindingRequest {
     pub assertion: Assertion,
 }
 
+/// A recovery key to add to `account`: its Ed25519 SPKI and a bind
+/// assertion over its key ID by a live key of the account.
+#[derive(Debug, Deserialize)]
+pub struct Recovery {
+    pub account: String,
+    pub spki: String,
+    pub binding: Assertion,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Revocation {
     pub account: String,
@@ -93,10 +102,15 @@ pub struct Revocation {
     pub assertion: Assertion,
 }
 
-/// Key and account IDs are base64url SHA-256: exactly 43 characters.
+/// Key and account IDs are kappas, `sha256:` and 64 lowercase hex digits,
+/// or, for keys and accounts made under prism/identity/1, base64url SHA-256
+/// (exactly 43 characters).
 pub fn check_id(field: &str, id: &str) -> Result<(), PasskeyError> {
-    let ok = id.len() == 43 && webauthn::unb64u(field, id).is_ok_and(|b| b.len() == 32);
-    if ok {
+    let kappa = id.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    let legacy = id.len() == 43 && webauthn::unb64u(field, id).is_ok_and(|b| b.len() == 32);
+    if kappa || legacy {
         Ok(())
     } else {
         Err(PasskeyError::Request(format!("{field} is not a key ID")))
@@ -144,8 +158,37 @@ fn verify(
     webauthn::check_assertion(config, record.alg, &spki, message.as_bytes(), assertion)
 }
 
+/// The live key of `account` that signed `assertion`, checked to sign
+/// `prism/identity/bind/1` for `key` and to leave room in the chain.
+fn binder(
+    store: &dyn KappaStore,
+    ns: &NamespaceRef,
+    config: &PasskeyConfig,
+    account: &str,
+    key: &str,
+    assertion: &Assertion,
+) -> Result<KeyRecord, PasskeyError> {
+    check_id("account", account)?;
+    let binder = signer(store, ns, account, assertion)?.ok_or_else(|| {
+        PasskeyError::Binding("the binding key is not a key of this account".into())
+    })?;
+    if records::chain_length(store, ns, &binder)? + 1 > MAX_CHAIN {
+        return Err(PasskeyError::Binding(format!(
+            "a binding chain may be at most {MAX_CHAIN} bindings long"
+        )));
+    }
+    verify(
+        config,
+        &binder,
+        &format!("prism/identity/bind/1\n{account}\n{key}"),
+        assertion,
+    )?;
+    Ok(binder)
+}
+
 /// Register a passkey: a new account's first key, or a key bound to an
-/// account by a bind assertion from one of its live keys.
+/// account by a bind assertion from one of its live keys (a passkey or a
+/// recovery key).
 pub fn register(
     store: &dyn KappaStore,
     ns: &NamespaceRef,
@@ -173,21 +216,7 @@ pub fn register(
     let (account, binding) = match request.binding {
         None => (key.clone(), None),
         Some(BindingRequest { account, assertion }) => {
-            check_id("account", &account)?;
-            let binder = signer(store, ns, &account, &assertion)?.ok_or_else(|| {
-                PasskeyError::Binding("the binding key is not a key of this account".into())
-            })?;
-            if records::chain_length(store, ns, &binder)? + 1 > MAX_CHAIN {
-                return Err(PasskeyError::Binding(
-                    "a binding chain may be at most five bindings long".into(),
-                ));
-            }
-            verify(
-                config,
-                &binder,
-                &format!("prism/identity/bind/1\n{account}\n{key}"),
-                &assertion,
-            )?;
+            binder(store, ns, config, &account, &key, &assertion)?;
             (account, Some(assertion))
         }
     };
@@ -202,6 +231,38 @@ pub fn register(
         origin,
         created: now,
         binding,
+    };
+    records::insert(store, ns, &record)?;
+    Ok(record)
+}
+
+/// Add a recovery key to an account. The owner keeps its private half
+/// outside every device (the recovery code); with it they bind a passkey on
+/// a new device, or revoke a lost one, when no device of theirs is at hand.
+/// Its credential is its raw 32-byte public key in base64url, so the code
+/// alone finds its record. It is bound like any key, by a live key of the
+/// account, and records the identity origin its binder was made on.
+pub fn recovery(
+    store: &dyn KappaStore,
+    ns: &NamespaceRef,
+    config: &PasskeyConfig,
+    request: Recovery,
+    now: u64,
+) -> Result<KeyRecord, PasskeyError> {
+    let spki = webauthn::unb64u("spki", &request.spki)?;
+    let public_key = webauthn::ed25519_public_key(&spki)?;
+    let key = webauthn::key_id(&spki);
+    let binder = binder(store, ns, config, &request.account, &key, &request.binding)?;
+    let record = KeyRecord {
+        spec: KEY_SPEC.to_string(),
+        key,
+        account: request.account,
+        credential: webauthn::b64u(&public_key),
+        alg: EDDSA,
+        spki: request.spki,
+        origin: binder.origin,
+        created: now,
+        binding: Some(request.binding),
     };
     records::insert(store, ns, &record)?;
     Ok(record)
