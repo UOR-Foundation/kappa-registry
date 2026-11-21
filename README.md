@@ -1,4 +1,14 @@
+![kappa-registry: UOR Foundation provisional placeholder PNG, not approved project branding](assets/readme-banner-PLACEHOLDER.png)
+
+*Illustrative placeholder pending Foundation branding review.*
+
 # kappa-registry
+
+**One content-addressed storage server for several standard client protocols, reducing duplicate storage while keeping each protocol's native interface.**
+
+[Quick start](#quick-start) · [OCI registry](#oci-distribution-spec) · [Git](#git-smart-http) · [S3](#s3-compatible-api) · [Nix cache](#nix-binary-cache) · [Identity](#identity) · [Testing](#testing) · [Docs](#documentation)
+
+[![CI](https://github.com/UOR-Foundation/kappa-registry/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/UOR-Foundation/kappa-registry/actions/workflows/ci.yml)
 
 A single-binary server that speaks Docker, Git, S3, Nix, and AT Protocol,
 storing everything in one content-addressed database. One process, one port,
