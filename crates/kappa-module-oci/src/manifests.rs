@@ -626,11 +626,20 @@ async fn tag_list(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
 
     if has_more {
         if let Some(last_tag) = tag_names.last() {
-            let link = format!(
-                "</v2/{}/tags/list?last={}>; rel=\"next\"",
-                ns.as_str(),
-                last_tag
-            );
+            let link = if let Some(limit) = n_param {
+                format!(
+                    "</v2/{}/tags/list?n={}&last={}>; rel=\"next\"",
+                    ns.as_str(),
+                    limit,
+                    last_tag
+                )
+            } else {
+                format!(
+                    "</v2/{}/tags/list?last={}>; rel=\"next\"",
+                    ns.as_str(),
+                    last_tag
+                )
+            };
             return (
                 StatusCode::OK,
                 [
