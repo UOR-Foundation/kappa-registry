@@ -625,10 +625,13 @@ async fn tag_list(cx: &Cx, ns: &NamespaceRef) -> topcoat::Result<Response> {
     let json_body = serde_json::to_string(&body).unwrap_or_default();
 
     if has_more {
-        if let Some(last_tag) = tag_names.last() {
+        // has_more is only true when n was supplied, so the limit is
+        // always present here; carry it so the next page keeps its size.
+        if let (Some(limit), Some(last_tag)) = (n_param, tag_names.last()) {
             let link = format!(
-                "</v2/{}/tags/list?last={}>; rel=\"next\"",
+                "</v2/{}/tags/list?n={}&last={}>; rel=\"next\"",
                 ns.as_str(),
+                limit,
                 last_tag
             );
             return (
